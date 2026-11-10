@@ -4,6 +4,7 @@ import { useState, useCallback, useRef } from "react";
 
 import { createArtifactDownload } from "../lib/artifact-api";
 import type { Artifact } from "@cogniplane/shared-types";
+import { ArtifactPreviewTooLargeError, TEXT_PREVIEW_TOO_LARGE_MESSAGE } from "../lib/artifact-preview";
 import { artifactApiBase, loadArtifactPreview } from "../lib/artifact-preview-loader";
 
 /**
@@ -95,9 +96,13 @@ export function useArtifactActions(input: {
           setPreviewContent(result.text);
         }
       }
-    } catch (_err) {
+    } catch (err) {
       if (previewRequestRef.current === thisRequest)
-        setPreviewError("Failed to load preview. Try downloading the file instead.");
+        setPreviewError(
+          err instanceof ArtifactPreviewTooLargeError
+            ? TEXT_PREVIEW_TOO_LARGE_MESSAGE
+            : "Failed to load preview. Try downloading the file instead."
+        );
     } finally {
       if (previewRequestRef.current === thisRequest) {
         setIsLoadingPreview(false);

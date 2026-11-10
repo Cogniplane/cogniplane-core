@@ -2,7 +2,9 @@ import { test, expect, describe, beforeEach, vi } from "vitest";
 import { decodeJwt } from "jose";
 import Fastify, { type FastifyInstance } from "fastify";
 import cookie from "@fastify/cookie";
+import { OauthException, WorkOS } from "@workos-inc/node";
 
+import { handleAppError } from "../app.js";
 import { registerAuthRoutes, timingSafeEqualString } from "./auth.js";
 import { resolveTenantMembershipRole } from "../services/auth/workos-tenant-provisioning.js";
 import { signRefreshToken } from "../lib/jwt.js";
@@ -182,6 +184,9 @@ async function buildHarness(opts: {
     ...(logLines ? { logger: { level: "warn", stream: { write: (line: string) => { logLines.push(JSON.parse(line)); } } } } : {}),
     ...(opts.trustProxy ? { trustProxy: opts.trustProxy } : {})
   });
+  // The production error handler, so the tests see the status and body that
+  // a client gets for an error the route does not handle.
+  app.setErrorHandler(handleAppError);
   app.decorate("redis", redis.asAppRedis());
   await app.register(cookie);
 
@@ -453,6 +458,164 @@ describe("POST /auth/callback", () => {
     expect(res.statusCode).toBe(400);
     expect(res.json()).toEqual({ error: "invalid_pkce_verifier" });
     expect(harness.workosMocks.authenticateWithCode).not.toHaveBeenCalled();
+  });
+
+  const FLOW_COOKIES = {
+    cogniplane_oauth_state: "the-state",
+    cogniplane_oauth_pkce: TEST_PKCE_VERIFIER
+  };
+
+  // Both flow cookies are single use. Every answer after the rate limit
+  // deletes them.
+  function expectFlowCookiesCleared(header: string | string[] | undefined) {
+    for (const name of ["cogniplane_oauth_state", "cogniplane_oauth_pkce"]) {
+      const cleared = parseSetCookie(header, name);
+      expect(cleared?.value).toBe("");
+      expect(cleared?.attrs["max-age"] ?? cleared?.attrs.expires).toBeDefined();
+    }
+  }
+
+  /**
+   * Sends the code exchange through the installed WorkOS SDK, with `answer`
+   * in place of the WorkOS API. The route then gets the exception that the
+   * SDK makes from that answer.
+   */
+  function exchangeThroughSdk(answer: () => Promise<Response>) {
+    const sdk = new WorkOS("test-workos-api-key", { fetchFn: answer, maxRetries: 0 });
+    harness.workosMocks.authenticateWithCode.mockImplementation(
+      (options: Parameters<WorkOS["userManagement"]["authenticateWithCode"]>[0]) =>
+        sdk.userManagement.authenticateWithCode(options)
+    );
+  }
+
+  const workosAnswer = (status: number, body: unknown) => async () =>
+    new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+
+  // The code goes to WorkOS and the state is compared with the cookie, so
+  // both must be strings of a known size before either is used.
+  test.each([
+    ["an object code", { code: { length: 1 }, state: "the-state" }, "invalid_request"],
+    ["an array code", { code: ["valid-code"], state: "the-state" }, "invalid_request"],
+    ["a number code", { code: 12345, state: "the-state" }, "invalid_request"],
+    ["a code over the size bound", { code: "c".repeat(513), state: "the-state" }, "invalid_request"],
+    ["an empty code", { code: "", state: "the-state" }, "missing_code"],
+    ["no code", { state: "the-state" }, "missing_code"],
+    ["an object state", { code: "valid-code", state: { value: "the-state" } }, "invalid_request"],
+    ["an array state", { code: "valid-code", state: ["the-state"] }, "invalid_request"],
+    ["an empty state", { code: "valid-code", state: "" }, "invalid_state"],
+    ["no state", { code: "valid-code" }, "invalid_state"],
+    ["a state over the size bound", { code: "valid-code", state: "s".repeat(129) }, "invalid_state"],
+    ["a body that is not an object", ["valid-code", "the-state"], "invalid_request"]
+  ] as const)("refuses %s with 400 before it calls WorkOS", async (_case, payload, error) => {
+    const res = await harness.app.inject({
+      method: "POST",
+      url: "/auth/callback",
+      payload: payload as never,
+      cookies: FLOW_COOKIES
+    });
+
+    expect(res.statusCode).toBe(400);
+    expect(res.json()).toEqual({ error });
+    expect(harness.workosMocks.authenticateWithCode).not.toHaveBeenCalled();
+    expectFlowCookiesCleared(res.headers["set-cookie"]);
+  });
+
+  test("sends a code at the size bound to WorkOS", async () => {
+    seedWorkOSHappyPath();
+    harness.workosMocks.listOrganizationMemberships.mockResolvedValue({ data: [] });
+    const code = "c".repeat(512);
+
+    const res = await harness.app.inject({
+      method: "POST",
+      url: "/auth/callback",
+      payload: { code, state: "the-state" },
+      cookies: FLOW_COOKIES
+    });
+
+    // The exchange ran; the user then has no organization.
+    expect(res.json()).toEqual({ error: "no_organization" });
+    expect(harness.workosMocks.authenticateWithCode).toHaveBeenCalledWith({
+      code,
+      clientId: "test-client-id",
+      codeVerifier: TEST_PKCE_VERIFIER
+    });
+  });
+
+  // WorkOS refuses a code it does not accept with the OAuth error
+  // invalid_grant (HTTP 400). The user must start a new sign-in, so the
+  // route answers like a refused local sign-in code: 401 invalid_code.
+  test.each([
+    ["an unknown code", "The code 'valid-code' is invalid."],
+    ["an expired code", "The code 'valid-code' has expired."],
+    ["a code used before", "The code 'valid-code' has already been used."],
+    ["a verifier that does not match", "The code_verifier does not match the code_challenge."]
+  ])("answers 401 invalid_code when WorkOS refuses %s", async (_case, description) => {
+    const logLines: Array<{ level: number; msg: string } & Record<string, unknown>> = [];
+    harness = await buildHarness({ logLines });
+    exchangeThroughSdk(workosAnswer(400, { error: "invalid_grant", error_description: description }));
+
+    const res = await harness.app.inject({
+      method: "POST",
+      url: "/auth/callback",
+      payload: { code: "valid-code", state: "the-state" },
+      cookies: FLOW_COOKIES
+    });
+
+    expect(res.statusCode).toBe(401);
+    expect(res.json()).toEqual({ error: "invalid_code" });
+    expect(harness.workosMocks.authenticateWithCode).toHaveBeenCalledTimes(1);
+    expect(harness.workosMocks.listOrganizationMemberships).not.toHaveBeenCalled();
+    expect(harness.pool.queries).toHaveLength(0);
+    expectFlowCookiesCleared(res.headers["set-cookie"]);
+    expect(parseSetCookie(res.headers["set-cookie"], "cogniplane_refresh")).toBeNull();
+    // The log names the refusal, but not the code, the state, the verifier
+    // or what WorkOS answered.
+    expect(logLines.map((line) => line.msg)).toContain("auth callback 401: WorkOS refused the authorization code");
+    const logged = JSON.stringify(logLines);
+    for (const secret of ["valid-code", "the-state", TEST_PKCE_VERIFIER, description, "invalid_grant"]) {
+      expect(logged).not.toContain(secret);
+    }
+  });
+
+  // Only a refused code is the client's fault. An outage, a wrong client
+  // configuration or a failure after the exchange stays a server error.
+  test.each([
+    ["WorkOS is unavailable", workosAnswer(503, { message: "Service Unavailable" })],
+    ["WorkOS cannot be reached", async () => { throw new TypeError("fetch failed"); }],
+    ["WorkOS refuses the client", workosAnswer(400, { error: "invalid_client", error_description: "Invalid client secret." })],
+    ["WorkOS refuses the API key", workosAnswer(401, { message: "Unauthorized" })],
+    ["WorkOS limits the rate", workosAnswer(429, { message: "Too many requests" })]
+  ] as const)("answers 500 when %s", async (_case, answer) => {
+    exchangeThroughSdk(answer);
+
+    const res = await harness.app.inject({
+      method: "POST",
+      url: "/auth/callback",
+      payload: { code: "valid-code", state: "the-state" },
+      cookies: FLOW_COOKIES
+    });
+
+    expect(res.statusCode).toBe(500);
+    expect(res.json()).toEqual({ error: "internal_error", message: "An unexpected error occurred." });
+    expectFlowCookiesCleared(res.headers["set-cookie"]);
+    expect(parseSetCookie(res.headers["set-cookie"], "cogniplane_refresh")).toBeNull();
+  });
+
+  test("an invalid_grant from the organization lookup after the exchange is not a refused code", async () => {
+    seedWorkOSHappyPath();
+    harness.workosMocks.listOrganizationMemberships.mockRejectedValue(
+      new OauthException(400, "req_1", "invalid_grant", "Not the code exchange.", {})
+    );
+
+    const res = await harness.app.inject({
+      method: "POST",
+      url: "/auth/callback",
+      payload: { code: "valid-code", state: "the-state" },
+      cookies: FLOW_COOKIES
+    });
+
+    expect(res.statusCode).toBe(500);
+    expect(res.json()).toEqual({ error: "internal_error", message: "An unexpected error occurred." });
   });
 
   test("first member of a tenant is promoted to owner; refresh JTI is issued; refresh cookie is scoped to /auth", async () => {

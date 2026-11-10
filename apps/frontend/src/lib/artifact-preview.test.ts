@@ -1,5 +1,12 @@
 import { describe, it, expect } from "vitest";
-import { canPreviewArtifact, getPreviewLanguage, isImageArtifact, isPdfArtifact } from "./artifact-preview";
+import {
+  canPreviewArtifact,
+  exceedsTextPreviewLimit,
+  getPreviewLanguage,
+  isImageArtifact,
+  isPdfArtifact,
+  TEXT_PREVIEW_MAX_BYTES
+} from "./artifact-preview";
 
 describe("canPreviewArtifact", () => {
   it("returns true for text/plain", () =>
@@ -29,6 +36,17 @@ describe("canPreviewArtifact", () => {
     expect(canPreviewArtifact({ mimeType: "image/jpeg", status: "ready" })).toBe(true));
   it("returns true for application/pdf", () =>
     expect(canPreviewArtifact({ mimeType: "application/pdf", status: "ready" })).toBe(true));
+});
+
+describe("exceedsTextPreviewLimit", () => {
+  it("returns false for a text file at the limit", () =>
+    expect(exceedsTextPreviewLimit({ mimeType: "text/csv", fileSizeBytes: TEXT_PREVIEW_MAX_BYTES })).toBe(false));
+  it("returns true for a text file over the limit", () =>
+    expect(exceedsTextPreviewLimit({ mimeType: "text/html", fileSizeBytes: TEXT_PREVIEW_MAX_BYTES + 1 })).toBe(true));
+  it("returns false for a large image", () =>
+    expect(exceedsTextPreviewLimit({ mimeType: "image/png", fileSizeBytes: TEXT_PREVIEW_MAX_BYTES * 20 })).toBe(false));
+  it("returns false for a large PDF", () =>
+    expect(exceedsTextPreviewLimit({ mimeType: "application/pdf", fileSizeBytes: TEXT_PREVIEW_MAX_BYTES * 20 })).toBe(false));
 });
 
 describe("isImageArtifact", () => {

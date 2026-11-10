@@ -82,6 +82,51 @@ test("consumeRateLimit concurrent calls respect the limit", async () => {
   expect(rejected).toBe(3);
 });
 
+test("resource_read reads its own limits and keeps one counter per user and one per tenant", async () => {
+  const limits = RequestLimits.fromAppConfig(createTestConfig({
+    RATE_LIMIT_WINDOW_MS: 60_000,
+    RESOURCE_READ_LIMIT_PER_USER_PER_WINDOW: 2,
+    RESOURCE_READ_LIMIT_PER_TENANT_PER_WINDOW: 3
+  }));
+  const read = (userId: string, tenantId: string, now: number) =>
+    limits.consumeRateLimit({ resource: "resource_read", userId, tenantId, now });
+
+  expect(await read("u1", "t1", 0)).toBeNull();
+  expect(await read("u1", "t1", 0)).toBeNull();
+  expect(await read("u1", "t1", 1_000)).toEqual({
+    error: "limit_exceeded", limitType: "rate_limit", resource: "resource_read", scope: "user", limit: 2,
+    retryAfterMs: 59_000, resetAt: new Date(60_000).toISOString(), message: "User resource read rate limit exceeded."
+  });
+  // A second member has a separate user counter, and shares the tenant counter.
+  expect(await read("u2", "t1", 1_000)).toBeNull();
+  expect(await read("u2", "t1", 1_000)).toMatchObject({ scope: "tenant", limit: 3 });
+  expect(await read("u3", "t2", 1_000)).toBeNull();
+  // Other resources keep their own counters.
+  expect(await limits.consumeRateLimit({ resource: "artifact_upload", userId: "u1", tenantId: "t1", now: 1_000 }))
+    .toBeNull();
+  // The next window starts again from zero.
+  expect(await read("u1", "t1", 60_000)).toBeNull();
+});
+
+test("a resource_read limit of 0 turns off only that scope", async () => {
+  const input = { resource: "resource_read" as const, userId: "u1", tenantId: "t1" };
+  const userOff = RequestLimits.fromAppConfig(createTestConfig({
+    RESOURCE_READ_LIMIT_PER_USER_PER_WINDOW: 0,
+    RESOURCE_READ_LIMIT_PER_TENANT_PER_WINDOW: 2
+  }));
+  expect(await userOff.consumeRateLimit(input)).toBeNull();
+  expect(await userOff.consumeRateLimit(input)).toBeNull();
+  expect(await userOff.consumeRateLimit(input)).toMatchObject({ scope: "tenant", limit: 2 });
+
+  const bothOff = RequestLimits.fromAppConfig(createTestConfig({
+    RESOURCE_READ_LIMIT_PER_USER_PER_WINDOW: 0,
+    RESOURCE_READ_LIMIT_PER_TENANT_PER_WINDOW: 0
+  }));
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    expect(await bothOff.consumeRateLimit(input)).toBeNull();
+  }
+});
+
 test("consumeTurnQuota allows requests under the quota", async () => {
   const limits = makeConfig({ userQuota: 3 });
   const now = new Date("2026-01-15T12:00:00.000Z");

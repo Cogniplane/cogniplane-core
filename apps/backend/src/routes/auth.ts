@@ -1,11 +1,13 @@
 import { timingSafeEqual } from "node:crypto";
 
 import type { FastifyInstance } from "fastify";
-import type { WorkOS } from "@workos-inc/node";
+import { OauthException, type WorkOS } from "@workos-inc/node";
+import { z } from "zod";
 
 import { type AppConfig, arePasskeysEnabled, isLoginTypeEnabled, isPasswordRecoveryEnabled } from "../config.js";
 import { requireBrowserAuthOrigin } from "../lib/browser-auth-origin.js";
 import type { Pool } from "../lib/db.js";
+import { apiError } from "../lib/http-errors.js";
 import { getWorkOS } from "../lib/workos-client.js";
 import type { AuditEventStore } from "../services/audit-event-store.js";
 import type { RefreshTokenRotationService } from "../services/auth/refresh-token-rotation-service.js";
@@ -32,6 +34,25 @@ const OAUTH_PKCE_COOKIE = "cogniplane_oauth_pkce";
 const OAUTH_STATE_TTL_S = 600;
 const OAUTH_PARAM_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
 const PKCE_VERIFIER_PATTERN = /^[A-Za-z0-9._~-]{43,128}$/;
+// The WorkOS examples show codes of 25 and 26 characters. The bound keeps
+// larger input out of the token request.
+const OAUTH_CODE_MAX_LENGTH = 512;
+
+// The schema checks only the field types and the code size. The checks in the
+// route give the specific errors, and OAUTH_PARAM_PATTERN bounds the state.
+const CallbackBodySchema = z.object({
+  code: z.string().max(OAUTH_CODE_MAX_LENGTH).optional(),
+  state: z.string().optional()
+});
+
+/**
+ * Classifies HTTP 400 `invalid_grant` from the code exchange as a refused
+ * authorization code. Network failures, WorkOS 5xx or 429 answers and refused
+ * client configuration remain server errors.
+ */
+function isRefusedAuthorizationCode(error: unknown): boolean {
+  return error instanceof OauthException && error.status === 400 && error.error === "invalid_grant";
+}
 
 export function timingSafeEqualString(a: string, b: string): boolean {
   if (a.length !== b.length) {
@@ -163,12 +184,17 @@ function registerWorkosAuthRoutes(
     }
     if (await enforceRateLimit(request, reply, limits, clientIpKey("auth_sign_in", request))) return reply;
 
-    const { code, state } = (request.body ?? {}) as { code?: string; state?: string };
+    const body = CallbackBodySchema.safeParse(request.body);
     const cookieState = (request.cookies as Record<string, string>)?.[OAUTH_STATE_COOKIE];
     const codeVerifier = (request.cookies as Record<string, string>)?.[OAUTH_PKCE_COOKIE];
     // Always clear the flow cookies — both are single-use regardless of outcome.
     reply.clearCookie(OAUTH_STATE_COOKIE, { path: "/" });
     reply.clearCookie(OAUTH_PKCE_COOKIE, { path: REFRESH_COOKIE_PATH });
+
+    if (!body.success) {
+      return reply.code(400).send(apiError("invalid_request"));
+    }
+    const { code, state } = body.data;
 
     if (!code) {
       return reply.code(400).send({ error: "missing_code" });
@@ -187,11 +213,21 @@ function registerWorkosAuthRoutes(
       return reply.code(400).send({ error: "invalid_pkce_verifier" });
     }
 
-    const authResponse = await workos.userManagement.authenticateWithCode({
-      code,
-      clientId: config.WORKOS_CLIENT_ID!,
-      codeVerifier
-    });
+    const authResponse = await workos.userManagement
+      .authenticateWithCode({
+        code,
+        clientId: config.WORKOS_CLIENT_ID!,
+        codeVerifier
+      })
+      .catch((error: unknown) => {
+        if (isRefusedAuthorizationCode(error)) return null;
+        throw error;
+      });
+    if (!authResponse) {
+      // The WorkOS answer can name the code, so it is not logged.
+      request.log.warn("auth callback 401: WorkOS refused the authorization code");
+      return reply.code(401).send(apiError("invalid_code"));
+    }
 
     const workosUser = authResponse.user;
 

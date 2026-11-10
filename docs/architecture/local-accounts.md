@@ -10,10 +10,21 @@ other people in Admin > People (`routes/tenant-local-members.ts`).
 
 - Passwords: Argon2id with `crypto.argon2` (Node version: [startup
   rules](../configuration.md#startup-rules); parameters in
-  `lib/password-hash.ts`). `LOCAL_AUTH_HASH_CONCURRENCY` caps parallel hashes
-  per process; a request past it gets a retryable 503. Rules in
-  `lib/password-policy.ts`: length limits after NFKC, a block list, no email
-  address, no composition rules. Unknown emails run the same hash work.
+  `lib/password-hash.ts`). Rules in `lib/password-policy.ts`: length limits
+  after NFKC, a block list, no email address, no composition rules. Unknown
+  emails run the same hash work.
+- Hash concurrency: `LOCAL_AUTH_HASH_CONCURRENCY` caps parallel hashes per
+  process, default 2. A request past it gets a retryable `503 busy`; it does not
+  wait in a queue. Each hash holds 19 MiB and one thread of the libuv thread
+  pool. That pool also runs `fs`, `dns.lookup`, `zlib` and other asynchronous
+  crypto, and it has 4 threads unless `UV_THREADPOOL_SIZE` sets another size
+  ([Node.js CLI](https://nodejs.org/api/cli.html#uv_threadpool_sizesize)). With
+  the default, a sign-in burst leaves 2 threads for that work. To allow more
+  parallel hashes, set `UV_THREADPOOL_SIZE` in the environment that starts the
+  backend, and keep the concurrency below it. Node creates the pool before
+  application code runs, so the backend does not set the size itself. A lower
+  value gives more `503 busy` answers in a burst. A value at or above the pool
+  size makes file and DNS work of all tenants wait behind hashes.
 - A wrong password and an unknown, disabled, removed or not-set-up account all
   return `401 invalid_credentials`. A throttled request returns `429
   too_many_attempts`; no hashing capacity or a throttle store failure returns

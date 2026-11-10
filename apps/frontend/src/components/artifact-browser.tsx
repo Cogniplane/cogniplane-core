@@ -32,7 +32,7 @@ import {
 } from "./artifact-panel.logic";
 import { PiiChip } from "./artifact-pii-chip";
 import { ArtifactPreviewModal } from "./artifact-preview-modal";
-import { canPreviewArtifact } from "../lib/artifact-preview";
+import { canPreviewArtifact, exceedsTextPreviewLimit } from "../lib/artifact-preview";
 import { useArtifactActions } from "../hooks/use-artifact-actions";
 import { useArtifactBrowserData } from "../hooks/use-artifact-browser-data";
 import { Button } from "@/components/ui/button";
@@ -323,7 +323,7 @@ export function ArtifactBrowser() {
           content={actions.previewContent}
           imageUrl={actions.previewImageUrl}
           error={actions.previewError}
-          onRetry={previewTarget && canPreviewArtifact(previewTarget) ? () => { void actions.openPreview(previewTarget); } : undefined}
+          onRetry={previewTarget && canPreviewArtifact(previewTarget) && !exceedsTextPreviewLimit(previewTarget) ? () => { void actions.openPreview(previewTarget); } : undefined}
           onClose={actions.closePreview}
         />
       ) : null}

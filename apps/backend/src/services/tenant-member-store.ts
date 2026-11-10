@@ -74,15 +74,40 @@ function isLoginType(value: unknown): value is LoginType {
   return value === "workos" || value === "local";
 }
 
+/**
+ * The membership read of the request middleware (`lib/auth-jwt.ts`) and of
+ * `/auth/refresh`. Both run before the tenant context exists, so they use the
+ * maintenance pool (`privilegedDb`).
+ *
+ * That role bypasses RLS: `app.current_tenant_id` has no effect on it, and the
+ * `tm.tenant_id = $1` and `tm.user_id = $2` predicates of `AUTH_STATE_SQL` are
+ * the tenant boundary. A single statement reads one snapshot. So the read runs
+ * without `withTenantScope`: one round trip per request, not four (BEGIN,
+ * set_config, SELECT, COMMIT).
+ *
+ * Each call reads the database, with no cache. A change of membership, role,
+ * local account status or security version applies to the next request.
+ *
+ * On the app_user pool, RLS hides every membership row from this read, so it
+ * returns null and the caller refuses the token. Use
+ * `TenantMemberStore.getAuthState` there.
+ */
+export class PrivilegedAuthStateLookup {
+  constructor(private readonly privilegedDb: Pool) {}
+
+  async getAuthState(tenantId: string, userId: string): Promise<TenantAuthState | null> {
+    const result = await this.privilegedDb.query<AuthStateRow>(AUTH_STATE_SQL, [tenantId, userId]);
+    return mapAuthState(result.rows[0]);
+  }
+}
+
 export class TenantMemberStore {
   constructor(private readonly db: Pool) {}
 
   /**
    * Returns the role of `userId` in `tenantId`, or null if no membership row
-   * exists. Used by the auth middleware to decide whether to admit the request
-   * — see `lib/auth-jwt.ts`. Construct against the privileged pool there:
-   * the lookup runs before the tenant context is established, and rejecting
-   * non-members is itself a tenant-spanning question.
+   * exists. Person access (`person-access-service.ts`) uses it to ask "is
+   * this user a member". Request admission uses `PrivilegedAuthStateLookup`.
    */
   async getRole(tenantId: string, userId: string): Promise<TenantMembershipRole | null> {
     return withTenantScope(this.db, tenantId, async (client) => {
@@ -106,8 +131,10 @@ export class TenantMemberStore {
 
   /**
    * Membership role plus the tenant's login type and the user's login path, in
-   * one query, or null if no membership row exists. Construct against the
-   * privileged pool, like `getRole`: it runs before the tenant context exists.
+   * one query, or null if no membership row exists. It runs in the tenant
+   * scope, so on the app_user pool RLS also limits it to `tenantId`. The
+   * request middleware and refresh use `PrivilegedAuthStateLookup`, which
+   * runs the same SQL and mapping without the transaction.
    */
   async getAuthState(tenantId: string, userId: string): Promise<TenantAuthState | null> {
     return withTenantScope(this.db, tenantId, async (client) => {

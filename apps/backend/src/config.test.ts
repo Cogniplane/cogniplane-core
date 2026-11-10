@@ -148,11 +148,31 @@ test("loadConfig enables local login next to WorkOS, or alone without WorkOS key
     WORKOS_API_KEY: undefined, WORKOS_CLIENT_ID: undefined, WORKOS_REDIRECT_URI: undefined
   }));
   expect(localOnly.AUTH_LOGIN_TYPES).toEqual(["local"]);
-  expect(localOnly.LOCAL_AUTH_HASH_CONCURRENCY).toBe(4);
+  // Below the 4 threads of the default libuv pool, which fs and dns.lookup share.
+  expect(localOnly.LOCAL_AUTH_HASH_CONCURRENCY).toBe(2);
+  const raised = loadConfig(workosConfig({
+    AUTH_MODE: "jwt", AUTH_LOGIN_TYPES: "local", LOCAL_AUTH_HASH_CONCURRENCY: "6",
+    WORKOS_API_KEY: undefined, WORKOS_CLIENT_ID: undefined, WORKOS_REDIRECT_URI: undefined
+  }));
+  expect(raised.LOCAL_AUTH_HASH_CONCURRENCY).toBe(6);
 });
 
 test("loadConfig resolves dev-headers to no login types", () => {
   expect(loadConfig(devConfig()).AUTH_LOGIN_TYPES).toEqual([]);
+});
+
+test("loadConfig reads the shared resource read limits, accepts 0 and rejects a negative value", () => {
+  const defaults = loadConfig(devConfig());
+  expect(defaults.RESOURCE_READ_LIMIT_PER_USER_PER_WINDOW).toBe(20);
+  expect(defaults.RESOURCE_READ_LIMIT_PER_TENANT_PER_WINDOW).toBe(100);
+  const overridden = loadConfig(devConfig({
+    RESOURCE_READ_LIMIT_PER_USER_PER_WINDOW: "0",
+    RESOURCE_READ_LIMIT_PER_TENANT_PER_WINDOW: "7"
+  }));
+  expect(overridden.RESOURCE_READ_LIMIT_PER_USER_PER_WINDOW).toBe(0);
+  expect(overridden.RESOURCE_READ_LIMIT_PER_TENANT_PER_WINDOW).toBe(7);
+  expect(() => loadConfig(devConfig({ RESOURCE_READ_LIMIT_PER_TENANT_PER_WINDOW: "-1" })))
+    .toThrow(/RESOURCE_READ_LIMIT_PER_TENANT_PER_WINDOW/);
 });
 
 test("loadConfig rejects SKILL_BUNDLE_STORAGE_BACKEND=bucket without SKILL_BUNDLE_BUCKET_NAME", () => {

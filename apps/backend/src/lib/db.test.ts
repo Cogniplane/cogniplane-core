@@ -1,5 +1,5 @@
 import type { Pool, PoolClient } from "pg";
-import { test, expect } from "vitest";
+import { test, expect, vi } from "vitest";
 
 import type { AppConfig } from "../config.js";
 import { createDeepAgentsCheckpointer } from "../services/deep-agents/deep-agents-checkpointer.js";
@@ -8,6 +8,7 @@ import {
   createMaintenanceDatabase,
   createPrivilegedDatabase,
   operationalPoolOptions,
+  type PoolErrorLogger,
   withTenantScope,
   withTransaction
 } from "./db.js";
@@ -215,8 +216,10 @@ const OPERATIONAL_LIMITS = {
 type ServingPool = {
   name: string;
   url: string;
+  /** The password in `url`. It must never reach a log line. */
+  password: string;
   applicationName: string;
-  open(url: string): { pool: Pool; close(): Promise<void> };
+  open(url: string, logger?: PoolErrorLogger): { pool: Pool; close(): Promise<void> };
 };
 
 function plainPool(pool: Pool) {
@@ -230,27 +233,31 @@ const SERVING_POOLS: ServingPool[] = [
   {
     name: "app",
     url: "postgres://app_user:app-secret@db.test:5432/cogniplane",
+    password: "app-secret",
     applicationName: "cogniplane-backend",
-    open: (url) => plainPool(createDatabase({ DATABASE_URL: url } as AppConfig))
+    open: (url, logger) => plainPool(createDatabase({ DATABASE_URL: url } as AppConfig, logger))
   },
   {
     name: "maintenance",
     url: "postgres://maintenance_user:maint-secret@db.test:5432/cogniplane",
+    password: "maint-secret",
     applicationName: "cogniplane-backend-maintenance",
-    open: (url) => plainPool(createMaintenanceDatabase(url))
+    open: (url, logger) => plainPool(createMaintenanceDatabase(url, logger))
   },
   {
     name: "operator",
     url: "postgres://postgres:operator-secret@db.test:5432/cogniplane",
+    password: "operator-secret",
     applicationName: "cogniplane-operator",
-    open: (url) => plainPool(createPrivilegedDatabase(url))
+    open: (url, logger) => plainPool(createPrivilegedDatabase(url, logger))
   },
   {
     name: "Deep Agents checkpointer",
     url: "postgres://app_user:checkpoint-secret@checkpoints.test:5432/cogniplane",
+    password: "checkpoint-secret",
     applicationName: "cogniplane-deep-agents-checkpointer",
-    open: (url) => {
-      const saver = createDeepAgentsCheckpointer(url);
+    open: (url, logger) => {
+      const saver = createDeepAgentsCheckpointer(url, logger);
       // PostgresSaver keeps the injected pool in a private field.
       return { pool: (saver as unknown as { pool: Pool }).pool, close: () => saver.end() };
     }
@@ -293,5 +300,88 @@ test("each serving pool is a separate pool with its own name", async () => {
     expect(new Set(opened.map(({ pool }) => pool.options.application_name)).size).toBe(SERVING_POOLS.length);
   } finally {
     await Promise.all(opened.map(({ close }) => close()));
+  }
+});
+
+// When an idle client loses its connection, pg-pool removes the client and emits
+// `error` on the pool. An `error` event with no listener throws, and server.ts
+// stops the process on an uncaught exception. So each serving pool must log the
+// error instead. pool-idle-error.integration.test.ts lets PostgreSQL drop a real
+// connection.
+
+const TERMINATED = "terminating connection due to administrator command";
+
+/**
+ * Emit what `makeIdleListener` in pg-pool emits for an idle client error. The
+ * error gets the client in `err.client`, and the client holds the connection
+ * parameters.
+ */
+function emitIdleConnectionError(pool: Pool, url: string, code?: string): void {
+  const client = { connectionParameters: { connectionString: url, password: new URL(url).password } };
+  const error = Object.assign(new Error(code ? TERMINATED : "Connection terminated unexpectedly"), { client }, code ? { code } : {});
+  pool.emit("error", error, client);
+}
+
+function recordingPoolLogger(): { logger: PoolErrorLogger; logged: Array<{ meta: object; msg: string }> } {
+  const logged: Array<{ meta: object; msg: string }> = [];
+  return { logger: { error: (meta, msg) => { logged.push({ meta, msg }); } }, logged };
+}
+
+test.each(SERVING_POOLS)("the $name pool logs an idle connection error and does not throw", async (serving) => {
+  const { logger, logged } = recordingPoolLogger();
+  const { pool, close } = serving.open(serving.url, logger);
+  try {
+    expect(() => emitIdleConnectionError(pool, serving.url, "57P01")).not.toThrow();
+
+    // The line holds only the pool name, the error code and the message. It
+    // never holds the error object, because `err.client` holds the connection
+    // parameters.
+    expect(logged).toEqual([{
+      msg: "idle database connection failed",
+      meta: { pool: serving.applicationName, code: "57P01", err: TERMINATED }
+    }]);
+    expect(JSON.stringify(logged)).not.toContain(serving.password);
+  } finally {
+    await close();
+  }
+});
+
+test("an idle connection error with no code logs no code field", async () => {
+  const { logger, logged } = recordingPoolLogger();
+  const pool = createDatabase({ DATABASE_URL: SERVING_POOLS[0].url } as AppConfig, logger);
+  try {
+    emitIdleConnectionError(pool, SERVING_POOLS[0].url);
+
+    expect(logged).toEqual([{
+      msg: "idle database connection failed",
+      meta: { pool: "cogniplane-backend", err: "Connection terminated unexpectedly" }
+    }]);
+  } finally {
+    await pool.end();
+  }
+});
+
+// Operator scripts such as migrate, delete-tenant and auth-bootstrap pass no
+// logger.
+test("without a logger, a pool writes the idle connection error as one JSON line", async () => {
+  const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+  const url = "postgres://postgres:operator-secret@db.test:5432/cogniplane";
+  const pool = createPrivilegedDatabase(url);
+  try {
+    expect(() => emitIdleConnectionError(pool, url, "57P01")).not.toThrow();
+
+    expect(consoleError).toHaveBeenCalledTimes(1);
+    const line = String(consoleError.mock.calls[0]?.[0]);
+    expect(JSON.parse(line)).toEqual({
+      level: "error",
+      msg: "idle database connection failed",
+      pool: "cogniplane-operator",
+      code: "57P01",
+      err: TERMINATED
+    });
+    expect(line).not.toContain("operator-secret");
+  } finally {
+    consoleError.mockRestore();
+    await pool.end();
   }
 });

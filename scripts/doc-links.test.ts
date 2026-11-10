@@ -116,10 +116,11 @@ it("names only files that exist in backticked references", () => {
 // matches any route under that prefix. A code span may
 // wrap over two lines. Fenced `ts` and `sql` blocks are checked too, without
 // comments and string literals; example names contain `myint` (overlays.md).
-// Names that production code does not define, listed on purpose: PostgreSQL
-// and Docker Compose names, the upstream sample code in mcp-proxy-signature.md,
-// and test constants that data.md cites with their test file.
-const EXTERNAL_NAMES = new Set(["max_connections", "pg_dump", "stop_grace_period", "highWater", "rawBody", "WRITE_PATHS", "GLOBAL_TABLES"]);
+// Names that production code does not define, listed on purpose: PostgreSQL,
+// Docker Compose and Node.js runtime names, the upstream sample code in
+// mcp-proxy-signature.md, and test constants that data.md cites with their
+// test file.
+const EXTERNAL_NAMES = new Set(["max_connections", "pg_dump", "stop_grace_period", "UV_THREADPOOL_SIZE", "highWater", "rawBody", "WRITE_PATHS", "GLOBAL_TABLES"]);
 // Legal texts quote third-party names verbatim; the route index is checked by
 // its own tests. The configuration reference is checked: its table names only
 // schema variables.

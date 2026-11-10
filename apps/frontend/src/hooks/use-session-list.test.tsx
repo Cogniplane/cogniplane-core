@@ -31,6 +31,7 @@ vi.mock("../lib/auth-context", () => ({
   useAuth: () => ({ user: { userId: "u-1", tenantId: "t-1" } })
 }));
 
+import { NEW_SESSION_HREF, NEW_SESSION_PARAM } from "../lib/new-session-link";
 import { queryKeys } from "../lib/query-keys";
 import { useSessionList } from "./use-session-list";
 
@@ -461,4 +462,60 @@ it.each([false, true])("restores only base or saved sessions when search finishe
   expect(result.current.selectedSessionId).toBe(hasBase ? "recent" : null);
   expect(window.localStorage.getItem("cogniplane:selected-session-id:v2:t-1:u-1")).toBe(hasBase ? "recent" : null);
   expect(result.current.sidebarSessions[0]?.sessionId).toBe("search-only");
+});
+
+describe("useSessionList: New session link", () => {
+  const SAVED = "cogniplane:selected-session-id:v2:t-1:u-1";
+
+  it("restores no session from the link, the saved selection or the first-session fallback", async () => {
+    // The saved selection is a session that crashes the page on every load.
+    window.localStorage.setItem(SAVED, "s-2");
+    window.history.replaceState(null, "", `/?session=s-2&${NEW_SESSION_PARAM}=1`);
+    let resolveList!: (page: { sessions: Session[]; trashRetentionDays: number }) => void;
+    api.listSessions.mockImplementation(({ ids }: { ids?: string[] } = {}) => ids
+      ? Promise.resolve({ sessions: serverSessions.filter((row) => ids.includes(row.sessionId)), trashRetentionDays: 7 })
+      : new Promise((resolve) => { resolveList = resolve; }));
+    const { result } = renderSessionList();
+
+    // The request shows while the list loads, and the link leaves the address bar at once.
+    await waitFor(() => expect(result.current.newSessionRequested).toBe(true));
+    expect(window.location.search).toBe("?session=s-2");
+    await act(async () => { resolveList({ sessions: serverSessions, trashRetentionDays: 7 }); });
+
+    await waitFor(() => expect(window.location.search).toBe(""));
+    expect(result.current.selectedSessionId).toBeNull();
+    expect(window.localStorage.getItem(SAVED)).toBeNull();
+    expect(result.current.newSessionRequested).toBe(false);
+    // The link asked for no lookup of the linked or saved session.
+    expect(api.listSessions.mock.calls.some(([input]) => (input as { ids?: string[] } | undefined)?.ids)).toBe(false);
+  });
+
+  it("selects and saves the new session, so a reload does not reopen the failed one", async () => {
+    window.localStorage.setItem(SAVED, "s-2");
+    // The link of the error pages.
+    window.history.replaceState(null, "", NEW_SESSION_HREF);
+    const first = renderSessionList();
+    await waitFor(() => expect(first.result.current.sessions).toHaveLength(2));
+    await waitFor(() => expect(first.result.current.newSessionRequested).toBe(false));
+
+    await act(async () => { await first.result.current.createSession(); });
+    expect(first.result.current.selectedSessionId).toBe("new-session");
+    expect(window.localStorage.getItem(SAVED)).toBe("new-session");
+    first.unmount();
+
+    // A plain reload restores the new session.
+    window.history.replaceState(null, "", "/");
+    const reload = renderSessionList();
+    await waitFor(() => expect(reload.result.current.selectedSessionId).toBe("new-session"));
+    expect(reload.result.current.newSessionRequested).toBe(false);
+  });
+
+  it("ignores the link where the hook does not own the workspace URL", async () => {
+    window.localStorage.setItem(SAVED, "s-2");
+    window.history.replaceState(null, "", `/?${NEW_SESSION_PARAM}=1`);
+    const { result } = renderSessionList(false);
+    await waitFor(() => expect(result.current.selectedSessionId).toBe("s-2"));
+    expect(result.current.newSessionRequested).toBe(false);
+    expect(window.location.search).toBe(`?${NEW_SESSION_PARAM}=1`);
+  });
 });
