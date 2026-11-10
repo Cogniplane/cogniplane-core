@@ -51,7 +51,7 @@ export function buildRuntimeAdapter(input: {
       runtimeSessions: stores.runtimeSessions,
       memories: stores.memories,
       policyService,
-      checkpointer: createDeepAgentsCheckpointer(config.DATABASE_URL),
+      checkpointer: createDeepAgentsCheckpointer(config.DATABASE_URL, logger),
       // In-process usage/cost accounting (each provider's API is called
       // directly from the backend).
       messages: stores.messages,
