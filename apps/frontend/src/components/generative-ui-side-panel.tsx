@@ -67,6 +67,7 @@ import { useElementWidth } from "../hooks/use-element-width";
 import { PARKED_PANEL_TARGET, REMOVED_PANEL_TARGET } from "../lib/agui/generative-ui-targets";
 import { keepTabInside, makeBackgroundInert } from "../lib/inert-background";
 import { generatedViewFitsBeside } from "./artifact-pane-geometry";
+import { RenderBoundary } from "./render-boundary";
 import { WORKSPACE_DRAWER_BACKDROP, WORKSPACE_DRAWER_SURFACE, WorkspaceDrawerHeader } from "./workspace-drawer";
 import { COGNIPLANE_GENERATIVE_UI } from "./generative-ui-catalog";
 import {
@@ -664,15 +665,20 @@ export function GenerativeUiSidePanel({
             ) : null}
             {!state.selected ? <EmptyState /> : null}
             {/* Render only the view named by the header. A markdown fence can
-                add another surface to this target without a panel activity. */}
+                add another surface to this target without a panel activity.
+                The key gives each view its own error boundary; the header and
+                Close stay outside it. */}
             {state.renderable && !state.failed ? <div key={state.selected?.surfaceId}>
-              <GenerativeUISurface
-                id={GENERATIVE_UI_PANEL_TARGET}
-                ui={COGNIPLANE_GENERATIVE_UI}
-                description={SIDE_PANEL_DESCRIPTION}
-                fallback={<EmptyState />}
-                autoScroll={false}
-              />
+              <RenderBoundary title="This view could not be shown"
+                description="An error stopped it from displaying. Try again, or ask the agent to create the view again.">
+                <GenerativeUISurface
+                  id={GENERATIVE_UI_PANEL_TARGET}
+                  ui={COGNIPLANE_GENERATIVE_UI}
+                  description={SIDE_PANEL_DESCRIPTION}
+                  fallback={<EmptyState />}
+                  autoScroll={false}
+                />
+              </RenderBoundary>
             </div> : null}
           </div>
         </div>
