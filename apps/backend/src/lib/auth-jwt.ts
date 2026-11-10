@@ -8,7 +8,7 @@ import { isPublicAuthPath, isPublicDownloadRequest } from "./auth-public-paths.j
 import { apiError } from "./http-errors.js";
 import { listIntegrationOAuthCallbackPaths } from "../services/integrations/integration-registry.js";
 import { sanitizeUrl } from "./sanitize-url.js";
-import type { TenantAuthState, TenantMemberStore } from "../services/tenant-member-store.js";
+import type { PrivilegedAuthStateLookup, TenantAuthState } from "../services/tenant-member-store.js";
 
 // Session routes every login type uses. Refresh and logout read only the
 // refresh cookie, so they must be reachable without an access token. The
@@ -70,7 +70,7 @@ export function jwtPublicAuthPaths(
  */
 export function jwtAuth(
   config: AppConfig,
-  tenantMembers: Pick<TenantMemberStore, "getAuthState">,
+  authStates: Pick<PrivilegedAuthStateLookup, "getAuthState">,
   oauthCallbackPaths: readonly string[] = listIntegrationOAuthCallbackPaths()
 ) {
   const publicAuthPaths = jwtPublicAuthPaths(config, oauthCallbackPaths);
@@ -115,13 +115,14 @@ export function jwtAuth(
     }
 
     // Look up the user's role and login type in this tenant. The caller must
-    // build the store on `privilegedDb`, because no tenant context exists yet.
+    // build `PrivilegedAuthStateLookup` on `privilegedDb`, because no tenant
+    // context exists yet.
     // The token is valid here, so a failed lookup is a server fault: answer a
     // retryable 503, as /auth/refresh does. A 401 would make the client drop
     // the session.
     let authState: TenantAuthState | null;
     try {
-      authState = await tenantMembers.getAuthState(payload.tid, payload.sub);
+      authState = await authStates.getAuthState(payload.tid, payload.sub);
     } catch (err) {
       request.log.error(
         { url: sanitizeUrl(request.url), method: request.method, userId: payload.sub, tenantId: payload.tid, err },

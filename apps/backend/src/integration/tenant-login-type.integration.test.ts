@@ -12,7 +12,7 @@ import {
   WorkOsEmailConflictError,
   WrongLoginTypeError
 } from "../services/auth/workos-tenant-provisioning.js";
-import { TenantMemberStore } from "../services/tenant-member-store.js";
+import { PrivilegedAuthStateLookup } from "../services/tenant-member-store.js";
 import { adminDatabaseUrl, maintenancePool, superuserPool } from "./support/database.js";
 import { seedMembership, seedTenant, seedUser } from "./support/fixtures.js";
 import { withStagedDatabase } from "./support/staged-migrations.js";
@@ -73,11 +73,11 @@ describe.skipIf(!adminDatabaseUrl())("tenant login type (migration 070)", () => 
     )).rejects.toMatchObject({ code: "23514" });
   });
 
-  test("getAuthState reads role, login type, and login path through the maintenance role", async () => {
+  test("the auth state lookup reads role, login type, and login path through the maintenance role", async () => {
     const tenantId = await seedTenant();
     const userId = await seedUser();
     await seedMembership(tenantId, userId, "admin");
-    const members = new TenantMemberStore(maintenancePool());
+    const members = new PrivilegedAuthStateLookup(maintenancePool());
 
     expect(await members.getAuthState(tenantId, userId)).toEqual({
       role: "admin", loginType: "workos", authSource: "workos", localStatus: null, securityVersion: null
