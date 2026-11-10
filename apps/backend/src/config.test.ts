@@ -155,6 +155,20 @@ test("loadConfig resolves dev-headers to no login types", () => {
   expect(loadConfig(devConfig()).AUTH_LOGIN_TYPES).toEqual([]);
 });
 
+test("loadConfig reads the shared resource read limits, accepts 0 and rejects a negative value", () => {
+  const defaults = loadConfig(devConfig());
+  expect(defaults.RESOURCE_READ_LIMIT_PER_USER_PER_WINDOW).toBe(20);
+  expect(defaults.RESOURCE_READ_LIMIT_PER_TENANT_PER_WINDOW).toBe(100);
+  const overridden = loadConfig(devConfig({
+    RESOURCE_READ_LIMIT_PER_USER_PER_WINDOW: "0",
+    RESOURCE_READ_LIMIT_PER_TENANT_PER_WINDOW: "7"
+  }));
+  expect(overridden.RESOURCE_READ_LIMIT_PER_USER_PER_WINDOW).toBe(0);
+  expect(overridden.RESOURCE_READ_LIMIT_PER_TENANT_PER_WINDOW).toBe(7);
+  expect(() => loadConfig(devConfig({ RESOURCE_READ_LIMIT_PER_TENANT_PER_WINDOW: "-1" })))
+    .toThrow(/RESOURCE_READ_LIMIT_PER_TENANT_PER_WINDOW/);
+});
+
 test("loadConfig rejects SKILL_BUNDLE_STORAGE_BACKEND=bucket without SKILL_BUNDLE_BUCKET_NAME", () => {
   expect(() => loadConfig({ SKILL_BUNDLE_STORAGE_BACKEND: "bucket" })).toThrow(/SKILL_BUNDLE_BUCKET_NAME is required when SKILL_BUNDLE_STORAGE_BACKEND=bucket/);
 });

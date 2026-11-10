@@ -180,3 +180,16 @@ use Redis: they count in process and through the `session_executions` lease.
   rules](../configuration.md#startup-rules).
 - A refusal returns `LimitExceededErrorPayload` with `retryAfterMs` and
   `resetAt`.
+- `resource_read` is one budget for three member reads that do heavy work on
+  each call. The artifact and project file version PDF previews
+  (`GET .../preview-text`) run `pdftotext`. The MCP App resource route
+  (`GET /sessions/:sessionId/mcp-apps/:toolCallId`) compiles the runtime
+  config, checks policy and can send a signed `resources/read` upstream. The
+  three routes share one counter per user and one per tenant
+  (`RESOURCE_READ_LIMIT_PER_*_PER_WINDOW`), so a client gets no more calls by
+  alternating routes. The check (`lib/resource-read-limit.ts`) runs after
+  input validation and before any lookup, so a 404 or 422 also counts.
+- Each saved widget in a chat loads its resource when it renders. In a chat
+  with more widgets than the user limit, each widget after the limit shows an
+  error and a reload button; a reload works when the next window starts. For
+  chats like this, increase `RESOURCE_READ_LIMIT_PER_USER_PER_WINDOW`.

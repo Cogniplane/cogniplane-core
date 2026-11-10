@@ -21,6 +21,7 @@ import type { RequestLimitsInterface } from "../services/request-limits.js";
 import { ensureUser } from "../lib/db.js";
 import { apiError, getErrorMessage, notFoundError, requestError } from "../lib/http-errors.js";
 import { parseRequestInput } from "../lib/route-validation.js";
+import { consumeResourceRead } from "../lib/resource-read-limit.js";
 import { artifactIdParams, sessionIdParams } from "../lib/route-schemas.js";
 import { ALLOWED_ARTIFACT_MIME_TYPES } from "../lib/allowed-mime-types.js";
 import { PERMANENT_PII_ERROR_CODES } from "../services/pii/pii-scan-job-handler.js";
@@ -316,6 +317,8 @@ export async function registerArtifactRoutes(
     if (!paramsResult.ok) {
       return paramsResult.response;
     }
+    const limited = await consumeResourceRead(stores.limits, request, reply);
+    if (limited) return limited;
 
     const artifact = await stores.artifacts.getReadable(tenantId, paramsResult.value.artifactId, userId);
     if (!artifact) {

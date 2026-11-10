@@ -66,5 +66,7 @@ selections. Routes: `routes/projects.ts`, `project-files.ts`,
 - PDF text: `ArtifactProcessor.extractArtifactText`
   (`services/artifacts/artifact-processor.ts`) runs `pdftotext`. It serves the
   turn input and `GET /artifacts/:artifactId/preview-text` (`not_a_pdf`,
-  `pdf_extraction_failed`).
+  `pdf_extraction_failed`). That route and the project file version preview
+  count against the shared `resource_read` rate limit
+  ([data](data.md#rate-limits-and-quotas)).
 

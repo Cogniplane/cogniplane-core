@@ -1,6 +1,6 @@
 import multipart from "@fastify/multipart";
 import Fastify from "fastify";
-import { describe, test, expect } from "vitest";
+import { describe, test, expect, vi } from "vitest";
 
 import { registerArtifactRoutes } from "./artifacts.js";
 import { ArtifactCursorError } from "../services/artifacts/artifact-store.js";
@@ -544,7 +544,10 @@ describe("GET /artifacts/:artifactId/preview-text", () => {
 
   // `reads` are what getReadable returns on each call: the first read gates the
   // request, the second is the re-check after extraction.
-  async function preview(reads: Version[]) {
+  async function preview(
+    reads: Version[],
+    limits: { consumeRateLimit: (input: unknown) => Promise<unknown> } = { async consumeRateLimit() { return null; } }
+  ) {
     let extractions = 0;
     let readCount = 0;
     const stores = {
@@ -564,7 +567,7 @@ describe("GET /artifacts/:artifactId/preview-text", () => {
           return "EXTRACTED TEXT";
         }
       },
-      limits: { async consumeRateLimit() { return null; } }
+      limits
     };
     const app = Fastify();
     app.decorate("config", createTestConfig());
@@ -575,7 +578,7 @@ describe("GET /artifacts/:artifactId/preview-text", () => {
     await app.ready();
     const response = await app.inject({ method: "GET", url: `/artifacts/${artifactId}/preview-text` });
     await app.close();
-    return { response, extractions: () => extractions };
+    return { response, extractions: () => extractions, readCount: () => readCount };
   }
 
   const ready = (detail: Record<string, unknown>): Version => ({ status: "ready", detail });
@@ -618,6 +621,33 @@ describe("GET /artifacts/:artifactId/preview-text", () => {
     const { response, extractions } = await preview([{ status: "pending", detail: {} }]);
 
     expect(response.statusCode).toBe(422);
+    expect(extractions()).toBe(0);
+  });
+
+  test("counts an allowed request once against the shared resource read limit", async () => {
+    const consumeRateLimit = vi.fn(async () => null);
+    const { response } = await preview([ready({})], { consumeRateLimit });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.headers["cache-control"]).toBe("private, no-store");
+    expect(consumeRateLimit).toHaveBeenCalledTimes(1);
+    expect(consumeRateLimit).toHaveBeenCalledWith({ resource: "resource_read", userId: "user-1", tenantId: "tenant-A" });
+  });
+
+  test.each([
+    [4_200, "5"],
+    [0, "1"]
+  ])("refuses over the limit (retry after %i ms) before it reads or extracts the artifact", async (retryAfterMs, header) => {
+    const limited = {
+      error: "limit_exceeded", limitType: "rate_limit", resource: "resource_read", scope: "user", limit: 20,
+      retryAfterMs, resetAt: new Date(0).toISOString(), message: "User resource read rate limit exceeded."
+    };
+    const { response, extractions, readCount } = await preview([ready({})], { async consumeRateLimit() { return limited; } });
+
+    expect(response.statusCode).toBe(429);
+    expect(response.headers["retry-after"]).toBe(header);
+    expect(response.json()).toEqual(limited);
+    expect(readCount()).toBe(0);
     expect(extractions()).toBe(0);
   });
 });

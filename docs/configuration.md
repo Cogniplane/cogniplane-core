@@ -176,6 +176,8 @@ from build arguments). Frontend variables are in `apps/frontend/.env.example`
 | `ADMIN_QUERY_LIMIT_PER_TENANT_PER_WINDOW` | number, integer, minimum 0 | `1000` | [data](architecture/data.md) |
 | `AUTH_ORGANIZATIONS_LIMIT_PER_USER_PER_WINDOW` | number, integer, minimum 0 | `20` | [data](architecture/data.md) |
 | `AUTH_ORGANIZATIONS_LIMIT_PER_TENANT_PER_WINDOW` | number, integer, minimum 0 | `100` | [data](architecture/data.md) |
+| `RESOURCE_READ_LIMIT_PER_USER_PER_WINDOW` | number, integer, minimum 0 | `20` | [data](architecture/data.md) |
+| `RESOURCE_READ_LIMIT_PER_TENANT_PER_WINDOW` | number, integer, minimum 0 | `100` | [data](architecture/data.md) |
 | `TURN_QUOTA_PER_USER_PER_DAY` | number, integer, minimum 0 | `200` | [data](architecture/data.md) |
 | `TURN_QUOTA_PER_TENANT_PER_DAY` | number, integer, minimum 0 | `1000` | [data](architecture/data.md) |
 | `PROJECT_FILE_RETENTION_ENABLED` | boolean | `true` | [data](architecture/data.md) |
