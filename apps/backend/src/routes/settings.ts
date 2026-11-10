@@ -39,7 +39,6 @@ import {
 import {
   buildScheduledJobAuditPayload,
   buildSectionSummaries,
-  buildSettingsSnapshot,
   getSectionTitle,
   isLiveSettingsSection
 } from "./settings-helpers.js";
@@ -49,6 +48,20 @@ const sectionKeySchema = z.enum(userSettingsSectionKeys);
 const settingsSectionBodySchema = z.object({
   config: z.record(z.string(), z.unknown())
 });
+
+/**
+ * Byte limit of one settings section save, 64 KiB. Fastify checks the raw
+ * request body before it parses it: it refuses a Content-Length over the
+ * limit and stops reading when more bytes arrive. The route then checks the
+ * text that it stores, `JSON.stringify(config)` in UTF-8, because parsing can
+ * make that text longer than the body: `1e20` becomes 21 digits. Each check
+ * accepts exactly this many bytes.
+ */
+export const SETTINGS_SECTION_MAX_BYTES = 64 * 1024;
+
+function settingsSectionTooLargeError() {
+  return apiError("settings_section_too_large", "The settings section is larger than the 64 KiB limit.");
+}
 
 type ScheduledJobBody = z.output<typeof ScheduledJobRequestSchema>;
 
@@ -61,15 +74,9 @@ function buildInvalidScheduledJobConfigError(error: unknown) {
   ]);
 }
 
-async function buildScheduledJobPersistenceInput(
-  settings: Pick<UserSettingsStore, "listSections">,
-  tenantId: string,
-  userId: string,
-  body: ScheduledJobBody
-) {
+function buildScheduledJobPersistenceInput(tenantId: string, userId: string, body: ScheduledJobBody) {
   const nextRunAt = body.enabled ? computeNextCronRunAt(body.cronExpression, body.timeZone) : null;
 
-  const sections = await settings.listSections(tenantId, userId);
   return {
     tenantId,
     userId,
@@ -80,15 +87,18 @@ async function buildScheduledJobPersistenceInput(
     targetType: body.targetType,
     targetRef: body.targetRef ?? null,
     input: body.input,
-    settingsSnapshot: buildSettingsSnapshot(sections),
+    // No code reads a job's settings snapshot: the scheduler runs a job from
+    // its own fields. So a new or edited job copies no settings section, and
+    // a large section cannot make the job row larger. A job that an earlier
+    // version saved keeps its snapshot until its next edit.
+    settingsSnapshot: {},
     enabled: body.enabled,
     nextRunAt
   };
 }
 
-async function resolveScheduledJobPersistenceInput(
+function resolveScheduledJobPersistenceInput(
   reply: FastifyReply,
-  settings: Pick<UserSettingsStore, "listSections">,
   tenantId: string,
   userId: string,
   body: unknown
@@ -101,7 +111,7 @@ async function resolveScheduledJobPersistenceInput(
   try {
     return {
       ok: true as const,
-      value: await buildScheduledJobPersistenceInput(settings, tenantId, userId, bodyResult.value)
+      value: buildScheduledJobPersistenceInput(tenantId, userId, bodyResult.value)
     };
   } catch (error) {
     reply.code(400);
@@ -202,9 +212,29 @@ export async function registerSettingsRoutes(
     });
   });
 
-  app.put("/me/settings/:section", async (request, reply) => {
+  app.put("/me/settings/:section", {
+    bodyLimit: SETTINGS_SECTION_MAX_BYTES,
+    // Give the body limit refusal fixed public text. Every other error goes on
+    // to the app error handler.
+    errorHandler(error, _request, reply) {
+      if (error.code !== "FST_ERR_CTP_BODY_TOO_LARGE") throw error;
+      reply.code(413).send(settingsSectionTooLargeError());
+    }
+  }, async (request, reply) => {
     const { userId, tenantId } = request.auth;
-    await ensureUser(app.db, userId);
+    // Each save writes the section row and an audit event, so the limit comes
+    // before any database write.
+    const rateLimitError = await stores.limits.consumeRateLimit({
+      resource: "settings_write",
+      userId,
+      tenantId
+    });
+    if (rateLimitError) {
+      reply.code(429);
+      reply.header("retry-after", Math.max(1, Math.ceil(rateLimitError.retryAfterMs / 1000)));
+      return rateLimitError;
+    }
+
     const paramsResult = parseRequestInput(
       reply,
       z.object({ section: sectionKeySchema }),
@@ -218,7 +248,12 @@ export async function registerSettingsRoutes(
     if (!bodyResult.ok) {
       return bodyResult.response;
     }
+    if (Buffer.byteLength(JSON.stringify(bodyResult.value.config), "utf8") > SETTINGS_SECTION_MAX_BYTES) {
+      reply.code(413);
+      return settingsSectionTooLargeError();
+    }
 
+    await ensureUser(app.db, userId);
     const section = await stores.settings.upsertSection({
       tenantId,
       userId,
@@ -304,13 +339,7 @@ export async function registerSettingsRoutes(
       return rateLimitError;
     }
 
-    const persistenceInputResult = await resolveScheduledJobPersistenceInput(
-      reply,
-      stores.settings,
-      tenantId,
-      userId,
-      request.body
-    );
+    const persistenceInputResult = resolveScheduledJobPersistenceInput(reply, tenantId, userId, request.body);
     if (!persistenceInputResult.ok) {
       return persistenceInputResult.response;
     }
@@ -358,13 +387,7 @@ export async function registerSettingsRoutes(
       return paramsResult.response;
     }
 
-    const persistenceInputResult = await resolveScheduledJobPersistenceInput(
-      reply,
-      stores.settings,
-      tenantId,
-      userId,
-      request.body
-    );
+    const persistenceInputResult = resolveScheduledJobPersistenceInput(reply, tenantId, userId, request.body);
     if (!persistenceInputResult.ok) {
       return persistenceInputResult.response;
     }
