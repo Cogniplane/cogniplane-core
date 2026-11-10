@@ -553,7 +553,7 @@ function isSingleFileSkillBundle(
 }
 
 type SkillRevisionImporter = Pick<SkillRevisionStore, "importSkillBundle">;
-type SkillBundleWriter = Pick<SkillBundleStorage, "storeBundle">;
+type SkillBundleWriter = Pick<SkillBundleStorage, "storeBundle" | "deleteBundle">;
 
 function buildSkillImportPayload(input: {
   tenantId: string;
@@ -594,19 +594,19 @@ function buildSkillImportPayload(input: {
       ...input.extraMetadata
     },
     createdBy: input.createdBy,
-    storeBundle: async ({ revisionNumber }) => {
+    storeBundle: async () => {
       if (inline) {
         return { storageUri: null };
       }
       return input.skillBundleStorage.storeBundle({
         tenantId: input.tenantId,
         skillId: validation.bundle.bundleName,
-        revisionNumber,
         bundleName: validation.bundle.bundleName,
         contentHash: validation.bundle.contentHash,
         sourcePath: input.bundleLocalPath
       });
-    }
+    },
+    deleteBundle: (storageUri) => input.skillBundleStorage.deleteBundle(storageUri)
   };
 }
 

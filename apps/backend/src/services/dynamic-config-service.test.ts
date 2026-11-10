@@ -299,7 +299,7 @@ test("DynamicConfigService imports a public GitHub skill bundle", async () => {
     makeStores({
       skillRevisions: {
         async importSkillBundle(_tenantId, input) {
-          const { storageUri } = await input.storeBundle({ revisionNumber: 1 });
+          const { storageUri } = await input.storeBundle();
           capturedImports.push({
             skillId: input.skillId,
             sourceType: input.sourceType,
@@ -397,7 +397,7 @@ test("DynamicConfigService imports zip bundles from nested archive wrappers", as
     makeStores({
       skillRevisions: {
         async importSkillBundle(_tenantId, input) {
-          const { storageUri } = await input.storeBundle({ revisionNumber: 1 });
+          const { storageUri } = await input.storeBundle();
           capturedImports.push({
             skillId: input.skillId,
             sourceType: input.sourceType,
@@ -464,7 +464,7 @@ test("DynamicConfigService allows inline edits when the tenant owns the skill", 
       skillRevisions: {
         async importSkillBundle(_tenantId, input) {
           importCalled = true;
-          const { storageUri } = await input.storeBundle({ revisionNumber: 2 });
+          const { storageUri } = await input.storeBundle();
           return makeImportedSkillBundle(input, 2, storageUri);
         }
       },
