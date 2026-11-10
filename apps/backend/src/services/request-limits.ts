@@ -7,6 +7,8 @@ export type LimitResource =
   | "project_file_write"
   | "scheduled_job_create"
   | "oauth_callback"
+  | "auth_sign_in"
+  | "auth_refresh"
   | "admin_query"
   | "auth_organizations";
 type LimitScope = "user" | "tenant";
@@ -22,6 +24,8 @@ const RESOURCE_LABELS: Record<LimitResource, string> = {
   project_file_write: "project file write",
   scheduled_job_create: "scheduled job creation",
   oauth_callback: "OAuth callback",
+  auth_sign_in: "sign-in",
+  auth_refresh: "refresh and sign-out",
   admin_query: "admin request",
   auth_organizations: "organization list"
 };
@@ -47,6 +51,8 @@ export type RequestLimitsConfigKeys = Pick<
   | "SCHEDULED_JOB_CREATE_LIMIT_PER_TENANT_PER_WINDOW"
   | "OAUTH_CALLBACK_LIMIT_PER_USER_PER_WINDOW"
   | "OAUTH_CALLBACK_LIMIT_PER_TENANT_PER_WINDOW"
+  | "AUTH_SIGN_IN_LIMIT_PER_IP_PER_WINDOW"
+  | "AUTH_REFRESH_LIMIT_PER_FAMILY_PER_WINDOW"
   | "ADMIN_QUERY_LIMIT_PER_USER_PER_WINDOW"
   | "ADMIN_QUERY_LIMIT_PER_TENANT_PER_WINDOW"
   | "AUTH_ORGANIZATIONS_LIMIT_PER_USER_PER_WINDOW"
@@ -89,6 +95,14 @@ export function buildLimitsConfig(config: RequestLimitsConfigKeys): {
           user: config.OAUTH_CALLBACK_LIMIT_PER_USER_PER_WINDOW,
           tenant: config.OAUTH_CALLBACK_LIMIT_PER_TENANT_PER_WINDOW
         },
+        // The auth limits count one subject per request in the user scope:
+        // the client IP for sign-in, and the verified refresh family (or the
+        // client IP without a valid refresh token) for refresh and sign-out.
+        // They have no tenant scope. Sign-in has no verified tenant, and a
+        // tenant-wide refresh count would let one tenant's traffic refuse all
+        // of its members.
+        auth_sign_in: { user: config.AUTH_SIGN_IN_LIMIT_PER_IP_PER_WINDOW, tenant: 0 },
+        auth_refresh: { user: config.AUTH_REFRESH_LIMIT_PER_FAMILY_PER_WINDOW, tenant: 0 },
         admin_query: {
           user: config.ADMIN_QUERY_LIMIT_PER_USER_PER_WINDOW,
           tenant: config.ADMIN_QUERY_LIMIT_PER_TENANT_PER_WINDOW

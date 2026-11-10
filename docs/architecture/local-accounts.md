@@ -19,7 +19,8 @@ other people in Admin > People (`routes/tenant-local-members.ts`).
   too_many_attempts`; no hashing capacity or a throttle store failure returns
   `503 busy`.
 - Throttle: per email (HMAC key in Redis; `services/auth/login-throttle.ts`) and
-  per IP. Both fail closed.
+  per IP (the [sign-in limit](data.md#rate-limits-and-quotas)). Both fail
+  closed.
 - One home tenant: composite foreign keys tie a local user to one identity and
   one tenant.
 - Links (setup, reset; TTLs in `local-account-service.ts`): 32 random bytes;

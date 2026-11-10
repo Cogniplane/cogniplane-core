@@ -16,7 +16,7 @@ import {
   WrongLoginTypeError
 } from "../services/auth/workos-tenant-provisioning.js";
 import { IntegrationRegistry } from "../services/integrations/integration-registry.js";
-import { enforceOAuthCallbackRateLimit } from "../services/integrations/oauth-callback-rate-limit.js";
+import { clientIpKey, enforceRateLimit } from "../services/rate-limit-reply.js";
 import type { LocalAuth } from "../services/auth/local-auth.js";
 import type { RequestLimitsInterface } from "../services/request-limits.js";
 import { registerLocalAuthRoutes } from "./auth-local.js";
@@ -114,8 +114,10 @@ function registerWorkosAuthRoutes(
     workos
   }: AuthRouteDeps & { refreshTokens: RefreshTokenRotationService; workos: WorkOS }
 ): void {
+  // Sign-in steps count per client IP (`auth_sign_in`). A limiter outage lets
+  // them through, as before; the state and PKCE checks still run.
   app.get("/auth/login", async (request, reply) => {
-    if (await enforceOAuthCallbackRateLimit(request, reply, limits)) return reply;
+    if (await enforceRateLimit(request, reply, limits, clientIpKey("auth_sign_in", request))) return reply;
 
     const { organization, connection } = request.query as Record<string, string | undefined>;
 
@@ -159,7 +161,7 @@ function registerWorkosAuthRoutes(
     if (!requireBrowserAuthOrigin(request, reply, config.API_ORIGIN, { requireJson: true })) {
       return reply;
     }
-    if (await enforceOAuthCallbackRateLimit(request, reply, limits)) return reply;
+    if (await enforceRateLimit(request, reply, limits, clientIpKey("auth_sign_in", request))) return reply;
 
     const { code, state } = (request.body ?? {}) as { code?: string; state?: string };
     const cookieState = (request.cookies as Record<string, string>)?.[OAUTH_STATE_COOKIE];

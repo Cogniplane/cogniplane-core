@@ -1,7 +1,8 @@
 import { test, expect, vi } from "vitest";
 import type { FastifyReply, FastifyRequest } from "fastify";
 
-import type { LimitExceededErrorPayload, RequestLimitsInterface } from "../request-limits.js";
+import { createTestConfig } from "../../test-helpers/test-config.js";
+import { RequestLimits, type LimitExceededErrorPayload, type RequestLimitsInterface } from "../request-limits.js";
 import { enforceOAuthCallbackRateLimit } from "./oauth-callback-rate-limit.js";
 
 function fakeReply() {
@@ -91,5 +92,21 @@ test("allows the request when no limiter is wired", async () => {
   const throttled = await enforceOAuthCallbackRateLimit(request, reply, undefined);
 
   expect(throttled).toBe(false);
+  expect(reply.code).not.toHaveBeenCalled();
+});
+
+// Issue #47: a sign-in flood from one IP must not stop the integration
+// callbacks of the people behind that IP, and the reverse.
+test("integration callbacks and sign-in have separate per-IP buckets in the real limiter", async () => {
+  const limits = RequestLimits.fromAppConfig(createTestConfig());
+  const signIn = { resource: "auth_sign_in" as const, userId: "203.0.113.5", tenantId: "203.0.113.5" };
+  let refusal = null;
+  for (let attempt = 0; attempt < 100 && !refusal; attempt += 1) refusal = await limits.consumeRateLimit(signIn);
+  expect(refusal).toMatchObject({ resource: "auth_sign_in" });
+
+  const reply = fakeReply();
+  const callback = await enforceOAuthCallbackRateLimit({ ip: "203.0.113.5" } as FastifyRequest, reply, limits);
+
+  expect(callback).toBe(false);
   expect(reply.code).not.toHaveBeenCalled();
 });

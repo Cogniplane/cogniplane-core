@@ -129,3 +129,23 @@ test("consumeTurnQuota concurrent calls respect the quota", async () => {
   expect(allowed).toBe(2);
   expect(rejected).toBe(3);
 });
+
+// Issue #47: the auth limits have one subject per request (the client IP, or
+// the verified refresh family) and no tenant scope.
+test("auth limits read their own settings and count one subject each", async () => {
+  const limits = RequestLimits.fromAppConfig(createTestConfig({
+    RATE_LIMIT_WINDOW_MS: 60_000,
+    AUTH_SIGN_IN_LIMIT_PER_IP_PER_WINDOW: 2,
+    AUTH_REFRESH_LIMIT_PER_FAMILY_PER_WINDOW: 3,
+    OAUTH_CALLBACK_LIMIT_PER_USER_PER_WINDOW: 1
+  }));
+  const signIn = { resource: "auth_sign_in" as const, userId: "198.51.100.1", tenantId: "198.51.100.1" };
+  const family = (id: string) => ({ resource: "auth_refresh" as const, userId: `family:${id}`, tenantId: `family:${id}` });
+
+  expect(await limits.consumeRateLimit(signIn)).toBeNull();
+  expect(await limits.consumeRateLimit(signIn)).toBeNull();
+  expect(await limits.consumeRateLimit(signIn)).toMatchObject({ resource: "auth_sign_in", scope: "user", limit: 2, message: "User sign-in rate limit exceeded." });
+  for (let i = 0; i < 3; i += 1) expect(await limits.consumeRateLimit(family("a"))).toBeNull();
+  expect(await limits.consumeRateLimit(family("a"))).toMatchObject({ resource: "auth_refresh", scope: "user", limit: 3, message: "User refresh and sign-out rate limit exceeded." });
+  expect(await limits.consumeRateLimit(family("b"))).toBeNull();
+});

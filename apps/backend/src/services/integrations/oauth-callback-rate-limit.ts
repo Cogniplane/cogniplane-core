@@ -1,23 +1,20 @@
 import type { FastifyReply, FastifyRequest } from "fastify";
 
+import { clientIpKey, enforceRateLimit } from "../rate-limit-reply.js";
 import type { RequestLimitsInterface } from "../request-limits.js";
 
 /**
- * Throttle an unauthenticated OAuth callback before it does any state
- * verification or upstream token exchange. The callback runs before any user
- * context exists, so the only source identifier available is the client IP —
- * we key the shared `oauth_callback` limit on the IP for BOTH the user and
- * tenant scope (a per-IP bucket). Without this, forged-state probes hit the
- * verification path unthrottled, allowing brute-forcing of state values.
+ * Throttle an unauthenticated integration OAuth callback (GitHub, Notion,
+ * Microsoft) before it does any state verification or upstream token
+ * exchange. The callback runs before any user context exists, so the only
+ * source identifier available is the client IP: the `oauth_callback` limit
+ * uses it for both the user and the tenant scope. Without this, forged-state
+ * probes hit the verification path unthrottled, allowing brute-forcing of
+ * state values. Sign-in has its own per-IP limit (`auth_sign_in`).
  *
- * Returns `true` if the request was throttled (a 429 has been written to
- * `reply` and the caller must stop), `false` to proceed. A missing limiter is
- * treated as "allow" so test/dev wiring without a limiter still works.
- *
- * `failClosed`: when the limiter itself fails, answer 503 instead of letting
- * the request through. Credential endpoints (local password sign-in) use it,
- * because an unthrottled password check is the attack this limit exists for
- * (docs/architecture/local-accounts.md).
+ * Returns `true` if the request was throttled and the caller must stop. A
+ * limiter outage lets the callback through: its state check still runs.
+ * See `enforceRateLimit` for `failClosed`.
  */
 export async function enforceOAuthCallbackRateLimit(
   request: FastifyRequest,
@@ -25,29 +22,5 @@ export async function enforceOAuthCallbackRateLimit(
   limits: Pick<RequestLimitsInterface, "consumeRateLimit"> | undefined,
   options: { failClosed?: boolean } = {}
 ): Promise<boolean> {
-  if (!limits) return false;
-
-  const ip = request.ip || "unknown";
-  let limiterFailed = false;
-  const limitError = await limits.consumeRateLimit({
-    resource: "oauth_callback",
-    userId: ip,
-    tenantId: ip
-  }).catch((err: unknown) => {
-    request.log.warn({ err }, "OAuth callback rate limiter unavailable");
-    limiterFailed = true;
-    return null;
-  });
-  if (limiterFailed && options.failClosed) {
-    reply.code(503);
-    reply.header("retry-after", "1");
-    reply.send({ error: "rate_limiter_unavailable" });
-    return true;
-  }
-  if (!limitError) return false;
-
-  reply.code(429);
-  reply.header("retry-after", Math.max(1, Math.ceil(limitError.retryAfterMs / 1000)));
-  reply.send(limitError);
-  return true;
+  return enforceRateLimit(request, reply, limits, clientIpKey("oauth_callback", request), options);
 }

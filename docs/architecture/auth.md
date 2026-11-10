@@ -48,6 +48,8 @@ Sign-in types:
   rotates. `lib/refresh-token-store.ts`.
 - Only explicit sign-out deletes the refresh cookie. If `/auth/logout` cannot
   revoke the family, it returns 503 `logout_unavailable` and keeps the cookie.
+- `/auth/refresh` and `/auth/logout` count per refresh family, apart from the
+  per-IP sign-in limit ([rate limits](data.md#rate-limits-and-quotas)).
 - The frontend keeps the access token in memory only (`lib/api-client.ts`),
   never in `localStorage` or `sessionStorage`. A reload uses the refresh cookie.
   A session-change gate keeps a refresh from sending a cookie that a sign-in or

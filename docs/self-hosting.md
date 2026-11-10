@@ -79,7 +79,10 @@ API_ORIGIN=https://app.example.com   # the frontend origin; exactly one origin
   STARTTLS) and `MAIL_FROM` together. Configure SPF, DKIM and DMARC for the
   sender domain. Effects of email on and off: [email](architecture/email.md).
 - Connectors (GitHub, Notion, Jira, Microsoft 365): [connectors](connectors.md).
-- Behind a proxy, set `TRUST_PROXY` to the proxy addresses.
+- Behind a proxy, set `TRUST_PROXY` to the proxy addresses. With `false`, all
+  clients share the proxy's per-IP sign-in limit ([rate
+  limits](architecture/data.md#rate-limits-and-quotas)); the backend logs a
+  warning at each start.
 
 ## Other backend settings
 

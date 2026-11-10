@@ -179,4 +179,28 @@ use Redis: they count in process and through the `session_executions` lease.
   (`TURN_QUOTA_PER_*_PER_DAY`, UTC days). Meaning of `0`: [startup
   rules](../configuration.md#startup-rules).
 - A refusal returns `LimitExceededErrorPayload` with `retryAfterMs` and
-  `resetAt`.
+  `resetAt`. Auth routes also send `Retry-After` in seconds
+  (`services/rate-limit-reply.ts`).
+- Auth limits. The sign-in and refresh limits count one subject per request
+  and have no tenant scope: sign-in has no verified tenant, and a tenant-wide
+  refresh count would let one tenant's traffic refuse all of its members.
+  - Sign-in, per client IP (`AUTH_SIGN_IN_LIMIT_PER_IP_PER_WINDOW`): WorkOS
+    login and callback, the public local steps, and local step-up and password
+    change. The local routes answer 503 when the limiter fails; the WorkOS
+    routes continue. The per-email throttle of local accounts is separate
+    ([local accounts](local-accounts.md)).
+  - Refresh and sign-out (`AUTH_REFRESH_LIMIT_PER_FAMILY_PER_WINDOW`): per
+    refresh family, read from the token after its signature check. A request
+    without a valid refresh token counts per client IP. Thus sign-in traffic,
+    other people behind the same IP, and a revoked family cannot refuse a valid
+    session. A limiter failure lets the request through.
+  - Integration OAuth callbacks, per client IP (`OAUTH_CALLBACK_LIMIT_*`).
+- Upgrade: `OAUTH_CALLBACK_LIMIT_*` no longer controls sign-in, refresh or
+  sign-out. If you changed those settings for authentication traffic, set
+  `AUTH_SIGN_IN_LIMIT_PER_IP_PER_WINDOW` and
+  `AUTH_REFRESH_LIMIT_PER_FAMILY_PER_WINDOW` too. Otherwise their defaults
+  apply, including when you previously disabled the shared limit with `0`.
+- The client IP is `request.ip`, which follows `TRUST_PROXY`. Behind a proxy
+  with `TRUST_PROXY=false`, all clients have the proxy address and share one
+  sign-in limit. In jwt mode, each start logs a warning while `TRUST_PROXY` is
+  `false` or `true` (`registerTrustProxyWarnings` in `app.ts`).
