@@ -6,8 +6,9 @@ import { jwtAuth, jwtPublicAuthPaths } from "./auth-jwt.js";
 import { getJwtSigningKey, signAccessToken, signRefreshToken } from "./jwt.js";
 import { runtimeTokenSecret } from "./derived-secrets.js";
 import { generateRuntimeToken, runtimeTokenExpiry } from "../services/auth/runtime-token.js";
-import type { TenantAuthState, TenantMembershipRole } from "../services/tenant-member-store.js";
+import { PrivilegedAuthStateLookup, type TenantAuthState, type TenantMembershipRole } from "../services/tenant-member-store.js";
 import { createTestConfig } from "../test-helpers/test-config.js";
+import { FakePool } from "../test-helpers/fake-pool.js";
 
 const JWT_CONFIG = createTestConfig({ AUTH_MODE: "jwt", AUTH_LOGIN_TYPES: ["workos"] });
 
@@ -313,6 +314,48 @@ test("public auth paths follow the enabled login types", async () => {
     expect((await app.inject("/auth/refresh")).statusCode).toBe(200);
     await app.close();
   }
+});
+
+// The production wiring (app.ts): the hook reads the membership through
+// PrivilegedAuthStateLookup on the privileged pool.
+test("jwt auth reads the membership with one statement on every request, with no cache", async () => {
+  const config = createTestConfig({ AUTH_MODE: "jwt", AUTH_LOGIN_TYPES: ["local"] });
+  const account: { member: boolean; securityVersion: number } = { member: true, securityVersion: 4 };
+  const pool = new FakePool();
+  pool.onQuery(/SELECT tm\.role, t\.login_type, u\.auth_source/, () => {
+    const rows = account.member
+      ? [{ role: "member", login_type: "local", auth_source: "local", local_status: "active", security_version: account.securityVersion }]
+      : [];
+    return { rows, rowCount: rows.length };
+  });
+  const app = Fastify();
+  app.addHook("onRequest", jwtAuth(config, new PrivilegedAuthStateLookup(pool.asPool()), []));
+  app.get("/artifacts", async (request) => ({ role: request.auth?.role ?? null }));
+  const token = await signAccessToken(config, { sub: "user-1", tid: "tenant-A", role: "member", email: "user-1@example.com", sv: 4, fid: "family-1" });
+  const get = () => app.inject({ method: "GET", url: "/artifacts", headers: { authorization: `Bearer ${token}` } });
+
+  try {
+    expect((await get()).json()).toEqual({ role: "member" });
+    expect((await get()).json()).toEqual({ role: "member" });
+    // A security change commits between two requests: the next request sees it.
+    account.securityVersion = 5;
+    const revoked = await get();
+    expect(revoked.statusCode).toBe(403);
+    expect(revoked.json()).toEqual({ error: "session_revoked" });
+    // So does a removal of the membership.
+    account.member = false;
+    const removed = await get();
+    expect(removed.statusCode).toBe(403);
+    expect(removed.json()).toEqual({ error: "not_a_member" });
+  } finally {
+    await app.close();
+  }
+
+  // One SELECT per request, and no BEGIN, set_config or COMMIT around it.
+  const authStateRead = ["SELECT tm.role, t.login_type, u.auth_source, li.status AS local_status, li.security_version", ["tenant-A", "user-1"]];
+  expect(pool.queries.map(({ text, values }) => [text.trim().split("\n")[0], values])).toEqual([
+    authStateRead, authStateRead, authStateRead, authStateRead
+  ]);
 });
 
 // Passkey ceremonies are public only with local login and an RP id.

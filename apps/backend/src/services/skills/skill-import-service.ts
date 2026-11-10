@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { inflateRawSync } from "node:zlib";
-import { access, mkdtemp, mkdir, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
@@ -22,6 +22,7 @@ import type {
 import type { SkillRevisionStore } from "./skill-revision-store.js";
 import type { SkillBundleStorage } from "./skill-bundle-storage.js";
 import {
+  MAX_GITHUB_ARCHIVE_ENTRIES,
   MAX_SKILL_BUNDLE_FILES,
   MAX_SKILL_BUNDLE_FILE_BYTES,
   MAX_SKILL_BUNDLE_TOTAL_BYTES
@@ -219,27 +220,88 @@ function formatValidationErrors(messages: SkillBundleValidationMessage[]): strin
     .join("\n");
 }
 
-async function extractZipArchive(archiveBuffer: Buffer, targetPath: string, maxTotalBytes: number): Promise<void> {
-  let archive: JSZip;
+/** Signature at the start of each central directory record ("PK\x01\x02"). */
+const ZIP_CENTRAL_DIRECTORY_SIGNATURE = Buffer.from([0x50, 0x4b, 0x01, 0x02]);
+
+/**
+ * Refuse an archive with more than `maxEntries` entries before JSZip parses it.
+ *
+ * JSZip makes objects for every central directory record before we see any
+ * entry. It reads records while their signature repeats and ignores the count
+ * in the end record, so that count is no bound. Each record that JSZip reads
+ * starts with the signature at a different offset, so the number of signature
+ * matches in the buffer is an upper bound. File content that contains the same
+ * 4 bytes can only make the count larger.
+ */
+function assertZipEntryCountWithinLimit(archiveBuffer: Buffer, maxEntries: number): void {
+  let count = 0;
+  let offset = archiveBuffer.indexOf(ZIP_CENTRAL_DIRECTORY_SIGNATURE);
+  while (offset !== -1) {
+    count += 1;
+    if (count > maxEntries) {
+      throw new AdminConfigError(`Repository archive has more than ${maxEntries} entries.`);
+    }
+    offset = archiveBuffer.indexOf(ZIP_CENTRAL_DIRECTORY_SIGNATURE, offset + 1);
+  }
+}
+
+async function loadZipArchive(archiveBuffer: Buffer): Promise<JSZip> {
   try {
-    archive = await JSZip.loadAsync(archiveBuffer);
+    return await JSZip.loadAsync(archiveBuffer);
   } catch {
     // JSZip rejects with a library error on malformed bytes; that's bad user
     // input, not a server fault — surface it as a 400, not an opaque 500.
     throw new AdminConfigError("Uploaded file is not a valid zip archive.");
   }
-  let totalUncompressedBytes = 0;
-  let fileCount = 0;
-  const maxAllowedTotalBytes = Math.min(MAX_SKILL_BUNDLE_TOTAL_BYTES, maxTotalBytes);
-  const maxFileBytes = Math.min(MAX_SKILL_BUNDLE_FILE_BYTES, maxAllowedTotalBytes);
+}
 
+type ZipArchiveEntry = {
+  entry: JSZip.JSZipObject;
+  /** Normalized relative path, without a trailing slash. */
+  relativePath: string;
+  segments: string[];
+};
+
+/**
+ * Normalize and check the path of every entry, also of entries that are not
+ * extracted. One unsafe name makes the whole archive unsafe.
+ *
+ * `entry.name` is the name after JSZip resolved its `.` and `..` segments (the
+ * raw name stays on `unsafeOriginalName`). Selection and extraction both use
+ * the path made from `entry.name`, so the import writes each entry to the path
+ * where it selected it.
+ */
+function listZipEntries(archive: JSZip): ZipArchiveEntry[] {
+  const entries: ZipArchiveEntry[] = [];
   for (const entry of Object.values(archive.files)) {
     const normalizedPath = normalizeZipEntryPath(entry.name);
     if (!normalizedPath) {
       continue;
     }
 
-    const absolutePath = path.join(targetPath, normalizedPath);
+    const segments = normalizedPath.split("/").filter(Boolean);
+    entries.push({ entry, relativePath: segments.join("/"), segments });
+  }
+  return entries;
+}
+
+/**
+ * Inflate and write `entries` under `targetPath`. The bundle limits apply to
+ * these entries only, so give it the selected skill folder, not a whole
+ * repository.
+ */
+async function extractZipEntries(
+  entries: ZipArchiveEntry[],
+  targetPath: string,
+  maxTotalBytes: number
+): Promise<void> {
+  let totalUncompressedBytes = 0;
+  let fileCount = 0;
+  const maxAllowedTotalBytes = Math.min(MAX_SKILL_BUNDLE_TOTAL_BYTES, maxTotalBytes);
+  const maxFileBytes = Math.min(MAX_SKILL_BUNDLE_FILE_BYTES, maxAllowedTotalBytes);
+
+  for (const { entry, relativePath } of entries) {
+    const absolutePath = path.join(targetPath, relativePath);
     if (!absolutePath.startsWith(`${targetPath}${path.sep}`) && absolutePath !== targetPath) {
       throw new AdminConfigError(`Unsafe zip entry path: ${entry.name}`);
     }
@@ -269,7 +331,7 @@ async function extractZipArchive(archiveBuffer: Buffer, targetPath: string, maxT
     await mkdir(path.dirname(absolutePath), { recursive: true });
 
     // The per-entry allocation budget is also floored by whatever is LEFT of
-    // the archive-wide total, so a bomb cannot evade the total by splitting
+    // the total for these entries, so a bomb cannot evade the total by splitting
     // itself across entries that are each individually within the cap.
     const remainingTotalBytes = maxAllowedTotalBytes - totalUncompressedBytes;
     const content = inflateEntryBounded(entry, Math.min(maxFileBytes, remainingTotalBytes));
@@ -303,54 +365,54 @@ function isIgnoredArchiveEntryName(entryName: string): boolean {
   return entryName === "__MACOSX" || entryName.startsWith(".");
 }
 
-async function locateArchiveRoot(extractedRoot: string): Promise<string> {
-  const entries = await readdir(extractedRoot, { withFileTypes: true });
-  const directories = entries
-    .filter((entry) => entry.isDirectory() && !isIgnoredArchiveEntryName(entry.name))
-    .map((entry) => entry.name);
-
-  if (directories.length === 1) {
-    return path.join(extractedRoot, directories[0]);
-  }
-
-  return extractedRoot;
+/**
+ * True when `segments` is `folder` or a path below it. The comparison is by
+ * whole segments, so `skills/demo` does not match `skills/demo-extra`.
+ */
+function isWithinFolder(segments: string[], folder: string[]): boolean {
+  return folder.length <= segments.length && folder.every((segment, index) => segments[index] === segment);
 }
 
-async function findSkillBundleRoots(rootPath: string): Promise<string[]> {
-  const candidates = new Set<string>();
-
-  async function walk(currentPath: string): Promise<void> {
-    const entries = await readdir(currentPath, { withFileTypes: true });
-
-    for (const entry of entries) {
-      if (entry.isDirectory()) {
-        if (isIgnoredArchiveEntryName(entry.name)) {
-          continue;
-        }
-
-        await walk(path.join(currentPath, entry.name));
-        continue;
-      }
-
-      if (entry.isFile() && entry.name === "SKILL.md") {
-        candidates.add(currentPath);
-      }
+/**
+ * The archive root is the only top-level folder, if there is exactly one.
+ * GitHub puts the repository in one `owner-repo-sha/` folder. If not, the root
+ * is the top of the archive. Hidden folders and `__MACOSX` do not count.
+ */
+function findArchiveRoot(entries: ZipArchiveEntry[]): string[] {
+  const topLevelFolders = new Set<string>();
+  for (const { entry, segments } of entries) {
+    if (segments.length > 1 || entry.dir) {
+      topLevelFolders.add(segments[0]);
     }
   }
 
-  await walk(rootPath);
-  return [...candidates].sort();
+  const visibleFolders = [...topLevelFolders].filter((name) => !isIgnoredArchiveEntryName(name));
+  return visibleFolders.length === 1 ? [visibleFolders[0]] : [];
 }
 
-async function locateSingleSkillBundleRoot(extractedRoot: string): Promise<string> {
-  const archiveRoot = await locateArchiveRoot(extractedRoot);
-  const bundleRoots = await findSkillBundleRoots(archiveRoot);
+/** Find the one folder below the archive root that has a SKILL.md file. */
+function locateSingleSkillBundleFolder(entries: ZipArchiveEntry[]): string[] {
+  const archiveRoot = findArchiveRoot(entries);
+  const bundleFolders = new Map<string, string[]>();
 
-  if (bundleRoots.length !== 1) {
+  for (const { entry, segments } of entries) {
+    if (entry.dir || segments.at(-1) !== "SKILL.md" || !isWithinFolder(segments, archiveRoot)) {
+      continue;
+    }
+
+    const folder = segments.slice(0, -1);
+    if (folder.slice(archiveRoot.length).some(isIgnoredArchiveEntryName)) {
+      continue;
+    }
+
+    bundleFolders.set(folder.join("/"), folder);
+  }
+
+  if (bundleFolders.size !== 1) {
     throw new AdminConfigError("Archive must contain exactly one skill bundle root with SKILL.md.");
   }
 
-  return bundleRoots[0];
+  return [...bundleFolders.values()][0];
 }
 
 export function parseGitHubSkillSource(input: {
@@ -522,28 +584,27 @@ function buildGitHubZipballUrl(source: ReturnType<typeof parseGitHubSkillSource>
   return `https://api.github.com/repos/${source.owner}/${source.repo}/zipball/${encodeURIComponent(ref)}`;
 }
 
-async function resolveGitHubBundleSubdirectory(
-  extractedRoot: string,
-  subdirectory: string
-): Promise<string> {
-  const archiveRoot = await locateArchiveRoot(extractedRoot);
-  const resolvedPath = path.join(archiveRoot, subdirectory);
+/**
+ * Find the folder `subdirectory` below the archive root. `subdirectory` comes
+ * from `normalizeRelativeSubdirectory`, which refused `..` and absolute paths.
+ * The folder exists when the archive has an entry below it or a folder entry
+ * for it.
+ */
+function locateGitHubSubdirectory(entries: ZipArchiveEntry[], subdirectory: string): string[] {
+  const folder = [...findArchiveRoot(entries), ...subdirectory.split("/")];
+  const exists = entries.some(
+    ({ entry, segments }) =>
+      isWithinFolder(segments, folder) && (segments.length > folder.length || entry.dir)
+  );
 
-  if (!resolvedPath.startsWith(`${archiveRoot}${path.sep}`) && resolvedPath !== archiveRoot) {
-    throw new AdminConfigError("GitHub subdirectory resolves outside the repository archive.");
-  }
-
-  try {
-    await access(resolvedPath);
-  } catch {
+  if (!exists) {
     // A nonexistent subdirectory is bad user input (the URL/subdirectory the
-    // admin typed), not a server fault — don't let the raw ENOENT become an
-    // opaque 500.
+    // admin typed), not a server fault.
     throw new AdminConfigError(
       `GitHub subdirectory "${subdirectory}" does not exist in the repository archive.`
     );
   }
-  return resolvedPath;
+  return folder;
 }
 
 function isSingleFileSkillBundle(
@@ -636,8 +697,10 @@ export async function importSkillBundleFromZip(input: {
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), "cogniplane-skill-import-"));
 
   try {
-    await extractZipArchive(input.archiveBuffer, tempRoot, input.config.ARTIFACT_MAX_UPLOAD_BYTES);
-    const bundleRootPath = await locateSingleSkillBundleRoot(tempRoot);
+    // An uploaded archive is the bundle: the bundle limits apply to all of it.
+    const entries = listZipEntries(await loadZipArchive(input.archiveBuffer));
+    await extractZipEntries(entries, tempRoot, input.config.ARTIFACT_MAX_UPLOAD_BYTES);
+    const bundleRootPath = path.join(tempRoot, ...locateSingleSkillBundleFolder(entries));
     const validation = await validateSkillBundleOrThrow(bundleRootPath);
 
     return await input.skillRevisions.importSkillBundle(
@@ -787,13 +850,20 @@ export async function importSkillBundleFromGithub(input: {
     response.body as ReadableStream<Uint8Array> | null,
     input.config.ARTIFACT_MAX_UPLOAD_BYTES
   );
+  assertZipEntryCountWithinLimit(archiveBuffer, MAX_GITHUB_ARCHIVE_ENTRIES);
+  const entries = listZipEntries(await loadZipArchive(archiveBuffer));
+  // The archive holds the whole repository. Select the skill folder from the
+  // entry names first, then inflate only that folder, so the bundle limits
+  // apply to the skill and not to the rest of the repository.
+  const bundleFolder = source.subdirectory
+    ? locateGitHubSubdirectory(entries, source.subdirectory)
+    : locateSingleSkillBundleFolder(entries);
+  const bundleEntries = entries.filter(({ segments }) => isWithinFolder(segments, bundleFolder));
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), "cogniplane-skill-import-github-"));
 
   try {
-    await extractZipArchive(archiveBuffer, tempRoot, input.config.ARTIFACT_MAX_UPLOAD_BYTES);
-    const bundleRootPath = source.subdirectory
-      ? await resolveGitHubBundleSubdirectory(tempRoot, source.subdirectory)
-      : await locateSingleSkillBundleRoot(tempRoot);
+    await extractZipEntries(bundleEntries, tempRoot, input.config.ARTIFACT_MAX_UPLOAD_BYTES);
+    const bundleRootPath = path.join(tempRoot, ...bundleFolder);
     const validation = await validateSkillBundleOrThrow(bundleRootPath);
 
     return await input.skillRevisions.importSkillBundle(

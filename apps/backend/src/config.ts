@@ -236,6 +236,10 @@ export const envSchema = z.object({
   // (each one fires recurring synthetic turns), independent of the per-window
   // creation rate limit. 0 disables the cap.
   SCHEDULED_JOB_MAX_ACTIVE_PER_USER: z.coerce.number().int().min(0).default(50),
+  // Personal settings saves (PUT /me/settings/:section). Each save writes the
+  // section row and an audit event.
+  SETTINGS_WRITE_LIMIT_PER_USER_PER_WINDOW: z.coerce.number().int().min(0).default(20),
+  SETTINGS_WRITE_LIMIT_PER_TENANT_PER_WINDOW: z.coerce.number().int().min(0).default(100),
   // OAuth callback verification (GitHub/Notion). The callbacks are
   // unauthenticated, so the limit is keyed per source IP (used as both the user
   // and tenant subject) to throttle probing of forged state values.
@@ -251,6 +255,13 @@ export const envSchema = z.object({
   // WorkOS throttles the whole deployment.
   AUTH_ORGANIZATIONS_LIMIT_PER_USER_PER_WINDOW: z.coerce.number().int().min(0).default(20),
   AUTH_ORGANIZATIONS_LIMIT_PER_TENANT_PER_WINDOW: z.coerce.number().int().min(0).default(100),
+  // One budget for the member reads that do heavy work on each call: the two
+  // PDF text previews run pdftotext, and the MCP App resource route compiles
+  // the runtime config, checks policy and can call the upstream server. The
+  // three routes share these counters, so a client gets no more calls by
+  // alternating routes.
+  RESOURCE_READ_LIMIT_PER_USER_PER_WINDOW: z.coerce.number().int().min(0).default(20),
+  RESOURCE_READ_LIMIT_PER_TENANT_PER_WINDOW: z.coerce.number().int().min(0).default(100),
   TURN_QUOTA_PER_USER_PER_DAY: z.coerce.number().int().min(0).default(200),
   TURN_QUOTA_PER_TENANT_PER_DAY: z.coerce.number().int().min(0).default(1000),
   PROJECT_FILE_RETENTION_ENABLED: booleanFromEnvSchema.default(true),

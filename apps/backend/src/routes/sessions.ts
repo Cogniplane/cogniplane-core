@@ -30,6 +30,7 @@ import { ensureUser } from "../lib/db.js";
 import { apiError, notFoundError } from "../lib/http-errors.js";
 import { sessionIdParams } from "../lib/route-schemas.js";
 import { parseRequestInput } from "../lib/route-validation.js";
+import { consumeResourceRead } from "../lib/resource-read-limit.js";
 import { serialize } from "../lib/serialize-response.js";
 import { openSseResponse } from "../lib/open-sse-response.js";
 import { uuidv7 } from "../lib/uuid.js";
@@ -142,6 +143,8 @@ async function registerScopedSessionRoutes(
   app.get("/sessions/:sessionId/mcp-apps/:toolCallId", async (request, reply) => {
     const params = parseRequestInput(reply, mcpAppParamsSchema, request.params);
     if (!params.ok) return params.response;
+    const limited = await consumeResourceRead(stores.limits, request, reply);
+    if (limited) return limited;
     const { tenantId, userId } = request.auth;
     const { sessionId, toolCallId } = params.value;
     const session = await stores.sessions.getReadable(tenantId, sessionId, userId);

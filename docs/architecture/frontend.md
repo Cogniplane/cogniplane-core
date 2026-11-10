@@ -1,7 +1,7 @@
 # Frontend
 
 Scope: structure of the Next.js app (`apps/frontend`) outside the chat: routes,
-providers, API clients, data fetching, overlays and builds. The chat is in [chat
+providers, API clients, data fetching, render errors, overlays and builds. The chat is in [chat
 UI](chat-ui.md). Before you use a Next.js API, read `apps/frontend/AGENTS.md`:
 this Next.js version differs from older ones.
 
@@ -41,6 +41,33 @@ this Next.js version differs from older ones.
   tests.
 - Overlays register frontend parts from `apps/frontend/src/overlays.ts`. See
   [overlays](../overlays.md).
+
+## Render errors
+
+An error that a component throws while it renders or in an effect goes to
+the nearest error boundary. Boundaries do not catch errors in event handlers
+or in async code; that code handles its own errors. A fallback never shows the
+error text or stack, because they can hold message, tool or server details.
+
+| Scope | Boundary | Recovery |
+|---|---|---|
+| Root layout | `app/global-error.tsx`: its own document, no providers, the saved theme | Try again, New session link |
+| Route page | `app/error.tsx` | Try again, New session link |
+| Chat of one session | `ChatRenderBoundary` (`components/workspace-main-state.tsx`), keyed by session id | Try again, New session in the same project; the sidebar and header keep working |
+| Tool view, side panel view, file preview | `RenderBoundary` (`components/render-boundary.tsx`), keyed by the content | Try again; Close and the header keep working |
+
+- Try again renders the same content once. Saved content that failed can
+  fail again; nothing retries by itself.
+- The New session link (`NEW_SESSION_HREF` in `lib/new-session-link.ts`)
+  loads `/?newSession=1`. `useSessionList` removes the parameter, selects no
+  session (not the linked, saved or first one), and clears the saved
+  selection. The workspace then opens New session.
+- Boundaries use `catchError` from `next/error`. The local ones call `reset`,
+  not `retry`: their content renders in the browser and needs no server
+  refresh.
+- When the chat fails, the shell drops the running turn and live approvals
+  that the chat reported. The session list still shows a turn that continues
+  on the server.
 
 ## Add a page
 

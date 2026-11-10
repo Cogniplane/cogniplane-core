@@ -5,8 +5,8 @@ import { registerSessionRoutes, type SessionRouteStores } from "../routes/sessio
 
 /**
  * A Fastify app with only the session routes and a fixed request identity.
- * `stores` is a partial fake. Call it inside a test: the app closes when the
- * test ends.
+ * `stores` is a partial fake. Its `limits` allow every request unless `stores`
+ * gives its own. Call it inside a test: the app closes when the test ends.
  */
 export async function sessionRoutesApp(
   stores: object,
@@ -17,6 +17,7 @@ export async function sessionRoutesApp(
   app.addHook("preHandler", async (request) => {
     request.auth = { userId: "user", tenantId: "tenant", role: "member", isAdmin: false, ...auth };
   });
-  await registerSessionRoutes(app, stores as unknown as SessionRouteStores);
+  const allowAll = { consumeRateLimit: async () => null };
+  await registerSessionRoutes(app, { limits: allowAll, ...stores } as unknown as SessionRouteStores);
   return app;
 }

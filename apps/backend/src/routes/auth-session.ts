@@ -17,7 +17,7 @@ import type { AuditEventStore } from "../services/audit-event-store.js";
 import { RefreshTokenRotationService } from "../services/auth/refresh-token-rotation-service.js";
 import { enforceOAuthCallbackRateLimit } from "../services/integrations/oauth-callback-rate-limit.js";
 import type { RequestLimitsInterface } from "../services/request-limits.js";
-import { TenantMemberStore } from "../services/tenant-member-store.js";
+import { PrivilegedAuthStateLookup } from "../services/tenant-member-store.js";
 
 // The session layer that every login type shares: token issue, refresh with
 // rotation and reuse detection, logout, and /auth/me. A login route proves who
@@ -245,7 +245,9 @@ export async function registerSessionRoutes(
     refreshTokens: RefreshTokenRotationService;
   }
 ): Promise<void> {
-  const tenantMembers = new TenantMemberStore(db);
+  // One statement on the privileged pool, outside a transaction; the SQL
+  // keeps the tenant and user predicates. See PrivilegedAuthStateLookup.
+  const authStates = new PrivilegedAuthStateLookup(db);
 
   // A refusal of /auth/refresh never deletes the refresh cookie. The cookie
   // jar is shared by every tab of the browser, and the Set-Cookie of an
@@ -281,7 +283,7 @@ export async function registerSessionRoutes(
     // retryable 503, not a 401 that ends the session.
     let admission: ReturnType<typeof checkAuthAdmission>;
     try {
-      admission = checkAuthAdmission(config, await tenantMembers.getAuthState(payload.tid, payload.sub), {
+      admission = checkAuthAdmission(config, await authStates.getAuthState(payload.tid, payload.sub), {
         sv: payload.sv
       });
     } catch (error) {

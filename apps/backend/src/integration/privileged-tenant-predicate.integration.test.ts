@@ -35,7 +35,7 @@ import {
 import { AuditEventStore } from "../services/audit-event-store.js";
 import { MessageStore } from "../services/message-store.js";
 import { PiiScanJobStore } from "../services/pii/pii-scan-job-store.js";
-import { TenantMemberStore } from "../services/tenant-member-store.js";
+import { PrivilegedAuthStateLookup, TenantMemberStore } from "../services/tenant-member-store.js";
 import {
   PiiSettingsConflictError,
   TenantOrgSettingsStore,
@@ -74,11 +74,9 @@ describe.skipIf(!adminDatabaseUrl())("privileged pool tenant predicates", () => 
   // Shape 1a: stores that call withTenantScope on the privileged pool. There
   // the wrapper is inert, and the predicate is the only tenant boundary.
 
-  describe("TenantMemberStore.getRole (the auth middleware's admission check)", () => {
-    // app.ts constructs this against privilegedDb: the lookup runs BEFORE any
-    // tenant context exists, because "is this user a member of this tenant" is
-    // itself a tenant-spanning question. If the tenant_id predicate were
-    // dropped, a membership in tenant A would admit the user to tenant B.
+  describe("TenantMemberStore.getRole on the privileged pool", () => {
+    // If the tenant_id predicate were dropped, a membership in tenant A would
+    // give the user a role in tenant B.
     test("returns the role for the tenant the user belongs to", async () => {
       const store = new TenantMemberStore(maintenancePool());
       expect(await store.getRole(tenantA.tenantId, tenantA.userId)).toBe("owner");
@@ -364,6 +362,31 @@ describe.skipIf(!adminDatabaseUrl())("privileged pool tenant predicates", () => 
   });
 
   // Shape 1b: privileged methods that carry tenant_id = $n.
+
+  describe("PrivilegedAuthStateLookup (the admission read of the auth middleware and /auth/refresh)", () => {
+    // app.ts and routes/auth-session.ts construct this against privilegedDb:
+    // the read runs BEFORE any tenant context exists, because "is this user a
+    // member of this tenant" is itself a tenant-spanning question. It has no
+    // withTenantScope. If the tenant_id predicate were dropped, a membership
+    // in tenant A would admit the user to tenant B.
+    function lookup(): PrivilegedAuthStateLookup {
+      return new PrivilegedAuthStateLookup(maintenancePool());
+    }
+
+    test("returns the state for the tenant the user belongs to", async () => {
+      expect(await lookup().getAuthState(tenantA.tenantId, tenantA.userId)).toEqual({
+        role: "owner", loginType: "workos", authSource: "workos", localStatus: null, securityVersion: null
+      });
+    });
+
+    test("returns null for a tenant the user does not belong to", async () => {
+      expect(await lookup().getAuthState(tenantB.tenantId, tenantA.userId)).toBeNull();
+    });
+
+    test("returns null for a user with no membership anywhere", async () => {
+      expect(await lookup().getAuthState(tenantA.tenantId, await seedUser())).toBeNull();
+    });
+  });
 
   describe("UserSettingsStore scheduled-job methods", () => {
     function store(): UserSettingsStore {

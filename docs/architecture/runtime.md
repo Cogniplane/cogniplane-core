@@ -157,8 +157,13 @@ delete). Limits: `SCHEDULED_JOB_CREATE_LIMIT_*` and
 - A scheduled turn cannot pause for approval: an enforced Policy Center
   `require_approval` match is denied, and so is every call that needs user
   consent ([memory](memory.md)).
-- A job keeps `settings_snapshot_json` and the owner's security version
+- A job keeps the owner's security version
   ([revocation](local-accounts.md#security-version-and-revocation)).
+- No code reads `settings_snapshot_json`. A new or edited job stores `{}`, not
+  a copy of the owner's [user settings](data.md#user-settings), so a large
+  section cannot make every job row larger. A job that an earlier version
+  saved keeps its snapshot until its next edit, and the API still returns the
+  field as `settingsSnapshot`.
 - An interrupted scheduled turn keeps its partial text with message status
   `interrupted`; the job run records `failed`. The run summary is a redacted
   prefix of the response (`scheduler-worker.ts`).
