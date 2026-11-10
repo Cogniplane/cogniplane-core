@@ -1,8 +1,9 @@
-import type { FastifyInstance } from "fastify";
+import type { FastifyInstance, FastifyReply } from "fastify";
 import { z } from "zod";
 
 import { ArtifactEnvelopeSchema } from "@cogniplane/shared-types";
 
+import type { AttachOverlaysInput } from "../../../../apps/backend/src/overlay-contracts.js";
 import { apiError } from "../../../../apps/backend/src/lib/http-errors.js";
 import type { RequestLimitsInterface } from "../../../../apps/backend/src/services/request-limits.js";
 import { parseRequestInput } from "../../../../apps/backend/src/lib/route-validation.js";
@@ -49,6 +50,9 @@ const importMicrosoftFileSchema = z.object({
 });
 
 export type MicrosoftFilesRouteStores = {
+  // The tenant toggles of Microsoft 365. Every route here reads Microsoft 365 for the
+  // member, so it needs Reads on, as the read tools do (docs/connectors.md).
+  loadIntegrationEnablement: AttachOverlaysInput["loadIntegrationEnablement"];
   microsoftFiles: Pick<
     MicrosoftFilesService,
     "listSites" | "listFiles" | "searchFiles" | "importFileToSession"
@@ -115,6 +119,13 @@ export async function registerMicrosoftFileRoutes(
   app: FastifyInstance,
   stores: MicrosoftFilesRouteStores
 ): Promise<void> {
+  async function refuseWhenReadsOff(tenantId: string, reply: FastifyReply) {
+    const enablement = await stores.loadIntegrationEnablement(tenantId, "microsoft");
+    if (enablement.tenantReadsEnabled) return null;
+    reply.code(403);
+    return apiError("microsoft_integration_disabled", "Your organization has not enabled Microsoft 365.");
+  }
+
   app.get("/integrations/microsoft/sites", async (request, reply) => {
     const inputResult = parseRequestInput(reply, microsoftSitesQuerySchema, request.query ?? {});
     if (!inputResult.ok) {
@@ -122,6 +133,8 @@ export async function registerMicrosoftFileRoutes(
     }
 
     const { tenantId, userId } = request.auth;
+    const disabled = await refuseWhenReadsOff(tenantId, reply);
+    if (disabled) return disabled;
 
     try {
       const sites = await stores.microsoftFiles.listSites({
@@ -142,6 +155,8 @@ export async function registerMicrosoftFileRoutes(
     }
 
     const { tenantId, userId } = request.auth;
+    const disabled = await refuseWhenReadsOff(tenantId, reply);
+    if (disabled) return disabled;
 
     try {
       const items = await stores.microsoftFiles.listFiles({
@@ -164,6 +179,8 @@ export async function registerMicrosoftFileRoutes(
     }
 
     const { tenantId, userId } = request.auth;
+    const disabled = await refuseWhenReadsOff(tenantId, reply);
+    if (disabled) return disabled;
 
     try {
       const results = await stores.microsoftFiles.searchFiles({
@@ -190,6 +207,8 @@ export async function registerMicrosoftFileRoutes(
     }
 
     const { tenantId, userId } = request.auth;
+    const disabled = await refuseWhenReadsOff(tenantId, reply);
+    if (disabled) return disabled;
 
     // An import adds a file to the session like an upload, so it shares the upload limit.
     const rateLimitError = await stores.limits?.consumeRateLimit({ resource: "artifact_upload", userId, tenantId });

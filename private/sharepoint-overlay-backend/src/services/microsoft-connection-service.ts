@@ -27,6 +27,8 @@ import {
 import type { RuntimeInvalidator } from "../../../../apps/backend/src/services/integrations/contracts.js";
 import { assertBoundIntegrationAccount } from "../../../../apps/backend/src/services/integrations/integration-account-binding.js";
 
+import { MICROSOFT_REQUEST_TIMEOUT_MS } from "./graph-http.js";
+
 const GRAPH_API_URL = "https://graph.microsoft.com/v1.0";
 const MICROSOFT_STATE_AUDIENCE = "cogniplane-microsoft-user-connect";
 const MICROSOFT_STATE_ISSUER = "cogniplane";
@@ -441,9 +443,12 @@ export class MicrosoftConnectionService {
         {
           method: "POST",
           headers: { "Content-Type": "application/x-www-form-urlencoded" },
-          body: body.toString()
+          body: body.toString(),
+          signal: AbortSignal.timeout(MICROSOFT_REQUEST_TIMEOUT_MS)
         }
-      );
+      ).catch(() => {
+        throw new Error("microsoft_token_exchange_failed");
+      });
 
       const tokenPayload = (await tokenResponse.json().catch(() => ({}))) as MicrosoftTokenResponse;
       if (!tokenResponse.ok || !tokenPayload.access_token) {
@@ -455,7 +460,10 @@ export class MicrosoftConnectionService {
         headers: {
           Authorization: `Bearer ${tokenPayload.access_token}`,
           "Content-Type": "application/json"
-        }
+        },
+        signal: AbortSignal.timeout(MICROSOFT_REQUEST_TIMEOUT_MS)
+      }).catch(() => {
+        throw new Error("microsoft_user_fetch_failed");
       });
 
       if (!profileResponse.ok) {
@@ -637,18 +645,27 @@ export class MicrosoftConnectionService {
       client_secret: clientSecret
     });
 
-    const response = await fetch(
-      `https://login.microsoftonline.com/${tenantConfig.entraTenantId}/oauth2/v2.0/token`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: body.toString()
-      }
-    );
-
-    const payload = (await response.json()) as MicrosoftTokenResponse;
+    // A refresh that fails, stalls or answers with no JSON keeps the stored token,
+    // as a refused refresh does. The time limit also ends the single flight, so a
+    // stalled refresh does not hold every later call of this member.
+    let response: Response;
+    let payload: MicrosoftTokenResponse;
+    try {
+      response = await fetch(
+        `https://login.microsoftonline.com/${tenantConfig.entraTenantId}/oauth2/v2.0/token`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: body.toString(),
+          signal: AbortSignal.timeout(MICROSOFT_REQUEST_TIMEOUT_MS)
+        }
+      );
+      payload = (await response.json()) as MicrosoftTokenResponse;
+    } catch {
+      return this.storedConnectionAfterFailedRefresh(record);
+    }
     if (!response.ok || !payload.access_token) {
-      return record;
+      return this.storedConnectionAfterFailedRefresh(record);
     }
 
     // A refresh has no session. Bind it to the row it started from, so it
@@ -667,6 +684,16 @@ export class MicrosoftConnectionService {
         ? encrypt(payload.refresh_token, this.config.DATA_ENCRYPTION_SECRET)
         : record.refreshTokenEncrypted
     });
+  }
+
+  // The stored token after a failed refresh. Read the connection again: a
+  // disconnect, a suspension or a reconnect to another account can occur while
+  // the token request runs, and then the token loaded before it must not be used.
+  private async storedConnectionAfterFailedRefresh(
+    record: MicrosoftConnectionRecord
+  ): Promise<MicrosoftConnectionRecord | null> {
+    const current = await this.store.get(record.tenantId, record.userId);
+    return current?.microsoftUserId === record.microsoftUserId ? current : null;
   }
 
   private getRedirectUri(): string {

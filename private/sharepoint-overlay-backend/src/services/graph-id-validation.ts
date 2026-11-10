@@ -10,14 +10,18 @@
 // It explicitly rejects URL-meaningful characters and whitespace.
 export const GRAPH_ID_PATTERN = /^[A-Za-z0-9!,._-]+$/;
 
+// A value of only dots ("." or "..") matches the pattern, but the URL parser of
+// fetch removes it as a dot segment, and the request goes to another Graph path.
+const DOT_SEGMENT = /^\.+$/;
+
 export function isValidGraphId(value: string): boolean {
-  return GRAPH_ID_PATTERN.test(value);
+  return GRAPH_ID_PATTERN.test(value) && !DOT_SEGMENT.test(value);
 }
 
 export class MicrosoftInvalidIdError extends Error {
   readonly field: string;
   constructor(field: string) {
-    super(`Invalid Microsoft Graph ID for "${field}". Must match ${GRAPH_ID_PATTERN}.`);
+    super(`Invalid Microsoft Graph ID for "${field}". Must match ${GRAPH_ID_PATTERN} and not be only dots.`);
     this.field = field;
     this.name = "MicrosoftInvalidIdError";
   }

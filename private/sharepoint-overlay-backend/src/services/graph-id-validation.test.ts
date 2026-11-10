@@ -48,3 +48,13 @@ test.each(["/root", "root/", "?root", "root?", " root", "root "])(
     expect(isValidGraphId(value)).toBe(false);
   }
 );
+
+test.each([".", "..", "..."])("rejects the dot segment %j, which the URL parser would remove", (value) => {
+  expect(isValidGraphId(value)).toBe(false);
+  expect(() => assertValidGraphId(value, "driveId")).toThrow(MicrosoftInvalidIdError);
+});
+
+test("accepts ids that contain dots among other characters", () => {
+  expect(isValidGraphId("contoso.sharepoint.com,1234,5678")).toBe(true);
+  expect(isValidGraphId("a.b")).toBe(true);
+});

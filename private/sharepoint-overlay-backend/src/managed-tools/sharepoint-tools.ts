@@ -13,7 +13,7 @@ import type {
 } from "../services/microsoft-files-service.js";
 import { downloadGraphContent, readBodyPrefix } from "../services/microsoft-files-service.js";
 import { isValidGraphId } from "../services/graph-id-validation.js";
-import { buildGraphHeaders } from "../services/graph-http.js";
+import { buildGraphHeaders, MICROSOFT_REQUEST_TIMEOUT_MS } from "../services/graph-http.js";
 import {
   allRequiredObjectSchema,
   arraySchema,
@@ -470,7 +470,8 @@ export function createSharepointTools(deps: SharepointToolDeps): ManagedToolDefi
           {
             method: "PUT",
             headers: { Authorization: `Bearer ${creds.token}`, "Content-Type": "text/plain" },
-            body: content
+            body: content,
+            signal: AbortSignal.timeout(SHAREPOINT_READ_TIMEOUT_MS)
           }
         );
 
@@ -511,7 +512,8 @@ export function createSharepointTools(deps: SharepointToolDeps): ManagedToolDefi
           {
             method: "POST",
             headers: { Authorization: `Bearer ${creds.token}`, "Content-Type": "application/json" },
-            body: JSON.stringify({ name: folderName, folder: {}, "@microsoft.graph.conflictBehavior": "fail" })
+            body: JSON.stringify({ name: folderName, folder: {}, "@microsoft.graph.conflictBehavior": "fail" }),
+            signal: AbortSignal.timeout(MICROSOFT_REQUEST_TIMEOUT_MS)
           }
         );
 
