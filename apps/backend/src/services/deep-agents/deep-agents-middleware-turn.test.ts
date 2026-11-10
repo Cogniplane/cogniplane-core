@@ -94,7 +94,7 @@ function setup(mode: typeof control.mode) {
   const read = vi.fn(async (path: string) => {
     const data = files.get(path);
     if (!data) throw new Error("file not found");
-    return data;
+    return new Blob([new Uint8Array(data)]).stream();
   });
   control.sandbox = {
     sandboxId: "sandbox", files: { write, read, getInfo: async () => ({ size: 0 }) },
@@ -133,7 +133,7 @@ describe("middleware sandbox turn ownership", () => {
       t.files.set(path, old);
       reached.release();
       await waiting.promise;
-      return old;
+      return new Blob([old]).stream();
     });
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const cancel = new AbortController();
@@ -155,7 +155,7 @@ describe("middleware sandbox turn ownership", () => {
 
   it("appends history while its turn is live", async () => {
     const t = setup("history");
-    t.read.mockImplementationOnce(async () => new TextEncoder().encode("Old history.\n"));
+    t.read.mockImplementationOnce(async () => new Blob(["Old history.\n"]).stream());
     const end = t.runtime.beginSandboxTurn!();
     await t.run({ messages: historyMessages() });
     end();

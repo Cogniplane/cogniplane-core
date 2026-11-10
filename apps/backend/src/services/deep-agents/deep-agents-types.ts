@@ -185,6 +185,8 @@ export type DeepAgentsE2bOptions = {
   networkConfirmTimeoutMs: number;
   /** Longest time for one provider request in that confirmation (E2B_NETWORK_REQUEST_TIMEOUT_MS). */
   networkRequestTimeoutMs: number;
+  /** Largest file that the backend reads from the sandbox (ARTIFACT_MAX_UPLOAD_BYTES). */
+  maxFileReadBytes?: number;
 };
 
 /**

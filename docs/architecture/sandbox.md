@@ -22,6 +22,12 @@ the variables named here.
   (`MAX_EXECUTE_OUTPUT_CHARS` in `deep-agents-e2b-backend.ts`), and
   `E2B_SANDBOX_TIMEOUT_MS`, a lifetime deadline that each turn start extends
   (activity inside a turn does not extend it).
+- Backend memory: one backend serves all tenants, so it limits what it reads
+  from a sandbox. A command sends at most `MAX_EXECUTE_OUTPUT_BYTES` of stdout
+  and of stderr: `capCommandOutput` drops the rest in the sandbox, and the
+  command runs to its end. A file read (file tools, `write_artifact`,
+  `project_write_file`) stops at `ARTIFACT_MAX_UPLOAD_BYTES` and fails with
+  `SandboxFileTooLargeError`.
 - `execute` reports the exit code through the custom event
   `cogniplane.execute_result` (`execute-result-event.ts`). The stream mapper
   marks the tool card `failed` for a non-zero code. It never parses result text.

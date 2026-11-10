@@ -320,7 +320,8 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
             executeTimeoutMs: this.config.DEEP_AGENTS_EXECUTE_TIMEOUT_MS,
             resolveNetworkPolicy: () => this.resolveSandboxPolicy(input.tenantId, sessionId),
             networkConfirmTimeoutMs: this.config.E2B_NETWORK_CONFIRM_TIMEOUT_MS,
-            networkRequestTimeoutMs: this.config.E2B_NETWORK_REQUEST_TIMEOUT_MS
+            networkRequestTimeoutMs: this.config.E2B_NETWORK_REQUEST_TIMEOUT_MS,
+            maxFileReadBytes: this.config.ARTIFACT_MAX_UPLOAD_BYTES
           } : null,
           approvals: {
             ...resolveTurnApprovalSettings(bundle.runtimePolicy),
@@ -518,7 +519,8 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
               executeTimeoutMs: this.config.DEEP_AGENTS_EXECUTE_TIMEOUT_MS,
               resolveNetworkPolicy: () => this.resolveSandboxPolicy(tenantId, sessionId),
               networkConfirmTimeoutMs: this.config.E2B_NETWORK_CONFIRM_TIMEOUT_MS,
-              networkRequestTimeoutMs: this.config.E2B_NETWORK_REQUEST_TIMEOUT_MS
+              networkRequestTimeoutMs: this.config.E2B_NETWORK_REQUEST_TIMEOUT_MS,
+              maxFileReadBytes: this.config.ARTIFACT_MAX_UPLOAD_BYTES
             }
           : null,
       ...(input.execution && !input.execution.projectId &&
