@@ -9,6 +9,9 @@ const MAX_TEXT_BUFFER = 16_384;
 // Secrets can span several AG-UI text deltas. Keep recent words until the
 // redactor sees the complete value and its delimiter.
 const HELD_WORDS = 8;
+// Text without whitespace, such as Chinese or Japanese, has no words to hold.
+// When more than this is held, release it up to its last safe split.
+const SPLIT_TEXT_LENGTH = 512;
 // A private-key block never enters the replay log. From a BEGIN header on, all
 // text is dropped up to the block's END line, also across deltas, and the log
 // gets one marker instead. No END line means the rest of the message is left
@@ -135,6 +138,57 @@ function safeTextCutoff(text: string): number {
   return cutoff;
 }
 
+const WHITESPACE = /\s/;
+
+// Whether the word that starts at `start` follows `Bearer` and whitespace, so
+// that it can be a Bearer value. Unlike the redactor, no word boundary is
+// needed before `Bearer`.
+function followsBearer(text: string, start: number): boolean {
+  let end = start;
+  while (end > 0 && WHITESPACE.test(text[end - 1]!)) end -= 1;
+  return end < start && /bearer$/i.test(text.slice(Math.max(0, end - 6), end));
+}
+
+// A cut between two non-ASCII code units, not inside a surrogate pair.
+function isNonAsciiCut(text: string, index: number): boolean {
+  const before = text.charCodeAt(index - 1);
+  const after = text.charCodeAt(index);
+  const pair = before >= 0xd800 && before <= 0xdbff && after >= 0xdc00 && after <= 0xdfff;
+  return before > 0x7f && after > 0x7f && !pair;
+}
+
+/**
+ * The last index where `text` can be cut so that each part is redacted alone,
+ * or 0. The cut is in a word, between two non-ASCII characters. Of the inline
+ * rules in redact-secrets.ts, only a Bearer value and a URL query parameter
+ * can match a non-ASCII character, and they stop only at whitespace or at an
+ * ASCII delimiter. So there is no cut in a word that follows `Bearer`, or
+ * after a `?` or `&` that is still open in the word. Then no rule can match
+ * across the cut, whatever text comes next. Remove key blocks first. A
+ * partial BEGIN header is ASCII, so no cut falls in it.
+ */
+function lastSafeSplit(text: string): number {
+  let split = 0;
+  let wordStart = 0;
+  let bearer = false;
+  let query = false;
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index]!;
+    if (WHITESPACE.test(char)) {
+      wordStart = index + 1;
+      query = false;
+      continue;
+    }
+    if (index === wordStart) bearer = followsBearer(text, index);
+    else if (!bearer && !query && isNonAsciiCut(text, index)) split = index;
+    // The redactor ends a Bearer value at `"',;` and a query parameter at `"';#`.
+    if (`"',;`.includes(char)) bearer = false;
+    if (char === "?" || char === "&") query = true;
+    else if (`"';#`.includes(char)) query = false;
+  }
+  return split;
+}
+
 function safeToolArgs(text: string): string {
   try {
     return JSON.stringify(redactSecrets(JSON.parse(text)));
@@ -158,6 +212,9 @@ type BufferedContent = {
   contentType: EventType;
   // Set while input is dropped up to the END line of a key block.
   pemDrop?: PemDrop;
+  // After a split search finds no cut, the input still to receive before the
+  // next search. Held text that cannot be cut is not searched on each delta.
+  splitSkip?: number;
 };
 
 /** A process-local replay window for one interactive turn. */
@@ -234,23 +291,26 @@ export class TurnEventLog {
       } else {
         state.text += event.delta;
       }
-      // Before the word cutoff and the size limit, so no part of a block is
-      // released and a held block never fills the buffer.
+      // Before the word cutoff, the split and the size limit, so no part of a
+      // block is released and a held block never fills the buffer.
       const split = removePemBlocks(state.text);
       state.text = split.rest;
       state.pemDrop = split.drop;
       if (split.emit) this.appendEntry({ ...event, delta: split.emit });
-      // Release complete words first, so only text that cannot be released yet
-      // (one unbroken token, or a key block being held) counts toward the limit.
+      // Release complete words, then split text without whitespace, so only
+      // text that cannot be released yet (one unbroken ASCII token, an open
+      // Bearer value or query parameter, or a key block being held) counts
+      // toward the limit.
       if (/\s/.test(event.delta)) {
         const candidate = headerCandidateStart(state.text);
         const words = safeTextCutoff(state.text);
-        const cutoff = candidate >= 0 ? Math.min(words, candidate) : words;
-        if (cutoff > 0) {
-          const safe = redactSecrets(state.text.slice(0, cutoff));
-          state.text = state.text.slice(cutoff);
-          if (safe) this.appendEntry({ ...event, delta: safe });
-        }
+        this.releaseText(state, event, candidate >= 0 ? Math.min(words, candidate) : words);
+      }
+      state.splitSkip = (state.splitSkip ?? 0) - event.delta.length;
+      if (state.text.length > SPLIT_TEXT_LENGTH && state.splitSkip <= 0) {
+        const cut = lastSafeSplit(state.text);
+        if (cut === 0) state.splitSkip = SPLIT_TEXT_LENGTH;
+        this.releaseText(state, event, cut);
       }
       if (state.text.length > MAX_TEXT_BUFFER) {
         state.text = "";
@@ -278,6 +338,14 @@ export class TurnEventLog {
       this.textBuffers.clear();
     }
     this.appendEntry(event);
+  }
+
+  // Redacts and releases the held text before `cutoff`.
+  private releaseText(state: BufferedContent, event: BaseEvent, cutoff: number): void {
+    if (cutoff <= 0) return;
+    const safe = redactSecrets(state.text.slice(0, cutoff));
+    state.text = state.text.slice(cutoff);
+    if (safe) this.appendEntry({ ...event, delta: safe });
   }
 
   private appendEntry(event: BaseEvent): void {

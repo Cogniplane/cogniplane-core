@@ -115,8 +115,9 @@ scheduled turns:
   with a key expiry), so a connection on another replica can replay a running
   turn. `services/turn-event-log.ts` redacts these events: it holds back text
   until a secret that spans several deltas is complete, and it replaces
-  private-key blocks with `[REDACTED PRIVATE KEY]`. Keep this when you change
-  the replay path.
+  private-key blocks with `[REDACTED PRIVATE KEY]`. Text without whitespace,
+  such as Chinese or Japanese, is released in parts, cut where no secret rule
+  can match across the cut. Keep this when you change the replay path.
 - `POST /sessions/:sessionId/interrupt` fences the execution in the database.
   The replica that runs the turn sees the fence through dispatch authorization
   and its heartbeat, and dispatches no further model or tool call; a sandbox

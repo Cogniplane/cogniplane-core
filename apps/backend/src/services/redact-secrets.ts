@@ -51,6 +51,10 @@ function redactQueryParameter(_match: string, separator: string, name: string, v
     : `${separator}${name}=${value.replace(URL_QUERY_PARAMETER_PATTERN, redactQueryParameter)}`;
 }
 
+// Live replay (lastSafeSplit in turn-event-log.ts) cuts held text between two
+// non-ASCII characters. It expects that, apart from private keys, only the
+// Bearer and URL query rules can match a non-ASCII character. Update it when a
+// rule can.
 function redactInlineSecrets(value: string): string {
   return value
     .replace(PEM_PRIVATE_KEY_PATTERN, "[REDACTED]")
