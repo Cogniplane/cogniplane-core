@@ -22,6 +22,29 @@ export function canPreviewArtifact(artifact: Pick<Artifact, "mimeType" | "status
   return PREVIEWABLE_MIME_TYPES.has(artifact.mimeType);
 }
 
+/** The largest text file that the preview downloads, in bytes. Images and PDF
+ *  files do not use this limit. */
+export const TEXT_PREVIEW_MAX_BYTES = 1024 * 1024;
+
+export const TEXT_PREVIEW_TOO_LARGE_MESSAGE =
+  `This file is too large to preview. The preview limit is ${TEXT_PREVIEW_MAX_BYTES / (1024 * 1024)} MB. Download the file to see all of it.`;
+
+/** The text preview refuses a file over the limit. It does not show the first
+ *  part, because a cut JSON, HTML or CSV file can look complete. */
+export class ArtifactPreviewTooLargeError extends Error {
+  constructor() {
+    super("Artifact content is larger than the text preview limit.");
+    this.name = "ArtifactPreviewTooLargeError";
+  }
+}
+
+/** True when the recorded size of a text artifact is over the preview limit.
+ *  The download read also counts the bytes, because this size can be wrong. */
+export function exceedsTextPreviewLimit(artifact: Pick<Artifact, "mimeType" | "fileSizeBytes">): boolean {
+  if (isImageArtifact(artifact.mimeType) || isPdfArtifact(artifact.mimeType)) return false;
+  return artifact.fileSizeBytes > TEXT_PREVIEW_MAX_BYTES;
+}
+
 // Maps previewable MIME types to their Monaco/highlight.js language identifiers.
 // text/plain is intentionally omitted — callers fall back to the "plaintext" default via the ?? operator.
 const MIME_TO_LANGUAGE: Record<string, string> = {

@@ -1,8 +1,8 @@
 # Projects and files
 
 Scope: projects (roles, settings, library) and artifacts (upload, storage,
-download, workspace sync, PDF text). Tenant isolation and retention are in
-[data](data.md).
+download, preview, workspace sync, PDF text). Tenant isolation and retention
+are in [data](data.md).
 
 ## Projects
 
@@ -71,4 +71,11 @@ selections. Routes: `routes/projects.ts`, `project-files.ts`,
   (`services/artifacts/artifact-processor.ts`) runs `pdftotext`. It serves the
   turn input and `GET /artifacts/:artifactId/preview-text` (`not_a_pdf`,
   `pdf_extraction_failed`).
+- Preview (`apps/frontend/src/lib/artifact-preview-loader.ts`): an image
+  loads from a download URL and a PDF from `preview-text`. Other text types
+  load from a download URL, up to `TEXT_PREVIEW_MAX_BYTES`
+  (`apps/frontend/src/lib/artifact-preview.ts`). Over that limit, the preview
+  shows no part of the file and tells the user to download it. The loader
+  checks `fileSizeBytes` before it asks for a token. The read checks
+  `Content-Length` and counts the bytes, and cancels the download at the limit.
 
