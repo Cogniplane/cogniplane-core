@@ -53,6 +53,7 @@ function PrivacyTabs() {
   const tab: PrivacyTab = params.get("tab") === "activity" ? "activity" : "settings";
   // Activity loads its dashboard on the first visit only. After that both panels
   // stay mounted, so an unsaved settings draft and the chosen range survive a switch.
+  // A hidden Activity panel stops its provider status reads.
   const [activityVisited, setActivityVisited] = useState(tab === "activity");
   if (tab === "activity" && !activityVisited) setActivityVisited(true);
 
@@ -75,7 +76,7 @@ function PrivacyTabs() {
         <PrivacySettings />
       </TabsContent>
       <TabsContent value="activity" forceMount hidden={tab !== "activity"}>
-        {activityVisited ? <AdminPiiDashboard /> : null}
+        {activityVisited ? <AdminPiiDashboard active={tab === "activity"} /> : null}
       </TabsContent>
     </Tabs>
   );

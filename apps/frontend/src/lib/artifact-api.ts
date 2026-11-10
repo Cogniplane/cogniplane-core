@@ -7,6 +7,7 @@ import {
 } from "@cogniplane/shared-types";
 
 import { createApiHeaders, request } from "./api-client";
+import { ArtifactPreviewTooLargeError } from "./artifact-preview";
 import { parseResponse } from "./validate-response";
 
 import type {
@@ -83,9 +84,11 @@ export async function createArtifactDownload(artifactId: string): Promise<Downlo
  * Fetch the raw text content of an artifact given its absolute download URL.
  * Caller must obtain a fresh DownloadHandle and prepend NEXT_PUBLIC_API_URL first.
  * Sends auth headers (X-User-Id in dev mode, Bearer token in production).
- * Throws if the response is not ok.
+ * Reads at most `maxBytes` of the body. When Content-Length or the bytes read
+ * go over that limit, it cancels the download and throws
+ * ArtifactPreviewTooLargeError. Throws if the response is not ok.
  */
-export async function fetchArtifactContent(downloadUrl: string): Promise<string> {
+export async function fetchArtifactContent(downloadUrl: string, maxBytes: number): Promise<string> {
   const response = await fetch(downloadUrl, {
     headers: createApiHeaders(),
     credentials: "include",
@@ -94,7 +97,31 @@ export async function fetchArtifactContent(downloadUrl: string): Promise<string>
   if (!response.ok) {
     throw new Error(`Failed to fetch artifact content: ${response.status}`);
   }
-  return response.text();
+  return readTextWithinLimit(response, maxBytes);
+}
+
+async function readTextWithinLimit(response: Response, maxBytes: number): Promise<string> {
+  if (Number(response.headers.get("content-length")) > maxBytes) {
+    await response.body?.cancel();
+    throw new ArtifactPreviewTooLargeError();
+  }
+  if (!response.body) return "";
+
+  // Content-Length can be missing, wrong, or the compressed size, so the loop
+  // counts the bytes that it reads.
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let bytesRead = 0;
+  let text = "";
+  for (let chunk = await reader.read(); !chunk.done; chunk = await reader.read()) {
+    bytesRead += chunk.value.byteLength;
+    if (bytesRead > maxBytes) {
+      await reader.cancel();
+      throw new ArtifactPreviewTooLargeError();
+    }
+    text += decoder.decode(chunk.value, { stream: true });
+  }
+  return text + decoder.decode();
 }
 
 export async function fetchArtifactPreviewText(artifactId: string): Promise<string> {

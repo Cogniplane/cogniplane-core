@@ -33,6 +33,19 @@ function subscribe(onChange: () => void): () => void {
   };
 }
 
+/**
+ * The saved theme, read as `public/theme-init.js` reads it. A page that renders
+ * its own <html> (the global error page) applies it again, because React
+ * removes the attributes that the script set.
+ */
+export function readSavedTheme(): Theme {
+  try {
+    return localStorage.getItem(THEME_STORAGE_KEY) === "dark" ? "dark" : "light";
+  } catch {
+    return "light";
+  }
+}
+
 function applyTheme(theme: Theme): void {
   document.documentElement.setAttribute("data-theme", theme);
 }

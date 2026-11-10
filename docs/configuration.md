@@ -170,6 +170,8 @@ from build arguments). Frontend variables are in `apps/frontend/.env.example`
 | `SCHEDULED_JOB_CREATE_LIMIT_PER_USER_PER_WINDOW` | number, integer, minimum 0 | `10` | [data](architecture/data.md), [runtime](architecture/runtime.md) |
 | `SCHEDULED_JOB_CREATE_LIMIT_PER_TENANT_PER_WINDOW` | number, integer, minimum 0 | `50` | [data](architecture/data.md), [runtime](architecture/runtime.md) |
 | `SCHEDULED_JOB_MAX_ACTIVE_PER_USER` | number, integer, minimum 0 | `50` | [startup rules](#startup-rules), [runtime](architecture/runtime.md) |
+| `SETTINGS_WRITE_LIMIT_PER_USER_PER_WINDOW` | number, integer, minimum 0 | `20` | [data](architecture/data.md) |
+| `SETTINGS_WRITE_LIMIT_PER_TENANT_PER_WINDOW` | number, integer, minimum 0 | `100` | [data](architecture/data.md) |
 | `OAUTH_CALLBACK_LIMIT_PER_USER_PER_WINDOW` | number, integer, minimum 0 | `20` | [data](architecture/data.md) |
 | `OAUTH_CALLBACK_LIMIT_PER_TENANT_PER_WINDOW` | number, integer, minimum 0 | `100` | [data](architecture/data.md) |
 | `ADMIN_QUERY_LIMIT_PER_USER_PER_WINDOW` | number, integer, minimum 0 | `300` | [data](architecture/data.md) |
@@ -187,7 +189,7 @@ from build arguments). Frontend variables are in `apps/frontend/.env.example`
 | `PII_SCAN_MAX_CONCURRENT_JOBS` | number, integer, > 0 | `2` | [pii](architecture/pii.md) |
 | `AUTH_MODE` | one of ["jwt", "workos", "dev-headers"] | `"dev-headers"` | [startup rules](#startup-rules), [auth](architecture/auth.md) |
 | `AUTH_LOGIN_TYPES` | string | `unset` | [startup rules](#startup-rules), [auth](architecture/auth.md) |
-| `LOCAL_AUTH_HASH_CONCURRENCY` | number, integer, minimum 1, maximum 64 | `4` | [local-accounts](architecture/local-accounts.md) |
+| `LOCAL_AUTH_HASH_CONCURRENCY` | number, integer, minimum 1, maximum 64 | `2` | [local-accounts](architecture/local-accounts.md) |
 | `WEBAUTHN_RP_ID` | string, minimum 1 | `unset` | [startup rules](#startup-rules), [local-accounts](architecture/local-accounts.md) |
 | `WEBAUTHN_RP_NAME` | string, minimum 1, maximum 64 | `"Cogniplane"` | [local-accounts](architecture/local-accounts.md) |
 | `SMTP_URL` | string, minimum 1 | `unset` | [startup rules](#startup-rules), [self-hosting](self-hosting.md) |

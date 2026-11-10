@@ -11,20 +11,36 @@ function resolveModelEffort(model: Model | null): EffortLevel | null {
   return model.defaultEffort ?? model.supportedEfforts[0] ?? null;
 }
 
-export function useEffortPreference(model: Model | null, enabled: boolean, ready: boolean) {
-  const [effort, setEffortState] = useState<EffortLevel | null>(() => {
-    if (typeof window === "undefined") return null;
-    const stored = localStorage.getItem(STORAGE_KEY);
+// A browser that blocks site data throws on any storage access, and a full
+// storage throws on a write. The effort then applies to this page only.
+function readSavedEffort(): EffortLevel | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const stored = window.localStorage.getItem(STORAGE_KEY);
     return stored ? stored as EffortLevel : null;
-  });
+  } catch {
+    return null;
+  }
+}
+
+function saveEffort(effort: EffortLevel | null): void {
+  try {
+    if (effort === null) {
+      window.localStorage.removeItem(STORAGE_KEY);
+    } else {
+      window.localStorage.setItem(STORAGE_KEY, effort);
+    }
+  } catch {
+    // Blocked or full storage: the effort stays in memory.
+  }
+}
+
+export function useEffortPreference(model: Model | null, enabled: boolean, ready: boolean) {
+  const [effort, setEffortState] = useState<EffortLevel | null>(readSavedEffort);
 
   const setEffort = useCallback((next: EffortLevel | null) => {
-    if (next === null) {
-      localStorage.removeItem(STORAGE_KEY);
-    } else {
-      localStorage.setItem(STORAGE_KEY, next);
-    }
     setEffortState(next);
+    saveEffort(next);
   }, []);
 
   useEffect(() => {

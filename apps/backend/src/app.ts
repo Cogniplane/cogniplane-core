@@ -170,9 +170,9 @@ export async function buildApp() {
   });
 
   app.decorate("config", config);
-  app.decorate("db", createDatabase(config));
+  app.decorate("db", createDatabase(config, app.log));
 
-  const privilegedDb = createMaintenanceDatabase(config.MAINTENANCE_DATABASE_URL);
+  const privilegedDb = createMaintenanceDatabase(config.MAINTENANCE_DATABASE_URL, app.log);
   try {
     await assertApplicationRole(app.db);
     await assertMaintenanceRole(privilegedDb);

@@ -38,6 +38,7 @@ import {
   turnStoppedNotice,
   turnStopReasonOfResult
 } from "../../components/agui-transcript";
+import { ApiError } from "../api-client";
 import { listApprovals, resolveApproval } from "../session-api";
 import { isReconnectRun } from "./deep-agents-browser-agent";
 import type { RemoteTurnSnapshot } from "./use-remote-turn";
@@ -67,6 +68,8 @@ export type AguiCustomEvents = {
   toolStatuses: ToolStatusRow[];
   // MCP App results by tool call id.
   mcpApps: Record<string, McpAppCall>;
+  // Sends the decision. A failure shows an error notice and enables the
+  // buttons again.
   onApprovalDecision: (approvalId: string, decision: ApprovalDecision) => void;
   // Replaces approvals and tool failures with a polled server snapshot while
   // the turn runs without a stream in this tab. Adds saved notices and apps
@@ -97,6 +100,46 @@ const EMPTY_MCP_APPS: Record<string, McpAppCall> = {};
 // A failed approval read is tried again after 2 s, 4 s, and 6 s.
 const APPROVAL_READ_RETRY_MS = 2_000;
 const APPROVAL_READ_ATTEMPTS = 4;
+
+// The notice of a failed decision. Its id ends with the approval id, so a new
+// failure of the same approval replaces it and a success removes it.
+const DECISION_FAILED_NOTICE_PREFIX = "approval-decision-failed:";
+
+// The decision route answers 404 when the approval is not open for the caller:
+// another tab decided it, it expired, or the caller cannot decide it now. 409
+// and 410 get the same treatment.
+const CLOSED_APPROVAL_STATUSES: ReadonlySet<number> = new Set([404, 409, 410]);
+
+function isClosedApprovalError(error: unknown): boolean {
+  return error instanceof ApiError && CLOSED_APPROVAL_STATUSES.has(error.status);
+}
+
+// The backend sends public error text (apiError), so an ApiError message can
+// show. A body with only an error code gives the code as the message, so the
+// status shows instead. Any other error is a request that got no answer.
+function decisionFailureText(error: unknown): string {
+  if (!(error instanceof ApiError)) {
+    return "The request to the server failed. Check your connection, then try again.";
+  }
+  const message = error.message.trim();
+  if (!message || message === error.code) {
+    return `The server did not confirm your decision (HTTP ${error.status}). Try again.`;
+  }
+  return `${/[.!?]$/.test(message) ? message : `${message}.`} Try again.`;
+}
+
+function decisionFailedNotice(noticeId: string, error: unknown): RuntimeNoticeRow {
+  const closed = isClosedApprovalError(error);
+  return runtimeNoticeRow({
+    noticeId,
+    level: "error",
+    title: closed ? "Approval no longer open" : "Decision not confirmed",
+    message: closed
+      ? "The server did not accept your decision because this approval is no longer open. For example, it expired or you decided it in another tab."
+      : decisionFailureText(error),
+    createdAt: new Date().toISOString()
+  });
+}
 
 type ApprovalRequiredValue = Pick<Approval, "approvalId" | "itemId" | "kind" | "title" | "summary" | "toolCallId" | "allowForTurn">;
 
@@ -162,6 +205,9 @@ export function useAguiCustomEvents(agent: AbstractAgent, options: AguiCustomEve
   // REST returns new objects on every poll, even when the saved turn is
   // unchanged. The last applied snapshot, to skip one that did not change.
   const lastSnapshotRef = useRef<string | null>(null);
+  // The agent of the subscription and a function that starts its approval
+  // read. Null after the cleanup.
+  const approvalReaderRef = useRef<{ agent: AbstractAgent; read: () => void } | null>(null);
 
   useEffect(() => {
     approvalRevisionRef.current += 1;
@@ -182,26 +228,38 @@ export function useAguiCustomEvents(agent: AbstractAgent, options: AguiCustomEve
     // A failed read keeps the cards that are shown and adds none: the event
     // alone does not show that its approval is still pending. The read is
     // tried again a few times, so a pending approval still gets its card.
+    //
+    // A decision that the server refuses because the approval is not open
+    // also starts a read. In a live run, an approval_required event during
+    // that read starts a newer read, so the older result cannot remove the
+    // new card.
     const approvalReads = new AbortController();
     let latestApprovalRead = 0;
+    let approvalReadRunning = false;
     let approvalRetry: ReturnType<typeof setTimeout> | undefined;
     const readServerApprovals = (attempt = 1) => {
       clearTimeout(approvalRetry);
       const read = ++latestApprovalRead;
       const revision = approvalRevisionRef.current;
       const isLatest = () => !approvalReads.signal.aborted && read === latestApprovalRead;
+      approvalReadRunning = true;
       listApprovals(agent.threadId, approvalReads.signal).then(
         (serverApprovals) => {
-          if (isLatest() && revision === approvalRevisionRef.current) {
+          if (!isLatest()) return;
+          approvalReadRunning = false;
+          if (revision === approvalRevisionRef.current) {
             setApprovals((prev) => withServerApprovals(prev, serverApprovals, closedApprovalIdsRef.current));
           }
         },
         () => {
-          if (!isLatest() || attempt >= APPROVAL_READ_ATTEMPTS) return;
+          if (!isLatest()) return;
+          approvalReadRunning = false;
+          if (attempt >= APPROVAL_READ_ATTEMPTS) return;
           approvalRetry = setTimeout(() => readServerApprovals(attempt + 1), APPROVAL_READ_RETRY_MS * attempt);
         }
       );
     };
+    approvalReaderRef.current = { agent, read: () => readServerApprovals() };
 
     const subscription = agent.subscribe({
       onRunInitialized({ input }) {
@@ -209,6 +267,7 @@ export function useAguiCustomEvents(agent: AbstractAgent, options: AguiCustomEve
         approvalRevisionRef.current += 1;
         // A read of an earlier run does not apply and is not tried again.
         latestApprovalRead += 1;
+        approvalReadRunning = false;
         clearTimeout(approvalRetry);
         if (isReconnectRun(input)) return;
         // A new send replaces the report of an earlier refused send.
@@ -243,6 +302,7 @@ export function useAguiCustomEvents(agent: AbstractAgent, options: AguiCustomEve
             setApprovals((prev) =>
               prev.some((a) => a.approvalId === v.approvalId) ? prev : [...prev, pendingApprovalRow(v)]
             );
+            if (approvalReadRunning) readServerApprovals();
             break;
           }
           case "runtime_notice": {
@@ -324,6 +384,7 @@ export function useAguiCustomEvents(agent: AbstractAgent, options: AguiCustomEve
 
     return () => {
       disposed = true;
+      approvalReaderRef.current = null;
       subscription.unsubscribe();
       approvalReads.abort();
       clearTimeout(approvalRetry);
@@ -332,6 +393,8 @@ export function useAguiCustomEvents(agent: AbstractAgent, options: AguiCustomEve
 
   const onApprovalDecision = useCallback(
     (approvalId: string, decision: ApprovalDecision) => {
+      const clickedAgent = approvalReaderRef.current?.agent;
+      const noticeId = `${DECISION_FAILED_NOTICE_PREFIX}${approvalId}`;
       setApprovals((prev) =>
         prev.map((a) =>
           a.approvalId === approvalId
@@ -339,17 +402,32 @@ export function useAguiCustomEvents(agent: AbstractAgent, options: AguiCustomEve
             : a
         )
       );
-      void resolveApproval(approvalId, decision.decision, decision.rememberForTurn)
-        .then(() => {
+      void resolveApproval(approvalId, decision.decision, decision.rememberForTurn).then(
+        () => {
           closedApprovalIdsRef.current.add(approvalId);
           setApprovals((prev) => prev.filter((a) => a.approvalId !== approvalId));
-        })
-        .catch(() => {
-          // Reset so the user can retry; the backend TTL still guards a stuck row.
+          setNotices((prev) => {
+            const kept = prev.filter((notice) => notice.noticeId !== noticeId);
+            return kept.length === prev.length ? prev : kept;
+          });
+        },
+        (error: unknown) => {
+          // Enable the buttons again, so the user can try again. The backend
+          // TTL still guards a stuck row.
           setApprovals((prev) =>
             prev.map((a) => (a.approvalId === approvalId ? { ...a, decisionState: "pending" } : a))
           );
-        });
+          // An answer after a session switch or an unmount does not report
+          // into the session that is shown now.
+          const reader = approvalReaderRef.current;
+          if (!reader || reader.agent !== clickedAgent) return;
+          const notice = decisionFailedNotice(noticeId, error);
+          setNotices((prev) => [...prev.filter((n) => n.noticeId !== noticeId), notice]);
+          // The server says that the approval is not open. Its pending list
+          // decides if the row stays.
+          if (isClosedApprovalError(error)) reader.read();
+        }
+      );
     },
     []
   );

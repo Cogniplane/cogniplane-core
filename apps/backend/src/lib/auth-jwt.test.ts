@@ -128,6 +128,42 @@ describe("jwt auth with a Bearer access token", () => {
     expect(response.json()).toEqual({ error: "not_a_member" });
   });
 
+  // A failed membership lookup (pool timeout, database down) says nothing
+  // about the token. A 401 would make the client treat the session as lost,
+  // so the answer is a retryable 503, and the log names the real cause.
+  test("answers a retryable 503 when the membership lookup fails", async () => {
+    const logs: Array<{ level: number; msg: string; err?: { message?: string } }> = [];
+    const failingLookup = vi.fn(async (): Promise<TenantAuthState | null> => {
+      throw new Error("timeout exceeded when trying to connect to db.internal:5432");
+    });
+    const app = Fastify({ logger: { level: "info", stream: { write: (line: string) => logs.push(JSON.parse(line)) } } });
+    app.addHook("onRequest", jwtAuth(config, { getAuthState: failingLookup }, []));
+    app.get("/artifacts", async (request) => ({ auth: request.auth ?? null }));
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/artifacts",
+      headers: { authorization: await bearer("user-1", "tenant-A") }
+    });
+    await app.close();
+
+    expect(failingLookup).toHaveBeenCalledWith("tenant-A", "user-1");
+    expect(response.statusCode).toBe(503);
+    expect(response.headers["retry-after"]).toBe("1");
+    // Fixed public text only: the database error stays in the server log.
+    expect(response.json()).toEqual({
+      error: "auth_unavailable",
+      message: "The server cannot check your session now. Try again in a moment."
+    });
+    expect(logs.filter((entry) => entry.msg.startsWith("auth "))).toEqual([
+      expect.objectContaining({
+        level: 50,
+        msg: "auth 503: membership lookup failed",
+        err: expect.objectContaining({ message: "timeout exceeded when trying to connect to db.internal:5432" })
+      })
+    ]);
+  });
+
   test("refuses an expired token", async () => {
     const expired = await new SignJWT({ sub: "user-1", tid: "tenant-A", role: "member" })
       .setProtectedHeader({ alg: "HS256", kid: config.JWT_KEY_ID })

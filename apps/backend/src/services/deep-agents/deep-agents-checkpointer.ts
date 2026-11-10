@@ -23,10 +23,9 @@
 // applied on the next `pnpm db:migrate`, never at serve time. migrate.ts then
 // grants app_user DML on the schema; the runtime saver connects as app_user.
 
-import pg from "pg";
 import { PostgresSaver } from "@langchain/langgraph-checkpoint-postgres";
 
-import { operationalPoolOptions } from "../../lib/db.js";
+import { createOperationalPool, type PoolErrorLogger } from "../../lib/db.js";
 
 export const DEEP_AGENTS_CHECKPOINT_SCHEMA = "deep_agents";
 
@@ -45,14 +44,16 @@ const CHECKPOINTER_POOL_MAX = 20;
  *
  * The pool stays separate from the app pool, with its own name and size, but
  * it gets the same operational limits: without them, a stalled connection or
- * statement could hold a turn's checkpoint write with no bound.
+ * statement could hold a turn's checkpoint write with no bound. It also gets
+ * the same `error` listener, so a dropped idle connection does not stop the
+ * process.
  */
-export function createDeepAgentsCheckpointer(databaseUrl: string): PostgresSaver {
-  const pool = new pg.Pool(operationalPoolOptions({
+export function createDeepAgentsCheckpointer(databaseUrl: string, logger?: PoolErrorLogger): PostgresSaver {
+  const pool = createOperationalPool({
     connectionString: databaseUrl,
     applicationName: "cogniplane-deep-agents-checkpointer",
     max: CHECKPOINTER_POOL_MAX
-  }));
+  }, logger);
   return new PostgresSaver(pool, undefined, {
     schema: DEEP_AGENTS_CHECKPOINT_SCHEMA
   });
