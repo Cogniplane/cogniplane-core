@@ -9,7 +9,8 @@ export type LimitResource =
   | "settings_write"
   | "oauth_callback"
   | "admin_query"
-  | "auth_organizations";
+  | "auth_organizations"
+  | "resource_read";
 type LimitScope = "user" | "tenant";
 type LimitType = "rate_limit" | "usage_quota";
 
@@ -25,7 +26,8 @@ const RESOURCE_LABELS: Record<LimitResource, string> = {
   settings_write: "settings write",
   oauth_callback: "OAuth callback",
   admin_query: "admin request",
-  auth_organizations: "organization list"
+  auth_organizations: "organization list",
+  resource_read: "resource read"
 };
 
 export function rateLimitMessage(resource: LimitResource, scope: LimitScope): string {
@@ -55,6 +57,8 @@ export type RequestLimitsConfigKeys = Pick<
   | "ADMIN_QUERY_LIMIT_PER_TENANT_PER_WINDOW"
   | "AUTH_ORGANIZATIONS_LIMIT_PER_USER_PER_WINDOW"
   | "AUTH_ORGANIZATIONS_LIMIT_PER_TENANT_PER_WINDOW"
+  | "RESOURCE_READ_LIMIT_PER_USER_PER_WINDOW"
+  | "RESOURCE_READ_LIMIT_PER_TENANT_PER_WINDOW"
   | "TURN_QUOTA_PER_USER_PER_DAY"
   | "TURN_QUOTA_PER_TENANT_PER_DAY"
 >;
@@ -104,6 +108,10 @@ export function buildLimitsConfig(config: RequestLimitsConfigKeys): {
         auth_organizations: {
           user: config.AUTH_ORGANIZATIONS_LIMIT_PER_USER_PER_WINDOW,
           tenant: config.AUTH_ORGANIZATIONS_LIMIT_PER_TENANT_PER_WINDOW
+        },
+        resource_read: {
+          user: config.RESOURCE_READ_LIMIT_PER_USER_PER_WINDOW,
+          tenant: config.RESOURCE_READ_LIMIT_PER_TENANT_PER_WINDOW
         }
       }
     },

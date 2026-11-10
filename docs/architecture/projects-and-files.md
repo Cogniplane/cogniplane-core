@@ -70,7 +70,9 @@ selections. Routes: `routes/projects.ts`, `project-files.ts`,
 - PDF text: `ArtifactProcessor.extractArtifactText`
   (`services/artifacts/artifact-processor.ts`) runs `pdftotext`. It serves the
   turn input and `GET /artifacts/:artifactId/preview-text` (`not_a_pdf`,
-  `pdf_extraction_failed`).
+  `pdf_extraction_failed`). That route and the project file version preview
+  count against the shared `resource_read` rate limit
+  ([data](data.md#rate-limits-and-quotas)).
 - Preview (`apps/frontend/src/lib/artifact-preview-loader.ts`): an image
   loads from a download URL and a PDF from `preview-text`. Other text types
   load from a download URL, up to `TEXT_PREVIEW_MAX_BYTES`

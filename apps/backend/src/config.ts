@@ -255,6 +255,13 @@ export const envSchema = z.object({
   // WorkOS throttles the whole deployment.
   AUTH_ORGANIZATIONS_LIMIT_PER_USER_PER_WINDOW: z.coerce.number().int().min(0).default(20),
   AUTH_ORGANIZATIONS_LIMIT_PER_TENANT_PER_WINDOW: z.coerce.number().int().min(0).default(100),
+  // One budget for the member reads that do heavy work on each call: the two
+  // PDF text previews run pdftotext, and the MCP App resource route compiles
+  // the runtime config, checks policy and can call the upstream server. The
+  // three routes share these counters, so a client gets no more calls by
+  // alternating routes.
+  RESOURCE_READ_LIMIT_PER_USER_PER_WINDOW: z.coerce.number().int().min(0).default(20),
+  RESOURCE_READ_LIMIT_PER_TENANT_PER_WINDOW: z.coerce.number().int().min(0).default(100),
   TURN_QUOTA_PER_USER_PER_DAY: z.coerce.number().int().min(0).default(200),
   TURN_QUOTA_PER_TENANT_PER_DAY: z.coerce.number().int().min(0).default(1000),
   PROJECT_FILE_RETENTION_ENABLED: booleanFromEnvSchema.default(true),

@@ -49,7 +49,8 @@ JavaScript: ask each model you enable for a small widget before you offer it.
   HTML through `GET /sessions/:sessionId/mcp-apps/:toolCallId`, which rechecks
   session read access, server selection, tool enablement, the declared URI and
   current Policy Center rules. A newly disabled tool or blocking rule also hides
-  saved widgets.
+  saved widgets. Before these checks, the route counts the request against the
+  shared `resource_read` rate limit ([data](data.md#rate-limits-and-quotas)).
 - A tool view that throws while it loads or renders shows a local notice; the
   reply and the other views stay ([render
   errors](frontend.md#render-errors)).
