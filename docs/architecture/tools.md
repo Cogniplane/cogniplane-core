@@ -114,6 +114,12 @@ result; throw only for a real failure.
   versions; removal keeps a versioned tombstone.
 - An endpoint, authentication or credential-scope change replaces the
   connection's credential binding; members must reconnect.
+- An organization secret stays bound to the origin of the upstream URL and to
+  the auth method (type and header or parameter name) that it was saved with.
+  An edit that changes either, with a blank secret, answers 400
+  (`MCP_SECRET_REENTRY_MESSAGE` in `services/mcp-server-store.ts`); the admin
+  form asks for the secret again (`mustReenterMcpSecret`). A new path on the
+  same origin keeps the secret.
 - A runtime call uses the acting member's credential. Project access never lends
   another member's credential. A member without a credential sees the connection
   but gets no runtime tools from it.

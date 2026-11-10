@@ -132,6 +132,7 @@ export const StepUpActionSchema = z.enum([
   "mcp_server.setup_create",
   "mcp_server.setup_update",
   "mcp_server.inherited_audience",
+  "mcp_server.publish",
   "mcp_server.widget_domain",
   "integration.update",
   "integration.overlay_settings",

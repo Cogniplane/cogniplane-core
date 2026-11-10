@@ -74,3 +74,35 @@ export function getMcpUpstreamWarnings(value: string): {
 
   return { http: url.protocol === "http:", privateNetwork };
 }
+
+/** The part of the MCP form that decides where an organization secret goes. */
+export type McpSecretTarget = {
+  mode: "managed" | "proxy";
+  upstreamUrl: string;
+  upstreamAuthType: AdminMcpServer["upstreamAuthType"];
+  upstreamAuthName: string;
+  credentialScope: "organization" | "personal";
+};
+
+function urlOrigin(url: string | null | undefined): string {
+  if (!url) return "";
+  try {
+    return new URL(url).origin;
+  } catch {
+    return url;
+  }
+}
+
+/**
+ * True when an edit sends the saved organization secret to another origin, or by
+ * another auth method. The backend then refuses a blank secret, so the form asks
+ * for it again (mcp-server-store.ts, MCP_SECRET_REENTRY_MESSAGE).
+ */
+export function mustReenterMcpSecret(saved: AdminMcpServer | undefined, draft: McpSecretTarget): boolean {
+  if (!saved || !saved.upstreamAuthConfigured || (saved.credentialScope ?? "organization") !== "organization") return false;
+  if (draft.mode !== "proxy" || draft.credentialScope !== "organization" || draft.upstreamAuthType === "none") return false;
+  const named = draft.upstreamAuthType === "header" || draft.upstreamAuthType === "query";
+  return urlOrigin(draft.upstreamUrl) !== urlOrigin(saved.upstreamUrl) ||
+    draft.upstreamAuthType !== saved.upstreamAuthType ||
+    (named && draft.upstreamAuthName !== (saved.upstreamAuthName ?? ""));
+}
