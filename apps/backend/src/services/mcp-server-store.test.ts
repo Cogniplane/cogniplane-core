@@ -1,10 +1,10 @@
-import { expect, test } from "vitest";
+import { describe, expect, test } from "vitest";
 
 import { FakePool } from "../test-helpers/fake-pool.js";
 import { computeConfigHash, decrypt, encrypt } from "../lib/crypto-utils.js";
 
 import { AdminConfigError } from "./admin-config-error.js";
-import { McpServerStore } from "./mcp-server-store.js";
+import { MCP_SECRET_REENTRY_MESSAGE, McpServerStore } from "./mcp-server-store.js";
 
 const ENCRYPTION_SECRET = "test-encryption-secret-must-be-at-least-32chars!";
 
@@ -282,6 +282,65 @@ test("McpServerStore keeps binding for metadata edits and rotates it for shared-
   expect(updateHashes).toEqual([expectedHash, resubmitted?.configHash]);
   // Only the rotation clears member secrets.
   expect(revoked).toEqual([["tenant-1", "secured-proxy"]]);
+});
+
+describe("McpServerStore keeps a saved secret only for its origin and auth method", () => {
+  const existing = {
+    upstream_url: "https://vendor.example/mcp",
+    upstream_auth_type: "bearer",
+    upstream_auth_name: null,
+    upstream_auth_secret_encrypted: encrypt("saved-secret", ENCRYPTION_SECRET),
+    credential_scope: "organization",
+    credential_binding_id: "00000000-0000-4000-8000-000000000001"
+  };
+  const input = {
+    serverId: "secured-proxy", serverName: "Secured proxy", description: null,
+    transportKind: "http" as const, mode: "proxy" as const, routePath: "/mcp/secured", enabled: true
+  };
+
+  /** A store whose server has `existing`; `written` gets the encrypted secret of each update. */
+  function storeWith(row: Record<string, unknown> = existing) {
+    const written: unknown[] = [];
+    const pool = new FakePool()
+      .onQuery("SELECT upstream_url", () => ({ rows: [row], rowCount: 1 }))
+      .onQuery("UPDATE member_mcp_credentials", () => ({ rows: [], rowCount: 0 }))
+      .onQuery("UPDATE admin_mcp_servers", (_text, values) => {
+        written.push(values[9]);
+        return { rows: [], rowCount: 0 };
+      });
+    return { store: new McpServerStore(pool.asPool(), ENCRYPTION_SECRET), written };
+  }
+
+  test.each([
+    ["another origin", { upstreamUrl: "https://collector.example/mcp" }],
+    ["another port", { upstreamUrl: "https://vendor.example:8443/mcp" }],
+    ["another auth type", { upstreamAuthType: "query" as const, upstreamAuthName: "key" }]
+  ])("refuses an edit to %s with a blank secret, and writes nothing", async (_case, change) => {
+    const { store, written } = storeWith();
+    await expect(store.updateMcpServer("tenant-1", { ...input, ...change })).rejects.toThrow(MCP_SECRET_REENTRY_MESSAGE);
+    expect(written).toEqual([]);
+  });
+
+  test("refuses a new header name with a blank secret", async () => {
+    const { store } = storeWith({ ...existing, upstream_auth_type: "header", upstream_auth_name: "X-API-Key" });
+    await expect(store.updateMcpServer("tenant-1", { ...input, upstreamAuthName: "X-Other-Key" }))
+      .rejects.toThrow(MCP_SECRET_REENTRY_MESSAGE);
+  });
+
+  test("keeps the secret for a new path on the same origin", async () => {
+    const { store, written } = storeWith();
+    await store.updateMcpServer("tenant-1", { ...input, upstreamUrl: "https://vendor.example/v2/mcp" });
+    expect(written).toEqual([existing.upstream_auth_secret_encrypted]);
+  });
+
+  test("accepts a new origin with the secret entered again", async () => {
+    const { store, written } = storeWith();
+    await store.updateMcpServer("tenant-1", {
+      ...input, upstreamUrl: "https://collector.example/mcp", upstreamAuthSecret: "new-secret"
+    });
+    expect(written).toHaveLength(1);
+    expect(written[0]).not.toBe(existing.upstream_auth_secret_encrypted);
+  });
 });
 
 test("inherited legacy query auth has a stable binding and hash across tenant reads", async () => {

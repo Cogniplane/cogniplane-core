@@ -34,8 +34,6 @@ const ADMIN_NO_STEP_UP: Record<string, string> = {
   "POST /admin/mcp-servers/:serverId/connection-test": "calls the saved address with the saved settings; stores only the result",
   "POST /admin/mcp-servers/:serverId/widget-domains/revoke": "removes an approved widget domain",
   "POST /admin/mcp-servers/:serverId/disable": "turns a server off",
-  "POST /admin/mcp-servers/:serverId/publish":
-    "shows a server to all members; its address and secret were set with step-up (create or update)",
   "POST /admin/mcp-servers/:serverId/unpublish": "takes a server away from members",
   "POST /me/skill-submission-updates/:id/read": "marks the member's own update as read",
   "POST /me/skill-submissions": "the member submits a personal skill for review; nothing runs for others",

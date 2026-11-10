@@ -30,6 +30,7 @@ const COPY: Partial<Record<StepUpAction, Copy>> = {
   "mcp_server.update": { title: "Save the MCP server", confirmLabel: "Save", description: DATA_SETTING },
   "mcp_server.setup_update": { title: "Save the MCP server", confirmLabel: "Save", description: DATA_SETTING },
   "mcp_server.inherited_audience": { title: "Change who can use this MCP server", confirmLabel: "Save", description: DATA_SETTING },
+  "mcp_server.publish": { title: "Show this MCP server to all members", confirmLabel: "Publish", description: DATA_SETTING },
   "mcp_server.widget_domain": { title: "Approve the widget domain", confirmLabel: "Approve", description: DATA_SETTING },
   "integration.update": { title: "Save the integration settings", confirmLabel: "Save", description: DATA_SETTING },
   "integration.overlay_settings": { title: "Save the integration settings", confirmLabel: "Save", description: DATA_SETTING },

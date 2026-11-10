@@ -19,7 +19,7 @@ import { toErrorMessage } from "@/lib/error-utils";
 import { useConfirmLeave } from "@/hooks/use-confirm-leave";
 import { DisclosureRow } from "../overview-row";
 import type { McpAudience } from "../../../lib/admin-api";
-import { deriveMcpServerId, getMcpAvailability, getMcpUpstreamWarnings } from "./admin-mcp-card.logic";
+import { deriveMcpServerId, getMcpAvailability, getMcpUpstreamWarnings, mustReenterMcpSecret } from "./admin-mcp-card.logic";
 import { AdminMcpConnectionTestCard, reachabilityLabel } from "./admin-mcp-connection-test";
 import { focusMcpElement, MCP_TEXT_FOCUS } from "./admin-mcp-focus";
 
@@ -331,6 +331,11 @@ function AdminMcpEditor({ headingRef, ...props }: {
     revealEditorStart(form);
   }, [showForm, editingMcpServerId]);
 
+  const secretMustBeReentered = mustReenterMcpSecret(
+    editingMcpServerId ? props.mcpServers.find(server => server.serverId === editingMcpServerId) : undefined,
+    mcpDraft
+  );
+
   async function handleSubmit(event: FormEvent<HTMLFormElement>): Promise<void> {
     event.preventDefault();
     if (savingRef.current || props.busyKey !== null || decision) return;
@@ -580,6 +585,7 @@ function AdminMcpEditor({ headingRef, ...props }: {
                       type="password"
                       autoComplete="new-password"
                       aria-describedby="mcp-secret-hint"
+                      required={secretMustBeReentered}
                       value={mcpDraft.upstreamAuthSecret}
                       onChange={(event) =>
                         setMcpDraft((current) => ({
@@ -589,9 +595,11 @@ function AdminMcpEditor({ headingRef, ...props }: {
                       }
                       placeholder="Upstream credential"
                     />
-                    <p id="mcp-secret-hint" className="text-sm text-on-surface-variant">{props.mcpServers.some(server => server.serverId === editingMcpServerId && server.credentialScope === "organization" && server.upstreamAuthConfigured)
-                      ? "Leave blank to keep the saved secret."
-                      : "Enter the upstream credential."}</p>
+                    <p id="mcp-secret-hint" className="text-sm text-on-surface-variant">{secretMustBeReentered
+                      ? "Enter the secret again. The address or the authentication method changed, and the saved secret is not sent to a new destination."
+                      : props.mcpServers.some(server => server.serverId === editingMcpServerId && server.credentialScope === "organization" && server.upstreamAuthConfigured)
+                        ? "Leave blank to keep the saved secret."
+                        : "Enter the upstream credential."}</p>
                   </div>
                 ) : null}
                 </div>

@@ -54,8 +54,9 @@ export async function registerAdminMcpServerRoutes(
     // The content security policy sources that this server's widgets may use.
     mcpAppCsp?: Pick<McpAppCspStore, "listForAdmin" | "approve" | "revoke">;
     // Step-up and owner notice of the routes that change where tool calls go:
-    // a server's address and secret, who uses a shared server, and a widget
-    // domain. Disable, unpublish, and revoke send data nowhere new.
+    // a server's address and secret, who uses a shared server (audience and
+    // publish), and a widget domain. Disable, unpublish, and revoke send data
+    // nowhere new.
     dataRoutes: Pick<DataRouteControl, "requireStepUp" | "ownerNotice">;
   }
 ): Promise<void> {
@@ -517,13 +518,28 @@ export async function registerAdminMcpServerRoutes(
       if (!paramsResult.ok) {
         return paramsResult.response;
       }
+      // Publish sends the tool calls of every member to the server's upstream: a data
+      // route, like a change of the audience. Unpublish sends data nowhere new.
+      if (isPublished) {
+        if (!(await serverExists(request, paramsResult.value.serverId, "own"))) {
+          return respondAdminNotFound(reply, "mcp_server_not_found");
+        }
+        if (!(await stores.dataRoutes.requireStepUp(request, reply, "POST /admin/mcp-servers/:serverId/publish"))) {
+          return reply;
+        }
+      }
 
       try {
         const mcpServer = await stores.dynamicConfig.setMcpServerPublished(
           request.auth.tenantId,
           paramsResult.value.serverId,
           isPublished,
-          (server) => auditInput(request, auditType, { serverId: server.serverId, version: server.version })
+          (server) => auditInput(
+            request,
+            auditType,
+            { serverId: server.serverId, version: server.version },
+            isPublished ? { setting: "mcp_server_audience", serverId: server.serverId } : undefined
+          )
         );
         if (!mcpServer) {
           return respondAdminNotFound(reply, "mcp_server_not_found");

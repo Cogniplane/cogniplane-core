@@ -78,6 +78,7 @@ export const STEP_UP_ROUTES = {
   "POST /admin/mcp-servers/setup": "mcp_server.setup_create",
   "PUT /admin/mcp-servers/:serverId/setup": "mcp_server.setup_update",
   "PUT /admin/mcp-servers/:serverId/inherited-availability": "mcp_server.inherited_audience",
+  "POST /admin/mcp-servers/:serverId/publish": "mcp_server.publish",
   "POST /admin/mcp-servers/:serverId/widget-domains/approve": "mcp_server.widget_domain",
   "PUT /admin/integrations/:integrationId": "integration.update",
   // Changes that can make a control weaker for every user: Policy Center
