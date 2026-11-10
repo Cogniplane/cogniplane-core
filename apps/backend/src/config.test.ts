@@ -173,6 +173,8 @@ test("loadConfig rejects explicit AUTH_MODE=dev-headers when NODE_ENV=production
 test("loadConfig rejects defaulted AUTH_MODE when NODE_ENV=production", () => {
   // AUTH_MODE defaults to dev-headers in the schema; production must override.
   expect(() => loadConfig({ NODE_ENV: "production" })).toThrow(/AUTH_MODE=dev-headers is only permitted when NODE_ENV/);
+  // A script serves no request: the production image runs its migration without the auth settings.
+  expect(loadConfig({ NODE_ENV: "production" }, undefined, { skipRuntimeChecks: true }).AUTH_MODE).toBe("dev-headers");
 });
 
 test("loadConfig fail-closes dev-headers on an unrecognized NODE_ENV (typo guard)", () => {

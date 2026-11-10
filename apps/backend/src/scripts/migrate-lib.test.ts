@@ -7,7 +7,7 @@ import { test, expect } from "vitest";
 
 import type { Pool } from "../lib/db.js";
 
-import { applyMigrations, assertUniqueVersionPrefixes } from "./migrate-lib.js";
+import { applyMigrations, assertUniqueVersionPrefixes, resolveAppUserPassword } from "./migrate-lib.js";
 
 const dirname = path.dirname(fileURLToPath(import.meta.url));
 const realMigrationsDir = path.resolve(dirname, "../../db/migrations");
@@ -170,4 +170,25 @@ test("applyMigrations rolls back the failing migration, rethrows, and releases t
   expect(
     pool.queries.filter((q) => q.sql.startsWith("INSERT INTO schema_migrations")).map((q) => q.params[0])
   ).toEqual([realFiles[0]]);
+});
+
+test("resolveAppUserPassword takes APP_USER_PASSWORD, then the password in DATABASE_URL", () => {
+  const url = "postgres://app_user:from%20url@db:5432/cogniplane";
+  expect(resolveAppUserPassword({ APP_USER_PASSWORD: "explicit", DATABASE_URL: url })).toBe("explicit");
+  expect(resolveAppUserPassword({ DATABASE_URL: url })).toBe("from url");
+});
+
+test("resolveAppUserPassword never falls back to the config default", () => {
+  // The config default of DATABASE_URL has a published password; the environment has none here.
+  expect(() => resolveAppUserPassword({})).toThrow("Set APP_USER_PASSWORD");
+  expect(() => resolveAppUserPassword({ DATABASE_URL: "postgres://app_user@db/cogniplane" })).toThrow("Set APP_USER_PASSWORD");
+  expect(() => resolveAppUserPassword({ DATABASE_URL: "not a url" })).toThrow("Set APP_USER_PASSWORD");
+});
+
+test("resolveAppUserPassword refuses the published default password in production only", () => {
+  const published = "postgres://app_user:app_user_password@localhost:5432/cogniplane";
+  expect(() => resolveAppUserPassword({ DATABASE_URL: published, NODE_ENV: "production" })).toThrow("published default");
+  expect(() => resolveAppUserPassword({ APP_USER_PASSWORD: "app_user_password", NODE_ENV: "staging" })).toThrow("published default");
+  expect(resolveAppUserPassword({ DATABASE_URL: published })).toBe("app_user_password");
+  expect(resolveAppUserPassword({ DATABASE_URL: published, NODE_ENV: "development" })).toBe("app_user_password");
 });

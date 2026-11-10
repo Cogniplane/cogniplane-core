@@ -17,6 +17,15 @@ test.each(["compose.yaml"])("%s separates migration from runtime", async file =>
   expect(services.backend.environment.APP_USER_PASSWORD || "").toBe("");
 });
 
+test("the backend image runs as production, and only the local Compose stack opts out", async () => {
+  const dockerfile = await readFile("docker/backend.Dockerfile", "utf8");
+  const runtimeStage = dockerfile.slice(dockerfile.lastIndexOf("\nFROM "));
+  expect(runtimeStage).toMatch(/^ENV NODE_ENV=production$/m);
+  const { services } = parse(await readFile("compose.yaml", "utf8"));
+  expect(services.backend.environment.NODE_ENV).toBe("development");
+  expect(services.migrate.environment.NODE_ENV).toBe("development");
+});
+
 test("compose exposure guard refuses a non-loopback bind while any default credential is active", async () => {
   const { services } = parse(await readFile("compose.yaml", "utf8"));
   const guard = services["exposure-guard"];
