@@ -148,7 +148,13 @@ test("loadConfig enables local login next to WorkOS, or alone without WorkOS key
     WORKOS_API_KEY: undefined, WORKOS_CLIENT_ID: undefined, WORKOS_REDIRECT_URI: undefined
   }));
   expect(localOnly.AUTH_LOGIN_TYPES).toEqual(["local"]);
-  expect(localOnly.LOCAL_AUTH_HASH_CONCURRENCY).toBe(4);
+  // Below the 4 threads of the default libuv pool, which fs and dns.lookup share.
+  expect(localOnly.LOCAL_AUTH_HASH_CONCURRENCY).toBe(2);
+  const raised = loadConfig(workosConfig({
+    AUTH_MODE: "jwt", AUTH_LOGIN_TYPES: "local", LOCAL_AUTH_HASH_CONCURRENCY: "6",
+    WORKOS_API_KEY: undefined, WORKOS_CLIENT_ID: undefined, WORKOS_REDIRECT_URI: undefined
+  }));
+  expect(raised.LOCAL_AUTH_HASH_CONCURRENCY).toBe(6);
 });
 
 test("loadConfig resolves dev-headers to no login types", () => {
