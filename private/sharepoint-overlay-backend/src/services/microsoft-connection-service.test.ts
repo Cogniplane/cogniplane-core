@@ -1101,3 +1101,39 @@ test("a suspended connection without an email cannot be confirmed", async () => 
   expect(store.ownerVersions.get(key)).toBe(8);
   expect(runtimeManager.invalidations).toEqual([]);
 });
+
+test.each([
+  ["a failed or timed-out request", async () => { throw new DOMException("The operation was aborted due to timeout", "TimeoutError"); }],
+  ["a body that is not JSON", async () => new Response("<html>gateway</html>", { status: 200 })]
+])("getRuntimeCredentials keeps the stored token after %s at refresh", async (_case, answer) => {
+  const config = createTestConfig({ API_ORIGIN: "http://localhost:3000" });
+  const store = new InMemoryMicrosoftConnectionStore();
+  const integrationStates = new InMemoryIntegrationStateStore();
+  integrationStates.seed(createMicrosoftTenantConfig(config.DATA_ENCRYPTION_SECRET));
+  const service = new MicrosoftConnectionService(config, store, undefined, undefined, integrationStates);
+  store.record = {
+    tenantId: "tenant-1", userId: "user-1", microsoftUserId: "ms-user-1", microsoftEmail: "test@example.com",
+    microsoftDisplayName: "Test User", tokenType: "bearer", grantedScopes: ["User.Read", "Files.Read.All"],
+    accessTokenEncrypted: encrypt("ms_old_access_token", config.DATA_ENCRYPTION_SECRET),
+    // Inside the refresh window and still valid: getRuntimeCredentials refreshes first.
+    accessTokenExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+    refreshTokenEncrypted: encrypt("ms_refresh_token", config.DATA_ENCRYPTION_SECRET), refreshTokenExpiresAt: null,
+    tokenLastRefreshedAt: null, tokenLastUsedAt: null,
+    createdAt: new Date().toISOString(), updatedAt: new Date().toISOString()
+  };
+  const signals: Array<AbortSignal | null | undefined> = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (_input, init) => {
+    signals.push(init?.signal);
+    return answer();
+  };
+  try {
+    const creds = await service.getRuntimeCredentials("tenant-1", "user-1");
+    expect(creds?.token).toBe("ms_old_access_token");
+    // The refresh has a time limit, so a stalled one cannot hold the member's later calls.
+    expect(signals).toHaveLength(1);
+    expect(signals[0]).toBeInstanceOf(AbortSignal);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});

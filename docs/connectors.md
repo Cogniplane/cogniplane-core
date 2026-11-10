@@ -50,6 +50,14 @@ reconnects; until then the write tools refuse with a reconnect message
 
 Imported files pass the overlay's PII import scope (`microsoftImports`).
 
+The member routes of the file picker (`GET /integrations/microsoft/sites`,
+`/files` and `/files/search`, and `POST
+/sessions/:sessionId/import-microsoft-file`) need Reads on for the tenant, as
+the read tools do; otherwise they answer 403 `microsoft_integration_disabled`
+(`private/sharepoint-overlay-backend/src/routes/microsoft-files.ts`). Identity and Graph requests stop after 15
+seconds, and an import download after 120 seconds (`private/sharepoint-overlay-backend/src/services/graph-http.ts`).
+A refresh that fails or stops keeps the stored token while it is valid.
+
 ## Proxy MCP servers
 
 Admin > Connections > Add connection (`POST /admin/mcp-servers/setup`, step-up

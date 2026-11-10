@@ -113,6 +113,11 @@ test("replyForMicrosoftError: unknown error type re-throws", () => {
 
 const SESSION_ID = "550e8400-e29b-41d4-a716-446655440000";
 
+/** The tenant toggles of Microsoft 365 with Reads on. */
+async function readsOn() {
+  return { tenantEnabled: true, tenantReadsEnabled: true, tenantWritesEnabled: false, platformConfigured: true };
+}
+
 test("GET /integrations/microsoft/files/search returns search results", async () => {
   const app = Fastify();
   app.addHook("preHandler", async (request) => {
@@ -125,6 +130,7 @@ test("GET /integrations/microsoft/files/search returns search results", async ()
   });
 
   await registerMicrosoftFileRoutes(app, {
+    loadIntegrationEnablement: readsOn,
     microsoftFiles: {
       async listSites() {
         return [];
@@ -203,6 +209,7 @@ test("POST /sessions/:sessionId/import-microsoft-file imports a file into the se
     updatedAt: new Date().toISOString()
   }));
   await registerMicrosoftFileRoutes(app, {
+    loadIntegrationEnablement: readsOn,
     microsoftFiles: {
       listSites: async () => [], listFiles: async () => [], searchFiles: async () => [],
       importFileToSession,
@@ -246,6 +253,7 @@ test.each([
     request.auth = { tenantId: "tenant-1", userId: "user-1", isAdmin: false, role: "member" };
   });
   await registerMicrosoftFileRoutes(app, {
+    loadIntegrationEnablement: readsOn,
     microsoftFiles: {
       listSites: async () => [], listFiles: async () => [], searchFiles: async () => [],
       importFileToSession: async () => { throw error; },
@@ -265,6 +273,7 @@ test("POST /sessions/:sessionId/import-microsoft-file applies the upload rate li
   const limited: unknown[] = [];
   let imports = 0;
   await registerMicrosoftFileRoutes(app, {
+    loadIntegrationEnablement: readsOn,
     microsoftFiles: {
       async listSites() { return []; },
       async listFiles() { return []; },
@@ -290,4 +299,38 @@ test("POST /sessions/:sessionId/import-microsoft-file applies the upload rate li
   expect(response.headers["retry-after"]).toBe("3");
   expect(limited).toEqual([{ resource: "artifact_upload", userId: "user-1", tenantId: "tenant-1" }]);
   expect(imports).toBe(0);
+});
+
+test.each([
+  ["GET", "/integrations/microsoft/sites", undefined],
+  ["GET", "/integrations/microsoft/files", undefined],
+  ["GET", "/integrations/microsoft/files/search?q=report", undefined],
+  ["POST", `/sessions/${SESSION_ID}/import-microsoft-file`, { driveId: "drive-1", itemId: "item-1" }]
+] as const)("%s %s answers 403 when the tenant turned Microsoft 365 reads off", async (method, url, payload) => {
+  const app = Fastify();
+  app.addHook("preHandler", async (request) => {
+    request.auth = { userId: "user-1", tenantId: "tenant-1", isAdmin: false, role: "member" };
+  });
+  const loadIntegrationEnablement = vi.fn(async () => ({
+    tenantEnabled: true, tenantReadsEnabled: false, tenantWritesEnabled: true, platformConfigured: true
+  }));
+  const used = vi.fn(async () => { throw new Error("the service must not be called"); });
+  const consumeRateLimit = vi.fn(async () => null);
+  await registerMicrosoftFileRoutes(app, {
+    loadIntegrationEnablement,
+    limits: { consumeRateLimit },
+    microsoftFiles: { listSites: used, listFiles: used, searchFiles: used, importFileToSession: used }
+  });
+  onTestFinished(async () => {
+    await app.close();
+  });
+
+  const response = await app.inject({ method, url, ...(payload ? { payload } : {}) });
+
+  expect(response.statusCode).toBe(403);
+  expect(response.json()).toMatchObject({ error: "microsoft_integration_disabled" });
+  expect(loadIntegrationEnablement).toHaveBeenCalledWith("tenant-1", "microsoft");
+  expect(used).not.toHaveBeenCalled();
+  // A refused import spends no upload quota.
+  expect(consumeRateLimit).not.toHaveBeenCalled();
 });

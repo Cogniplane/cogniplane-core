@@ -6,7 +6,7 @@ import type { UploadAdmission } from "../../../../apps/backend/src/services/arti
 import { safeJsonBody } from "../../../../apps/backend/src/services/managed-tools/types.js";
 import type { MicrosoftConnectionService, MicrosoftRuntimeCredentials } from "./microsoft-connection-service.js";
 import { assertValidGraphId } from "./graph-id-validation.js";
-import { buildGraphHeaders } from "./graph-http.js";
+import { buildGraphHeaders, MICROSOFT_DOWNLOAD_TIMEOUT_MS, MICROSOFT_REQUEST_TIMEOUT_MS } from "./graph-http.js";
 
 type GraphDriveItem = Record<string, unknown>;
 
@@ -287,6 +287,7 @@ export class MicrosoftFilesService {
     init?: RequestInit
   ): Promise<T> {
     const response = await this.fetchImpl(url, {
+      signal: AbortSignal.timeout(MICROSOFT_REQUEST_TIMEOUT_MS),
       ...init,
       headers: {
         ...buildGraphHeaders(creds.token),
@@ -303,7 +304,7 @@ export class MicrosoftFilesService {
   }
 
   private downloadContent(initialUrl: string, token: string): Promise<Response> {
-    return downloadGraphContent(this.fetchImpl, initialUrl, token);
+    return downloadGraphContent(this.fetchImpl, initialUrl, token, AbortSignal.timeout(MICROSOFT_DOWNLOAD_TIMEOUT_MS));
   }
 
   async listSites(input: {

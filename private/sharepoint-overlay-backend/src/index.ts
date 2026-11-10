@@ -100,7 +100,8 @@ export function bootstrap(input: AttachOverlaysInput): OverlayHandles {
     });
     registerMicrosoftFileRoutes(app, {
       microsoftFiles: microsoftFilesService,
-      limits: input.limits
+      limits: input.limits,
+      loadIntegrationEnablement: input.loadIntegrationEnablement
     });
   };
 
