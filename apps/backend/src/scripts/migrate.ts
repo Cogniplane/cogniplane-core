@@ -5,7 +5,7 @@ import { loadConfig } from "../config.js";
 import { createDatabase } from "../lib/db.js";
 
 import { ensureMaintenanceRole, DEFAULT_MAINTENANCE_ROLE } from "./maintenance-role.js";
-import { applyMigrations, ensureAppUserRole } from "./migrate-lib.js";
+import { applyMigrations, ensureAppUserRole, resolveAppUserPassword } from "./migrate-lib.js";
 import {
   DEEP_AGENTS_CHECKPOINT_SCHEMA,
   setupDeepAgentsCheckpointer
@@ -33,10 +33,6 @@ const migrationConfig = {
 };
 const db = createDatabase(migrationConfig);
 
-// Extract the app_user password from DATABASE_URL so we can set it on the
-// role after migrations run. The role is created without a password in SQL
-// (no hardcoded secret in the repo); the password comes from the operator's
-// DATABASE_URL at runtime.
 function extractPassword(databaseUrl: string): string | null {
   try {
     return decodeURIComponent(new URL(databaseUrl).password) || null;
@@ -54,6 +50,9 @@ async function run() {
   if (decodeURIComponent(maintenanceUrl.username) !== DEFAULT_MAINTENANCE_ROLE || !maintenancePassword) {
     throw new Error("MAINTENANCE_DATABASE_URL must name maintenance_user and include its password.");
   }
+  // Before any migration runs, so that a missing password changes nothing.
+  // loadConfig has already read apps/backend/.env into process.env.
+  const appUserPassword = resolveAppUserPassword(process.env);
   await applyMigrations(db, migrationsDir, console.log, async (client) => {
     // Checkpointer DDL and role setup share the numbered migrations' lock.
     await setupDeepAgentsCheckpointer(migrationConfig.DATABASE_URL);
@@ -62,15 +61,8 @@ async function run() {
     await ensureMaintenanceRole(client, maintenancePassword);
     console.log("Ensured maintenance_user with explicit runtime grants.");
 
-    const appUserPassword = process.env.APP_USER_PASSWORD || extractPassword(config.DATABASE_URL);
-    if (appUserPassword) {
-      await ensureAppUserRole(client, appUserPassword);
-      console.log("Ensured app_user role exists with correct password and grants.");
-    } else {
-      console.warn(
-        "Warning: no password found in DATABASE_URL — app_user will have no password set."
-      );
-    }
+    await ensureAppUserRole(client, appUserPassword);
+    console.log("Ensured app_user role exists with correct password and grants.");
   });
 }
 

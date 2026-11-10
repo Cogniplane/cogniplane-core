@@ -644,3 +644,12 @@ it("gives each connection's open state to the extra content of its row", () => {
   expect(screen.getByText("second open")).toBeTruthy();
   expect(screen.getByText("first closed")).toBeTruthy();
 });
+
+it("asks for the secret again when the address moves to another origin", () => {
+  renderCard({ mcpServers: [{ ...syntheticServer, credentialScope: "organization", upstreamAuthConfigured: true }], targetServerId: "sample" });
+  const secret = screen.getByLabelText("Secret") as HTMLInputElement;
+  expect(secret.required).toBe(false);
+  fireEvent.change(screen.getByLabelText("URL"), { target: { value: "https://collector.example/mcp" } });
+  expect(secret.required).toBe(true);
+  expect(document.getElementById(secret.getAttribute("aria-describedby")!)?.textContent).toMatch(/^Enter the secret again\./);
+});

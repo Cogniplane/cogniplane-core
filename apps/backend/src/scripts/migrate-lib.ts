@@ -138,6 +138,44 @@ export function escapeAppUserPassword(password: string): string {
   return password.replace(/'/g, "''");
 }
 
+/** The password in the DATABASE_URL default of config.ts, which anyone can read. */
+const PUBLISHED_APP_USER_PASSWORD = "app_user_password";
+
+/** NODE_ENV values that are not production, as config.ts reads them. */
+const NON_PRODUCTION_ENVS = new Set(["development", "dev", "test", ""]);
+
+/**
+ * The password that the migration sets on app_user: APP_USER_PASSWORD, else the
+ * password in DATABASE_URL. Read the environment, not the loaded config: the config
+ * gives DATABASE_URL a default with a published password, and the migration would set
+ * that password on the live role. Throws when there is no password, and in production
+ * when it is the published one.
+ */
+export function resolveAppUserPassword(env: NodeJS.ProcessEnv): string {
+  const password = env.APP_USER_PASSWORD || passwordInUrl(env.DATABASE_URL);
+  if (!password) {
+    throw new Error(
+      "Set APP_USER_PASSWORD, or DATABASE_URL with the app_user password. The migration sets the password of app_user from it."
+    );
+  }
+  const nodeEnv = (env.NODE_ENV ?? "").trim().toLowerCase();
+  if (password === PUBLISHED_APP_USER_PASSWORD && !NON_PRODUCTION_ENVS.has(nodeEnv)) {
+    throw new Error(
+      "The app_user password is the published default. Set APP_USER_PASSWORD to a secret value."
+    );
+  }
+  return password;
+}
+
+function passwordInUrl(databaseUrl: string | undefined): string | null {
+  if (!databaseUrl) return null;
+  try {
+    return decodeURIComponent(new URL(databaseUrl).password) || null;
+  } catch {
+    return null;
+  }
+}
+
 /** The unprivileged role production connects as. */
 export const DEFAULT_APP_ROLE = "app_user";
 

@@ -42,7 +42,8 @@ link here instead of repeating these rules.
 - `SMTP_URL` and `MAIL_FROM` are set together, only with `AUTH_MODE=jwt`.
   `SMTP_ALLOW_PLAINTEXT` is refused unless `NODE_ENV` is unset, `development`,
   `dev` or `test`.
-- Any other `NODE_ENV` value counts as production and requires `AUTH_MODE=jwt`.
+- Any other `NODE_ENV` value counts as production and requires `AUTH_MODE=jwt`
+  for the server. Scripts (migration, operator commands) skip this rule.
 - `dev-headers` requires a loopback `API_HOST` (`127.0.0.1`, `::1`,
   `localhost`), unless `COGNIPLANE_ALLOW_DEV_HEADERS_ON_NON_LOOPBACK=1`, which
   then requires `DEV_HEADERS_AUTH_KEY` (16 characters or more). `API_HOST`
@@ -142,7 +143,7 @@ from build arguments). Frontend variables are in `apps/frontend/.env.example`
 | `ARTIFACT_BUCKET_ACCESS_KEY_ID` | string, minimum 1 | `unset` | [self-hosting](self-hosting.md) |
 | `ARTIFACT_BUCKET_SECRET_ACCESS_KEY` | string, minimum 1 | `unset` | [self-hosting](self-hosting.md) |
 | `ARTIFACT_BUCKET_SESSION_TOKEN` | string, minimum 1 | `unset` | [self-hosting](self-hosting.md) |
-| `ARTIFACT_MAX_UPLOAD_BYTES` | number, integer, > 0 | `26214400` | [projects-and-files](architecture/projects-and-files.md), [skills](architecture/skills.md) |
+| `ARTIFACT_MAX_UPLOAD_BYTES` | number, integer, > 0 | `26214400` | [projects-and-files](architecture/projects-and-files.md), [sandbox](architecture/sandbox.md) |
 | `MAX_REQUEST_BODY_BYTES` | number, integer, > 0 | `2097152` | [security](security.md) |
 | `LOG_LEVEL` | one of ["fatal", "error", "warn", "info", "debug", "trace", "silent"] | `"info"` | [operations](operations.md) |
 | `ARTIFACT_DOWNLOAD_TTL_MS` | number, integer, > 0 | `900000` | [projects-and-files](architecture/projects-and-files.md) |

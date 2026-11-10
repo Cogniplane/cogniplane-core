@@ -107,6 +107,9 @@ store them as you store the database.
   stack to expose `dev-headers`: anyone who reaches the backend can act as any
   user. Deploy with `AUTH_MODE=jwt`, TLS and the steps in
   [self-hosting](self-hosting.md).
+- The backend image sets `NODE_ENV=production`, which refuses `dev-headers` at
+  boot. `compose.yaml` sets `NODE_ENV=development` on `backend` and `migrate`
+  for this local stack only.
 - Artifacts and skill bundles use local storage in `backend-data`.
 - The backend has `stop_grace_period: 40s`, longer than its shutdown deadline
   ([shutdown](operations.md#upgrade)).
