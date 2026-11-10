@@ -35,6 +35,10 @@ WORKDIR /app
 
 ENV BUILD_SHA=$BUILD_SHA
 ENV BUILD_DATE=$BUILD_DATE
+# The production startup checks (config.ts) apply only when NODE_ENV is set to a
+# production value; an unset NODE_ENV counts as development. compose.yaml sets
+# development for the local stack.
+ENV NODE_ENV=production
 
 # Project PDF previews invoke pdftotext at request time. PDF OCR for the PII
 # scan (PII_PDF_OCR_ENABLED) uses pdfinfo, pdftoppm and tesseract.

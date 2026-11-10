@@ -797,7 +797,10 @@ export function loadConfig(
   if (parsed.SMTP_ALLOW_PLAINTEXT && !isRecognizedNonProd) {
     throw new Error("SMTP_ALLOW_PLAINTEXT is for development only. Unset it, and use smtps:// or smtp:// with STARTTLS.");
   }
-  if (!isRecognizedNonProd && authMode !== "jwt") {
+  // Only for the server: a script with skipRuntimeChecks (migration, operator
+  // commands) serves no request, so no header can reach it. The backend image sets
+  // NODE_ENV=production, and its migration job must run without the auth settings.
+  if (!opts.skipRuntimeChecks && !isRecognizedNonProd && authMode !== "jwt") {
     throw new Error(
       `AUTH_MODE=${parsed.AUTH_MODE} is only permitted when NODE_ENV is unset or one of ` +
         `[development, dev, test] (got NODE_ENV=${JSON.stringify(source.NODE_ENV)}). ` +

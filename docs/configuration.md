@@ -42,7 +42,8 @@ link here instead of repeating these rules.
 - `SMTP_URL` and `MAIL_FROM` are set together, only with `AUTH_MODE=jwt`.
   `SMTP_ALLOW_PLAINTEXT` is refused unless `NODE_ENV` is unset, `development`,
   `dev` or `test`.
-- Any other `NODE_ENV` value counts as production and requires `AUTH_MODE=jwt`.
+- Any other `NODE_ENV` value counts as production and requires `AUTH_MODE=jwt`
+  for the server. Scripts (migration, operator commands) skip this rule.
 - `dev-headers` requires a loopback `API_HOST` (`127.0.0.1`, `::1`,
   `localhost`), unless `COGNIPLANE_ALLOW_DEV_HEADERS_ON_NON_LOOPBACK=1`, which
   then requires `DEV_HEADERS_AUTH_KEY` (16 characters or more). `API_HOST`

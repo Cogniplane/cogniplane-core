@@ -126,6 +126,8 @@ services:
       postgres:
         condition: service_healthy
     environment:
+      # The image sets NODE_ENV=production. This stack is the local one.
+      NODE_ENV: development
       DATABASE_URL: postgres://app_user:${APP_USER_PASSWORD:-local-dev-app-user-password}@postgres:5432/cogniplane
       MIGRATION_DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD:-postgres}@postgres:5432/cogniplane
       MAINTENANCE_DATABASE_URL: postgres://maintenance_user:${MAINTENANCE_USER_PASSWORD:-local-dev-maintenance-password}@postgres:5432/cogniplane
@@ -163,6 +165,9 @@ services:
     ports:
       - "127.0.0.1:3001:3001"
     environment:
+      # The image sets NODE_ENV=production, which refuses AUTH_MODE=dev-headers at
+      # boot. This stack is the local one; on a server, remove this line and use jwt.
+      NODE_ENV: development
       API_HOST: 0.0.0.0
       API_PORT: 3001
       API_ORIGIN: http://localhost:3000

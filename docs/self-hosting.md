@@ -57,7 +57,7 @@ The roles and their grants are in [database roles](database-roles.md).
 ## Authentication
 
 ```bash
-NODE_ENV=production                  # turns on the production startup checks
+NODE_ENV=production                  # production startup checks; the backend image sets it
 AUTH_MODE=jwt
 AUTH_LOGIN_TYPES=workos,local        # one or both
 JWT_SECRET=<32+ random bytes>
