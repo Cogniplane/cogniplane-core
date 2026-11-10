@@ -12,6 +12,7 @@ import {
 } from "@cogniplane/shared-types";
 
 import { apiError, requestError } from "../../lib/http-errors.js";
+import { isFileTooLargeError } from "../../lib/multipart-errors.js";
 import { serialize } from "../../lib/serialize-response.js";
 import {
   activateSkillRevisionBodySchema,
@@ -63,19 +64,6 @@ function respondSkillConfigError(reply: FastifyReply, error: unknown) {
   // Unexpected error: rethrow so the global error handler logs it and
   // returns an opaque 500 instead of leaking the raw message.
   throw error;
-}
-
-// @fastify/multipart rejects with this code when a part exceeds the
-// configured fileSize limit (both during request.file() and while buffering
-// via toBuffer()). Other multipart failures are FastifyErrors with their own
-// 4xx statusCode and reach the global handler, which surfaces 4xx verbatim
-// and keeps everything else an opaque 500.
-function isFileTooLargeError(error: unknown): boolean {
-  return (
-    typeof error === "object" &&
-    error !== null &&
-    (error as { code?: unknown }).code === "FST_REQ_FILE_TOO_LARGE"
-  );
 }
 
 function respondSkillUploadTooLarge(reply: FastifyReply) {
