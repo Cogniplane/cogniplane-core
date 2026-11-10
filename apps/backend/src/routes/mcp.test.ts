@@ -1716,6 +1716,110 @@ test("a managed tool handler's internal error never reaches the model", async ()
   expect(response.body).not.toContain("i7x9k2mq0zt4vabc");
 });
 
+const LOGGED_KEY = "sk-ant-api03-gatewaylogtestgatewaylogtest";
+const LOGGED_TOKEN = "ghp_gatewaylogtestgatewaylogtest0123456";
+
+/** Fails the way a driver or an SDK does: a key in the message, secrets in
+ * enumerable fields, a Postgres code and a transport cause. */
+function sdkShapedError(): Error {
+  const cause = Object.assign(new Error("connect ECONNREFUSED 10.0.4.17:5432"), { code: "ECONNREFUSED" });
+  return Object.assign(new Error(`permission denied for table artifacts, key ${LOGGED_KEY}`, { cause }), {
+    code: "42501",
+    config: { headers: { Authorization: `Bearer ${LOGGED_TOKEN}` } },
+    client: { apiKey: LOGGED_KEY }
+  });
+}
+
+function captureLogs() {
+  const lines: string[] = [];
+  return {
+    logStream: { write: (line: string) => { lines.push(line); } },
+    lines,
+    record: (msg: string) => lines.map((line) => JSON.parse(line)).find((record) => record.msg === msg)
+  };
+}
+
+/** The serialized record keeps what explains the failure and nothing else. */
+function expectLoggedCause(logs: ReturnType<typeof captureLogs>, msg: string, toolName: string) {
+  const record = logs.record(msg);
+  expect(record).toMatchObject({
+    toolName,
+    error: {
+      type: "Error",
+      message: "permission denied for table artifacts, key [REDACTED]",
+      stack: expect.stringContaining("Error: permission denied for table artifacts, key [REDACTED]\n    at "),
+      code: "42501",
+      cause: { type: "Error", message: "connect ECONNREFUSED 10.0.4.17:5432", code: "ECONNREFUSED" }
+    }
+  });
+  expect(Object.keys(record.error)).toEqual(["type", "message", "stack", "code", "cause"]);
+  const output = logs.lines.join("");
+  expect(output).not.toContain(LOGGED_KEY);
+  expect(output).not.toContain(LOGGED_TOKEN);
+}
+
+test("a managed tool failure logs its message, stack and cause, and no SDK fields", async () => {
+  const logs = captureLogs();
+  const { app, toolContexts } = await createTestApp({
+    logStream: logs.logStream,
+    extraManagedTools: [{
+      name: "exploding_tool",
+      description: "Throws the way an SDK does.",
+      readOnly: true,
+      inputSchema: { type: "object", properties: {}, additionalProperties: true },
+      handler: async () => { throw sdkShapedError(); }
+    } as never]
+  });
+  onTestFinished(async () => { await app.close(); });
+  const context = await createTestToolContext(toolContexts, {
+    sessionId: "session-managed-log",
+    userId: "log-user",
+    runtimeId: "runtime-log",
+    metadata: {
+      runtimePolicy: {
+        ...testRuntimePolicy,
+        enabledMcpServers: [...testRuntimePolicy.enabledMcpServers, "managed-session-context"],
+        enabledToolIds: [...testRuntimePolicy.enabledToolIds, "exploding_tool"]
+      }
+    }
+  });
+
+  const response = await callManagedTool(app, { sid: "session-managed-log", uid: "log-user", rid: "runtime-log" },
+    "exploding_tool", { toolContextId: context.toolContextId });
+
+  expect(response.json().error).toEqual({ code: -32000, message: "Tool call failed." });
+  expectLoggedCause(logs, "Managed tool call failed", "exploding_tool");
+  expect(logs.record("Managed tool call failed").serverId).toBe("managed-session-context");
+});
+
+test("a forwarded tool failure before egress logs its message, stack and cause, and no SDK fields", async () => {
+  const logs = captureLogs();
+  const { upstream, upstreamUrl, upstreamRequests } = await createProxyMcpUpstream();
+  const { app, toolContexts } = await createTestApp({
+    logStream: logs.logStream,
+    proxyUpstreamUrl: upstreamUrl,
+    policyService: {
+      async gateAction() { throw sdkShapedError(); },
+      async evaluate() { throw sdkShapedError(); }
+    } as never
+  });
+  onTestFinished(async () => { await Promise.all([app.close(), upstream.close()]); });
+  const context = await createTestToolContext(toolContexts, {
+    sessionId: "session-forwarded-log",
+    metadata: { runtimePolicy: { ...testRuntimePolicy, enabledMcpServers: ["test-proxy"] } }
+  });
+
+  const response = await app.inject({ method: "POST", url: "/mcp/test-proxy",
+    headers: { authorization: `Bearer ${runtimeToken({ sid: "session-forwarded-log", uid: "test-user", rid: context.runtimeId })}` },
+    payload: { jsonrpc: "2.0", id: 1, method: "tools/call",
+      params: { name: "search", arguments: { toolContextId: context.toolContextId } } } });
+
+  expect(response.json().error).toEqual({ code: -32000, message: "Tool call failed." });
+  expect(toolCallRequests(upstreamRequests)).toHaveLength(0);
+  expectLoggedCause(logs, "Forwarded tool call failed", "search");
+  expect(logs.record("Forwarded tool call failed").serverId).toBe("test-proxy");
+});
+
 test.each(["https://mcp.example.test", "http://127.0.0.1:3108"])(
   "forwardRpc follows a bounded same-origin redirect from %s manually",
   async (origin) => {

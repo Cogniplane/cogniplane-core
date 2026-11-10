@@ -78,6 +78,13 @@ the turn, an interrupt and the SDK's special protocol errors still throw and end
 the call. In a new tool, return a refusal that the model can act on as a tool
 result; throw only for a real failure.
 
+For an internal failure the model gets fixed text (`clientSafeToolErrorMessage`
+in `lib/tool-call-error.ts`). Only the log keeps the cause. `toolErrorForLog`
+writes the type, message, stack, code and cause chain, and applies the
+`redactSecrets()` text rules to the message and the stack, and removes URL
+user information from logged text. It does not write other fields of the
+error, because SDK errors keep request headers and client objects there.
+
 ## Add a core managed tool
 
 1. In `services/managed-tools/`, export a catalog array (`name`, `description`,

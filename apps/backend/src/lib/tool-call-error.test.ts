@@ -2,7 +2,7 @@ import { expect, test } from "vitest";
 
 import { AdminConfigError } from "../services/admin-config-error.js";
 import { GithubConnectionNotConfiguredError } from "../services/integrations/github/github-connection-errors.js";
-import { clientSafeToolErrorMessage, ToolCallError } from "./tool-call-error.js";
+import { clientSafeToolErrorMessage, ToolCallError, toolErrorForLog } from "./tool-call-error.js";
 
 const FALLBACK = "Tool call failed.";
 
@@ -75,4 +75,46 @@ test("classification is by name, so a duplicated module instance still passes th
   impostor.name = "ToolCallError";
   expect(impostor instanceof ToolCallError).toBe(false);
   expect(clientSafeToolErrorMessage(impostor, FALLBACK)).toBe(impostor.message);
+});
+
+test("a non-Error throw logs only its type", () => {
+  expect(toolErrorForLog("postgres://user:pw@10.0.4.17/db")).toEqual({ type: "string" });
+  expect(toolErrorForLog({ message: "spoofed", token: "abc" })).toEqual({ type: "object" });
+});
+
+test("the logged type is the class name, as pino's serializer writes it", () => {
+  // pg's DatabaseError sets `name` to the protocol message name, "error".
+  class DatabaseError extends Error {}
+  const error = Object.assign(new DatabaseError("deadlock detected"), { name: "error", code: "40P01" });
+  expect(toolErrorForLog(error)).toMatchObject({ type: "DatabaseError", message: "deadlock detected", code: "40P01" });
+});
+
+test("a cause chain that loops stops after three causes", () => {
+  const error = new Error("outer");
+  error.cause = error;
+  let depth = 0;
+  for (let logged = toolErrorForLog(error); logged.cause; logged = logged.cause) depth += 1;
+  expect(depth).toBe(3);
+});
+
+test("an error whose getter throws logs as unknown instead of throwing", () => {
+  const error = new Error("hidden");
+  Object.defineProperty(error, "message", { get() { throw new Error("getter"); } });
+  expect(toolErrorForLog(error)).toEqual({ type: "unknown" });
+});
+
+
+test("logged messages, stacks, codes and causes remove URL credentials", () => {
+  const error = Object.assign(new Error("connect postgres://db-user:db-password@db.internal/app"), {
+    code: "https://api-user:p%40ss@api.internal/failure",
+    cause: new Error("fetch https://cause-user:cause-password@upstream.internal/tool")
+  });
+  const logged = toolErrorForLog(error);
+  expect(logged.message).toBe("connect postgres://[REDACTED]@db.internal/app");
+  expect(logged.stack).toContain(logged.message);
+  expect(logged.code).toBe("https://[REDACTED]@api.internal/failure");
+  expect(logged.cause?.message).toBe("fetch https://[REDACTED]@upstream.internal/tool");
+  for (const secret of ["db-user", "db-password", "api-user", "p%40ss", "cause-user", "cause-password"]) {
+    expect(JSON.stringify(logged)).not.toContain(secret);
+  }
 });

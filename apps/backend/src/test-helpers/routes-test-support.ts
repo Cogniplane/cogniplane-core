@@ -753,6 +753,9 @@ export async function createTestApp(
     integrationToolCalls?: McpRouteStores["integrationToolCalls"];
     // Defaults to the real store over the fake database, which keeps nothing.
     memories?: McpRouteStores["memories"];
+    // Receives each serialized log line at level warn and above. Without it the
+    // app does not log.
+    logStream?: { write(line: string): void };
   } = {}
 ) {
   const {
@@ -765,6 +768,7 @@ export async function createTestApp(
     activationTracker,
     integrationToolCalls = { checkToolCall: async () => null },
     memories: memoriesOverride,
+    logStream,
     ...appConfigOverrides
   } = configOverrides;
   const db = new FakeDatabase();
@@ -780,7 +784,10 @@ export async function createTestApp(
   const artifactStorageRoot = await mkdtemp(path.join(os.tmpdir(), "cogniplane-core-artifact-tests-"));
   const artifactStorage = new LocalArtifactStorage(artifactStorageRoot);
   const config = createTestConfig({ ARTIFACT_STORAGE_ROOT: artifactStorageRoot, ...appConfigOverrides });
-  const app = Fastify({ bodyLimit: config.MAX_REQUEST_BODY_BYTES });
+  const app = Fastify({
+    bodyLimit: config.MAX_REQUEST_BODY_BYTES,
+    ...(logStream ? { logger: { level: "warn", stream: logStream } } : {})
+  });
   const limits = RequestLimits.fromAppConfig(config);
   app.decorate("config", config);
   const pool = db as unknown as Pool;
