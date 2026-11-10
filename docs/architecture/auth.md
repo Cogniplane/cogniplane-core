@@ -109,6 +109,19 @@ Sign-in types:
 `services/auth/workos-tenant-provisioning.ts`. Setup:
 [self-hosting](../self-hosting.md#authentication).
 
+- Input: `code` and `state` must be strings, and `code` can have at most
+  `OAUTH_CODE_MAX_LENGTH` characters. Other bodies return 400
+  `invalid_request`. A missing code returns 400 `missing_code`. A state that
+  does not match the state cookie returns 400 `invalid_state`. A missing PKCE
+  verifier cookie returns 400 `invalid_pkce_verifier`. The route sends the
+  code to WorkOS only after these checks.
+- The state and PKCE cookies are single use. Every answer after the rate limit
+  deletes them.
+- Refused code: if the WorkOS code exchange answers 400 with the OAuth error
+  `invalid_grant`, the route returns 401 `invalid_code`. The user must start
+  a new sign-in. The log line names no code, state, verifier or WorkOS answer.
+- Other WorkOS failures of the code exchange return 500: network errors,
+  WorkOS 5xx and 429 answers, and a refused client or API key.
 - Organization: a hint counts only when it matches a membership. One membership
   selects that organization. Several return 409
   `organization_selection_required`, and the user signs in again with one. None
