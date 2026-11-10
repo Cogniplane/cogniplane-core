@@ -123,8 +123,10 @@ Fields that agents change most often (the full list is `TenantSettingsSchema` in
 - Session trash and project file retention run in the scheduler worker
   ([background workers](runtime.md#background-workers)).
 - Deleted sessions go to trash for `SESSION_TRASH_RETENTION_DAYS`
-  (`SESSION_TRASH_RETENTION_ENABLED`). Purge removes messages, storage objects
-  and the checkpoint thread.
+  (`SESSION_TRASH_RETENTION_ENABLED`). The delete kills the session sandbox
+  ([sandbox](sandbox.md#e2b-sandbox)). Purge removes messages, storage objects
+  and the checkpoint thread, and kills a sandbox that the row still names (a row
+  that an earlier version moved to trash).
 - `PROJECT_FILE_RETENTION_ENABLED` (scheduler,
   `ProjectFileStore.cleanupExpired`) deletes promoted files and files in the
   trash for more than 30 days, with their versions. It does not prune the

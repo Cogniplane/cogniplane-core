@@ -389,7 +389,9 @@ export const envSchema = z.object({
   // meanwhile share the same check, so the wait does not multiply with the number of calls.
   // The kill of a sandbox that does not match has a deadline of the same length: its tries
   // (the lease is checked before each) stop there, a kill that still fails is logged as an
-  // error, and the sandbox is replaced all the same.
+  // error, and the sandbox is replaced all the same. The kill of the sandbox of an archived,
+  // deleted or purged session has the same deadline, and each of its requests has the
+  // request timeout below.
   E2B_NETWORK_CONFIRM_TIMEOUT_MS: z.coerce.number().int().positive().default(20 * 1000),
   // Timeout of one E2B API request inside that check. The E2B SDK default is 60 s,
   // which four reads in a row would multiply to minutes. A request never gets more

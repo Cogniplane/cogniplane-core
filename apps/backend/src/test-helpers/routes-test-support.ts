@@ -193,7 +193,7 @@ class InMemorySessionStore {
     return updated;
   }
 
-  async setArchived(tenantId: string, sessionId: string, userId: string, archived: boolean): Promise<SessionRecord | null> {
+  async setArchived(tenantId: string, sessionId: string, userId: string, archived: boolean) {
     const session = await this.getOwned(tenantId, sessionId, userId);
     if (!session || session.status !== (archived ? "active" : "archived")) return null;
     const now = new Date().toISOString();
@@ -201,17 +201,17 @@ class InMemorySessionStore {
     if (archived) updated.archivedAt = now;
     else delete updated.archivedAt;
     this.sessions.set(sessionId, updated);
-    return updated;
+    return { session: updated, releasedSandboxId: null };
   }
 
-  async remove(_tenantId: string, sessionId: string, userId: string): Promise<boolean> {
+  async remove(_tenantId: string, sessionId: string, userId: string) {
     const session = this.sessions.get(sessionId);
     if (!session || session.userId !== userId || session.status === "deleted") {
-      return false;
+      return null;
     }
     const now = new Date().toISOString();
     this.sessions.set(sessionId, { ...session, status: "deleted", deletedAt: now, updatedAt: now });
-    return true;
+    return { releasedSandboxId: null };
   }
 
   async restoreDeleted(_tenantId: string, sessionId: string, userId: string): Promise<SessionRecord | null> {
@@ -448,6 +448,7 @@ class FakeRuntimeManager implements RuntimeAdapter {
     return this.busySessions.delete(input.sessionId) ? "interrupted" as const : "no_active_turn" as const;
   }
   async purgeSessionData() {}
+  async destroySandbox() { return "killed" as const; }
   async invalidateTenantRuntimes() { return []; }
   async invalidateRuntimesForUser() { return []; }
   async invalidateRuntimesForIntegration() { return []; }

@@ -8,6 +8,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { ALL_TRAFFIC, Sandbox } from "e2b";
 
 import { isSandboxGoneError } from "../deep-agents/deep-agents-e2b-backend.js";
+import { E2bSandboxDisposal } from "./e2b-sandbox-disposal.js";
 import {
   loadE2bSandboxClass,
   toE2bCreateOptions,
@@ -30,7 +31,7 @@ const requests: Recorded[] = [];
 let server: Server;
 let previousApiUrl: string | undefined;
 // How the stub answers. "silent" never answers, like a provider that hangs.
-let mode: "error-500" | "unavailable-503" | "silent" = "error-500";
+let mode: "error-500" | "unavailable-503" | "silent" | "not-found-404" | "deleted-204" = "error-500";
 // Whether the stub accepts a `connect`, so that a test can get a Sandbox instance.
 let connectable = false;
 let onCreateRequest: (() => void) | undefined;
@@ -52,7 +53,12 @@ beforeAll(async () => {
         return;
       }
       if (mode === "silent") return;
-      const status = mode === "unavailable-503" ? 503 : 500;
+      if (mode === "deleted-204") {
+        response.writeHead(204);
+        response.end();
+        return;
+      }
+      const status = mode === "unavailable-503" ? 503 : mode === "not-found-404" ? 404 : 500;
       response.writeHead(status, { "content-type": "application/json" });
       response.end(JSON.stringify({ code: status, message: "stub" }));
     });
@@ -100,6 +106,7 @@ describe("E2B SDK surface used by the sandbox network policy", () => {
     expect(typeof SandboxClass.create).toBe("function");
     expect(typeof SandboxClass.connect).toBe("function");
     expect(typeof SandboxClass.getInfo).toBe("function");
+    expect(typeof SandboxClass.kill).toBe("function");
     expect(typeof Sandbox.prototype.kill).toBe("function");
     expect(ALL_TRAFFIC).toBe(SANDBOX_DENY_ALL_EGRESS);
   });
@@ -209,6 +216,52 @@ describe("E2B SDK time limits and retries used by the network check", () => {
     expect(bySignal).toBeInstanceOf(Error);
     expect(isSandboxGoneError(byTimeout)).toBe(false);
     expect(requests.filter((request) => request.method === "DELETE")).toHaveLength(2);
+  });
+});
+
+// Archive, delete and purge kill the sandbox of a session by its id, with the static
+// call. It sends no connect: a connect sends a new lifetime for the sandbox.
+describe("E2B SDK kill by id used when a session is disposed", () => {
+  const deleteRequests = () => requests.filter((request) => request.method === "DELETE" && request.path.endsWith("/sandboxes/sbx-1"));
+  const logger = () => ({ info: () => {}, warn: () => {}, error: () => {} });
+  const disposal = (requestTimeoutMs = 5_000, deadlineMs = 5_000) => new E2bSandboxDisposal({
+    apiKey: "e2b_test_key", requestTimeoutMs, deadlineMs, logger: logger(), retryBackoffMs: [0, 0, 0]
+  });
+
+  it("sends one DELETE, and reports whether the provider had the sandbox", async () => {
+    const SandboxClass = await loadE2bSandboxClass();
+    mode = "deleted-204";
+    await expect(SandboxClass.kill("sbx-1", { apiKey: "e2b_test_key", requestTimeoutMs: 5_000 })).resolves.toBe(true);
+    mode = "not-found-404";
+    await expect(SandboxClass.kill("sbx-1", { apiKey: "e2b_test_key", requestTimeoutMs: 5_000 })).resolves.toBe(false);
+
+    expect(deleteRequests()).toHaveLength(2);
+    expect(requests.filter((request) => request.method !== "DELETE")).toEqual([]);
+  });
+
+  it("throws for an HTTP 500 an error that is not a gone sandbox", async () => {
+    const failure = await Sandbox.kill("sbx-1", { apiKey: "e2b_test_key", requestTimeoutMs: 5_000 }).catch((error: unknown) => error);
+    expect(failure).toMatchObject({ statusCode: 500 });
+    expect(isSandboxGoneError(failure)).toBe(false);
+  });
+
+  it("disposes through the SDK: killed, not found, and failed after its tries with no request after the end", async () => {
+    mode = "deleted-204";
+    await expect(disposal().destroy({ tenantId: "t", sessionId: "s", sandboxId: "sbx-1" })).resolves.toBe("killed");
+    mode = "not-found-404";
+    await expect(disposal().destroy({ tenantId: "t", sessionId: "s", sandboxId: "sbx-1" })).resolves.toBe("not_found");
+    mode = "error-500";
+    requests.length = 0;
+    await expect(disposal().destroy({ tenantId: "t", sessionId: "s", sandboxId: "sbx-1" })).resolves.toBe("failed");
+    expect(deleteRequests()).toHaveLength(4);
+
+    mode = "silent";
+    requests.length = 0;
+    await expect(disposal(200, 500).destroy({ tenantId: "t", sessionId: "s", sandboxId: "sbx-1" })).resolves.toBe("failed");
+    const atSettle = requests.length;
+    expect(atSettle).toBeGreaterThanOrEqual(1);
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    expect(requests.length).toBe(atSettle);
   });
 });
 

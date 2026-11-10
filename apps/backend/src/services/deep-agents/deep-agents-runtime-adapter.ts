@@ -82,6 +82,11 @@ import type {
   DeepAgentsSessionState
 } from "./deep-agents-types.js";
 import { E2B_WORKSPACE_BASE } from "../runtime/e2b-sandbox.js";
+import {
+  E2bSandboxDisposal,
+  type ReleasedSandbox,
+  type SandboxDisposalOutcome
+} from "../runtime/e2b-sandbox-disposal.js";
 import { resolveSandboxNetworkPolicy } from "../runtime/sandbox-network-policy.js";
 
 const PROVIDER_ID = "deep-agents";
@@ -133,6 +138,8 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
   private readonly activeTurns = new Set<string>();
   private readonly pendingIntegrationInvalidations = new Set<string>();
   private readonly approvalCoordinator: ApprovalCoordinator;
+  /** Kills the sandbox of a disposed session (destroySandbox). Null without E2B_API_KEY. */
+  private readonly sandboxDisposal: Pick<E2bSandboxDisposal, "destroy"> | null;
   private readonly pendingWorkspaceResetNotices = new Map<
     string,
     { noticeId: string; message: string; expiryTimer: NodeJS.Timeout }
@@ -206,6 +213,8 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
        * while still live, letting a second turn start on the same session.
        */
       activeTurns?: Pick<ActiveTurnsRegistry, "keepAlive" | "snapshot">;
+      /** Test-only: the kill of a disposed session's sandbox. Built from E2B_API_KEY otherwise. */
+      sandboxDisposal?: Pick<E2bSandboxDisposal, "destroy">;
     },
     private readonly providerCredentials?: ProviderCredentials,
     private readonly runtimeFactory: DeepAgentsRuntimeFactory = createDeepAgentsSessionRuntime,
@@ -216,6 +225,15 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
       approvals: stores.approvals, auditEvents: stores.auditEvents, logger: log,
       ttlMs: config.APPROVAL_REQUEST_TTL_MS
     });
+    // The kill of a disposed session's sandbox has the limits of the kill of a replaced one.
+    this.sandboxDisposal = stores.sandboxDisposal ?? (config.E2B_API_KEY
+      ? new E2bSandboxDisposal({
+          apiKey: config.E2B_API_KEY,
+          requestTimeoutMs: config.E2B_NETWORK_REQUEST_TIMEOUT_MS,
+          deadlineMs: config.E2B_NETWORK_CONFIRM_TIMEOUT_MS,
+          logger: log
+        })
+      : null);
   }
 
   hasActiveTurn(sessionId: string): boolean {
@@ -1388,6 +1406,23 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
     } finally {
       this.clearPendingWorkspaceResetNotice(input.sessionId);
     }
+  }
+
+  /**
+   * Kill the sandbox that archive, delete or purge took from the session row. See
+   * RuntimeAdapter.destroySandbox. A runtime of the session that this replica still
+   * holds keeps a dead sandbox in memory: at its next use it reads the empty record
+   * and starts a new one.
+   */
+  async destroySandbox(input: ReleasedSandbox): Promise<SandboxDisposalOutcome> {
+    if (!this.sandboxDisposal) {
+      this.log.warn(
+        { sessionId: input.sessionId, sandboxId: input.sandboxId },
+        "The sandbox of a disposed session was not killed: E2B is not configured. It runs until the provider expires it"
+      );
+      return "skipped";
+    }
+    return this.sandboxDisposal.destroy(input);
   }
 
   async close(): Promise<void> {

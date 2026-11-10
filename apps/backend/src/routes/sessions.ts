@@ -2,7 +2,7 @@ import { SessionListCursorSchema } from "../services/session-store.js";
 import { canBrowseSessionContent, UNSUPPORTED_TRANSCRIPT_ERROR } from "../services/session-access.js";
 import { ProjectAccessError } from "../services/project-access.js";
 import { SessionExecutionError } from "../services/session-execution-store.js";
-import type { FastifyInstance } from "fastify";
+import type { FastifyInstance, FastifyRequest } from "fastify";
 import { z } from "zod";
 import { deriveActionSeverity } from "../services/mcp/policy-gate.js";
 import { forwardSignedProxyRpc, proxySigningSecret, proxyUpstreamLimits } from "../services/mcp/proxy-forward.js";
@@ -113,7 +113,7 @@ export type SessionRouteStores = {
   policyService?: Pick<AppDependencies["policyService"], "gateCompletedToolResource">;
   managedToolCatalog?: Pick<ManagedToolCatalog, "get">;
   mcpAppCsp?: Pick<McpAppCspStore, "listApproved" | "recordRequested">;
-  runtimeAdapter: Pick<AppDependencies["runtimeAdapter"], "id" | "hasActiveTurn" | "abortSession" | "purgeSessionData" | "interruptTurn">;
+  runtimeAdapter: Pick<AppDependencies["runtimeAdapter"], "id" | "hasActiveTurn" | "abortSession" | "purgeSessionData" | "interruptTurn" | "destroySandbox">;
   limits: AppDependencies["limits"];
   activeTurns: AppDependencies["activeTurns"];
   auditEvents: Pick<AppDependencies["auditEvents"], "create">;
@@ -121,6 +121,25 @@ export type SessionRouteStores = {
     Partial<Pick<AppDependencies["executions"], "stopAndGetOwner" | "currentOwner">>;
   turnBus?: TurnCoordinationBus;
 };
+
+/**
+ * Kill the sandbox that archive or delete took from the session in its transaction.
+ * The change is committed, so a failure here never fails the request: the adapter logs
+ * a failed kill, and the sandbox then runs until its provider lifetime cap.
+ */
+async function destroyReleasedSandbox(
+  stores: Pick<SessionRouteStores, "runtimeAdapter">,
+  request: FastifyRequest,
+  input: { tenantId: string; sessionId: string; sandboxId: string | null }
+): Promise<void> {
+  if (!input.sandboxId) return;
+  try {
+    await stores.runtimeAdapter.destroySandbox({ tenantId: input.tenantId, sessionId: input.sessionId, sandboxId: input.sandboxId });
+  } catch (err) {
+    request.log.error({ err, sessionId: input.sessionId, sandboxId: input.sandboxId },
+      "Failed to kill the sandbox of a disposed session; it runs until the provider expires it");
+  }
+}
 
 export async function registerSessionRoutes(
   app: FastifyInstance,
@@ -508,11 +527,14 @@ async function registerScopedSessionRoutes(
         return apiError("session_busy", "Wait for the current turn to finish before archiving or restoring this session.");
       }
       try {
-        const updated = await stores.sessions.setArchived(tenantId, sessionId, userId, archived);
-        if (!updated) {
+        const changed = await stores.sessions.setArchived(tenantId, sessionId, userId, archived);
+        if (!changed) {
           reply.code(409);
           return apiError("session_archive_conflict", "The session changed or has a pending approval. Refresh and try again.");
         }
+        const updated = changed.session;
+        // A warm runtime of the session stays: no turn runs, and its next use reads the empty record.
+        await destroyReleasedSandbox(stores, request, { tenantId, sessionId, sandboxId: changed.releasedSandboxId });
         // Match interrupt telemetry: an audit failure does not undo a completed transition.
         try {
           await stores.auditEvents.create({
@@ -648,6 +670,9 @@ async function registerScopedSessionRoutes(
         "Runtime cleanup failed after session deletion"
       );
     }
+    // After the local runtime stops: a stopped runtime does not try to replace the sandbox
+    // when the kill ends a command that still runs in it.
+    await destroyReleasedSandbox(stores, request, { tenantId, sessionId, sandboxId: removed.releasedSandboxId });
 
     // Keep the conversation and its durable runtime state during the
     // configured recovery period. The retention worker purges them after expiry.

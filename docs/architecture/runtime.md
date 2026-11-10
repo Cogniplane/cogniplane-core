@@ -43,7 +43,7 @@ variables named here.
 | | Normal chat | Project chat |
 |---|---|---|
 | Graph state | Postgres checkpointer, `thread_id` = session id | In-memory checkpoints for the life of the runtime; each turn rebuilds history from saved user and assistant messages |
-| Sandbox binding | Sandbox id saved; any replica reconnects while it exists | Not saved; a new runtime starts a new sandbox |
+| Sandbox binding | Sandbox id saved; any replica reconnects while it exists; archive, delete and purge kill it ([sandbox](sandbox.md#e2b-sandbox)) | Not saved; a new runtime starts a new sandbox |
 | Personal skills and defaults | Yes | No |
 
 ## Checkpointer

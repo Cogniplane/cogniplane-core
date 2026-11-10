@@ -141,7 +141,9 @@ retention policy.
 tenant's rows and writes a receipt (`tenant_deletion_receipts`) in one
 transaction, then removes storage objects and checkpoint threads, which are
 queued in `tenant_deletion_cleanup`. It flushes the whole Redis database of
-`REDIS_URL`, so it signs out every user of the environment.
+`REDIS_URL`, so it signs out every user of the environment. It kills no E2B
+sandbox: a sandbox of the tenant runs until E2B expires it
+(`E2B_SANDBOX_TIMEOUT_MS` after its last turn start).
 
 ```bash
 MIGRATION_DATABASE_URL=... pnpm --filter @cogniplane/backend tenant:delete \

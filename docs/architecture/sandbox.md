@@ -18,6 +18,21 @@ the variables named here.
   tools rely on the E2B VM boundary.
 - The sandbox is created at the first shell or workspace file call and kept per
   session.
+- Archive, delete and purge of a normal chat kill its saved sandbox. The session
+  store reads `sessions.sandbox_id` under the session row lock and clears it in
+  the transaction that changes the status. The status change also stops the
+  execution lease, so after that transaction no runtime can adopt the sandbox.
+  The kill (`services/runtime/e2b-sandbox-disposal.ts`) therefore needs no lease
+  check. It sends no connect, and makes up to four tries inside
+  `E2B_NETWORK_CONFIRM_TIMEOUT_MS`. A restored chat starts a new sandbox at its
+  next shell or file call, with no `Workspace reset` notice.
+- Idle teardown, runtime invalidation and shutdown do not kill a saved sandbox:
+  the next turn, on any replica, reconnects to it.
+- Known limits of the disposal kill: a kill that fails after its tries, or a
+  process that stops between the commit and the kill, leaves the sandbox with its
+  files and its network until E2B expires it (`E2B_SANDBOX_TIMEOUT_MS` after the
+  last turn start). The error log names the sandbox; nothing tries the kill again,
+  because the session row no longer names it. Tenant deletion kills no sandbox.
 - Limits: `DEEP_AGENTS_EXECUTE_TIMEOUT_MS` per command, an output cap
   (`MAX_EXECUTE_OUTPUT_CHARS` in `deep-agents-e2b-backend.ts`), and
   `E2B_SANDBOX_TIMEOUT_MS`, a lifetime deadline that each turn start extends

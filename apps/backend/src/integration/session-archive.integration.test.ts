@@ -25,7 +25,7 @@ describe.skipIf(!adminDatabaseUrl())("session archive persistence", () => {
 
     expect(await store.setArchived(foreignTenant, id, user, true)).toBeNull();
     expect(await store.setArchived(tenant, id, foreignUser, true)).toBeNull();
-    const archived = await store.setArchived(tenant, id, user, true);
+    const archived = (await store.setArchived(tenant, id, user, true))?.session;
     expect(archived).toMatchObject({ status: "archived", archivedAt: expect.any(String) });
     expect((await store.listPage(tenant, user)).sessions).toEqual([]);
     expect((await store.listPage(tenant, user, { status: "archived" })).sessions).toEqual([{
@@ -41,16 +41,16 @@ describe.skipIf(!adminDatabaseUrl())("session archive persistence", () => {
     expect((await saver!.getTuple(config))?.checkpoint.channel_values).toEqual({ messages: ["preserved history"] });
     expect((await superuserPool().query("SELECT message_id FROM messages WHERE session_id = $1", [id])).rows).toEqual([{ message_id: messageId }]);
 
-    const restored = await store.setArchived(tenant, id, user, false);
+    const restored = (await store.setArchived(tenant, id, user, false))?.session;
     expect(restored?.status).toBe("active");
     expect(restored).not.toHaveProperty("archivedAt");
     expect((await store.listPage(tenant, user, { status: "archived" })).sessions).toEqual([]);
     expect((await store.listPage(tenant, user)).sessions.map((row) => row.sessionId)).toEqual([id]);
     expect((await saver!.getTuple(config))?.checkpoint.channel_values).toEqual({ messages: ["preserved history"] });
     await store.setArchived(tenant, id, user, true);
-    expect(await store.remove(foreignTenant, id, user)).toBe(false);
-    expect(await store.remove(tenant, id, foreignUser)).toBe(false);
-    expect(await store.remove(tenant, id, user)).toBe(true);
+    expect(await store.remove(foreignTenant, id, user)).toBeNull();
+    expect(await store.remove(tenant, id, foreignUser)).toBeNull();
+    expect(await store.remove(tenant, id, user)).toEqual({ releasedSandboxId: null });
     expect(await store.setArchived(tenant, id, user, false)).toBeNull();
     expect((await store.listPage(tenant, user, { status: "archived" })).sessions).toEqual([]);
     await saver!.deleteThread(id);
@@ -70,7 +70,7 @@ describe.skipIf(!adminDatabaseUrl())("session archive persistence", () => {
     const archived = (await store.listPage(tenant, user, { status: "archived", purposes })).sessions;
     expect(archived.map((session) => session.sessionId).sort()).toEqual([normal.sessionId, improvement.sessionId].sort());
     expect((await store.listPage(tenant, user, { status: "archived", purposes: "all" })).sessions).toHaveLength(3);
-    const restored = await store.setArchived(tenant, scheduled.sessionId, user, false);
+    const restored = (await store.setArchived(tenant, scheduled.sessionId, user, false))?.session;
     expect(restored?.purpose).toBe("scheduled");
     expect((await store.listPage(tenant, user, { purposes })).sessions).toEqual([]);
   });
@@ -115,6 +115,6 @@ describe.skipIf(!adminDatabaseUrl())("session archive persistence", () => {
     expect(await store.setArchived(tenant, id, user, true)).toBeNull();
     expect((await store.getOwned(tenant, id, user))?.status).toBe("active");
     await superuserPool().query("UPDATE approvals SET status = 'rejected' WHERE approval_id = $1", [approval]);
-    expect((await store.setArchived(tenant, id, user, true))?.status).toBe("archived");
+    expect((await store.setArchived(tenant, id, user, true))?.session.status).toBe("archived");
   });
 });

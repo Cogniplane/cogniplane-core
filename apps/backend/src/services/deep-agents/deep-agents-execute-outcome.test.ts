@@ -25,7 +25,8 @@ vi.mock("../runtime/e2b-sandbox.js", async (importOriginal) => {
   return { ...actual, loadE2bSandboxClass: (async () => ({
     create: async () => control.sandbox!,
     connect: async () => { throw new Error("Unexpected sandbox reconnect"); },
-    getInfo: async () => ({ network: { denyOut: ["0.0.0.0/0"], allowPublicTraffic: false } })
+    getInfo: async () => ({ network: { denyOut: ["0.0.0.0/0"], allowPublicTraffic: false } }),
+    kill: async () => { throw new Error("Unexpected sandbox kill by id"); }
   })) satisfies typeof loadE2bSandboxClass };
 });
 

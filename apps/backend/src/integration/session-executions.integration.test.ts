@@ -453,13 +453,13 @@ describe.skipIf(!adminDatabaseUrl())("durable session execution", () => {
 
   test("project session archive and restore retries are idempotent", async () => {
     const h = await setup();
-    const archive = await h.sessions.setArchived(h.tenantId, h.sessionId, h.userId, true);
+    const archive = (await h.sessions.setArchived(h.tenantId, h.sessionId, h.userId, true))?.session;
     expect(archive).toMatchObject({ sessionId: h.sessionId, status: "archived", projectId: h.owner.projectId });
-    const archiveRetry = await h.sessions.setArchived(h.tenantId, h.sessionId, h.userId, true);
+    const archiveRetry = (await h.sessions.setArchived(h.tenantId, h.sessionId, h.userId, true))?.session;
     expect(archiveRetry).toMatchObject({ sessionId: h.sessionId, status: "archived", projectId: h.owner.projectId });
-    const restore = await h.sessions.setArchived(h.tenantId, h.sessionId, h.userId, false);
+    const restore = (await h.sessions.setArchived(h.tenantId, h.sessionId, h.userId, false))?.session;
     expect(restore).toMatchObject({ sessionId: h.sessionId, status: "active", projectId: h.owner.projectId });
-    const restoreRetry = await h.sessions.setArchived(h.tenantId, h.sessionId, h.userId, false);
+    const restoreRetry = (await h.sessions.setArchived(h.tenantId, h.sessionId, h.userId, false))?.session;
     expect(restoreRetry).toMatchObject({ sessionId: h.sessionId, status: "active", projectId: h.owner.projectId });
   });
 
@@ -491,13 +491,13 @@ describe.skipIf(!adminDatabaseUrl())("durable session execution", () => {
     await expect(sessions.remove(h.tenantId, h.sessionId, viewer)).rejects.toMatchObject({ status: 403 });
     expect(await sessions.rename(h.tenantId, h.sessionId, viewer, "Forbidden")).toBeNull();
     expect(await sessions.rename(h.tenantId, h.sessionId, h.editorId, "Edited title")).toMatchObject({ sessionName: "Edited title" });
-    expect(await sessions.setArchived(h.tenantId, h.sessionId, h.editorId, true)).toMatchObject({ status: "archived", userId: h.userId });
+    expect(await sessions.setArchived(h.tenantId, h.sessionId, h.editorId, true)).toMatchObject({ session: { status: "archived", userId: h.userId } });
     await h.projects.setArchived(h.tenantId, h.userId, h.owner.projectId, true);
     await expect(sessions.setArchived(h.tenantId, h.sessionId, h.editorId, false)).rejects.toMatchObject({ code: "project_archived" });
     await expect(sessions.remove(h.tenantId, h.sessionId, h.editorId)).rejects.toMatchObject({ code: "project_archived" });
     await h.projects.setArchived(h.tenantId, h.userId, h.owner.projectId, false);
-    expect(await sessions.setArchived(h.tenantId, h.sessionId, h.editorId, false)).toMatchObject({ status: "active" });
-    expect(await sessions.remove(h.tenantId, h.sessionId, h.editorId)).toBe(true);
+    expect(await sessions.setArchived(h.tenantId, h.sessionId, h.editorId, false)).toMatchObject({ session: { status: "active" } });
+    expect(await sessions.remove(h.tenantId, h.sessionId, h.editorId)).toEqual({ releasedSandboxId: null });
   });
 
   test("an admitted shared turn prevents capability edits before any streaming message exists", async () => {

@@ -215,7 +215,7 @@ describe.skipIf(!adminDatabaseUrl())("shared session reads", () => {
     expect((await h.app.inject(`/sessions/${personal.sessionId}/messages`)).statusCode).toBe(404);
     expect((await h.app.inject(`/sessions/${personal.sessionId}/artifacts`)).statusCode).toBe(404);
     expect((await h.app.inject(`/artifacts/${artifact.artifactId}/preview-text`)).statusCode).toBe(200);
-    expect(await h.sessions.remove(h.tenantId, personal.sessionId, h.userId)).toBe(true);
+    expect(await h.sessions.remove(h.tenantId, personal.sessionId, h.userId)).toEqual({ releasedSandboxId: null });
     expect((await h.app.inject(`/sessions/${personal.sessionId}/messages`)).statusCode).toBe(404);
     expect((await h.app.inject("/artifacts")).json().items).toEqual(expect.arrayContaining([
       expect.objectContaining({ artifactId: artifact.artifactId }),

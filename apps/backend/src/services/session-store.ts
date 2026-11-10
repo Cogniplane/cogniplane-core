@@ -90,7 +90,18 @@ export type SessionPageOptions = SessionListOptions & {
 export type SessionTrashCleanupOptions = {
   batchSize?: number;
   purgeRuntime?: (input: { tenantId: string; sessionId: string; userId: string }) => Promise<void>;
+  /**
+   * Kills a sandbox that a purged row still named. It runs after the commit, once the
+   * row is gone, and must not throw: nothing tries again (see SessionStore.remove).
+   */
+  destroySandbox?: (input: { tenantId: string; sessionId: string; sandboxId: string }) => Promise<void>;
 };
+
+/**
+ * Archive and delete take the saved sandbox of the session (`sessions.sandbox_id`).
+ * The caller kills `releasedSandboxId` after the commit; null means there is nothing to kill.
+ */
+export type SessionSandboxRelease = { releasedSandboxId: string | null };
 
 type SessionStorageGcRow = {
   tenant_id: string;
@@ -183,7 +194,7 @@ export class SessionStore {
     if (projectId) await requireProjectAccess(client, { tenantId, projectId, userId }, "editor", { lock: true, active: options.active ?? true });
     else if (initial.rows[0].user_id !== userId) return false;
     // Admission and assignment also lock project before session.
-    const current = await client.query("SELECT project_id, status, purpose, user_id, capability_selection, capability_version FROM sessions WHERE tenant_id=$1 AND session_id=$2 FOR UPDATE", [tenantId, sessionId]);
+    const current = await client.query("SELECT project_id, status, purpose, user_id, capability_selection, capability_version, sandbox_id FROM sessions WHERE tenant_id=$1 AND session_id=$2 FOR UPDATE", [tenantId, sessionId]);
     if (!current.rows[0] || current.rows[0].project_id !== projectId) return false;
     if (projectId && options.checkBusy !== false) {
       const busy = await client.query(`SELECT 1 WHERE EXISTS (
@@ -196,7 +207,8 @@ export class SessionStore {
     return { projectId, status: current.rows[0].status as SessionRecord["status"],
       purpose: current.rows[0].purpose as string, ownerId: current.rows[0].user_id as string,
       capabilitySelection: current.rows[0].capability_selection as unknown,
-      capabilityVersion: current.rows[0].capability_version as unknown };
+      capabilityVersion: current.rows[0].capability_version as unknown,
+      sandboxId: current.rows[0].sandbox_id as string | null };
   }
 
   // Capability selection is readable project metadata, including for viewers.
@@ -527,9 +539,13 @@ export class SessionStore {
     });
   }
 
+  /**
+   * Archive or restore. Archive also takes the saved sandbox, as `remove` does: a
+   * restored session starts a new sandbox at its next shell or file call.
+   */
   async setArchived(
     tenantId: string, sessionId: string, userId: string, archived: boolean
-  ): Promise<SessionRecord | null> {
+  ): Promise<({ session: SessionRecord } & SessionSandboxRelease) | null> {
     return withTenantScope(this.db, tenantId, async (client) => {
       const locked = await this.lockLifecycleSession(client, tenantId, sessionId, userId, { checkBusy: false, active: false });
       if (!locked) return null;
@@ -540,7 +556,7 @@ export class SessionStore {
            FROM sessions WHERE tenant_id=$1 AND session_id=$2`,
           [tenantId, sessionId]
         );
-        return current.rows[0] ? mapSession(current.rows[0]) : null;
+        return current.rows[0] ? { session: mapSession(current.rows[0]), releasedSandboxId: null } : null;
       }
       if (locked.projectId) {
         await requireProjectAccess(client, { tenantId, projectId: locked.projectId, userId }, "editor", { active: true });
@@ -556,7 +572,9 @@ export class SessionStore {
       const result = await client.query(
         `UPDATE sessions s
          SET status = $4, archived_at = CASE WHEN $4 = 'archived' THEN NOW() ELSE NULL END,
-             deleted_at = NULL, updated_at = NOW()
+             deleted_at = NULL, updated_at = NOW(),
+             sandbox_id = CASE WHEN $4 = 'archived' THEN NULL ELSE s.sandbox_id END,
+             sandbox_network_policy = CASE WHEN $4 = 'archived' THEN NULL ELSE s.sandbox_network_policy END
          WHERE s.tenant_id = $1 AND s.session_id = $2 AND ${sessionLifecycleAccessSql("s", "$3")}
            AND s.status = $5 AND s.purpose <> 'project_reference'
            AND ($4 <> 'archived' OR NOT EXISTS (
@@ -566,23 +584,35 @@ export class SessionStore {
          RETURNING ${SESSION_COLUMNS}`,
         [tenantId, sessionId, userId, archived ? "archived" : "active", archived ? "active" : "archived"]
       );
-      return result.rows[0] ? mapSession(result.rows[0]) : null;
+      if (!result.rows[0]) return null;
+      return { session: mapSession(result.rows[0]), releasedSandboxId: archived ? locked.sandboxId : null };
     });
   }
 
-  async remove(tenantId: string, sessionId: string, userId: string): Promise<boolean> {
+  /**
+   * Move the session to the trash, and take its saved sandbox. The id is read under
+   * the session row lock and cleared in the same UPDATE that changes the status, and
+   * that change stops the execution lease (trigger `session_execution_revocation`).
+   * After the commit no runtime can load the sandbox or write a record over it, so the
+   * caller kills it with no lease check. Only a normal chat saves a sandbox
+   * (`SessionExecutionStore.bindSandboxId`). A project chat has none, except a chat that
+   * moved into a project: it keeps the sandbox of its normal chat, and no project turn loads it.
+   */
+  async remove(tenantId: string, sessionId: string, userId: string): Promise<SessionSandboxRelease | null> {
     return withTenantScope(this.db, tenantId, async (client) => {
-      if (!await this.lockLifecycleSession(client, tenantId, sessionId, userId)) return false;
+      const locked = await this.lockLifecycleSession(client, tenantId, sessionId, userId);
+      if (!locked) return null;
       const removalUpdate = await client.query(
         `
           UPDATE sessions s
-          SET status = 'deleted', deleted_at = NOW(), updated_at = NOW()
+          SET status = 'deleted', deleted_at = NOW(), updated_at = NOW(),
+              sandbox_id = NULL, sandbox_network_policy = NULL
           WHERE tenant_id = $1 AND session_id = $2 AND ${sessionLifecycleAccessSql("s", "$3")}
             AND status IN ('active', 'archived') AND purpose <> 'project_reference'
         `,
         [tenantId, sessionId, userId]
       );
-      return (removalUpdate.rowCount ?? 0) > 0;
+      return (removalUpdate.rowCount ?? 0) > 0 ? { releasedSandboxId: locked.sandboxId } : null;
     });
   }
 
@@ -626,6 +656,8 @@ export class SessionStore {
         [limit, this.retentionDays],
       );
       let deletedSessions = 0;
+      // Delete takes the sandbox, but a row that an earlier version trashed can still name one.
+      const releasedSandboxes: Array<{ tenantId: string; sessionId: string; sandboxId: string }> = [];
       for (const candidate of candidates.rows) {
         const artifacts = await db.query<{ storage_key: string }>(
           `SELECT DISTINCT storage_key FROM artifacts
@@ -659,13 +691,16 @@ export class SessionStore {
           `DELETE FROM session_executions WHERE tenant_id=$1 AND session_id=$2`,
           [candidate.tenant_id, candidate.session_id],
         );
-        const deleted = await db.query(
+        const deleted = await db.query<{ sandbox_id: string | null }>(
           `DELETE FROM sessions
            WHERE tenant_id=$1 AND session_id=$2 AND status='deleted'
-             AND deleted_at <= NOW() - ($3 * INTERVAL '1 day')`,
+             AND deleted_at <= NOW() - ($3 * INTERVAL '1 day')
+           RETURNING sandbox_id`,
           [candidate.tenant_id, candidate.session_id, this.retentionDays],
         );
         deletedSessions += deleted.rowCount ?? 0;
+        const sandboxId = deleted.rows[0]?.sandbox_id;
+        if (sandboxId) releasedSandboxes.push({ tenantId: candidate.tenant_id, sessionId: candidate.session_id, sandboxId });
       }
 
       const storageGc = await db.query<SessionStorageGcRow>(
@@ -702,7 +737,7 @@ export class SessionStore {
          RETURNING gc.tenant_id, gc.session_id, gc.user_id`,
         [limit],
       );
-      return { deletedSessions, storageGc: storageGc.rows, runtimeGc: runtimeGc.rows };
+      return { deletedSessions, releasedSandboxes, storageGc: storageGc.rows, runtimeGc: runtimeGc.rows };
     });
 
     let deletedObjects = 0;
@@ -777,6 +812,11 @@ export class SessionStore {
           );
         }
       }
+    }
+
+    // Last, so that a kill that hangs to its deadline does not hold the GC work above.
+    if (options.destroySandbox) {
+      for (const released of committed.releasedSandboxes) await options.destroySandbox(released);
     }
     return { deletedSessions: committed.deletedSessions, deletedObjects, purgedRuntimes };
   }
