@@ -8,6 +8,7 @@ import { requireBrowserAuthOrigin } from "../lib/browser-auth-origin.js";
 import type { Pool } from "../lib/db.js";
 import {
   type AuthMethod,
+  type RefreshTokenPayload,
   signAccessToken,
   signRefreshToken,
   verifyRefreshToken
@@ -15,7 +16,7 @@ import {
 import type { RefreshRotationResult, UnauditedReuse } from "../lib/refresh-token-store.js";
 import type { AuditEventStore } from "../services/audit-event-store.js";
 import { RefreshTokenRotationService } from "../services/auth/refresh-token-rotation-service.js";
-import { enforceOAuthCallbackRateLimit } from "../services/integrations/oauth-callback-rate-limit.js";
+import { clientIp, enforceRateLimit, type RateLimitKey } from "../services/rate-limit-reply.js";
 import type { RequestLimitsInterface } from "../services/request-limits.js";
 import { PrivilegedAuthStateLookup } from "../services/tenant-member-store.js";
 
@@ -144,6 +145,28 @@ async function auditKeptReuse(
   }
 }
 
+/** The claims of a refresh token whose signature and lifetime are valid, or null. */
+async function verifiedRefreshToken(config: AppConfig, token: string | undefined): Promise<RefreshTokenPayload | null> {
+  if (!token) return null;
+  try {
+    return await verifyRefreshToken(config, token);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The limit of /auth/refresh and /auth/logout (`auth_refresh`). A verified
+ * token counts against its refresh family, so the people behind one IP, and
+ * the other sign-ins of one person, do not share a count; a revoked family can
+ * use up only its own. A request without a valid token counts against the
+ * client IP. The subject never comes from a claim that was not verified.
+ */
+function refreshRateLimitKey(request: FastifyRequest, payload: RefreshTokenPayload | null): RateLimitKey {
+  const subject = payload ? `family:${payload.fid}` : `ip:${clientIp(request)}`;
+  return { resource: "auth_refresh", userId: subject, tenantId: subject };
+}
+
 function requireRefreshTokenStore(app: FastifyInstance) {
   if (!app.redis) {
     throw new Error("Redis is required for refresh token revocation.");
@@ -262,17 +285,18 @@ export async function registerSessionRoutes(
     if (!requireBrowserAuthOrigin(request, reply, config.API_ORIGIN, { requireJson: false })) {
       return reply;
     }
-    if (await enforceOAuthCallbackRateLimit(request, reply, limits)) return reply;
 
+    // The signature check comes first, because the limit needs the verified
+    // family. It reads no store; the limit comes before every store read. A
+    // limiter outage lets the request through. The claim below uses the same
+    // Redis and answers 503 when it is down.
     const refreshToken = (request.cookies as Record<string, string>)?.[REFRESH_COOKIE_NAME];
+    const payload = await verifiedRefreshToken(config, refreshToken);
+    if (await enforceRateLimit(request, reply, limits, refreshRateLimitKey(request, payload))) return reply;
     if (!refreshToken) {
       return reply.code(401).send({ error: "missing_refresh_token" });
     }
-
-    let payload: Awaited<ReturnType<typeof verifyRefreshToken>>;
-    try {
-      payload = await verifyRefreshToken(config, refreshToken);
-    } catch {
+    if (!payload) {
       return reply.code(401).send({ error: "invalid_refresh_token" });
     }
 
@@ -446,29 +470,25 @@ export async function registerSessionRoutes(
     if (!requireBrowserAuthOrigin(request, reply, config.API_ORIGIN, { requireJson: false })) {
       return reply;
     }
-    if (await enforceOAuthCallbackRateLimit(request, reply, limits)) return reply;
 
+    // The same limit as refresh: per verified family, or per client IP. A
+    // limiter outage lets the sign-out through.
     const refreshToken = (request.cookies as Record<string, string>)?.[REFRESH_COOKIE_NAME];
+    const verified = await verifiedRefreshToken(config, refreshToken);
+    if (await enforceRateLimit(request, reply, limits, refreshRateLimitKey(request, verified))) return reply;
 
     // Revoke the entire refresh-token family so any rotated jti from the
-    // same login chain becomes unusable.
-    if (refreshToken) {
-      let familyId: string | null = null;
+    // same login chain becomes unusable. An expired or invalid token has no
+    // family to revoke.
+    if (verified) {
       try {
-        familyId = (await verifyRefreshToken(config, refreshToken)).fid;
-      } catch {
-        // An expired or invalid token has no family to revoke.
-      }
-      if (familyId) {
-        try {
-          await refreshTokens.revoke(familyId);
-        } catch (error) {
-          // The family is still active. Keep the cookie, so that the client
-          // can retry. A 200 here would report a sign-out that did not occur.
-          request.log.error({ err: error }, "auth logout: refresh-family revocation failed");
-          reply.header("Retry-After", "1");
-          return reply.code(503).send({ error: "logout_unavailable" });
-        }
+        await refreshTokens.revoke(verified.fid);
+      } catch (error) {
+        // The family is still active. Keep the cookie, so that the client
+        // can retry. A 200 here would report a sign-out that did not occur.
+        request.log.error({ err: error }, "auth logout: refresh-family revocation failed");
+        reply.header("Retry-After", "1");
+        return reply.code(503).send({ error: "logout_unavailable" });
       }
     }
 

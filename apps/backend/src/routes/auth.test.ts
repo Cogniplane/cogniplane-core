@@ -14,9 +14,12 @@ import { FakePool } from "../test-helpers/fake-pool.js";
 import { FakeRefreshTokenRedis } from "../test-helpers/fake-refresh-token-redis.js";
 import { createFakeWorkOS, type FakeWorkOSHandlers } from "../test-helpers/fake-workos.js";
 import { InMemoryAuditEventStore } from "../test-helpers/in-memory-audit-events.js";
-import type {
-  LimitExceededErrorPayload,
-  RequestLimitsInterface
+import { FakeLimitRedis } from "../test-helpers/fake-limit-redis.js";
+import { RedisRequestLimits, RequestLimitsUnavailableError } from "../services/redis-request-limits.js";
+import {
+  RequestLimits,
+  type LimitExceededErrorPayload,
+  type RequestLimitsInterface
 } from "../services/request-limits.js";
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -160,6 +163,8 @@ async function buildHarness(opts: {
   limits?: RequestLimitsInterface;
   /** Receives every log line at warn level or higher. */
   logLines?: Array<{ level: number; msg: string } & Record<string, unknown>>;
+  /** Fastify's `trustProxy`, as a TRUST_PROXY IP/CIDR list. Default: trust nothing. */
+  trustProxy?: string;
 } = {}): Promise<Harness> {
   const pool = new FakePool();
   const redis = new FakeRefreshTokenRedis();
@@ -175,9 +180,10 @@ async function buildHarness(opts: {
   });
 
   const logLines = opts.logLines;
-  const app = logLines
-    ? Fastify({ logger: { level: "warn", stream: { write: (line: string) => { logLines.push(JSON.parse(line)); } } } })
-    : Fastify();
+  const app = Fastify({
+    ...(logLines ? { logger: { level: "warn", stream: { write: (line: string) => { logLines.push(JSON.parse(line)); } } } } : {}),
+    ...(opts.trustProxy ? { trustProxy: opts.trustProxy } : {})
+  });
   // The production error handler, so the tests see the status and body that
   // a client gets for an error the route does not handle.
   app.setErrorHandler(handleAppError);
@@ -343,7 +349,7 @@ describe("GET /auth/login", () => {
 
     expectRateLimited(res);
     expect(consumeRateLimit).toHaveBeenCalledWith({
-      resource: "oauth_callback",
+      resource: "auth_sign_in",
       userId: "127.0.0.1",
       tenantId: "127.0.0.1"
     });
@@ -1008,7 +1014,7 @@ describe("POST /auth/refresh", () => {
     expect(res.json()).toEqual({ error: "missing_refresh_token" });
   });
 
-  test("rate-limits before reading or rotating the refresh token", async () => {
+  test("rate-limits before any store read or rotation of the refresh token", async () => {
     const { limits } = createThrottledLimits();
     const throttled = await buildHarness({ limits });
 
@@ -1794,6 +1800,238 @@ describe("POST /auth/logout", () => {
     // The family must still be active — a forged logout cannot revoke it.
     expect(harness.redis.store.get(`refresh_family:${familyId}`)).toBe("active");
     expect(consumeRateLimit).not.toHaveBeenCalled();
+  });
+});
+
+// Issue #47. These tests use the real limiters, not a mock that refuses
+// everything. Every injected request comes from 127.0.0.1, as when many
+// people are behind one NAT or one proxy.
+describe("auth rate limits, with the real limiter", () => {
+  type Response = Awaited<ReturnType<Harness["app"]["inject"]>>;
+
+  /** Sends until the first 429. Fails when no refusal comes. */
+  async function untilRefused(send: () => Promise<Response>): Promise<Response> {
+    for (let attempt = 0; attempt < 500; attempt += 1) {
+      const res = await send();
+      if (res.statusCode === 429) return res;
+    }
+    throw new Error("the limit never refused a request");
+  }
+
+  async function signIn(h: Harness, userId: string, familyId: string): Promise<string> {
+    const jti = `jti-${familyId}`;
+    await issueRefreshJti(h.redis, { jti, familyId, ttlSeconds: 60 });
+    return signRefreshToken(TEST_CONFIG, { sub: userId, tid: "tenant-1", jti, fid: familyId });
+  }
+
+  function refresh(h: Harness, token?: string, extra: Record<string, unknown> = {}) {
+    return h.app.inject({
+      method: "POST",
+      url: "/auth/refresh",
+      ...(token === undefined ? {} : { cookies: { cogniplane_refresh: token } }),
+      ...extra
+    });
+  }
+
+  function logout(h: Harness, token?: string) {
+    return h.app.inject({
+      method: "POST",
+      url: "/auth/logout",
+      ...(token === undefined ? {} : { cookies: { cogniplane_refresh: token } })
+    });
+  }
+
+  function startWorkosLogin(h: Harness) {
+    h.workosMocks.getAuthorizationUrlWithPKCE.mockResolvedValue({
+      url: "https://api.workos.com/auth/authorize?state=stub",
+      state: "s".repeat(43),
+      codeVerifier: TEST_PKCE_VERIFIER
+    });
+  }
+
+  async function harnessWith(limits: RequestLimitsInterface, opts: Parameters<typeof buildHarness>[0] = {}) {
+    const h = await buildHarness({ ...opts, limits });
+    h.pool.onQuery(/SELECT email FROM users/, () => ({ rows: [{ email: "person@example.com" }], rowCount: 1 }));
+    startWorkosLogin(h);
+    return h;
+  }
+
+  /** Records the subject of each limiter call, then asks the real limiter. */
+  function recording(limits: RequestLimitsInterface) {
+    const subjects: string[] = [];
+    const wrapped = {
+      consumeRateLimit: (input: Parameters<RequestLimitsInterface["consumeRateLimit"]>[0]) => {
+        subjects.push(`${input.resource} ${input.userId}`);
+        return limits.consumeRateLimit(input);
+      }
+    } as unknown as RequestLimitsInterface;
+    return { subjects, limits: wrapped };
+  }
+
+  test("exhausting public sign-in on one IP does not block refresh or sign-out of the people behind it", async () => {
+    const h = await harnessWith(RequestLimits.fromAppConfig(TEST_CONFIG));
+    const loginRefused = await untilRefused(() => h.app.inject({ method: "GET", url: "/auth/login" }));
+    const callbackRefused = await h.app.inject({ method: "POST", url: "/auth/callback", payload: { code: "c", state: "s" } });
+
+    const alice = await refresh(h, await signIn(h, "user-alice", "fid-alice"));
+    const bob = await refresh(h, await signIn(h, "user-bob", "fid-bob"));
+    const carolOut = await logout(h, await signIn(h, "user-carol", "fid-carol"));
+
+    expect(alice.statusCode).toBe(200);
+    expect(bob.statusCode).toBe(200);
+    expect(carolOut.statusCode).toBe(200);
+    expect(h.redis.store.get("refresh_family:fid-carol")).toBe("revoked");
+    expect(loginRefused.json()).toMatchObject({ error: "limit_exceeded", resource: "auth_sign_in", scope: "user", limit: 20 });
+    expect(callbackRefused.statusCode).toBe(429);
+    expect(h.workosMocks.authenticateWithCode).not.toHaveBeenCalled();
+  });
+
+  test("a revoked family that reaches its limit does not block another family of the same person", async () => {
+    const h = await harnessWith(RequestLimits.fromAppConfig(TEST_CONFIG));
+    const stolen = await signIn(h, "user-alice", "fid-stolen");
+    h.redis.store.set("refresh_family:fid-stolen", "revoked");
+
+    const refused = await untilRefused(() => refresh(h, stolen));
+    const current = await refresh(h, await signIn(h, "user-alice", "fid-current"));
+    expect(current.statusCode).toBe(200);
+    const rotated = parseSetCookie(current.headers["set-cookie"], "cogniplane_refresh")!.value;
+    const signedOut = await logout(h, rotated);
+
+    expect(signedOut.statusCode).toBe(200);
+    expect(h.redis.store.get("refresh_family:fid-current")).toBe("revoked");
+    expect(refused.json()).toMatchObject({ error: "limit_exceeded", resource: "auth_refresh", scope: "user", limit: 60 });
+    const retryAfter = Number(refused.headers["retry-after"]);
+    expect(retryAfter).toBeGreaterThanOrEqual(1);
+    expect(retryAfter).toBeLessThanOrEqual(60);
+    expect(retryAfter).toBe(Math.max(1, Math.ceil(refused.json().retryAfterMs / 1000)));
+    // The abused family stays refused, for refresh and for sign-out.
+    expect((await logout(h, stolen)).statusCode).toBe(429);
+  });
+
+  test("a forged or expired refresh token counts per IP and cannot use or exhaust a family's limit", async () => {
+    const { limits, subjects } = recording(RequestLimits.fromAppConfig(TEST_CONFIG));
+    const h = await harnessWith(limits);
+    const victim = await signIn(h, "user-victim", "fid-victim");
+    const claims = { sub: "user-victim", tid: "tenant-1", jti: "jti-forged", fid: "fid-victim" };
+    const otherKey = await signRefreshToken({ ...TEST_CONFIG, JWT_SECRET: "a-secret-that-is-not-the-server-one!!" }, claims);
+    const encode = (value: object) => Buffer.from(JSON.stringify(value)).toString("base64url");
+    const unsigned = `${encode({ alg: "none", kid: TEST_CONFIG.JWT_KEY_ID })}.${encode({ ...claims, iss: "cogniplane", aud: "cogniplane-refresh" })}.`;
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(Date.now() - 8 * 24 * 60 * 60 * 1000);
+    let expired: string;
+    try {
+      expired = await signRefreshToken(TEST_CONFIG, claims);
+    } finally {
+      vi.useRealTimers();
+    }
+
+    const refused = await untilRefused(async () => {
+      for (const token of [otherKey, unsigned, expired]) {
+        const res = await refresh(h, token);
+        if (res.statusCode === 429) return res;
+        expect(res.statusCode).toBe(401);
+      }
+      return logout(h, otherKey);
+    });
+    const victimRefresh = await refresh(h, victim);
+
+    expect(victimRefresh.statusCode).toBe(200);
+    expect(refused.json()).toMatchObject({ resource: "auth_refresh", scope: "user" });
+    expect(new Set(subjects.slice(0, -1))).toEqual(new Set(["auth_refresh ip:127.0.0.1"]));
+    expect(subjects.at(-1)).toBe("auth_refresh family:fid-victim");
+  });
+
+  test("refresh and sign-out without a cookie count per IP, apart from signed-in families", async () => {
+    const h = await harnessWith(RequestLimits.fromAppConfig(TEST_CONFIG));
+
+    const refused = await untilRefused(() => refresh(h));
+    const outRefused = await logout(h);
+    const signedIn = await refresh(h, await signIn(h, "user-alice", "fid-alice"));
+
+    expect(signedIn.statusCode).toBe(200);
+    expect(refused.json()).toMatchObject({ resource: "auth_refresh", scope: "user", limit: 60 });
+    expect(outRefused.statusCode).toBe(429);
+    expect(outRefused.headers["retry-after"]).toMatch(/^[1-9]\d*$/);
+  });
+
+  test("a limiter outage lets a valid refresh and sign-out through, and logs no token", async () => {
+    const logLines: Array<{ level: number; msg: string } & Record<string, unknown>> = [];
+    const limits = {
+      consumeRateLimit: async () => { throw new RequestLimitsUnavailableError(new Error("connect ECONNREFUSED 10.1.2.3:6379")); }
+    } as unknown as RequestLimitsInterface;
+    const h = await harnessWith(limits, { logLines });
+    const token = await signIn(h, "user-alice", "fid-outage");
+
+    const refreshed = await refresh(h, token);
+    const rotated = parseSetCookie(refreshed.headers["set-cookie"], "cogniplane_refresh")!.value;
+    const signedOut = await logout(h, rotated);
+
+    expect(refreshed.statusCode).toBe(200);
+    expect(signedOut.statusCode).toBe(200);
+    expect(h.redis.store.get("refresh_family:fid-outage")).toBe("revoked");
+    expect(logLines.filter((line) => line.level === 40).map((line) => [line.msg, line.resource])).toEqual([
+      ["rate limiter unavailable", "auth_refresh"],
+      ["rate limiter unavailable", "auth_refresh"]
+    ]);
+    const logged = JSON.stringify(logLines);
+    expect(logged).not.toContain(token);
+    expect(logged).not.toContain(rotated);
+    expect(logged).not.toContain("fid-outage");
+  });
+
+  test("the Redis limiter keys sign-in on the IP and refresh on the verified family, in the configured window", async () => {
+    const fake = new FakeLimitRedis();
+    const config = createTestConfig({ ...TEST_CONFIG, RATE_LIMIT_WINDOW_MS: 45_000 });
+    const h = await harnessWith(RedisRequestLimits.fromAppConfig(fake.asRedis(), config));
+    const token = await signIn(h, "user-alice", "fid-redis");
+
+    expect((await h.app.inject({ method: "GET", url: "/auth/login" })).statusCode).toBe(200);
+    expect((await refresh(h, token)).statusCode).toBe(200);
+    expect((await refresh(h, "not-a-real-jwt")).statusCode).toBe(401);
+
+    expect([...fake.counters.keys()]).toEqual([
+      "rl:auth_sign_in:user:127.0.0.1",
+      "rl:auth_refresh:user:family:fid-redis",
+      "rl:auth_refresh:user:ip:127.0.0.1"
+    ]);
+    for (const key of fake.counters.keys()) {
+      expect(fake.windowOf(key)).toBeGreaterThan(44_000);
+      expect(fake.windowOf(key)).toBeLessThanOrEqual(45_000);
+    }
+  });
+
+  describe("behind a proxy", () => {
+    function viaProxy(h: Harness, client: string) {
+      return () => h.app.inject({ method: "GET", url: "/auth/login", remoteAddress: "10.0.0.5", headers: { "x-forwarded-for": client } });
+    }
+
+    test("with TRUST_PROXY set to the proxy, sign-in counts per client, and a forged X-Forwarded-For counts against its sender", async () => {
+      const h = await harnessWith(RequestLimits.fromAppConfig(TEST_CONFIG), { trustProxy: "10.0.0.0/8" });
+
+      await untilRefused(viaProxy(h, "203.0.113.7"));
+      expect((await viaProxy(h, "203.0.113.8")()).statusCode).toBe(200);
+
+      // A direct client outside the list cannot choose the IP of its bucket.
+      const forging = () => h.app.inject({
+        method: "GET", url: "/auth/login", remoteAddress: "198.51.100.9", headers: { "x-forwarded-for": "203.0.113.8" }
+      });
+      await untilRefused(forging);
+      expect((await viaProxy(h, "203.0.113.8")()).statusCode).toBe(200);
+    });
+
+    test("with TRUST_PROXY=false behind a proxy, sign-in shares the proxy's bucket, but refresh stays per family", async () => {
+      const h = await harnessWith(RequestLimits.fromAppConfig(TEST_CONFIG));
+
+      await untilRefused(viaProxy(h, "203.0.113.7"));
+      const neighbour = await viaProxy(h, "203.0.113.8")();
+      const neighbourRefresh = await refresh(h, await signIn(h, "user-bob", "fid-bob"), {
+        remoteAddress: "10.0.0.5", headers: { "x-forwarded-for": "203.0.113.8" }
+      });
+
+      // The misconfiguration that the TRUST_PROXY boot warning names.
+      expect(neighbour.statusCode).toBe(429);
+      expect(neighbourRefresh.statusCode).toBe(200);
+    });
   });
 });
 

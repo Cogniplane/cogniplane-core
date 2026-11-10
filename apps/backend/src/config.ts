@@ -240,11 +240,19 @@ export const envSchema = z.object({
   // section row and an audit event.
   SETTINGS_WRITE_LIMIT_PER_USER_PER_WINDOW: z.coerce.number().int().min(0).default(20),
   SETTINGS_WRITE_LIMIT_PER_TENANT_PER_WINDOW: z.coerce.number().int().min(0).default(100),
-  // OAuth callback verification (GitHub/Notion). The callbacks are
+  // Integration OAuth callbacks (GitHub, Notion, Microsoft). The callbacks are
   // unauthenticated, so the limit is keyed per source IP (used as both the user
   // and tenant subject) to throttle probing of forged state values.
   OAUTH_CALLBACK_LIMIT_PER_USER_PER_WINDOW: z.coerce.number().int().min(0).default(20),
   OAUTH_CALLBACK_LIMIT_PER_TENANT_PER_WINDOW: z.coerce.number().int().min(0).default(100),
+  // Sign-in steps per client IP: WorkOS login and callback, local password,
+  // link, second-factor, enrolment and passkey steps, and the local step-up
+  // and password change. The per-email throttle of local accounts is separate.
+  AUTH_SIGN_IN_LIMIT_PER_IP_PER_WINDOW: z.coerce.number().int().min(0).default(20),
+  // POST /auth/refresh and /auth/logout per refresh family (one sign-in, shared
+  // by the tabs of a browser). A request without a valid refresh token counts
+  // per client IP. The default allows a browser that opens many tabs at once.
+  AUTH_REFRESH_LIMIT_PER_FAMILY_PER_WINDOW: z.coerce.number().int().min(0).default(60),
   // Admin routes run the heaviest aggregate queries in the app. A compromised
   // admin account could hammer them without this limit. The limit is generous
   // enough for normal dashboard use (many panels load in parallel).
