@@ -53,6 +53,7 @@ function mapRow(row: Record<string, unknown>): PolicyRule {
     conditions: toConditions(row.conditions_json),
     reason: row.reason == null ? null : String(row.reason),
     createdBy: row.created_by == null ? null : String(row.created_by),
+    revision: Number(row.revision),
     createdAt: isoTimestamp(row.created_at),
     updatedAt: isoTimestamp(row.updated_at)
   };
@@ -169,7 +170,15 @@ export class PolicyRuleStore {
     });
   }
 
-  /** Partial update. Only provided fields change; the rest are preserved. */
+  /**
+   * Partial update. Only provided fields change; the rest are preserved.
+   *
+   * `input.expectedRevision` is the revision that the change is based on. When
+   * the rule has another revision, the update throws PolicyRuleConflictError
+   * and writes nothing: no change, no audit event, no owner notice. The check
+   * runs before the weaker-change check, so a stale save never asks for
+   * step-up. A saved change adds 1 to the revision.
+   */
   async update(
     tenantId: string,
     ruleId: string,
@@ -177,12 +186,14 @@ export class PolicyRuleStore {
     options: PolicyRuleWriteOptions<PolicyRule>
   ): Promise<PolicyRule | null> {
     // Read and write in one locked transaction, so two partial updates (or an
-    // update and a reorder) cannot overwrite each other's fields.
+    // update and a reorder) cannot overwrite each other's fields, and of two
+    // saves from the same revision only the first is stored.
     return withTenantScope(this.db, tenantId, async (client) => {
       await lockPolicyRules(client, tenantId);
       const before = await rulesOf(client, tenantId);
       const existing = before.find((rule) => rule.ruleId === ruleId);
       if (!existing) return null;
+      if (existing.revision !== input.expectedRevision) throw new PolicyRuleConflictError();
 
       const next = {
         name: input.name ?? existing.name,
@@ -204,8 +215,9 @@ export class PolicyRuleStore {
             effect = $7,
             conditions_json = $8::jsonb,
             reason = $9,
+            revision = revision + 1,
             updated_at = NOW()
-          WHERE tenant_id = $1 AND rule_id = $2
+          WHERE tenant_id = $1 AND rule_id = $2 AND revision = $10
           RETURNING *
         `,
         [
@@ -217,10 +229,14 @@ export class PolicyRuleStore {
           next.enabled,
           next.effect,
           JSON.stringify(next.conditions),
-          next.reason
+          next.reason,
+          input.expectedRevision
         ]
       );
-      if (!result.rows[0]) return null;
+      // Every store write takes the rule lock. The revision in the WHERE
+      // clause also refuses a change that a writer without the lock committed
+      // after the read above (the UPDATE reads the newest row version).
+      if (!result.rows[0]) throw new PolicyRuleConflictError();
       const rule = mapRow(result.rows[0]);
       const after = before.map((candidate) => (candidate.ruleId === ruleId ? rule : candidate));
       const weaker = weakensPolicy(before, after, [existing, rule]);
@@ -255,7 +271,9 @@ export class PolicyRuleStore {
    * a mismatch means the caller's view drifted (a rule was created/deleted since
    * they fetched the list), so we reject the whole reorder rather than apply it
    * to a stale set. It rewrites priorities to index*10 (gaps for future single
-   * inserts) and returns the new ordering.
+   * inserts) and returns the new ordering. A rule whose priority changes gets
+   * the next revision: its place decides what it does, so an edit from before
+   * the move is refused.
    *
    * Throws {@link PolicyReorderMismatchError} on a set mismatch — the route maps
    * it to a 409 so the UI can refetch and retry.
@@ -279,8 +297,12 @@ export class PolicyRuleStore {
       }
 
       for (let index = 0; index < ruleIds.length; index += 1) {
+        // In SET, `priority` is the value before this UPDATE.
         await client.query(
-          `UPDATE policy_rule SET priority = $3, updated_at = NOW() WHERE tenant_id = $1 AND rule_id = $2`,
+          `UPDATE policy_rule
+              SET revision = CASE WHEN priority = $3 THEN revision ELSE revision + 1 END,
+                  priority = $3, updated_at = NOW()
+            WHERE tenant_id = $1 AND rule_id = $2`,
           [tenantId, ruleIds[index], index * 10]
         );
       }
@@ -331,6 +353,16 @@ async function appendPriority(client: PoolClient, tenantId: string): Promise<num
     [tenantId]
   );
   return Number(result.rows[0]?.next ?? 0);
+}
+
+// Raised by update() when the rule has another revision than the one that the
+// change is based on. The route answers 409 `policy_rule_conflict`, and the
+// editor shows the saved rule next to the draft.
+export class PolicyRuleConflictError extends Error {
+  constructor() {
+    super("The policy rule has another revision than the one that the change is based on.");
+    this.name = "PolicyRuleConflictError";
+  }
 }
 
 // Raised by reorder() when the supplied rule-ID set doesn't match the tenant's

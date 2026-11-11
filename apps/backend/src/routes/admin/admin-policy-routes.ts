@@ -19,6 +19,7 @@ import {
 import type { PolicyDecisionFilters, PolicyRule } from "@cogniplane/shared-types";
 import type { FastifyRequest } from "fastify";
 
+import { apiError } from "../../lib/http-errors.js";
 import { serialize } from "../../lib/serialize-response.js";
 import type { AuditEventInput } from "../../services/audit-event-store.js";
 import type { AuditEventType } from "../../services/audit-event-types.js";
@@ -28,6 +29,7 @@ import type { PolicyDecisionStore } from "../../services/policy/policy-decision-
 import { lintRules } from "../../services/policy/policy-lint.js";
 import {
   PolicyReorderMismatchError,
+  PolicyRuleConflictError,
   type PolicyRuleStore
 } from "../../services/policy/policy-rule-store.js";
 import type { PolicyService } from "../../services/policy/policy-service.js";
@@ -184,7 +186,9 @@ export async function registerAdminPolicyRoutes(
     }
   }));
 
-  // Update a rule (partial).
+  // Update a rule (partial). The body names the revision that the change is
+  // based on (`expectedRevision`); another revision answers 409, so a save
+  // from a stale form cannot replace a newer edit.
   app.patch("/admin/policy/rules/:ruleId", withAdmin(app, async (request, reply) => {
     const params = ruleIdParamsSchema.safeParse(request.params);
     if (!params.success) return respondAdminNotFound(reply, "policy_rule_not_found");
@@ -194,8 +198,9 @@ export async function registerAdminPolicyRoutes(
 
     try {
       const audit = ruleAudit(request, "admin.policy_rule.updated", ruleChange("rule_changed"),
-        (rule: PolicyRule) => ({ ruleId: rule.ruleId, effect: rule.effect, enabled: rule.enabled }));
-      // A missing rule answers 404 before any classification: it spends no step-up token.
+        (rule: PolicyRule) => ({ ruleId: rule.ruleId, effect: rule.effect, enabled: rule.enabled, revision: rule.revision }));
+      // A missing rule (404) and another revision (409) answer before any
+      // classification: they spend no step-up token and write nothing.
       const written = await stores.dataRoutes.writeWithStepUpIfWeaker(request, reply, "PATCH /admin/policy/rules/:ruleId",
         (allowWeaker) => stores.policyRules.update(request.auth.tenantId, params.data.ruleId, parsed.value, { allowWeaker, audit }));
       if (!written) return reply;
@@ -204,6 +209,11 @@ export async function registerAdminPolicyRoutes(
       await stores.policyService.invalidate(request.auth.tenantId);
       return serialize(PolicyRuleEnvelopeSchema, { rule });
     } catch (error) {
+      if (error instanceof PolicyRuleConflictError) {
+        reply.code(409);
+        return apiError("policy_rule_conflict",
+          "This rule changed after you loaded it. Load the saved rule, compare it with your changes, and save again.");
+      }
       return respondAdminMutationError(reply, error, "Failed to update policy rule.");
     }
   }));

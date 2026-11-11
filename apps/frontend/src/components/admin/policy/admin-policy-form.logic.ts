@@ -6,6 +6,7 @@ import {
   type PolicyEffect,
   type PolicyRule,
   type PolicyRuleInput,
+  type PolicyRulePatch,
   type PolicySeverity,
   type PolicyTurnContext
 } from "@cogniplane/shared-types";
@@ -123,6 +124,105 @@ export function draftToInput(draft: PolicyRuleDraft): PolicyRuleInput {
     conditions: draftConditions(draft),
     reason: draft.reason.trim() ? draft.reason.trim() : null
   };
+}
+
+/**
+ * The PATCH body of an edited rule: every form field, and the revision of the
+ * saved rule that the draft started from. The server refuses the save when
+ * the rule has another revision.
+ */
+export function draftToPatch(draft: PolicyRuleDraft, base: PolicyRule): PolicyRulePatch {
+  return { ...draftToInput(draft), expectedRevision: base.revision };
+}
+
+/** A rule save: a new rule, or an edit with the revision that it is based on. */
+export type PolicyRuleSave =
+  | { ruleId: null; input: PolicyRuleInput }
+  | { ruleId: string; patch: PolicyRulePatch };
+
+/**
+ * How a save ended. `conflict`: the rule has a newer revision. `missing`: the
+ * rule was deleted. Both keep the draft; the editor shows why.
+ */
+export type PolicyRuleSaveResult = "saved" | "conflict" | "missing" | "failed";
+
+// ── Stale edit review ────────────────────────────────────────────────────────
+//
+// After a newer revision, the editor shows the saved rule next to the draft.
+// `base` is the saved rule that the draft started from. A field that differs
+// from it was changed by the admin, by the newer save, or by both.
+
+type RuleField = "name" | "effect" | "enabled" | "toolNames" | "categories" | "severities" | "turnContexts" | "reason";
+
+// Each field and the draft key that holds it.
+const RULE_FIELDS: ReadonlyArray<{ field: RuleField; label: string; key: keyof PolicyRuleDraft }> = [
+  { field: "name", label: "Name", key: "name" },
+  { field: "effect", label: "Effect", key: "effect" },
+  { field: "enabled", label: "Enabled", key: "enabled" },
+  { field: "toolNames", label: "Tool names", key: "toolNamesText" },
+  { field: "categories", label: "Categories / servers", key: "categoriesText" },
+  { field: "severities", label: "Severities", key: "severities" },
+  { field: "turnContexts", label: "Turn context", key: "turnContexts" },
+  { field: "reason", label: "Explanation", key: "reason" }
+];
+
+/** A field as the save stores it, in words. Equal text means an equal stored value. */
+function fieldText(draft: PolicyRuleDraft, field: RuleField): string {
+  switch (field) {
+    case "name": return draft.name.trim();
+    case "effect": return EFFECT_LABELS[draft.effect];
+    case "enabled": return draft.enabled ? "On" : "Off";
+    case "toolNames": return parseCsv(draft.toolNamesText).join(", ") || "Any";
+    case "categories": return parseCsv(draft.categoriesText).join(", ") || "Any";
+    case "severities": return ALL_SEVERITIES.filter((value) => draft.severities.includes(value)).map((value) => SEVERITY_LABELS[value]).join(", ") || "Any";
+    case "turnContexts": return ALL_TURN_CONTEXTS.filter((value) => draft.turnContexts.includes(value)).map((value) => TURN_CONTEXT_LABELS[value]).join(", ") || "Any";
+    case "reason": return draft.reason.trim() || "None";
+  }
+}
+
+// Compare stored values separately from labels such as "Any" and "None".
+function fieldValue(draft: PolicyRuleDraft, field: RuleField): string {
+  const input = draftToInput(draft);
+  const value = field === "toolNames" || field === "categories" || field === "severities" || field === "turnContexts"
+    ? [...(input.conditions?.[field] ?? [])].sort()
+    : input[field];
+  return JSON.stringify(value);
+}
+
+export type RuleConflictRow = {
+  field: RuleField;
+  label: string;
+  saved: string;
+  draft: string;
+  changedBy: "you" | "someone else" | "both";
+};
+
+/** The fields where the saved rule and the draft differ, in form order. */
+export function ruleConflictRows(base: PolicyRule, saved: PolicyRule, draft: PolicyRuleDraft): RuleConflictRow[] {
+  const baseDraft = draftFromRule(base);
+  const savedDraft = draftFromRule(saved);
+  return RULE_FIELDS.flatMap(({ field, label }) => {
+    const savedText = fieldText(savedDraft, field);
+    const draftText = fieldText(draft, field);
+    if (fieldValue(savedDraft, field) === fieldValue(draft, field)) return [];
+    const mine = fieldValue(draft, field) !== fieldValue(baseDraft, field);
+    const theirs = fieldValue(savedDraft, field) !== fieldValue(baseDraft, field);
+    return [{ field, label, saved: savedText, draft: draftText, changedBy: mine && theirs ? "both" : mine ? "you" : "someone else" }];
+  });
+}
+
+/**
+ * "Keep my changes": each field that the admin changed keeps the draft value,
+ * as typed. Every other field takes the saved value, so the save does not
+ * undo a field that only the newer save changed.
+ */
+export function keepDraftChanges(base: PolicyRule, saved: PolicyRule, draft: PolicyRuleDraft): PolicyRuleDraft {
+  const baseDraft = draftFromRule(base);
+  const next: PolicyRuleDraft = { ...draftFromRule(saved) };
+  for (const { field, key } of RULE_FIELDS) {
+    if (fieldValue(draft, field) !== fieldValue(baseDraft, field)) Object.assign(next, { [key]: draft[key] });
+  }
+  return next;
 }
 
 // Add/remove a value from a checkbox-set dimension, idempotently. Generic over

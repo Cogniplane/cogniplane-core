@@ -279,6 +279,7 @@ function makePolicyRule(overrides: Partial<PolicyRule>): PolicyRule {
     conditions: {},
     reason: null,
     createdBy: null,
+    revision: 1,
     createdAt: "2026-05-31T00:00:00.000Z",
     updatedAt: "2026-05-31T00:00:00.000Z",
     ...overrides

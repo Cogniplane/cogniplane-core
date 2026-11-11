@@ -1,4 +1,4 @@
-import { test, expect } from "vitest";
+import { test, expect, vi } from "vitest";
 
 import Fastify, { type FastifyRequest } from "fastify";
 
@@ -19,6 +19,7 @@ import { PolicyService } from "../../services/policy/policy-service.js";
 import type { PolicyDecisionStore } from "../../services/policy/policy-decision-store.js";
 import {
   PolicyReorderMismatchError,
+  PolicyRuleConflictError,
   type PolicyRuleStore,
   type PolicyRuleWriteOptions
 } from "../../services/policy/policy-rule-store.js";
@@ -30,10 +31,11 @@ import { InMemoryAuditEventStore } from "../../test-helpers/in-memory-audit-even
 import { createTestConfig } from "../../test-helpers/test-config.js";
 
 // In-memory rule store keyed by tenant. Mirrors the real store's contract
-// (list ordered by priority, partial update, unique ruleId per tenant; each
-// write classifies the change with the real weakensPolicy, refuses a weaker
-// change unless allowed, and writes its audit event with the change). The
-// SQL and the lock run in the integration suite.
+// (list ordered by priority, partial update, unique ruleId per tenant; an
+// update from an older revision is refused before anything else; each write
+// classifies the change with the real weakensPolicy, refuses a weaker change
+// unless allowed, and writes its audit event with the change). The SQL and
+// the lock run in the integration suite.
 class InMemoryRuleStore {
   private rules: PolicyRule[] = [];
   private seq = 0;
@@ -84,6 +86,7 @@ class InMemoryRuleStore {
       conditions: input.conditions ?? {},
       reason: input.reason ?? null,
       createdBy,
+      revision: 1,
       createdAt: "2026-05-31T00:00:00.000Z",
       updatedAt: "2026-05-31T00:00:00.000Z"
     };
@@ -94,6 +97,7 @@ class InMemoryRuleStore {
     options: PolicyRuleWriteOptions<PolicyRule>): Promise<PolicyRule | null> {
     const existing = await this.get(tenantId, ruleId);
     if (!existing) return null;
+    if (existing.revision !== input.expectedRevision) throw new PolicyRuleConflictError();
     const updated: PolicyRule = {
       ...existing,
       name: input.name ?? existing.name,
@@ -103,6 +107,7 @@ class InMemoryRuleStore {
       effect: input.effect ?? existing.effect,
       conditions: input.conditions ?? existing.conditions,
       reason: input.reason !== undefined ? input.reason : existing.reason,
+      revision: existing.revision + 1,
       updatedAt: "2026-05-31T00:01:00.000Z"
     };
     const next = this.rules.map((r) => (r.ruleId === ruleId && r.tenantId === tenantId ? updated : r));
@@ -139,8 +144,12 @@ class InMemoryRuleStore {
         "ruleIds must be exactly the tenant's current set of policy rules."
       );
     }
-    const next = this.rules.map((r) =>
-      r.tenantId === tenantId && ruleIds.includes(r.ruleId) ? { ...r, priority: ruleIds.indexOf(r.ruleId) * 10 } : r);
+    // A moved rule gets the next revision.
+    const next = this.rules.map((r) => {
+      if (r.tenantId !== tenantId || !ruleIds.includes(r.ruleId)) return r;
+      const priority = ruleIds.indexOf(r.ruleId) * 10;
+      return priority === r.priority ? r : { ...r, priority, revision: r.revision + 1 };
+    });
     const moved = existing.filter((r) => r.priority !== ruleIds.indexOf(r.ruleId) * 10);
     const after = next.filter((r) => r.tenantId === tenantId)
       .sort((a, b) => (a.priority !== b.priority ? a.priority - b.priority : a.ruleId.localeCompare(b.ruleId)));
@@ -223,7 +232,7 @@ function fakeDecision(overrides: Partial<SeededDecision> & Pick<SeededDecision, 
 
 type AuthSession = NonNullable<FastifyRequest["auth"]["session"]>;
 
-async function buildApp(options: { now?: () => Date; dataRoutes?: DataRouteControl; session?: AuthSession } = {}) {
+async function buildApp(options: { now?: () => Date; dataRoutes?: DataRouteControl; session?: AuthSession; isAdmin?: boolean } = {}) {
   const app = Fastify();
   const audit = new InMemoryAuditEventStore();
   const ruleStore = new InMemoryRuleStore(audit);
@@ -240,8 +249,8 @@ async function buildApp(options: { now?: () => Date; dataRoutes?: DataRouteContr
     request.auth = {
       userId: "admin-user",
       tenantId: "t1",
-      isAdmin: true,
-      role: "owner" as const,
+      isAdmin: options.isAdmin ?? true,
+      role: options.isAdmin === false ? "member" as const : "owner" as const,
       ...(options.session ? { session: options.session } : {})
     };
   });
@@ -254,7 +263,7 @@ async function buildApp(options: { now?: () => Date; dataRoutes?: DataRouteContr
     now: options.now
   });
   await app.ready();
-  return { app, audit, decisionStore, ruleStore };
+  return { app, audit, decisionStore, ruleStore, policyService };
 }
 
 test("create → list round-trips a rule and audits the creation", async () => {
@@ -395,7 +404,7 @@ test("patch rejects a typo'd condition key with 400", async () => {
   const res = await app.inject({
     method: "PATCH",
     url: `/admin/policy/rules/${ruleId}`,
-    payload: { conditions: { severity: ["file_change"] } }
+    payload: { conditions: { severity: ["file_change"] }, expectedRevision: 1 }
   });
   expect(res.statusCode).toBe(400);
 
@@ -462,7 +471,7 @@ test("patch updates a rule and audits it", async () => {
   const patched = await app.inject({
     method: "PATCH",
     url: `/admin/policy/rules/${ruleId}`,
-    payload: { name: "R", effect: "require_approval" }
+    payload: { name: "R", effect: "require_approval", expectedRevision: 1 }
   });
   expect(patched.statusCode).toBe(200);
   expect(patched.json().rule.effect).toBe("require_approval");
@@ -483,7 +492,7 @@ test("patch accepts a partial body (only enabled) and preserves the existing eff
   const patched = await app.inject({
     method: "PATCH",
     url: `/admin/policy/rules/${ruleId}`,
-    payload: { enabled: false }
+    payload: { enabled: false, expectedRevision: 1 }
   });
   expect(patched.statusCode).toBe(200);
   expect(patched.json().rule.enabled).toBe(false);
@@ -505,7 +514,7 @@ test("patch with an empty body is rejected", async () => {
   const res = await app.inject({
     method: "PATCH",
     url: `/admin/policy/rules/${ruleId}`,
-    payload: {}
+    payload: { expectedRevision: 1 }
   });
   expect(res.statusCode).toBe(400);
   await app.close();
@@ -526,7 +535,7 @@ test("patch with only an unknown/typo'd field is rejected (no silent no-op + fal
   const res = await app.inject({
     method: "PATCH",
     url: `/admin/policy/rules/${ruleId}`,
-    payload: { enbaled: false }
+    payload: { enbaled: false, expectedRevision: 1 }
   });
   expect(res.statusCode).toBe(400);
   // No "admin.policy_rule.updated" audit event should have fired.
@@ -539,9 +548,97 @@ test("patch on an unknown rule returns 404", async () => {
   const res = await app.inject({
     method: "PATCH",
     url: "/admin/policy/rules/pol_missing",
-    payload: { name: "x", effect: "block" }
+    payload: { name: "x", effect: "block", expectedRevision: 1 }
   });
   expect(res.statusCode).toBe(404);
+  await app.close();
+});
+
+// A rule edit names the revision that the admin loaded. A save from an older
+// copy must not replace a newer save, and a partial patch (a direct toggle of
+// `enabled`) needs the revision too.
+test("patch needs the revision that the admin loaded", async () => {
+  const { app, audit } = await buildApp();
+  const created = await app.inject({ method: "POST", url: "/admin/policy/rules", payload: { name: "R", effect: "block" } });
+  const ruleId = created.json().rule.ruleId;
+  const auditCountBefore = audit.events.length;
+
+  for (const payload of [{ enabled: false }, { enabled: false, expectedRevision: 0 }, { enabled: false, expectedRevision: "1" }]) {
+    const res = await app.inject({ method: "PATCH", url: `/admin/policy/rules/${ruleId}`, payload });
+    expect(res.statusCode, JSON.stringify(payload)).toBe(400);
+  }
+  expect(audit.events.length).toBe(auditCountBefore);
+  const list = await app.inject({ method: "GET", url: "/admin/policy/rules" });
+  expect(list.json().rules[0]).toMatchObject({ enabled: true, revision: 1 });
+  await app.close();
+});
+
+test("patch from an older revision answers 409 and changes nothing, audits nothing and keeps the rule cache", async () => {
+  const { app, audit, policyService } = await buildApp();
+  const created = await app.inject({ method: "POST", url: "/admin/policy/rules",
+    payload: { name: "Allow exports", effect: "allow", enabled: false } });
+  const ruleId = created.json().rule.ruleId;
+  const stricter = await app.inject({ method: "PATCH", url: `/admin/policy/rules/${ruleId}`,
+    payload: { enabled: true, effect: "block", expectedRevision: 1 } });
+  expect(stricter.json().rule).toMatchObject({ enabled: true, effect: "block", revision: 2 });
+  const auditCountBefore = audit.events.length;
+  const invalidate = vi.spyOn(policyService, "invalidate");
+
+  const stale = await app.inject({ method: "PATCH", url: `/admin/policy/rules/${ruleId}`,
+    payload: { name: "Allow customer exports", enabled: false, effect: "allow", expectedRevision: 1 } });
+
+  expect(stale.statusCode).toBe(409);
+  expect(stale.json()).toEqual({
+    error: "policy_rule_conflict",
+    message: "This rule changed after you loaded it. Load the saved rule, compare it with your changes, and save again."
+  });
+  expect(audit.events.length).toBe(auditCountBefore);
+  expect(invalidate).not.toHaveBeenCalled();
+  const list = await app.inject({ method: "GET", url: "/admin/policy/rules" });
+  expect(list.json().rules[0]).toMatchObject({ name: "Allow exports", enabled: true, effect: "block", revision: 2 });
+
+  // From the saved revision, the save commits and gives the next one.
+  const fresh = await app.inject({ method: "PATCH", url: `/admin/policy/rules/${ruleId}`,
+    payload: { name: "Block exports", expectedRevision: 2 } });
+  expect(fresh.statusCode).toBe(200);
+  expect(fresh.json().rule).toMatchObject({ name: "Block exports", revision: 3 });
+  expect(audit.events.at(-1)).toMatchObject({ type: "admin.policy_rule.updated", payload: { ruleId, revision: 3 } });
+  expect(invalidate).toHaveBeenCalledTimes(1);
+  await app.close();
+});
+
+test("a stale weaker patch answers 409 and does not ask for step-up", async () => {
+  const dataRoutes = devDataRoutes();
+  const requireStepUp = vi.spyOn(dataRoutes, "requireStepUp");
+  const { app } = await buildApp({ dataRoutes });
+  const created = await app.inject({ method: "POST", url: "/admin/policy/rules", payload: { name: "Block", effect: "block" } });
+  const ruleId = created.json().rule.ruleId;
+  await app.inject({ method: "PATCH", url: `/admin/policy/rules/${ruleId}`, payload: { name: "Block all", expectedRevision: 1 } });
+
+  const stale = await app.inject({ method: "PATCH", url: `/admin/policy/rules/${ruleId}`, payload: { enabled: false, expectedRevision: 1 } });
+  expect(stale.statusCode).toBe(409);
+  expect(requireStepUp).not.toHaveBeenCalled();
+  await app.close();
+});
+
+test("a create carries no revision: the new rule starts at revision 1", async () => {
+  const { app } = await buildApp();
+  const withRevision = await app.inject({ method: "POST", url: "/admin/policy/rules",
+    payload: { name: "R", effect: "block", expectedRevision: 1 } });
+  expect(withRevision.statusCode).toBe(400);
+  const created = await app.inject({ method: "POST", url: "/admin/policy/rules", payload: { name: "R", effect: "block" } });
+  expect(created.json().rule.revision).toBe(1);
+  await app.close();
+});
+
+test("a member who is not an admin cannot change a rule", async () => {
+  const { app, ruleStore } = await buildApp({ isAdmin: false });
+  const rule = await ruleStore.create("t1", { name: "Block", effect: "block" }, "admin-user", ALLOW_WEAKER);
+  const res = await app.inject({ method: "PATCH", url: `/admin/policy/rules/${rule.ruleId}`,
+    payload: { enabled: false, expectedRevision: 1 } });
+  expect(res.statusCode).toBe(403);
+  expect(res.json()).toEqual({ error: "admin_required" });
+  expect(await ruleStore.get("t1", rule.ruleId)).toEqual(rule);
   await app.close();
 });
 

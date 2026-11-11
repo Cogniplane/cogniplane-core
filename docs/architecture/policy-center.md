@@ -45,3 +45,28 @@ approval proof is in [approvals](approvals.md#policy-center-approval-proof).
 - A weaker rule change is a [sensitive
   change](sensitive-changes.md#weaker-controls-and-skill-releases).
 - Overlay catalog categories: see [overlays](../overlays.md).
+
+## Edit a rule
+
+- Each rule has a `revision` (migration 086). It starts at 1. Each edit adds
+  1, and a reorder adds 1 to each rule that it moves, because the place of a
+  rule decides what it does.
+- `PATCH /admin/policy/rules/:ruleId` must send `expectedRevision`: the
+  revision that the change is based on. A partial patch, for example only
+  `enabled`, sends it too. When the rule has another revision, the route
+  answers 409 `policy_rule_conflict` and writes nothing: no change, no audit
+  event, no owner notice and no rule cache drop. A deleted rule answers 404.
+- `PolicyRuleStore.update` checks the revision under the tenant's rule lock,
+  before it classifies the change, so a stale save never asks for step-up.
+  The `UPDATE` also names the revision, so a writer without the lock cannot be
+  overwritten. A create sends no revision.
+- The rule editor (`components/admin/policy/admin-policy-rules-card.tsx`)
+  keeps the saved rule that the draft started from and sends its revision.
+  When a save gets 409, or the rule list shows a newer revision, the editor
+  keeps the draft, shows the saved values next to it, and blocks Save until
+  the admin chooses "Use the saved rule" or "Keep my changes". "Keep my
+  changes" keeps the fields that the admin changed and takes the saved value
+  of every other field. The next save sends the revision of the rule that the
+  admin compared. A list refresh never moves the draft to a newer revision.
+- When someone deleted the rule, the editor keeps the draft and can create
+  it as a new rule.

@@ -9,7 +9,6 @@ import type {
   PolicyDecisionsListResponse,
   PolicyLintWarning,
   PolicyRule,
-  PolicyRuleInput,
   PolicySimulateRequest,
   PolicySimulateResponse
 } from "@cogniplane/shared-types";
@@ -21,6 +20,7 @@ import {
   writeDecisionUrl,
   type DecisionFilters
 } from "../components/admin/policy/admin-policy-decision-url";
+import type { PolicyRuleSave, PolicyRuleSaveResult } from "../components/admin/policy/admin-policy-form.logic";
 import {
   createPolicyRule,
   deletePolicyRule,
@@ -34,6 +34,7 @@ import {
   updatePolicyRule,
   type PolicyDecisionsListParams
 } from "../lib/admin-api";
+import { ApiError } from "../lib/api-client";
 import { toErrorMessage } from "../lib/error-utils";
 import { queryKeys } from "../lib/query-keys";
 
@@ -43,12 +44,12 @@ export function usePolicyData() {
   const lintKey = queryKeys.admin.policyLint();
   // A rule mutation can change which rules are unreachable, so refresh the lint
   // alongside the rules every time. The monitor summary shows current rule
-  // names and status.
+  // names and status. The promise settles when the rules are read again.
   const invalidateRules = () => {
-    void queryClient.invalidateQueries({ queryKey: rulesKey });
     void queryClient.invalidateQueries({ queryKey: lintKey });
     void queryClient.invalidateQueries({ queryKey: queryKeys.admin.policyMonitorSummary() });
     void queryClient.invalidateQueries({ queryKey: queryKeys.admin.history() });
+    return queryClient.invalidateQueries({ queryKey: rulesKey });
   };
 
   const rulesQuery = useQuery({
@@ -64,14 +65,14 @@ export function usePolicyData() {
   });
 
   const submitMutation = useMutation({
-    mutationFn: (vars: { ruleId: string | null; input: PolicyRuleInput }) =>
-      vars.ruleId ? updatePolicyRule(vars.ruleId, vars.input) : createPolicyRule(vars.input),
-    onSuccess: () => invalidateRules()
+    mutationFn: (save: PolicyRuleSave) =>
+      save.ruleId === null ? createPolicyRule(save.input) : updatePolicyRule(save.ruleId, save.patch),
+    onSuccess: () => { void invalidateRules(); }
   });
 
   const deleteMutation = useMutation({
     mutationFn: (ruleId: string) => deletePolicyRule(ruleId),
-    onSuccess: () => invalidateRules()
+    onSuccess: () => { void invalidateRules(); }
   });
 
   // Reorder is optimistic: paint the new order immediately, roll back the cached
@@ -99,7 +100,7 @@ export function usePolicyData() {
     onError: (_error, _ruleIds, context) => {
       if (context?.previous) queryClient.setQueryData(rulesKey, context.previous);
     },
-    onSettled: () => invalidateRules()
+    onSettled: () => { void invalidateRules(); }
   });
 
   const actionLock = useRef(false);
@@ -109,6 +110,33 @@ export function usePolicyData() {
   const [simulation, setSimulation] = useState<PolicySimulateResponse | null>(null);
   const [simulationError, setSimulationError] = useState<string | null>(null);
   const [simulating, setSimulating] = useState(false);
+
+  /**
+   * Saves a rule. An edit that the server refuses because the rule has a
+   * newer revision (409) or is gone (404) is not an error to show: the rules
+   * are read again first, so the editor can compare the draft with the saved
+   * rule (or say that it was deleted) when it gets the answer. A failed read
+   * leaves the rules marked stale.
+   */
+  async function saveRule(save: PolicyRuleSave): Promise<PolicyRuleSaveResult> {
+    if (actionLock.current) return "failed";
+    actionLock.current = true;
+    setActionError(null);
+    try {
+      await submitMutation.mutateAsync(save);
+      return "saved";
+    } catch (error) {
+      const refusal = save.ruleId === null ? null : staleEditRefusal(error);
+      if (refusal) {
+        await invalidateRules();
+        return refusal;
+      }
+      setActionError(toErrorMessage(error, "Failed to save policy rule."));
+      return "failed";
+    } finally {
+      actionLock.current = false;
+    }
+  }
 
   async function actOnRules(action: () => Promise<unknown>, fallback: string) {
     if (actionLock.current) return false;
@@ -158,8 +186,7 @@ export function usePolicyData() {
     simulation,
     simulationError,
     simulating,
-    saveRule: (ruleId: string | null, input: PolicyRuleInput) =>
-      actOnRules(() => submitMutation.mutateAsync({ ruleId, input }), "Failed to save policy rule."),
+    saveRule,
     deleteRule: (ruleId: string) =>
       actOnRules(() => deleteMutation.mutateAsync(ruleId), "Failed to delete policy rule."),
     reorderRules: (ruleIds: string[]) =>
@@ -193,6 +220,14 @@ export function usePolicyData() {
       }
     }
   };
+}
+
+/** Why the server refused a rule edit, when the editor can show it: a newer revision, or a deleted rule. */
+function staleEditRefusal(error: unknown): "conflict" | "missing" | null {
+  if (!(error instanceof ApiError)) return null;
+  if (error.status === 409 && error.code === "policy_rule_conflict") return "conflict";
+  if (error.status === 404 && error.code === "policy_rule_not_found") return "missing";
+  return null;
 }
 
 export type { DecisionFilters } from "../components/admin/policy/admin-policy-decision-url";

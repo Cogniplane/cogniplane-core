@@ -26,7 +26,7 @@ afterEach(() => {
 function policyRule(ruleId: string, name: string, priority: number): PolicyRule {
   return {
     ruleId, tenantId: "t", name, description: null, priority, enabled: true, effect: "block",
-    conditions: { toolNames: ["github_write_file"] }, reason: null, createdBy: null,
+    conditions: { toolNames: ["github_write_file"] }, reason: null, createdBy: null, revision: 1,
     createdAt: "2026-09-01T00:00:00Z", updatedAt: "2026-09-01T00:00:00Z"
   };
 }
@@ -39,7 +39,7 @@ function drop(active: string, over: string | null) {
 
 it("moves the dragged rule to the place of the rule it was dropped on", () => {
   const onReorder = vi.fn();
-  render(<AdminPolicyRulesCard rules={rules} lintWarnings={[]} busyKey={null} onSave={async () => true} onDelete={vi.fn()} onReorder={onReorder} />);
+  render(<AdminPolicyRulesCard rules={rules} lintWarnings={[]} busyKey={null} onSave={async () => "saved" as const} onDelete={vi.fn()} onReorder={onReorder} />);
 
   drop("third", "first");
   drop("first", "third");
@@ -49,7 +49,7 @@ it("moves the dragged rule to the place of the rule it was dropped on", () => {
 
 it("ignores a drop outside the list or onto the same rule", () => {
   const onReorder = vi.fn();
-  render(<AdminPolicyRulesCard rules={rules} lintWarnings={[]} busyKey={null} onSave={async () => true} onDelete={vi.fn()} onReorder={onReorder} />);
+  render(<AdminPolicyRulesCard rules={rules} lintWarnings={[]} busyKey={null} onSave={async () => "saved" as const} onDelete={vi.fn()} onReorder={onReorder} />);
 
   drop("second", null);
   drop("second", "second");

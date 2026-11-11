@@ -28,15 +28,21 @@ import {
   ALL_TURN_CONTEXTS,
   draftFromRule,
   draftToInput,
+  draftToPatch,
   describeConditions,
   EFFECT_LABELS,
   emptyDraft,
   isDraftValid,
+  keepDraftChanges,
   reorderedRuleIds,
+  ruleConflictRows,
   SEVERITY_LABELS,
   toggleInList,
   TURN_CONTEXT_LABELS,
-  type PolicyRuleDraft
+  type PolicyRuleDraft,
+  type PolicyRuleSave,
+  type PolicyRuleSaveResult,
+  type RuleConflictRow
 } from "./admin-policy-form.logic";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -65,7 +71,8 @@ type Props = {
   lintError?: string | null;
   onRetryLint?: () => void;
   actionError?: string | null;
-  onSave: (ruleId: string | null, input: ReturnType<typeof draftToInput>) => Promise<boolean>;
+  /** Resolves when the save ends. After `conflict` or `missing`, the rules are already read again. */
+  onSave: (save: PolicyRuleSave) => Promise<PolicyRuleSaveResult>;
   onDelete: (ruleId: string) => Promise<boolean> | void;
   onReorder: (ruleIds: string[]) => void;
   /** The last 7 days of Monitor records. Each rule shows its own counts. */
@@ -80,10 +87,52 @@ const LINT_KIND_LABELS: Record<PolicyLintWarning["kind"], string> = {
   unknown_condition: "Unknown condition"
 };
 
+/**
+ * What stops the save of an edited rule until the admin acts. `review`: the
+ * list has a newer revision; the admin compares it with the draft and
+ * chooses. `loading` and `unavailable`: the server refused the save, and the
+ * saved rule is being read or could not be read. `deleted`: the rule is gone.
+ */
+type EditConflict =
+  | { kind: "review"; saved: PolicyRule }
+  | { kind: "loading" }
+  | { kind: "unavailable" }
+  | { kind: "deleted" };
+
+function editConflict(input: {
+  base: PolicyRule | null;
+  saved: PolicyRule | undefined;
+  refusal: "conflict" | "missing" | null;
+  saving: boolean;
+  listCurrent: boolean;
+  refreshing: boolean;
+}): EditConflict | null {
+  const { base, saved, refusal } = input;
+  // A new rule has nothing to compare. The list can show this editor's own
+  // save before the save answers, so nothing is compared during a save.
+  if (!base || input.saving) return null;
+  if (refusal === "missing" || (input.listCurrent && !saved)) return { kind: "deleted" };
+  if (saved && saved.revision > base.revision) return { kind: "review", saved };
+  if (refusal === "conflict") return { kind: input.refreshing ? "loading" : "unavailable" };
+  return null;
+}
+
 export function AdminPolicyRulesCard({ rules, lintWarnings, busyKey, onSave, onDelete, onReorder, evidence, children, rulesState = "current", rulesError, refreshing = false, onRetryRules, lintState = "current", lintError, onRetryLint, actionError }: Props) {
   const actionLock = useRef(false);
   const [localPending, setLocalPending] = useState<"save" | "delete" | null>(null);
   const [draft, setDraft] = useState<PolicyRuleDraft | null>(null);
+  // The saved rule that an edit started from. The save sends its revision,
+  // and the server refuses the save when the rule has another one. Only the
+  // admin's choice after a comparison moves it to a newer revision; a list
+  // refresh never does.
+  const [base, setBase] = useState<PolicyRule | null>(null);
+  // The server's answer to the last save of this edit.
+  const [refusal, setRefusal] = useState<"conflict" | "missing" | null>(null);
+  function openEditor(next: PolicyRuleDraft | null, from: PolicyRule | null) {
+    setDraft(next);
+    setBase(from);
+    setRefusal(null);
+  }
 
   // Group lint warnings by the rule they're about so each row can show its own.
   const warningsByRule = new Map<string, PolicyLintWarning[]>();
@@ -98,6 +147,11 @@ export function AdminPolicyRulesCard({ rules, lintWarnings, busyKey, onSave, onD
   const busy = busyKey !== null || localPending !== null;
   const editable = rulesState === "current" && !refreshing;
   const reorderable = !draft && !busy && editable && rules.length > 1;
+  const saving = busyKey === "submit" || localPending === "save";
+  const savedRule = draft?.ruleId ? rules.find((rule) => rule.ruleId === draft.ruleId) : undefined;
+  const conflict = editConflict({ base, saved: savedRule, refusal, saving, listCurrent: editable, refreshing });
+  // An edited rule that is no longer in the list keeps its editor above the list.
+  const orphaned = draft !== null && draft.ruleId !== null && !savedRule;
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 4 } }),
@@ -128,22 +182,58 @@ export function AdminPolicyRulesCard({ rules, lintWarnings, busyKey, onSave, onD
   }, [rulesState, editable, busy, restoreFocus]);
   function closeEditor(focusId: string) {
     returnFocus.current = focusId;
-    setDraft(null);
+    openEditor(null, null);
     requestAnimationFrame(restoreFocus);
   }
 
   async function handleSave() {
-    if (!draft || !isDraftValid(draft) || busy || actionLock.current || !editable) return;
+    if (!draft || !isDraftValid(draft) || busy || actionLock.current || !editable || conflict) return;
+    let save: PolicyRuleSave;
+    if (draft.ruleId === null) save = { ruleId: null, input: draftToInput(draft) };
+    else if (base) save = { ruleId: draft.ruleId, patch: draftToPatch(draft, base) };
+    else return;
     actionLock.current = true;
     setLocalPending("save");
     try {
-      const ok = await onSave(draft.ruleId, draftToInput(draft));
-      if (ok) closeEditor(draft.ruleId ? editButtonId(draft.ruleId) : NEW_RULE_ID);
+      const result = await onSave(save);
+      if (result === "saved") closeEditor(draft.ruleId ? editButtonId(draft.ruleId) : NEW_RULE_ID);
+      else if (result === "conflict" || result === "missing") setRefusal(result);
     } finally {
       actionLock.current = false;
       setLocalPending(null);
     }
   }
+
+  // The admin's choice after a comparison. The next save sends the revision of
+  // the saved rule that the admin compared. Focus moves to Save, the next step.
+  function resolveConflict(saved: PolicyRule, keepMine: boolean) {
+    if (!draft || !base || busy || !editable) return;
+    document.getElementById(SAVE_RULE_ID)?.focus();
+    setDraft(keepMine ? keepDraftChanges(base, saved, draft) : draftFromRule(saved));
+    setBase(saved);
+    setRefusal(null);
+  }
+
+  // A deleted rule cannot take the draft. The admin can create it again.
+  function recreateRule() {
+    if (!draft || busy) return;
+    openEditor({ ...draft, ruleId: null }, null);
+  }
+
+  const conflictNotice = conflict && draft ? (
+    <RuleConflictNotice
+      id={CONFLICT_ID}
+      conflict={conflict}
+      base={base}
+      draft={draft}
+      choiceDisabled={busy || !editable}
+      loadDisabled={busy}
+      onUseSaved={(saved) => resolveConflict(saved, false)}
+      onKeepMine={(saved) => resolveConflict(saved, true)}
+      onLoadSaved={onRetryRules}
+      onCreateNew={recreateRule}
+    />
+  ) : null;
 
   async function handleDelete(ruleId: string) {
     if (busy || actionLock.current || !editable) return;
@@ -159,7 +249,6 @@ export function AdminPolicyRulesCard({ rules, lintWarnings, busyKey, onSave, onD
   }
 
   const creating = draft !== null && draft.ruleId === null;
-  const saving = busyKey === "submit" || localPending === "save";
   const deleting = localPending === "delete" || (busyKey?.startsWith("delete-") ?? false);
 
   return (
@@ -167,7 +256,7 @@ export function AdminPolicyRulesCard({ rules, lintWarnings, busyKey, onSave, onD
       <div className="flex flex-wrap items-center justify-between gap-3">
         <h2 id="policy-rules-title" className="text-lg font-semibold text-on-surface">Rules</h2>
         {/* An open editor has unsaved edits, so the button cancels it before it starts a new rule. */}
-        <Button id={NEW_RULE_ID} type="button" variant="outline" size="sm" aria-expanded={creating} disabled={busy || !editable} onClick={() => setDraft(draft ? null : emptyDraft())}>
+        <Button id={NEW_RULE_ID} type="button" variant="outline" size="sm" aria-expanded={creating} disabled={busy || !editable} onClick={() => openEditor(draft ? null : emptyDraft(), null)}>
           {draft ? "Cancel" : "New rule"}
         </Button>
       </div>
@@ -192,7 +281,7 @@ export function AdminPolicyRulesCard({ rules, lintWarnings, busyKey, onSave, onD
       </div>
       {actionError && !draft ? <p role="alert" className="mt-3 text-sm text-danger">{actionError}</p> : null}
       {busyKey === "reorder" ? <p role="status" className="mt-3 text-sm text-on-surface-variant">Saving rule order...</p> : null}
-      {creating && draft ? <div className="mt-4"><RuleEditor
+      {(creating || orphaned) && draft ? <div className="mt-4"><RuleEditor
             draft={draft}
             onChange={setDraft}
             onCancel={() => closeEditor(NEW_RULE_ID)}
@@ -201,6 +290,7 @@ export function AdminPolicyRulesCard({ rules, lintWarnings, busyKey, onSave, onD
             deleting={deleting}
             error={actionError}
             disabled={busy || !editable}
+            conflict={conflictNotice}
           /></div> : null}
 
       <div className="mt-3 border-t border-outline-variant">
@@ -221,7 +311,7 @@ export function AdminPolicyRulesCard({ rules, lintWarnings, busyKey, onSave, onD
                     editing={draft?.ruleId === rule.ruleId}
                     // One editor at a time, so an open draft is never replaced without a warning.
                     editDisabled={busy || !editable || draft !== null && draft.ruleId !== rule.ruleId}
-                    onEdit={() => draft?.ruleId === rule.ruleId ? closeEditor(editButtonId(rule.ruleId)) : setDraft(draftFromRule(rule))}
+                    onEdit={() => draft?.ruleId === rule.ruleId ? closeEditor(editButtonId(rule.ruleId)) : openEditor(draftFromRule(rule), rule)}
                   >
                     {draft?.ruleId === rule.ruleId ? <RuleEditor
             draft={draft}
@@ -232,6 +322,7 @@ export function AdminPolicyRulesCard({ rules, lintWarnings, busyKey, onSave, onD
             deleting={deleting}
             error={actionError}
             disabled={busy || !editable}
+            conflict={conflictNotice}
             onDelete={() => { void handleDelete(rule.ruleId); }}
           /> : null}
                   </SortableRuleRow>
@@ -247,7 +338,115 @@ export function AdminPolicyRulesCard({ rules, lintWarnings, busyKey, onSave, onD
 }
 
 const NEW_RULE_ID = "policy-new-rule";
+const SAVE_RULE_ID = "policy-save-rule";
+const CONFLICT_ID = "policy-rule-conflict";
 const editButtonId = (ruleId: string) => `policy-edit-${ruleId}`;
+
+const CHANGED_BY: Record<RuleConflictRow["changedBy"], string> = {
+  you: "Changed by you",
+  "someone else": "Changed by someone else",
+  both: "Changed by you and someone else"
+};
+
+/**
+ * Why the edited rule cannot be saved yet. After a newer revision it shows
+ * the saved rule next to the draft and asks the admin to choose; the draft
+ * stays until then. After a delete it offers to create the rule again.
+ */
+function RuleConflictNotice({ id, conflict, base, draft, choiceDisabled, loadDisabled, onUseSaved, onKeepMine, onLoadSaved, onCreateNew }: {
+  id: string;
+  conflict: EditConflict;
+  base: PolicyRule | null;
+  draft: PolicyRuleDraft;
+  choiceDisabled: boolean;
+  loadDisabled: boolean;
+  onUseSaved: (saved: PolicyRule) => void;
+  onKeepMine: (saved: PolicyRule) => void;
+  onLoadSaved?: () => void;
+  onCreateNew: () => void;
+}) {
+  const box = "flex flex-col gap-3 rounded-lg border border-warning/40 bg-warning-surface p-3 text-sm text-on-surface";
+  if (conflict.kind === "deleted") {
+    return (
+      <div className={box}>
+        <p id={id} role="alert">
+          <span className="font-semibold">Someone deleted this rule after you opened it.</span>{" "}
+          Your draft is kept, but you cannot save it to this rule.
+        </p>
+        <Button type="button" size="sm" variant="outline" className="self-start" disabled={choiceDisabled} onClick={onCreateNew}>
+          Create it as a new rule
+        </Button>
+      </div>
+    );
+  }
+  const loading = conflict.kind === "loading";
+  return (
+    <div className={box}>
+      <p id={id} role="alert">
+        <span className="font-semibold">Someone changed this rule after you opened it.</span> Your draft is kept.
+      </p>
+      {conflict.kind === "review" && base ? (
+        <RuleComparison base={base} saved={conflict.saved} draft={draft} disabled={choiceDisabled} onUseSaved={onUseSaved} onKeepMine={onKeepMine} />
+      ) : (
+        <>
+          {conflict.kind === "unavailable" ? <p className="text-danger">Could not load the saved rule.</p> : null}
+          {onLoadSaved ? (
+            <Button type="button" size="sm" variant="outline" className="self-start" aria-disabled={loading || loadDisabled}
+              onClick={() => { if (!loading && !loadDisabled) onLoadSaved(); }}>
+              {loading ? "Loading the saved rule..." : "Load the saved rule"}
+            </Button>
+          ) : null}
+        </>
+      )}
+    </div>
+  );
+}
+
+function RuleComparison({ base, saved, draft, disabled, onUseSaved, onKeepMine }: {
+  base: PolicyRule;
+  saved: PolicyRule;
+  draft: PolicyRuleDraft;
+  disabled: boolean;
+  onUseSaved: (saved: PolicyRule) => void;
+  onKeepMine: (saved: PolicyRule) => void;
+}) {
+  const rows = ruleConflictRows(base, saved, draft);
+  const cell = "border-t border-warning/30 py-1.5 pr-3 align-top";
+  return (
+    <>
+      <p>Compare your draft with the saved rule, then choose what to keep.</p>
+      {rows.length > 0 ? (
+        <table aria-label="Saved rule and your draft" className="w-full text-left">
+          <thead>
+            <tr className="text-on-surface-variant">
+              <th scope="col" className="py-1.5 pr-3 font-medium">Field</th>
+              <th scope="col" className="py-1.5 pr-3 font-medium">Saved now</th>
+              <th scope="col" className="py-1.5 font-medium">Your draft</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((row) => (
+              <tr key={row.field}>
+                <th scope="row" className={`${cell} font-medium`}>
+                  {row.label}
+                  <span className="block text-xs font-normal text-on-surface-variant">{CHANGED_BY[row.changedBy]}</span>
+                </th>
+                <td className={cell}>{row.saved}</td>
+                <td className={`${cell} pr-0`}>{row.draft}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      ) : <p>The saved rule has the same values as your draft.</p>}
+      {saved.priority !== base.priority ? <p>Its place in the rule order changed too. The first matching rule decides.</p> : null}
+      <p className="text-on-surface-variant">Keep my changes keeps each field that you changed. The other fields take the saved values.</p>
+      <div className="flex flex-wrap gap-2">
+        <Button type="button" size="sm" variant="outline" disabled={disabled} onClick={() => onUseSaved(saved)}>Use the saved rule</Button>
+        <Button type="button" size="sm" disabled={disabled} onClick={() => onKeepMine(saved)}>Keep my changes</Button>
+      </div>
+    </>
+  );
+}
 
 /** "3 would-be blocks, 1 approval request in 7 days", linked to those rule matches. Null when the rule did not match. */
 function ruleEvidence(rule: PolicyRule, evidence: PolicyMonitorSummaryResponse | undefined): ReactNode {
@@ -345,6 +544,7 @@ function RuleEditor({
   deleting,
   disabled,
   error,
+  conflict,
   onDelete
 }: {
   draft: PolicyRuleDraft;
@@ -355,6 +555,8 @@ function RuleEditor({
   deleting: boolean;
   disabled: boolean;
   error?: string | null;
+  /** Why the draft cannot be saved yet (RuleConflictNotice). Save waits until it is gone. */
+  conflict?: ReactNode;
   onDelete?: () => void;
 }) {
   const errorId = useId();
@@ -473,8 +675,11 @@ function RuleEditor({
       </label>
 
       </fieldset>
+      {conflict}
       <div ref={actions} className="flex flex-wrap gap-2">
-        <Button type="button" onClick={() => { if (!disabled) onSave(); }} disabled={!disabled && !isDraftValid(draft)} aria-disabled={disabled || !isDraftValid(draft)} aria-describedby={error ? errorId : undefined}>
+        <Button id={SAVE_RULE_ID} type="button" onClick={() => { if (!disabled && !conflict) onSave(); }} disabled={!disabled && !isDraftValid(draft)}
+          aria-disabled={disabled || !isDraftValid(draft) || Boolean(conflict)}
+          aria-describedby={[error ? errorId : null, conflict ? CONFLICT_ID : null].filter(Boolean).join(" ") || undefined}>
           {saving ? "Saving…" : draft.ruleId ? "Save changes" : "Create rule"}
         </Button>
         <Button type="button" variant="ghost" disabled={disabled} onClick={onCancel}>
