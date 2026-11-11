@@ -6,7 +6,10 @@ import { PasswordHasher } from "../lib/password-hash.js";
 import { bootstrapLocalTenant } from "../scripts/local-auth-commands-lib.js";
 import { LocalAccountService, markLocalIdentityRemoved } from "../services/auth/local-account-service.js";
 import { createDeepAgentsCheckpointer } from "../services/deep-agents/deep-agents-checkpointer.js";
-import { TenantDeletionService } from "../services/tenant-deletion-service.js";
+import {
+  TenantDeletionService,
+  USER_ID_COLUMNS_WITHOUT_FOREIGN_KEY
+} from "../services/tenant-deletion-service.js";
 import {
   adminDatabaseUrl,
   appPool,
@@ -17,6 +20,8 @@ import {
 import {
   seedArtifact,
   seedMembership,
+  seedMessage,
+  seedScheduledJob,
   seedSession,
   seedTenant,
   seedUser
@@ -53,6 +58,68 @@ describe.skipIf(!adminDatabaseUrl())("tenant offboarding", () => {
       ORDER BY c.table_name
     `);
     expect(result.rows.filter((row) => !row.has_cascade).map((row) => row.table_name)).toEqual([]);
+  });
+
+  // Tenant deletion finds users through every column that can store a user id.
+  // It reads foreign keys to users from the catalog; any other such column must
+  // be in USER_ID_COLUMNS_WITHOUT_FOREIGN_KEY. Unknown, it would keep a user row
+  // of the deleted tenant, or point at a deleted user in another tenant.
+  test("names every column that can hold a user id", async () => {
+    // Column names that look like a user id but hold another system's id.
+    const otherIdentifiers = new Set([
+      "user_github_connections.github_user_id",
+      "user_jira_cleanups.pipedream_external_user_id",
+      "user_jira_connections.pipedream_external_user_id",
+      "user_jira_identities.pipedream_external_user_id",
+      "user_microsoft_connections.microsoft_user_id",
+      "user_notion_connections.notion_user_id"
+    ]);
+    const result = await superuserPool().query<{
+      name: string;
+      data_type: string;
+      has_tenant_id: boolean;
+      user_foreign_key: boolean;
+    }>(`
+      SELECT c.table_name || '.' || c.column_name AS name, c.data_type,
+             EXISTS (
+               SELECT 1 FROM information_schema.columns t
+               WHERE t.table_schema = 'public' AND t.table_name = c.table_name AND t.column_name = 'tenant_id'
+             ) AS has_tenant_id,
+             EXISTS (
+               SELECT 1
+               FROM pg_constraint con
+               JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = ANY (con.conkey)
+               WHERE con.contype = 'f'
+                 AND con.confrelid = 'public.users'::regclass
+                 AND con.conrelid = format('public.%I', c.table_name)::regclass
+                 AND a.attname = c.column_name
+             ) AS user_foreign_key
+      FROM information_schema.columns c
+      JOIN information_schema.tables t
+        ON t.table_schema = c.table_schema AND t.table_name = c.table_name AND t.table_type = 'BASE TABLE'
+      WHERE c.table_schema = 'public' AND c.table_name <> 'users'
+      ORDER BY name
+    `);
+    const columns = new Map(result.rows.map((row) => [row.name, row]));
+    const listed = USER_ID_COLUMNS_WITHOUT_FOREIGN_KEY.map(([table, column]) => `${table}.${column}`);
+
+    // A listed column is a text column of a tenant table with no foreign key.
+    const wrongEntries = listed.filter((name) => {
+      const column = columns.get(name);
+      return !column || column.data_type !== "text" || !column.has_tenant_id || column.user_foreign_key;
+    });
+    expect(wrongEntries).toEqual([]);
+    expect([...otherIdentifiers].filter((name) => !columns.has(name))).toEqual([]);
+
+    // `table.column` names: user_id, *_user_id, *_by.
+    const userIdName = /[._]user_id$|_by$/;
+    const unclassified = result.rows
+      .filter((row) => userIdName.test(row.name) && !row.user_foreign_key)
+      .map((row) => row.name)
+      .filter((name) => !listed.includes(name) && !otherIdentifiers.has(name));
+    expect(unclassified).toEqual([]);
+    // The pattern finds every listed column, so it still finds new ones.
+    expect(listed.filter((name) => !userIdName.test(name))).toEqual([]);
   });
 
   test("deletes one non-production tenant and records a content-free receipt", async () => {
@@ -226,5 +293,206 @@ describe.skipIf(!adminDatabaseUrl())("tenant offboarding", () => {
       expect((await superuserPool().query(`SELECT 1 FROM ${table} WHERE tenant_id = $1`, [boot.tenantId])).rowCount, table).toBe(0);
     }
     expect((await superuserPool().query(`SELECT 1 FROM users WHERE user_id = ANY($1)`, [[boot.userId, removed.userId]])).rowCount).toBe(0);
+  });
+
+  // Member removal (routes/tenant.ts) deletes only the membership row. The
+  // removed member's sessions, jobs, settings and audit events stay in that
+  // tenant, so a user without a membership can still belong to another tenant.
+  describe("user rows", () => {
+    function deletionService() {
+      return new TenantDeletionService({
+        db: superuserPool(),
+        artifactStorage: { delete: vi.fn(async () => undefined) },
+        skillBundleStorage: { deleteBundle: vi.fn(async () => undefined) },
+        purgeRuntimeThread: (threadId) => checkpointer!.deleteThread(threadId),
+        flushRedis: vi.fn(async () => undefined)
+      });
+    }
+
+    const deletion = (tenantId: string) => ({
+      requestId: `NONPROD-OFFBOARD-${randomUUID()}`,
+      tenantId,
+      redisDisposition: "Integration Redis double flushed.",
+      thirdPartyDisposition: "None.",
+      backupDisposition: "None."
+    });
+
+    async function existingUsers(userIds: string[]): Promise<string[]> {
+      const result = await superuserPool().query<{ user_id: string }>(
+        `SELECT user_id FROM users WHERE user_id = ANY($1::text[]) ORDER BY user_id`,
+        [userIds]
+      );
+      return result.rows.map((row) => row.user_id);
+    }
+
+    // Row count of every tenant table for one tenant. A cascade from a user
+    // delete changes it; equal counts before and after show that the deletion
+    // of another tenant removed nothing here.
+    async function tenantRows(tenantId: string): Promise<Record<string, number>> {
+      const tables = await superuserPool().query<{ table_name: string }>(`
+        SELECT table_name FROM information_schema.columns
+        WHERE table_schema = 'public' AND column_name = 'tenant_id'
+        ORDER BY table_name
+      `);
+      const counts: Record<string, number> = {};
+      for (const { table_name: tableName } of tables.rows) {
+        const quoted = `"${tableName.replaceAll('"', '""')}"`;
+        const result = await superuserPool().query<{ count: number }>(
+          `SELECT COUNT(*)::int AS count FROM public.${quoted} WHERE tenant_id = $1`,
+          [tenantId]
+        );
+        counts[tableName] = result.rows[0]!.count;
+      }
+      return counts;
+    }
+
+    async function seedAuditEvent(tenantId: string, userId: string): Promise<string> {
+      const result = await superuserPool().query<{ id: string }>(
+        `INSERT INTO audit_events (tenant_id, user_id, event_type) VALUES ($1, $2, 'session.created') RETURNING id::text`,
+        [tenantId, userId]
+      );
+      return result.rows[0]!.id;
+    }
+
+    async function seedTenantWithOwner(): Promise<string> {
+      const tenantId = await seedTenant();
+      await seedMembership(tenantId, await seedUser(), "owner");
+      return tenantId;
+    }
+
+    test("keeps a former member whose rows in another tenant restrict the user delete", async () => {
+      const target = await seedTenantWithOwner();
+      const other = await seedTenantWithOwner();
+      const formerMember = await seedUser();
+      await seedMembership(target, formerMember);
+      // Removed from `other` earlier: its session, message and project stay there.
+      const session = await seedSession(other, formerMember);
+      await seedMessage(other, formerMember, session);
+      await superuserPool().query(
+        `INSERT INTO projects (project_id, tenant_id, user_id, name) VALUES ($1, $2, $3, 'Former member project')`,
+        [`project_${randomUUID()}`, other, formerMember]
+      );
+      const otherBefore = await tenantRows(other);
+
+      const receipt = await deletionService().execute(deletion(target));
+
+      expect(receipt.status).toBe("completed");
+      expect((await superuserPool().query(`SELECT 1 FROM tenants WHERE tenant_id = $1`, [target])).rowCount).toBe(0);
+      expect(await existingUsers([formerMember])).toEqual([formerMember]);
+      expect(await tenantRows(other)).toEqual(otherBefore);
+      expect(otherBefore).toMatchObject({ sessions: 1, messages: 1, projects: 1 });
+    });
+
+    test("keeps a former member whose rows in another tenant cascade, lose their user, or name it without a foreign key", async () => {
+      const target = await seedTenantWithOwner();
+      const other = await seedTenantWithOwner();
+      // Removed from `other` earlier: rows that a user delete would cascade
+      // away (job, settings) or set to NULL (audit event) stay there.
+      const formerMember = await seedUser();
+      await seedMembership(target, formerMember);
+      await seedScheduledJob({ tenantId: other, userId: formerMember, due: false });
+      await superuserPool().query(
+        `INSERT INTO user_settings_sections (tenant_id, user_id, section_key) VALUES ($1, $2, 'general')`,
+        [other, formerMember]
+      );
+      const auditId = await seedAuditEvent(other, formerMember);
+      // A former admin of `other` that only an actor column names there.
+      const formerAdmin = await seedUser();
+      await seedMembership(target, formerAdmin);
+      await superuserPool().query(
+        `INSERT INTO admin_skills (tenant_id, skill_id, skill_name, created_by) VALUES ($1, 'skill-former-admin', 'Kept', $2)`,
+        [other, formerAdmin]
+      );
+      const otherBefore = await tenantRows(other);
+
+      const receipt = await deletionService().execute(deletion(target));
+
+      expect(receipt.status).toBe("completed");
+      expect(await existingUsers([formerMember, formerAdmin])).toEqual([formerMember, formerAdmin].sort());
+      expect(await tenantRows(other)).toEqual(otherBefore);
+      expect(otherBefore).toMatchObject({ scheduled_jobs: 1, user_settings_sections: 1, admin_skills: 1 });
+      const audit = await superuserPool().query(`SELECT user_id FROM audit_events WHERE id = $1`, [auditId]);
+      expect(audit.rows).toEqual([{ user_id: formerMember }]);
+    });
+
+    test("deletes former members that only the deleted tenant names, and keeps every other user", async () => {
+      const target = await seedTenantWithOwner();
+      const other = await seedTenantWithOwner();
+      const shared = await seedUser();
+      await seedMembership(target, shared);
+      await seedMembership(other, shared);
+      await seedSession(other, shared);
+      const otherOnly = await seedUser();
+      await seedMembership(other, otherOnly);
+      await seedAuditEvent(other, otherOnly);
+      // No tenant row names this user (a dev-headers `ensureUser` row).
+      const unrelated = await seedUser();
+      // A WorkOS member removed from the target earlier: no membership and no
+      // local identity, but its session, message and audit event stay.
+      const formerMember = await seedUser();
+      const session = await seedSession(target, formerMember);
+      await seedMessage(target, formerMember, session);
+      await seedAuditEvent(target, formerMember);
+      // A former admin of the target that only an actor column names.
+      const formerAdmin = await seedUser();
+      await superuserPool().query(
+        `INSERT INTO admin_skills (tenant_id, skill_id, skill_name, created_by) VALUES ($1, 'skill-former-admin', 'Gone', $2)`,
+        [target, formerAdmin]
+      );
+      const otherBefore = await tenantRows(other);
+
+      const receipt = await deletionService().execute(deletion(target));
+
+      expect(receipt.status).toBe("completed");
+      expect(await existingUsers([shared, otherOnly, unrelated, formerMember, formerAdmin]))
+        .toEqual([shared, otherOnly, unrelated].sort());
+      // The target owner, the former member and the former admin.
+      expect(receipt.rowCounts.orphaned_users).toBe(3);
+      expect(await tenantRows(other)).toEqual(otherBefore);
+      expect(otherBefore).toMatchObject({ tenant_memberships: 3, sessions: 1, audit_events: 1 });
+    });
+
+    // A sign-in that adds a candidate user to another tenant while the
+    // deletion runs. Its foreign-key check holds FOR KEY SHARE on the users
+    // row until it commits.
+    test("waits for a concurrent reference to a candidate user, then keeps the user and the reference", async () => {
+      const target = await seedTenantWithOwner();
+      const other = await seedTenantWithOwner();
+      const joining = await seedUser();
+      await seedMembership(target, joining);
+
+      const writer = await superuserPool().connect();
+      let running: Promise<unknown> | undefined;
+      try {
+        await writer.query("BEGIN");
+        const pid = Number((await writer.query("SELECT pg_backend_pid() AS pid")).rows[0].pid);
+        await writer.query(
+          `INSERT INTO tenant_memberships (tenant_id, user_id, role) VALUES ($1, $2, 'member')`,
+          [other, joining]
+        );
+        running = deletionService().execute(deletion(target));
+        running.catch(() => undefined);
+        await vi.waitFor(async () => {
+          const waiting = await superuserPool().query<{ count: number }>(
+            `SELECT count(*)::int AS count FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))`,
+            [pid]
+          );
+          expect(waiting.rows[0]!.count).toBeGreaterThan(0);
+        }, { timeout: 10_000 });
+        await writer.query("COMMIT");
+        await expect(running).resolves.toMatchObject({ status: "completed" });
+      } finally {
+        await writer.query("ROLLBACK").catch(() => undefined);
+        writer.release();
+        await Promise.allSettled([running]);
+      }
+
+      expect(await existingUsers([joining])).toEqual([joining]);
+      const membership = await superuserPool().query(
+        `SELECT 1 FROM tenant_memberships WHERE tenant_id = $1 AND user_id = $2`,
+        [other, joining]
+      );
+      expect(membership.rowCount).toBe(1);
+    });
   });
 });

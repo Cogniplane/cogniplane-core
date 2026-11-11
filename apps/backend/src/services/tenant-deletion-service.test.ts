@@ -7,8 +7,9 @@ import { TenantDeletionService } from "./tenant-deletion-service.js";
 // Unit tests for the operator offboarding path. They use an in-memory stand-in
 // for the privileged pool, so they prove the service's own decisions: replay
 // checks, transaction boundaries and cleanup accounting. The real cascade,
-// cross-tenant object sharing and receipt content are proven against Postgres
-// in src/integration/tenant-deletion.integration.test.ts.
+// cross-tenant object sharing, the user rows that stay or go, and receipt
+// content are proven against Postgres in
+// src/integration/tenant-deletion.integration.test.ts.
 
 type QueueItem = { requestId: string; kind: string; locator: string; attempts: number; lastError: string | null };
 type Receipt = Record<string, unknown>;
@@ -40,6 +41,11 @@ class OffboardingDatabase {
   readonly tenantObjects = new Map<string, { kind: string; locator: string }[]>();
   // Locators that rows outside the deleted tenant still reference.
   readonly sharedLocators = new Set<string>();
+  // Foreign keys to users that the catalog query returns.
+  userForeignKeys: Record<string, unknown>[] = [{
+    constraint_name: "tenant_memberships_user_id_fkey", schema_name: "public",
+    table_name: "tenant_memberships", column_name: "user_id", tenant_scoped: true
+  }];
   failOn: { fragment: string; error: Error } | null = null;
   rollbackError: Error | null = null;
 
@@ -98,7 +104,10 @@ class OffboardingDatabase {
         : 1;
       return this.result([{ count: String(count) }]);
     }
-    if (sql.startsWith("SELECT user_id FROM tenant_memberships")) {
+    if (sql.startsWith("SELECT con.conname") && sql.includes("FROM pg_constraint")) {
+      return this.result(this.userForeignKeys);
+    }
+    if (sql.startsWith("SELECT user_id FROM users")) {
       return this.result(this.members.filter(member => member.tenantId === values[0]).map(member => ({ user_id: member.userId })));
     }
     if (sql.startsWith("INSERT INTO tenant_deletion_receipts")) {
@@ -318,6 +327,26 @@ describe("TenantDeletionService", () => {
 
     expect(db.receipts.size).toBe(0);
     expect(db.ran("DELETE FROM")).toBe(false);
+    expectRolledBackWithoutCleanup(db, deps);
+  });
+
+  test("stops before it deletes anything when a foreign key to users does not use user_id", async () => {
+    const db = new OffboardingDatabase();
+    seedTenant(db, "tenant-1");
+    db.userForeignKeys.push({
+      constraint_name: "exports_owner_email_fkey", schema_name: "public",
+      table_name: "exports", column_name: null, tenant_scoped: true
+    });
+    const deps = storage();
+    const service = new TenantDeletionService({ db: db.asPool(), ...deps });
+
+    await expect(service.execute(input("request-1", "tenant-1"))).rejects.toThrow(
+      "Foreign key exports_owner_email_fkey references users without user_id; tenant deletion cannot check it."
+    );
+
+    expect(db.ran("INSERT INTO tenant_deletion_receipts")).toBe(false);
+    expect(db.ran("DELETE FROM")).toBe(false);
+    expect(db.tenants.has("tenant-1")).toBe(true);
     expectRolledBackWithoutCleanup(db, deps);
   });
 
