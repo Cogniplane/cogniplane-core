@@ -1255,18 +1255,34 @@ const WRITE_PATHS: Record<string, WritePath> = {
     write: async () => ({ job_id: await scheduledJob() })
   },
   scheduled_job_runs: {
-    path: "UserSettingsStore.createJobRun",
+    path: "UserSettingsStore.claimJob",
     writer: "app",
     write: async () => {
       const { owner } = await people();
-      const runId = randomUUID();
-      await new UserSettingsStore(appPool(), maintenancePool()).createJobRun({
+      const settings = new UserSettingsStore(appPool(), maintenancePool());
+      const jobId = randomUUID();
+      // Due now, so the claim matches it. The claim moves it far ahead, so
+      // scheduler ticks in other files do not take it.
+      const created = await settings.createScheduledJob({
         tenantId: owner.tenantId,
-        runId,
-        jobId: await scheduledJob(),
+        jobId,
         userId: owner.userId,
-        sessionId: null
-      });
+        jobName: "Run history",
+        description: null,
+        cronExpression: "0 9 * * 1",
+        timeZone: "UTC",
+        targetType: "prompt",
+        targetRef: null,
+        input: { prompt: "Write the run history." },
+        settingsSnapshot: {},
+        enabled: true,
+        nextRunAt: new Date(Date.now() - 60_000).toISOString(),
+        ownerSecurityVersion: null
+      }, { maxActive: 0 });
+      if (created.status !== "created") throw new Error("createScheduledJob did not create the job");
+      const runId = randomUUID();
+      const claimed = await settings.claimJob(owner.tenantId, jobId, FAR_FUTURE().toISOString(), runId);
+      if (!claimed) throw new Error("claimJob did not claim the job");
       return { run_id: runId };
     }
   },

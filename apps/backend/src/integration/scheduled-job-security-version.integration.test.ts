@@ -164,7 +164,8 @@ function scopedWorker(tenantId: string, options: {
     settings: {
       listDueJobs: async () => (await settings.listDueJobs(10_000)).filter((job) => job.tenantId === tenantId),
       claimJob: settings.claimJob.bind(settings),
-      createJobRun: settings.createJobRun.bind(settings),
+      parkJob: settings.parkJob.bind(settings),
+      attachJobRunSession: settings.attachJobRunSession.bind(settings),
       completeJobRun: settings.completeJobRun.bind(settings),
       recordJobRunOutcome: settings.recordJobRunOutcome.bind(settings),
       sweepStaleJobRuns: async () => [],
@@ -509,7 +510,7 @@ describe.skipIf(!adminDatabaseUrl())("migration 080: scheduled job owner securit
       // are not claimed, so the worker pauses them for a review.
       const migrated = new UserSettingsStore(db, db);
       const claimable = async (owner: { tenantId: string }, jobId: string) =>
-        (await migrated.claimJob(owner.tenantId, jobId, null)) !== null;
+        (await migrated.claimJob(owner.tenantId, jobId, null, randomUUID())) !== null;
       expect({
         savedBefore: await claimable(boot, savedBefore), ranAfter: await claimable(boot, ranAfter),
         editedAfter: await claimable(boot, editedAfter), editedBefore: await claimable(boot, editedBefore),

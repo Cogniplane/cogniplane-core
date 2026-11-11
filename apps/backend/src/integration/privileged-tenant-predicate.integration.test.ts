@@ -20,6 +20,8 @@
 //     they see nothing, which is the silent-empty-queue failure the boot
 //     assertion in app.ts exists to prevent.
 
+import { randomUUID } from "node:crypto";
+
 import { DEFAULT_PII_PROTECTION, type PiiProtectionSettings } from "@cogniplane/shared-types";
 import { beforeAll, describe, expect, test } from "vitest";
 
@@ -390,8 +392,8 @@ describe.skipIf(!adminDatabaseUrl())("privileged pool tenant predicates", () => 
 
   describe("UserSettingsStore scheduled-job methods", () => {
     function store(): UserSettingsStore {
-      // Both pools privileged: these methods are called from the scheduler
-      // worker, which has no request scope.
+      // Claims use the job's tenant scope; cross-tenant scheduler methods
+      // still use the maintenance pool.
       return new UserSettingsStore(appPool(), maintenancePool());
     }
 
@@ -400,7 +402,7 @@ describe.skipIf(!adminDatabaseUrl())("privileged pool tenant predicates", () => 
         tenantId: tenantA.tenantId,
         userId: tenantA.userId
       });
-      const claimed = await store().claimJob(tenantA.tenantId, jobId, null);
+      const claimed = await store().claimJob(tenantA.tenantId, jobId, null, randomUUID());
       expect(claimed?.jobId).toBe(jobId);
     });
 
@@ -409,11 +411,11 @@ describe.skipIf(!adminDatabaseUrl())("privileged pool tenant predicates", () => 
         tenantId: tenantA.tenantId,
         userId: tenantA.userId
       });
-      expect(await store().claimJob(tenantB.tenantId, jobId, null)).toBeNull();
+      expect(await store().claimJob(tenantB.tenantId, jobId, null, randomUUID())).toBeNull();
 
       // And the job is still claimable by its owner, so the refusal did not
       // half-apply.
-      expect((await store().claimJob(tenantA.tenantId, jobId, null))?.jobId).toBe(jobId);
+      expect((await store().claimJob(tenantA.tenantId, jobId, null, randomUUID()))?.jobId).toBe(jobId);
     });
 
     test("recordJobRunOutcome does not touch another tenant's failure counter", async () => {
@@ -461,6 +463,23 @@ describe.skipIf(!adminDatabaseUrl())("privileged pool tenant predicates", () => 
         [jobId]
       );
       expect(after[0]?.enabled).toBe(false);
+    });
+
+    test("parkJob does not park another tenant's job", async () => {
+      const jobId = await seedScheduledJob({
+        tenantId: tenantA.tenantId,
+        userId: tenantA.userId
+      });
+      const nextRunAt = async () => (await superuserPool().query<{ next_run_at: Date | null }>(
+        `SELECT next_run_at FROM scheduled_jobs WHERE job_id = $1`,
+        [jobId]
+      )).rows[0]?.next_run_at;
+
+      await store().parkJob(tenantB.tenantId, jobId);
+      expect(await nextRunAt()).toBeInstanceOf(Date);
+
+      await store().parkJob(tenantA.tenantId, jobId);
+      expect(await nextRunAt()).toBeNull();
     });
   });
 

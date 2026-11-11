@@ -46,6 +46,9 @@ export function scheduledInterruptionMessage(reason?: TurnStopReason): string {
 export const OWNER_SECURITY_CHANGED_RUN_ERROR =
   "The run did not start because your account security changed after the job was saved.";
 
+/** The run error when the backend shut down after the claim, before the turn started. */
+export const SCHEDULER_STOPPED_RUN_ERROR = "The run did not start because the scheduler stopped.";
+
 /**
  * Per-job runtime resolution, mirroring the interactive /messages path
  * (`resolveRuntimeModel`): validates key presence and picks the default model
@@ -68,7 +71,8 @@ export type SchedulerWorkerDeps = {
     UserSettingsStore,
     | "listDueJobs"
     | "claimJob"
-    | "createJobRun"
+    | "parkJob"
+    | "attachJobRunSession"
     | "completeJobRun"
     | "recordJobRunOutcome"
     | "sweepStaleJobRuns"
@@ -303,7 +307,8 @@ export class SchedulerWorker {
         this.activeCount += 1;
         let claimed: ClaimedScheduledJob | null = null;
         try {
-          claimed = await this.deps.settings.claimJob(job.tenantId, job.jobId, nextRunAt);
+          // The claim also writes the pending run with this id.
+          claimed = await this.deps.settings.claimJob(job.tenantId, job.jobId, nextRunAt, uuidv7());
         } finally {
           if (!claimed) {
             this.activeCount -= 1;
@@ -425,9 +430,10 @@ export class SchedulerWorker {
 
   /**
    * A job whose cron expression can't be parsed will never produce a future
-   * run. Disable it (preferred) or, if no disable capability is wired, claim it
-   * with next_run_at = NULL so it goes dormant. Either way an audit event is
-   * written so the disable/dormancy is traceable.
+   * run. Disable it (preferred) or, if no disable capability is wired, park it
+   * with next_run_at = NULL so it goes dormant. Parking is not a claim, so it
+   * writes no run. Either way an audit event is written so the
+   * disable/dormancy is traceable.
    */
   private async handleInvalidCronJob(job: ScheduledJobRecord, error: unknown): Promise<void> {
     const reason = error instanceof Error ? error.message : String(error);
@@ -456,10 +462,10 @@ export class SchedulerWorker {
     // per-minute invalid-cron job doesn't re-fire this branch every tick.
     if (!disabled) {
       try {
-        await this.deps.settings.claimJob(job.tenantId, job.jobId, null);
-      } catch (claimError) {
+        await this.deps.settings.parkJob(job.tenantId, job.jobId);
+      } catch (parkError) {
         this.deps.logger.error(
-          { error: claimError, jobId: job.jobId },
+          { error: parkError, jobId: job.jobId },
           "Failed to park job with invalid cron expression"
         );
       }
@@ -490,11 +496,11 @@ export class SchedulerWorker {
 
   /**
    * Mark `scheduled_job_runs` rows stuck in `pending` past any legitimate
-   * lifetime as failed. A run is only ever completed by the `executeJob` that
-   * created it, so a process crash/restart strands its rows forever without
-   * this. The cutoff is strictly longer than the watchdog's worst case
-   * (timeout + abort-settle grace) plus a buffer, so live runs are never
-   * swept. Best-effort: a sweep failure must not break the tick, and the
+   * lifetime as failed. The claim writes the run, and only the `executeJob`
+   * of that claim completes it, so a process crash/restart after the claim
+   * strands its row forever without this. The cutoff is strictly longer than
+   * the watchdog's worst case (timeout + abort-settle grace) plus a buffer, so
+   * live runs are never swept. Best-effort: a sweep failure must not break the tick, and the
    * poison counter is NOT touched — a crash is not the job's fault.
    */
   private async sweepStaleJobRuns(): Promise<void> {
@@ -626,10 +632,11 @@ export class SchedulerWorker {
   }
 
   private async executeJobWithTimeout(job: ClaimedScheduledJob): Promise<void> {
-    // `executeJob` owns the run-record lifecycle. On timeout we abort the
-    // runtime session. That ends the AG-UI turn and unblocks the `for await` loop,
-    // so the same promise settles with status="failed" and records the outcome.
-    // We therefore never need to invent a second completeJobRun here.
+    // The claim wrote the pending run, and `executeJob` completes it. On
+    // timeout we abort the runtime session. That ends the AG-UI turn and
+    // unblocks the `for await` loop, so the same promise settles with
+    // status="failed" and records the outcome. We therefore never need to
+    // invent a second completeJobRun here.
     const turn: ScheduledTurnHandle = { sessionId: null, adapter: null, timedOut: false };
     // Tracked on its own: after the abort grace this wrapper returns and frees
     // the slot, but the job can still be writing its outcome.
@@ -702,7 +709,7 @@ export class SchedulerWorker {
   }
 
   private async executeJob(job: ClaimedScheduledJob, turn: ScheduledTurnHandle): Promise<void> {
-    const runId = uuidv7();
+    const runId = job.runId;
     const startTime = Date.now();
     let sessionId: string | null = null;
     // Created with the assistant row; it classifies the turn and writes the
@@ -725,7 +732,7 @@ export class SchedulerWorker {
     const stopIfTimedOut = () => {
       if (turn.timedOut) throw new Error("Scheduled job timed out before its turn started");
       // The runtimes close at shutdown; a job still preparing must not start a turn.
-      if (this.turnsRefused) throw new Error("Scheduler shut down before the job's turn started");
+      if (this.turnsRefused) throw jobOwnerError(SCHEDULER_STOPPED_RUN_ERROR);
     };
     // The claim compared the owner's security version, but the account can
     // change while the run prepares (for example during the PII check). Check
@@ -748,6 +755,8 @@ export class SchedulerWorker {
       // audit, tool security, persistence, and approvals behave identically
       // to user-initiated turns. Diverging into a thinner path would mean
       // re-implementing those guarantees.
+      // Shutdown can start between the claim and this point.
+      stopIfTimedOut();
       const session = await this.deps.sessions.create(
         job.tenantId,
         job.userId,
@@ -758,16 +767,14 @@ export class SchedulerWorker {
       // Expose the session id so the timeout watchdog can abort this runtime.
       turn.sessionId = sessionId;
 
-      await this.deps.settings.createJobRun({
-        tenantId: job.tenantId,
-        runId,
-        jobId: job.jobId,
-        userId: job.userId,
-        sessionId
-      });
+      // The claim wrote the run without a session. No row means that the job
+      // was deleted, so the turn does not start.
+      const attached = await this.deps.settings.attachJobRunSession({ tenantId: job.tenantId, runId, sessionId });
+      if (!attached) throw new Error("Scheduled job run record is missing");
+      // Session creation can outlive the job timeout.
+      stopIfTimedOut();
 
-      // Ordering: after createJobRun so a failure lands on a real run row,
-      // before the message rows so it leaves no dangling pending assistant.
+      // Before the message rows, so a failure leaves no dangling pending assistant.
       const resolution = await this.deps.resolveRuntime(job.tenantId);
       if (resolution.kind === "error") {
         // 400 (statusCode) so classifyTurnFailure passes this through to
@@ -1069,7 +1076,7 @@ export class SchedulerWorker {
       outcome;
 
     try {
-      await this.deps.settings.completeJobRun({
+      const completed = await this.deps.settings.completeJobRun({
         tenantId: job.tenantId,
         runId,
         status,
@@ -1079,6 +1086,10 @@ export class SchedulerWorker {
         errorMessage,
         summary
       });
+      // The run row goes with its job, so a job deleted during the run has none.
+      if (!completed) {
+        this.deps.logger.warn({ runId, jobId: job.jobId }, "Scheduled job run record is missing; outcome not saved");
+      }
     } catch (error) {
       this.deps.logger.error({ error, runId }, "Failed to complete job run record");
     }
