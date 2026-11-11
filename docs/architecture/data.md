@@ -131,6 +131,13 @@ Fields that agents change most often (the full list is `TenantSettingsSchema` in
   `ProjectFileStore.cleanupExpired`) deletes promoted files and files in the
   trash for more than 30 days, with their versions. It does not prune the
   versions of a live file.
+- When the job deletes the target of an update draft, it deletes the draft
+  only if the draft is promoted or was in the trash for more than 30 days. It
+  keeps every other draft, also a draft in the trash for less than 30 days,
+  with its versions and objects. The kept draft loses its target and base
+  version and becomes a new-file draft. A draft in the trash keeps its trash
+  date, so its own 30 days do not restart. The `project_file_retention_deleted`
+  audit event lists these drafts in `detachedFileIds`.
 - Skill revision cleanup runs only when an admin calls it
   ([skills](skills.md#import-and-lifecycle)).
 - Spending records stay when sessions or messages are deleted.
