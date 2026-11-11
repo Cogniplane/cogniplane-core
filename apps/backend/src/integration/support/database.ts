@@ -29,6 +29,7 @@ import { fileURLToPath } from "node:url";
 
 import pg from "pg";
 
+import { createMigrationDatabase } from "../../lib/db.js";
 import { setupDeepAgentsCheckpointer } from "../../services/deep-agents/deep-agents-checkpointer.js";
 import { ensureMaintenanceRole } from "../../scripts/maintenance-role.js";
 import { applyMigrations, ensureAppUserRole } from "../../scripts/migrate-lib.js";
@@ -196,7 +197,9 @@ export async function createRunDatabase(): Promise<
   }
 
   const runUrl = withDatabase(admin, database);
-  const runPool = new pg.Pool({ connectionString: runUrl, max: 1 });
+  // The pool of the production migration command, so that every run applies
+  // the real migrations with its limits.
+  const runPool = createMigrationDatabase(runUrl);
   try {
     // Silence the per-migration log; a failure still throws with the file name.
     await applyMigrations(runPool, MIGRATIONS_DIR, () => {});

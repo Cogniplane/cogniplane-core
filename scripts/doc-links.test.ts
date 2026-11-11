@@ -120,7 +120,7 @@ it("names only files that exist in backticked references", () => {
 // Docker Compose and Node.js runtime names, the upstream sample code in
 // mcp-proxy-signature.md, and test constants that data.md cites with their
 // test file.
-const EXTERNAL_NAMES = new Set(["max_connections", "pg_dump", "stop_grace_period", "UV_THREADPOOL_SIZE", "highWater", "rawBody", "WRITE_PATHS", "GLOBAL_TABLES"]);
+const EXTERNAL_NAMES = new Set(["max_connections", "pg_dump", "pg_cancel_backend", "pg_stat_activity", "stop_grace_period", "UV_THREADPOOL_SIZE", "highWater", "rawBody", "WRITE_PATHS", "GLOBAL_TABLES"]);
 // Legal texts quote third-party names verbatim; the route index is checked by
 // its own tests. The configuration reference is checked: its table names only
 // schema variables.
