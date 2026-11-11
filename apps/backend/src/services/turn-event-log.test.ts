@@ -1,9 +1,33 @@
 import { EventType, type BaseEvent } from "@ag-ui/client";
 import { expect, test, vi } from "vitest";
-import { TurnEventLog } from "./turn-event-log.js";
+import { redactSecrets } from "./redact-secrets.js";
+import { TurnEventLog, type SequencedTurnEvent } from "./turn-event-log.js";
 
 function textEvent(delta: string): BaseEvent {
   return { type: EventType.TEXT_MESSAGE_CONTENT, messageId: "answer", delta } as BaseEvent;
+}
+
+function mirroredLog(): { log: TurnEventLog; mirrored: SequencedTurnEvent[] } {
+  const log = new TurnEventLog();
+  const mirrored: SequencedTurnEvent[] = [];
+  log.setMirror(async (entry) => { mirrored.push(entry); });
+  return { log, mirrored };
+}
+
+function replayedText(entries: SequencedTurnEvent[], type = EventType.TEXT_MESSAGE_CONTENT): string {
+  return entries.filter((entry) => entry.event.type === type)
+    .map((entry) => (entry.event as { delta?: string }).delta ?? "").join("");
+}
+
+// Cuts `text` into deltas whose lengths repeat `sizes`, in UTF-16 code units.
+function chunks(text: string, sizes: number[]): string[] {
+  const deltas: string[] = [];
+  for (let index = 0, step = 0; index < text.length; step += 1) {
+    const size = sizes[step % sizes.length]!;
+    deltas.push(text.slice(index, index + size));
+    index += size;
+  }
+  return deltas;
 }
 
 test("replays events in sequence, follows live events, and closes listeners", () => {
@@ -341,4 +365,122 @@ test("bounds a single unbroken text chunk without replaying its raw content", ()
     entry.event.type === EventType.TEXT_MESSAGE_CONTENT
   )?.event;
   expect(content).toMatchObject({ delta: "[Reply text exceeds live replay limit]" });
+});
+
+// Chinese, Japanese and Thai with no whitespace, Latin words with no spaces
+// around them, and emoji: surrogate pairs, a ZWJ sequence and a flag. Delta
+// cuts and release cuts fall next to and inside them.
+const NO_SPACE_TEXT =
+  "日本語の回答は単語の間に空白がありません。中文回答的词语之间没有空格。我们用Python和TypeScript写代码。ภาษาไทยไม่มีช่องว่าง😀👨‍👩‍👧🇯🇵"
+    .repeat(250);
+const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+
+test.each([
+  ["reply text in small deltas", EventType.TEXT_MESSAGE_START, EventType.TEXT_MESSAGE_CONTENT,
+    { type: EventType.TEXT_MESSAGE_END, messageId: "answer" }, [1, 2, 3, 5, 8, 13]],
+  ["reasoning text in small deltas", EventType.REASONING_MESSAGE_START, EventType.REASONING_MESSAGE_CONTENT,
+    { type: EventType.REASONING_MESSAGE_END, messageId: "answer" }, [1, 2, 3, 5, 8, 13]],
+  ["reply text in one delta, ended by the run", EventType.TEXT_MESSAGE_START, EventType.TEXT_MESSAGE_CONTENT,
+    { type: EventType.RUN_FINISHED, threadId: "s", runId: "r" }, [NO_SPACE_TEXT.length]]
+])("streams %s without whitespace and rebuilds it exactly", async (_name, start, content, end, sizes) => {
+  expect(NO_SPACE_TEXT.length).toBeGreaterThan(16_384);
+  const { log, mirrored } = mirroredLog();
+  log.append({ type: start, messageId: "answer", role: "assistant" } as BaseEvent);
+  for (const delta of chunks(NO_SPACE_TEXT, sizes)) {
+    log.append({ type: content, messageId: "answer", delta } as BaseEvent);
+  }
+  // Before the end, all but a short tail is in the replay.
+  const live = replayedText(log.subscribe(0, () => undefined)!.replay, content);
+  expect(NO_SPACE_TEXT.startsWith(live)).toBe(true);
+  expect(NO_SPACE_TEXT.length - live.length).toBeLessThan(1_000);
+
+  log.append(end as BaseEvent);
+  const replay = log.subscribe(0, () => undefined)!.replay;
+  expect(replay[0]?.sequence).toBe(1);
+  expect(replayedText(replay, content)).toBe(NO_SPACE_TEXT);
+  for (const { event } of replay) expect((event as { delta?: string }).delta ?? "").not.toMatch(LONE_SURROGATE);
+  await vi.waitFor(() => expect(mirrored).toEqual(replay), { interval: 1 });
+});
+
+test("streams text without whitespace again after it held a long secret", () => {
+  const log = new TurnEventLog();
+  log.append({ type: EventType.TEXT_MESSAGE_START, messageId: "answer", role: "assistant" } as BaseEvent);
+  // The query value is held until `#`, longer than one split search.
+  for (const delta of chunks(`?token=${"秘".repeat(600)}#${NO_SPACE_TEXT}`, [3])) log.append(textEvent(delta));
+  const expected = `?token=REDACTED#${NO_SPACE_TEXT}`;
+  const live = replayedText(log.subscribe(0, () => undefined)!.replay);
+  expect(expected.startsWith(live)).toBe(true);
+  expect(expected.length - live.length).toBeLessThan(1_000);
+  log.append({ type: EventType.TEXT_MESSAGE_END, messageId: "answer" } as BaseEvent);
+  expect(replayedText(log.subscribe(0, () => undefined)!.replay)).toBe(expected);
+});
+
+const BEFORE_TEXT = "前文没有空格".repeat(100);
+const AFTER_TEXT = "后文也没有空格".repeat(100);
+const SECRET_BODY = "Q7xK9mP2vL4nR8tW3yZ6bC1dF5gH0jA";
+
+// Each piece of `secret` that has `length` code units.
+function pieces(secret: string, length: number): string[] {
+  return Array.from({ length: secret.length - length + 1 }, (_, index) => secret.slice(index, index + length));
+}
+
+// Deltas for `text` that cut `part` at each of its boundaries, then small deltas.
+function splitsAround(text: string, part: string): string[][] {
+  const offset = text.indexOf(part);
+  const splits = Array.from({ length: part.length + 1 }, (_, index) =>
+    [text.slice(0, offset + index), text.slice(offset + index)]);
+  return [...splits, chunks(text, [1]), chunks(text, [1, 2, 3, 5, 8, 13])];
+}
+
+test.each([
+  ["an Anthropic key", `密钥sk-ant-api03-${SECRET_BODY}。`, SECRET_BODY],
+  ["a GitHub token", `令牌ghp_${SECRET_BODY}。`, SECRET_BODY],
+  ["an AWS key", "密钥AKIAQ7XK9MP2VL4NR8TW。", "Q7XK9MP2VL4NR8TW"],
+  ["a JWT", `令牌eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.${SECRET_BODY}。`, SECRET_BODY],
+  ["a Bearer token", `请求头Bearer ${SECRET_BODY}。`, SECRET_BODY],
+  // Ideographic spaces are whitespace. `#` ends a query parameter, not a Bearer
+  // value; `,` ends a Bearer value, not a query parameter.
+  ["a Bearer value in Chinese", "请求头Bearer\u3000\u3000秘密#令牌值。", "秘密#令牌值"],
+  ["a URL token", `链接https://example.com/a?token=${SECRET_BODY}#片段。`, SECRET_BODY],
+  ["a URL key in Chinese", "链接https://example.com/a?b=1&api_key=秘密,令牌值。", "秘密,令牌值"],
+  ["a URL credential name in Chinese", `链接https://example.com/a?中文token中文=${SECRET_BODY}#片段。`, SECRET_BODY]
+])("never replays part of %s in text without whitespace", async (_name, secretText, secret) => {
+  const text = `${BEFORE_TEXT}${secretText}${AFTER_TEXT}`;
+  // The replay must be what redaction of the complete text gives.
+  const expected = redactSecrets(text);
+  for (const piece of pieces(secret, 3)) expect(expected).not.toContain(piece);
+  for (const deltas of splitsAround(text, secretText)) {
+    const { log, mirrored } = mirroredLog();
+    log.append({ type: EventType.TEXT_MESSAGE_START, messageId: "answer", role: "assistant" } as BaseEvent);
+    for (const delta of deltas) log.append(textEvent(delta));
+    log.append({ type: EventType.TEXT_MESSAGE_END, messageId: "answer" } as BaseEvent);
+    expect(replayedText(log.subscribe(0, () => undefined)!.replay)).toBe(expected);
+    await vi.waitFor(() => expect(replayedText(mirrored)).toBe(expected), { interval: 1 });
+  }
+});
+
+test("drops a key block in text without whitespace at each header and body split", async () => {
+  const header = "-----BEGIN PRIVATE KEY-----\n";
+  const text = `${BEFORE_TEXT}密钥如下：${header}${KEY_LINE.repeat(3)}-----END PRIVATE KEY-----\n${AFTER_TEXT}`;
+  const expected = `${BEFORE_TEXT}密钥如下：[REDACTED PRIVATE KEY]${AFTER_TEXT}`;
+  for (const deltas of splitsAround(text, `${header}${KEY_LINE}`)) {
+    const { log, mirrored } = mirroredLog();
+    log.append({ type: EventType.TEXT_MESSAGE_START, messageId: "answer", role: "assistant" } as BaseEvent);
+    for (const delta of deltas) log.append(textEvent(delta));
+    log.append({ type: EventType.TEXT_MESSAGE_END, messageId: "answer" } as BaseEvent);
+    expect(replayedText(log.subscribe(0, () => undefined)!.replay)).toBe(expected);
+    await vi.waitFor(() => expect(replayedText(mirrored)).toBe(expected), { interval: 1 });
+  }
+});
+
+test("never cuts an unbroken ASCII run, also inside text without whitespace", () => {
+  const log = new TurnEventLog();
+  log.append({ type: EventType.TEXT_MESSAGE_START, messageId: "answer", role: "assistant" } as BaseEvent);
+  for (const delta of chunks(`${BEFORE_TEXT}${"x".repeat(16_385)}`, [7])) log.append(textEvent(delta));
+  log.append({ type: EventType.TEXT_MESSAGE_END, messageId: "answer" } as BaseEvent);
+  const replay = replayedText(log.subscribe(0, () => undefined)!.replay);
+  // The run can be an unknown credential: it is dropped, not cut and released.
+  expect(replay).toContain(BEFORE_TEXT.slice(0, -1));
+  expect(replay).not.toContain("xxxx");
+  expect(replay).toContain("[Reply text exceeds live replay limit]");
 });

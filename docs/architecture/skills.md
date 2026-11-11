@@ -29,8 +29,9 @@ Pipeline (files under `services/`):
 
 1. `validateSkillBundle` (`skills/skill-bundle-validator.ts`)
 2. `buildSkillImportPayload` (`skills/skill-import-service.ts`)
-3. `importSkillBundle` (`skills/skill-revision-store.ts`): merges name,
-   description and instructions into `metadata`
+3. `importSkillBundle` (`skills/skill-revision-store.ts`): stores the bundle
+   before its transaction, then merges name, description and instructions into
+   `metadata`
 4. `activateSkillRevision` (`skills/skill-lifecycle-service.ts`)
 5. `compileRuntimeConfig` (`dynamic-config-service.ts`)
 6. `buildSkillsLibraryFiles` (`deep-agents/deep-agents-skills-library.ts`),
@@ -85,19 +86,38 @@ audit event.
 
 `skill-bundle-storage.ts`; `SKILL_BUNDLE_STORAGE_BACKEND` selects the backend.
 
-- `local`: `<SKILL_BUNDLE_STORAGE_ROOT>/<tenantId>/<bundleName>/<contentHash>/`.
+- `local`:
+  `<SKILL_BUNDLE_STORAGE_ROOT>/<tenantId>/<bundleName>/<contentHash>-<uploadId>/`.
   The tenant directory keeps cleanup per tenant. Use a persistent volume.
 - `bucket`:
-  `s3://<bucket>/<prefix>/skills/<tenantId>/<skillId>/<revisionNumber>-<contentHash>.tar.gz`,
+  `s3://<bucket>/<prefix>/skills/<tenantId>/<skillId>/<contentHash>-<uploadId>.tar.gz`,
   with the artifact bucket connection settings, `SKILL_BUNDLE_BUCKET_NAME` and
   `SKILL_BUNDLE_BUCKET_PREFIX`. `materializeBundle` downloads and extracts into
   `SKILL_BUNDLE_CACHE_ROOT`.
+- Each import stores its bundle at a new location, also when the same bytes
+  are already stored: the upload id in the name is a new UUIDv7. The upload runs
+  before the import transaction, so it holds no lock. When the import fails,
+  it tries to delete that location if no revision uses it. Cleanup needs no lock with
+  imports, because no import can start to use a location that cleanup deletes.
+- Revisions stored before this layout keep their URIs: `<contentHash>/`
+  directories, which revisions of the same bytes share, and
+  `<revisionNumber>-<contentHash>.tar.gz` keys. Reads and deletes accept them.
+  During a rolling deploy, old replicas can still reuse a shared directory
+  while cleanup deletes it. The race is closed after all replicas use the new
+  layout.
+- A stored bundle that no revision names stays, and neither cleanup nor
+  tenant deletion finds it, after:
+  - a process crash after the upload;
+  - a COMMIT error while the import transaction is still open, because the
+    commit can still apply;
+  - a failed delete after a failed import;
+  - a failed bundle delete in cleanup, after its revision is gone.
 - A stored URI whose scheme does not match the configured backend is an error.
   No tool moves bundles or artifacts between local and bucket storage: choose
   the backend before tenants store files, or copy the objects and rewrite the
   stored URIs yourself.
-- The content hash names the object. Materialization does not verify the bytes
-  against it, so protect the bucket against writes by others.
+- The content hash is part of the object name. Materialization does not verify
+  the bytes against it, so protect the bucket against writes by others.
 
 ## Runtime loading
 

@@ -38,7 +38,7 @@ import {
 import type { ThrottleKind, ThrottleOutcome } from "../services/auth/login-throttle.js";
 import { STEP_UP_ROUTES } from "../services/auth/step-up-routes.js";
 import type { AuthMethod } from "../lib/jwt.js";
-import { enforceOAuthCallbackRateLimit } from "../services/integrations/oauth-callback-rate-limit.js";
+import { clientIpKey, enforceRateLimit } from "../services/rate-limit-reply.js";
 import type { RequestLimitsInterface } from "../services/request-limits.js";
 import { clearRefreshCookie, prepareSession, setRefreshCookie } from "./auth-session.js";
 import { requireStepUp } from "../services/auth/local-auth.js";
@@ -129,6 +129,16 @@ export async function registerLocalAuthRoutes(
   }
 ): Promise<void> {
   const { accounts, mfa, passkeys, challenges, flows, throttle, stepUp, refreshTokens } = localAuth;
+
+  /**
+   * The per-IP sign-in limit (`auth_sign_in`), shared by every sign-in step
+   * and by the secret checks of a signed-in local user (step-up, password
+   * change). It fails closed: an unthrottled secret check is the attack it
+   * exists for. Refresh and sign-out have their own limit (auth-session.ts).
+   */
+  function limitSignIn(request: FastifyRequest, reply: FastifyReply): Promise<boolean> {
+    return enforceRateLimit(request, reply, limits, clientIpKey("auth_sign_in", request), { failClosed: true });
+  }
 
   /**
    * Runs one secret check (password or second-factor code) under the
@@ -315,7 +325,7 @@ export async function registerLocalAuthRoutes(
   /** Public flow routes: origin, JSON, per-IP limit, and the body. */
   async function guardPublic<T>(request: FastifyRequest, reply: FastifyReply, schema: { safeParse(input: unknown): unknown }) {
     if (!requireBrowserAuthOrigin(request, reply, config.API_ORIGIN, { requireJson: true })) return null;
-    if (await enforceOAuthCallbackRateLimit(request, reply, limits, { failClosed: true })) return null;
+    if (await limitSignIn(request, reply)) return null;
     const body = parseRequestInput(reply, schema as never, request.body);
     if (!body.ok) {
       reply.send(body.response);
@@ -444,7 +454,7 @@ export async function registerLocalAuthRoutes(
   // Forced enrolment during sign-in (policy, manager reset, or recovery).
   app.post("/auth/local/enroll/totp/start", async (request, reply) => {
     if (!requireBrowserAuthOrigin(request, reply, config.API_ORIGIN, { requireJson: false })) return reply;
-    if (await enforceOAuthCallbackRateLimit(request, reply, limits, { failClosed: true })) return reply;
+    if (await limitSignIn(request, reply)) return reply;
     const current = await currentFlow(request, reply, ["enroll", "recover"]);
     if (!current) return reply;
     try {
@@ -494,7 +504,7 @@ export async function registerLocalAuthRoutes(
     }
     // Before the check, like sign-in: a correct proof clears the per-email
     // throttle, so only the per-IP limit bounds the work.
-    if (await enforceOAuthCallbackRateLimit(request, reply, limits, { failClosed: true })) return reply;
+    if (await limitSignIn(request, reply)) return reply;
     const body = parseRequestInput(reply, StepUpRequestSchema, request.body);
     if (!body.ok) return body.response;
     const { tenantId, userId } = request.auth;
@@ -595,7 +605,7 @@ export async function registerLocalAuthRoutes(
     if (!requireBrowserAuthOrigin(request, reply, config.API_ORIGIN, { requireJson: true })) return reply;
     const sessionVersion = localSessionVersion(request, reply);
     if (sessionVersion === null) return reply;
-    if (await enforceOAuthCallbackRateLimit(request, reply, limits, { failClosed: true })) return reply;
+    if (await limitSignIn(request, reply)) return reply;
     const body = parseRequestInput(reply, PasswordChangeRequestSchema, request.body);
     if (!body.ok) return body.response;
     const { tenantId, userId } = request.auth;
@@ -770,7 +780,7 @@ export async function registerLocalAuthRoutes(
   // Passwordless sign-in: the browser offers the passkeys it has for this site.
   app.post("/auth/passkey/login/options", async (request, reply) => {
     if (!requireBrowserAuthOrigin(request, reply, config.API_ORIGIN, { requireJson: false })) return reply;
-    if (await enforceOAuthCallbackRateLimit(request, reply, limits, { failClosed: true })) return reply;
+    if (await limitSignIn(request, reply)) return reply;
     const options = await passkeyService.authenticationOptions();
     await startPublicCeremony(reply, options.challenge, "login");
     return reply.send({ options });
@@ -795,7 +805,7 @@ export async function registerLocalAuthRoutes(
   // Second factor after the password: one of the account's passkeys.
   app.post("/auth/local/mfa/passkey/options", async (request, reply) => {
     if (!requireBrowserAuthOrigin(request, reply, config.API_ORIGIN, { requireJson: false })) return reply;
-    if (await enforceOAuthCallbackRateLimit(request, reply, limits, { failClosed: true })) return reply;
+    if (await limitSignIn(request, reply)) return reply;
     const current = await currentFlow(request, reply, ["mfa"]);
     if (!current) return reply;
     try {
@@ -839,7 +849,7 @@ export async function registerLocalAuthRoutes(
   // instead of an authenticator app.
   app.post("/auth/local/enroll/passkey/options", async (request, reply) => {
     if (!requireBrowserAuthOrigin(request, reply, config.API_ORIGIN, { requireJson: false })) return reply;
-    if (await enforceOAuthCallbackRateLimit(request, reply, limits, { failClosed: true })) return reply;
+    if (await limitSignIn(request, reply)) return reply;
     const current = await currentFlow(request, reply, ["enroll", "recover"]);
     if (!current) return reply;
     try {
@@ -912,7 +922,7 @@ export async function registerLocalAuthRoutes(
     if (!requireBrowserAuthOrigin(request, reply, config.API_ORIGIN, { requireJson: true })) return reply;
     const version = localSessionVersion(request, reply);
     if (version === null) return reply;
-    if (await enforceOAuthCallbackRateLimit(request, reply, limits, { failClosed: true })) return reply;
+    if (await limitSignIn(request, reply)) return reply;
     const body = parseRequestInput(reply, PasskeyStepUpOptionsRequestSchema, request.body);
     if (!body.ok) return body.response;
     const { tenantId, userId } = request.auth;
@@ -935,7 +945,7 @@ export async function registerLocalAuthRoutes(
     if (version === null) return reply;
     const familyId = request.auth.session?.familyId;
     if (!familyId) return reply.code(403).send({ error: "login_type_not_allowed" });
-    if (await enforceOAuthCallbackRateLimit(request, reply, limits, { failClosed: true })) return reply;
+    if (await limitSignIn(request, reply)) return reply;
     if (!(await requireActiveFamily(request, reply))) return reply;
     const body = parseRequestInput(reply, PasskeyStepUpRequestSchema, request.body);
     if (!body.ok) return body.response;

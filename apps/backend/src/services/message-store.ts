@@ -631,6 +631,16 @@ export class MessageStore {
     });
   }
 
+  /**
+   * Saves the text and status of an assistant row. Returns null when no row
+   * of this tenant and user matches.
+   *
+   * An active status (`pending` or `streaming`) changes only a row that is
+   * still active. The mid-turn checkpoint saves `streaming` and the text it
+   * had when it started. The turn waits for it for a limited time only, so the
+   * checkpoint can reach the database after the final write. It then changes
+   * nothing and returns null. A terminal status always replaces the row.
+   */
   async updateContent(
     tenantId: string,
     messageId: string,
@@ -648,6 +658,9 @@ export class MessageStore {
       ...(duration === null ? {} : { durationMs: duration }),
       ...(status === "interrupted" && stopReason ? { stopReason } : {})
     };
+    const activeRowOnly = status === "pending" || status === "streaming"
+      ? "AND status IN ('pending', 'streaming')"
+      : "";
     return withTenantScope(this.db, tenantId, async (client) => {
       const updatedMessage = await client.query(
         `
@@ -655,6 +668,7 @@ export class MessageStore {
           SET status = $4, content_text = $5, updated_at = NOW(),
               detail_json = COALESCE(detail_json, '{}'::jsonb) || $6::jsonb
           WHERE tenant_id = $1 AND message_id = $2 AND user_id = $3
+            ${activeRowOnly}
           RETURNING ${MESSAGE_RETURNING_COLUMNS}
         `,
         [tenantId, messageId, userId, status, truncateForStorage(redactSecrets(content), MAX_MESSAGE_CONTENT_LENGTH),

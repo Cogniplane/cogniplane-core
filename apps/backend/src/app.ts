@@ -7,7 +7,7 @@ import multipart from "@fastify/multipart";
 import { registerAppLifecycle, registerAppRoutes } from "./app-bootstrap.js";
 import { buildAppDependencies, buildSchedulerWorker } from "./app-dependencies.js";
 import { SessionExecutionStore } from "./services/session-execution-store.js";
-import { isLoginTypeEnabled, isMailEnabled, loadConfig } from "./config.js";
+import { type AppConfig, isLoginTypeEnabled, isMailEnabled, loadConfig } from "./config.js";
 import { localDevAuth } from "./lib/auth.js";
 import { jwtAuth } from "./lib/auth-jwt.js";
 import { buildLocalAuth } from "./services/auth/local-auth.js";
@@ -94,6 +94,46 @@ export function parseTrustProxy(raw: string): boolean | string {
   return value;
 }
 
+/**
+ * Logs warnings about TRUST_PROXY values that can make the per-IP sign-in
+ * limits count the wrong address. It never changes what is trusted.
+ *
+ * - At boot in jwt mode, `false` and `true` log a warning. The server cannot
+ *   tell at boot whether a proxy is in front of it, so it warns at each boot.
+ *   With `false` behind a proxy, every client has the proxy's address and
+ *   shares its sign-in limit. With `true`, a client that connects directly
+ *   sets its own address in X-Forwarded-For.
+ * - With `false`, in every mode, the first request that has X-Forwarded-For
+ *   logs a warning once per process.
+ */
+export function registerTrustProxyWarnings(
+  app: FastifyInstance,
+  config: Pick<AppConfig, "AUTH_MODE" | "TRUST_PROXY">
+): void {
+  const trust = parseTrustProxy(config.TRUST_PROXY);
+  if (config.AUTH_MODE === "jwt" && trust === false) {
+    app.log.warn(
+      "TRUST_PROXY is false, so request.ip is the TCP peer address. Behind a proxy or load balancer, all clients " +
+        "share the per-IP sign-in limits of the proxy address. Set TRUST_PROXY to the IP/CIDR list of the proxies."
+    );
+  }
+  if (config.AUTH_MODE === "jwt" && trust === true) {
+    app.log.warn(
+      "TRUST_PROXY is true, so X-Forwarded-For is trusted from every peer. A client that connects directly can set " +
+        "the address of its per-IP sign-in limits. Set TRUST_PROXY to the IP/CIDR list of the proxies."
+    );
+  }
+  if (trust === false) {
+    let warned = false;
+    app.addHook("onRequest", async (request) => {
+      if (!warned && request.headers["x-forwarded-for"]) {
+        warned = true;
+        request.log.warn("Forwarded client IP ignored. Configure TRUST_PROXY with the proxy IP/CIDR so auth rate limits use client IPs.");
+      }
+    });
+  }
+}
+
 function requireRedis(app: FastifyInstance) {
   if (!app.redis) throw new Error("Redis is required for local login.");
   return app.redis;
@@ -153,15 +193,7 @@ export async function buildApp() {
   });
 
   app.setErrorHandler(handleAppError);
-  if (parseTrustProxy(config.TRUST_PROXY) === false) {
-    let warned = false;
-    app.addHook("onRequest", async (request) => {
-      if (!warned && request.headers["x-forwarded-for"]) {
-        warned = true;
-        request.log.warn("Forwarded client IP ignored. Configure TRUST_PROXY with the proxy IP/CIDR so auth rate limits use client IPs.");
-      }
-    });
-  }
+  registerTrustProxyWarnings(app, config);
   // Unmatched routes return the app's standard `{ error }` envelope rather than
   // Fastify's default `{ statusCode, error, message }` body, so clients parse a
   // single 404 contract whether the route is missing or the request was rejected.

@@ -14,7 +14,7 @@ import { PasskeyChallengeStore } from "../services/auth/passkey-challenge-store.
 import { FakeRefreshTokenRedis } from "../test-helpers/fake-refresh-token-redis.js";
 import { InMemoryAuditEventStore } from "../test-helpers/in-memory-audit-events.js";
 import { createTestConfig } from "../test-helpers/test-config.js";
-import type { RequestLimitsInterface } from "../services/request-limits.js";
+import { RequestLimits, type RequestLimitsInterface } from "../services/request-limits.js";
 import { registerLocalAuthRoutes } from "./auth-local.js";
 
 // Route behaviour of local sign-in, links, step-up, and the user's own
@@ -235,6 +235,37 @@ describe("POST /auth/step-up", () => {
     expect(res.statusCode).toBe(403);
     expect(res.json()).toEqual({ error: "invalid_credentials" });
     expect([...throttle.records.values()][0]?.fails).toBe(1);
+  });
+});
+
+// Issue #47: public sign-in steps have a per-IP limit of their own, with the
+// real limiter. Refresh and sign-out are not in it (routes/auth.test.ts).
+describe("per-IP sign-in limit on public local steps", () => {
+  test("a password spray over many emails from one IP stops at the sign-in limit, before the password check", async () => {
+    const { app, accounts } = await buildHarness({ passkeys: true, limits: RequestLimits.fromAppConfig(CONFIG) });
+    accounts.signInWithPassword.mockRejectedValue(new LocalAccountError("invalid_credentials"));
+    let attempt = 0;
+    const login = (ip: string) => app.inject({
+      method: "POST", url: "/auth/local/login", remoteAddress: ip, headers: { origin: ORIGIN },
+      payload: { email: `person${(attempt += 1)}@example.com`, password: "wrong password" }
+    });
+
+    const answers: number[] = [];
+    for (let i = 0; i < 21; i += 1) answers.push((await login("198.51.100.1")).statusCode);
+    const refused = await login("198.51.100.1");
+    const passkeyStep = await app.inject({
+      method: "POST", url: "/auth/passkey/login/options", remoteAddress: "198.51.100.1", headers: { origin: ORIGIN }
+    });
+    const otherIp = await login("198.51.100.2");
+
+    // A different email each time, so the per-email throttle never answers.
+    expect(answers).toEqual([...Array(20).fill(401), 429]);
+    expect(refused.statusCode).toBe(429);
+    expect(refused.json()).toMatchObject({ error: "limit_exceeded", resource: "auth_sign_in", scope: "user", limit: 20 });
+    expect(Number(refused.headers["retry-after"])).toBeGreaterThanOrEqual(1);
+    expect(passkeyStep.statusCode).toBe(429);
+    expect(accounts.signInWithPassword).toHaveBeenCalledTimes(21);
+    expect(otherIp.statusCode).toBe(401);
   });
 });
 

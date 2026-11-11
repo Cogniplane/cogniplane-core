@@ -100,6 +100,8 @@ function createFakeUploader(objects: Map<string, Buffer>) {
   };
 }
 
+const uploadIdPattern = "[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}";
+
 test("local skill bundle storage caches and materializes a bundle directory", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "cogniplane-skill-storage-"));
   const sourcePath = path.join(root, "source-bundle");
@@ -115,7 +117,6 @@ test("local skill bundle storage caches and materializes a bundle directory", as
   const stored = await storage.storeBundle({
     tenantId: "t1",
     skillId: "pdf-processing",
-    revisionNumber: 1,
     bundleName: "pdf-processing",
     contentHash: "abc123",
     sourcePath
@@ -126,20 +127,63 @@ test("local skill bundle storage caches and materializes a bundle directory", as
   const installedContent = await readFile(path.join(installRoot, "SKILL.md"), "utf8");
   expect(installedContent.includes("pdf-processing")).toBe(true);
 
-  const storedAgain = await storage.storeBundle({
-    tenantId: "t1",
-    skillId: "pdf-processing",
-    revisionNumber: 1,
-    bundleName: "pdf-processing",
-    contentHash: "abc123",
-    sourcePath
-  });
-  expect(storedAgain.storageUri).toBe(stored.storageUri);
-
   const materialized = await storage.materializeBundle(stored.storageUri);
   // Local path is namespaced by tenantId so per-tenant cleanup cannot rm a
   // bundle another tenant still uses.
-  expect(materialized.localPath.endsWith(path.join("t1", "pdf-processing", "abc123"))).toBeTruthy();
+  expect(path.relative(cacheRoot, materialized.localPath))
+    .toMatch(new RegExp(`^t1/pdf-processing/abc123-${uploadIdPattern}$`));
+});
+
+test("local skill bundle storage writes each store of the same bytes to its own directory", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "cogniplane-skill-unique-"));
+  onTestFinished(async () => { await rm(root, { recursive: true, force: true }); });
+  const sourcePath = path.join(root, "source");
+  await mkdir(sourcePath, { recursive: true });
+  await writeFile(path.join(sourcePath, "SKILL.md"), "same bytes");
+  const cacheRoot = path.join(root, "cache");
+  const storage = new LocalSkillBundleStorage(cacheRoot);
+  const input = { tenantId: "t1", skillId: "s1", bundleName: "s1", contentHash: "abc123", sourcePath };
+
+  const first = await storage.storeBundle(input);
+  const second = await storage.storeBundle(input);
+
+  // No import can pick up a directory that another import or a cleanup owns.
+  expect(first.storageUri).not.toBe(second.storageUri);
+  for (const stored of [first, second]) {
+    expect(stored.storageUri).toMatch(new RegExp(`^file://${cacheRoot}/t1/s1/abc123-${uploadIdPattern}$`));
+  }
+  await storage.deleteBundle(first.storageUri);
+  const { localPath } = await storage.materializeBundle(second.storageUri);
+  expect(await readFile(path.join(localPath, "SKILL.md"), "utf8")).toBe("same bytes");
+  expect(await readdir(path.join(cacheRoot, "t1", "s1"))).toHaveLength(1);
+});
+
+test("bucket skill bundle storage writes each store of the same bytes to its own key", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "cogniplane-skill-bucket-unique-"));
+  onTestFinished(async () => { await rm(root, { recursive: true, force: true }); });
+  const sourcePath = path.join(root, "source");
+  await mkdir(sourcePath, { recursive: true });
+  await writeFile(path.join(sourcePath, "SKILL.md"), "same bytes");
+  const objects = new Map<string, Buffer>();
+  const storage = new BucketSkillBundleStorage({
+    client: createFakeS3Client(objects), bucketName: "skill-bucket", keyPrefix: "",
+    cacheRoot: path.join(root, "cache"), uploader: createFakeUploader(objects)
+  });
+  const input = { tenantId: "t1", skillId: "s1", bundleName: "s1", contentHash: "abc123", sourcePath };
+
+  const first = await storage.storeBundle(input);
+  const second = await storage.storeBundle(input);
+
+  // The key does not depend on a revision number, so the upload can run before
+  // the import transaction allocates one.
+  expect(first.storageUri).not.toBe(second.storageUri);
+  for (const stored of [first, second]) {
+    expect(stored.storageUri).toMatch(new RegExp(`^s3://skill-bucket/skills/t1/s1/abc123-${uploadIdPattern}\\.tar\\.gz$`));
+  }
+  await storage.deleteBundle(first.storageUri);
+  const { localPath } = await storage.materializeBundle(second.storageUri);
+  expect(await readFile(path.join(localPath, "SKILL.md"), "utf8")).toBe("same bytes");
+  expect(objects.size).toBe(1);
 });
 
 test("local skill bundle storage isolates identical bundles across tenants", async () => {
@@ -156,7 +200,6 @@ test("local skill bundle storage isolates identical bundles across tenants", asy
 
   const shared = {
     skillId: "shared",
-    revisionNumber: 1,
     bundleName: "shared",
     contentHash: "samehash",
     sourcePath
@@ -204,14 +247,13 @@ test("bucket skill bundle storage uploads a tarball and extracts on materialize"
   const stored = await storage.storeBundle({
     tenantId: "tenant-a",
     skillId: "pdf-processing",
-    revisionNumber: 3,
     bundleName: "pdf-processing",
     contentHash: "deadbeef",
     sourcePath
   });
 
-  expect(stored.storageUri).toBe("s3://skill-bucket/skills/tenant-a/pdf-processing/3-deadbeef.tar.gz");
-  expect(objects.has("skill-bucket/skills/tenant-a/pdf-processing/3-deadbeef.tar.gz")).toBeTruthy();
+  expect(stored.storageUri).toMatch(new RegExp(`^s3://skill-bucket/skills/tenant-a/pdf-processing/deadbeef-${uploadIdPattern}\\.tar\\.gz$`));
+  expect(objects.has(stored.storageUri.slice("s3://".length))).toBeTruthy();
 
   const { localPath: installRoot } = await storage.materializeBundle(stored.storageUri);
 
@@ -332,12 +374,11 @@ test("bucket skill bundle storage handles bucket prefixes with regex metacharact
   const stored = await storage.storeBundle({
     tenantId: "t1",
     skillId: "s1",
-    revisionNumber: 4,
     bundleName: "s1",
     contentHash: "abc",
     sourcePath
   });
-  expect(stored.storageUri).toBe(`s3://my-bucket/${prefix}/skills/t1/s1/4-abc.tar.gz`);
+  expect(stored.storageUri.startsWith(`s3://my-bucket/${prefix}/skills/t1/s1/abc-`)).toBe(true);
 
   // Materialize must not throw even though the prefix has `[`, `]`, `.`.
   const { localPath: installRoot } = await storage.materializeBundle(stored.storageUri);
@@ -365,13 +406,12 @@ test("bucket skill bundle storage applies the configured key prefix", async () =
   const stored = await storage.storeBundle({
     tenantId: "t1",
     skillId: "s1",
-    revisionNumber: 7,
     bundleName: "s1",
     contentHash: "h",
     sourcePath
   });
-  expect(stored.storageUri).toBe("s3://my-bucket/env/demo/skills/t1/s1/7-h.tar.gz");
-  expect(objects.has("my-bucket/env/demo/skills/t1/s1/7-h.tar.gz")).toBeTruthy();
+  expect(stored.storageUri).toMatch(new RegExp(`^s3://my-bucket/env/demo/skills/t1/s1/h-${uploadIdPattern}\\.tar\\.gz$`));
+  expect(objects.has(stored.storageUri.slice("s3://".length))).toBeTruthy();
 
   await rm(tmpRoot, { recursive: true, force: true });
 });
@@ -389,7 +429,7 @@ test("local skill bundle storage never reads or deletes outside its root", async
     await expect(storage.deleteBundle(uri)).rejects.toThrow("outside the bundle storage root");
     await expect(storage.materializeBundle(uri)).rejects.toThrow("outside the bundle storage root");
   }
-  await expect(storage.storeBundle({ tenantId: "t1", skillId: "s", revisionNumber: 1,
+  await expect(storage.storeBundle({ tenantId: "t1", skillId: "s",
     bundleName: "../../outside", contentHash: "x", sourcePath: outside })).rejects.toThrow("outside the bundle storage root");
   expect(await readFile(path.join(outside, "keep.txt"), "utf8")).toBe("keep");
 });
@@ -425,7 +465,7 @@ test("local skill bundle storage refuses a symlinked directory that leads outsid
   const uri = `file://${path.join(cacheRoot, "link", "victim")}`;
   await expect(storage.deleteBundle(uri)).rejects.toThrow("outside the bundle storage root");
   await expect(storage.materializeBundle(uri)).rejects.toThrow("outside the bundle storage root");
-  await expect(storage.storeBundle({ tenantId: "link", skillId: "s", revisionNumber: 1,
+  await expect(storage.storeBundle({ tenantId: "link", skillId: "s",
     bundleName: "victim", contentHash: "h", sourcePath: outside })).rejects.toThrow("outside the bundle storage root");
   expect(await readFile(path.join(outside, "victim", "keep.txt"), "utf8")).toBe("keep");
 });
@@ -441,9 +481,9 @@ test("local skill bundle storage builds its temporary path from the checked path
 
   // Contained destination cache/t1/victim, but a raw-hash temp path would be outside.
   copyDestinations.length = 0;
-  const stored = await storage.storeBundle({ tenantId: "t1", skillId: "s", revisionNumber: 1,
+  const stored = await storage.storeBundle({ tenantId: "t1", skillId: "s",
     bundleName: "a/b", contentHash: "../../victim", sourcePath });
-  expect(stored.storageUri).toBe(`file://${path.join(cacheRoot, "t1", "victim")}`);
+  expect(stored.storageUri).toMatch(new RegExp(`^file://${path.join(cacheRoot, "t1", "victim")}-${uploadIdPattern}$`));
   expect(copyDestinations).toHaveLength(1);
   expect(copyDestinations[0]!.startsWith(`${cacheRoot}${path.sep}`)).toBe(true);
   expect((await readdir(root)).sort()).toEqual(["cache", "source"]);

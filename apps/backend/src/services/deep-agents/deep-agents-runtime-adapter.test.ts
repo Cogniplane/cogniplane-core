@@ -2725,6 +2725,160 @@ describe("interrupting a turn while onBeforeTurn is still running (R9)", () => {
 
 });
 
+// Every exit after the slot is reserved must release the turn once. In
+// production, nothing makes the memory read or the backend build fail today, so
+// the first two tests inject the failure.
+describe("turn slot release on every exit after admission", () => {
+  const WATCHDOG_MS = 43_210;
+  const reservation = { tenantId: sessionInput.tenantId, reservationId: "reply", reservedMicroUsd: 1_000_000 };
+
+  function setup(input: {
+    stream?: StreamScript;
+    memories?: unknown;
+    runtime?: (runtime: DeepAgentsSessionRuntime) => DeepAgentsSessionRuntime;
+  } = {}) {
+    const base = makeRuntimeFactory(input.stream ?? (() => scriptedChatStream()));
+    const sandboxEnds: Array<ReturnType<typeof vi.fn>> = [];
+    const beginSandboxTurn = () => {
+      const end = vi.fn();
+      sandboxEnds.push(end);
+      return end;
+    };
+    // Only the first turn holds a spending reservation.
+    const spending = {
+      reserve: vi.fn().mockResolvedValueOnce(reservation).mockResolvedValue(null),
+      finish: vi.fn(async () => {})
+    };
+    // The watchdog is the only timer armed with WATCHDOG_MS.
+    const setTimer = vi.spyOn(globalThis, "setTimeout");
+    const clearTimer = vi.spyOn(globalThis, "clearTimeout");
+    const watchdogs = () => setTimer.mock.calls.flatMap(([, delay], index) =>
+      delay === WATCHDOG_MS ? [setTimer.mock.results[index]!.value] : []);
+    const adapter = makeAdapter({
+      factory: (init) => {
+        const runtime = { ...base.factory(init), beginSandboxTurn };
+        return input.runtime?.(runtime) ?? runtime;
+      },
+      memories: input.memories,
+      dynamicConfig: makeDynamicConfig({ enabledToolIds: [...testRuntimePolicy.enabledToolIds, "memory_search"] }),
+      modelSpending: spending,
+      config: createTestConfig({ ANTHROPIC_API_KEY: "sk-ant-test-key", RUNTIME_TURN_TIMEOUT_MS: WATCHDOG_MS })
+    });
+    return {
+      adapter,
+      modelRequests: base.modelRequests,
+      sandboxEnds,
+      spending,
+      armedWatchdogs: () => watchdogs().length,
+      unclearedWatchdogs: () => watchdogs().filter((timer) => !clearTimer.mock.calls.some(([cleared]) => cleared === timer)).length,
+      async close() {
+        await adapter.close();
+        setTimer.mockRestore();
+        clearTimer.mockRestore();
+      }
+    };
+  }
+
+  async function expectFailedTurnReleasedOnce(
+    turn: ReturnType<typeof setup>,
+    failure: { error: string; heal: () => void }
+  ) {
+    const session = await turn.adapter.createSession(sessionInput);
+    const cancel = new AbortController();
+    const addListener = vi.spyOn(cancel.signal, "addEventListener");
+    const removeListener = vi.spyOn(cancel.signal, "removeEventListener");
+
+    await expect(collect(turn.adapter.runMessageAGUI(session, { ...runMessageInput(), cancelSignal: cancel.signal })))
+      .rejects.toThrow(failure.error);
+
+    expect(turn.adapter.hasActiveTurn(sessionInput.sessionId)).toBe(false);
+    expect(turn.sandboxEnds).toHaveLength(1);
+    expect(turn.sandboxEnds[0]).toHaveBeenCalledTimes(1);
+    expect(turn.spending.finish).toHaveBeenCalledTimes(1);
+    expect(turn.spending.finish).toHaveBeenCalledWith(reservation);
+    expect(removeListener).toHaveBeenCalledWith("abort", addListener.mock.calls[0]![1]);
+    expect(turn.armedWatchdogs()).toBe(1);
+    expect(turn.unclearedWatchdogs()).toBe(0);
+    expect(turn.modelRequests).toHaveLength(0);
+
+    // Neither a capability refresh nor the next turn is refused as busy.
+    failure.heal();
+    await expect(turn.adapter.createSession(sessionInput)).resolves.toMatchObject({ runtimeId: session.runtimeId });
+    const events = await collect(turn.adapter.runMessageAGUI(session, runMessageInput()));
+    expect(events.at(-1)).toMatchObject({ type: AGUIEventType.RUN_FINISHED });
+    expect(turn.sandboxEnds.map((end) => end.mock.calls.length)).toEqual([1, 1]);
+    expect(turn.spending.finish).toHaveBeenCalledTimes(1);
+    expect(turn.armedWatchdogs()).toBe(2);
+    expect(turn.unclearedWatchdogs()).toBe(0);
+  }
+
+  it("releases the slot once when the memory read rejects", async () => {
+    let failing = true;
+    // Stands in for a memory formatter that throws on an odd record.
+    const record = {
+      memoryId: "m1", userId: sessionInput.userId, slug: "odd-record", metadata: {}, createdAt: "", updatedAt: "",
+      get content(): string {
+        if (failing) throw new Error("odd memory record");
+        return "plain text";
+      }
+    };
+    const turn = setup({ memories: { search: async () => [record] } });
+    try {
+      await expectFailedTurnReleasedOnce(turn, { error: "odd memory record", heal: () => { failing = false; } });
+    } finally {
+      await turn.close();
+    }
+  });
+
+  it("releases the slot once when the turn backend cannot be built", async () => {
+    let failing = true;
+    // Stands in for a constructor that checks its input. It fails after the
+    // approval turn and the notice sink of the turn exist.
+    const turn = setup({
+      runtime: (runtime) => ({
+        ...runtime,
+        getMcpToolNames() {
+          if (failing) throw new Error("invalid tool table");
+          return runtime.getMcpToolNames();
+        }
+      })
+    });
+    try {
+      await expectFailedTurnReleasedOnce(turn, { error: "invalid tool table", heal: () => { failing = false; } });
+    } finally {
+      await turn.close();
+    }
+  });
+
+  it("releases the slot once when the consumer stops reading after RUN_STARTED", async () => {
+    const blocked = makeDeferred();
+    const turn = setup({
+      stream: async function* () {
+        yield { event: "on_chat_model_stream", metadata: {}, data: { chunk: { content: "partial" } } };
+        await blocked.promise;
+      }
+    });
+    try {
+      const session = await turn.adapter.createSession(sessionInput);
+      const iterator = turn.adapter.runMessageAGUI(session, runMessageInput())[Symbol.asyncIterator]();
+      await expect(iterator.next()).resolves.toMatchObject({ value: { type: AGUIEventType.RUN_STARTED } });
+
+      await iterator.return?.();
+
+      expect(turn.adapter.hasActiveTurn(sessionInput.sessionId)).toBe(false);
+      expect(turn.sandboxEnds.map((end) => end.mock.calls.length)).toEqual([1]);
+      expect(turn.spending.finish).toHaveBeenCalledTimes(1);
+      expect(turn.unclearedWatchdogs()).toBe(0);
+      blocked.resolve();
+      const events = await collect(turn.adapter.runMessageAGUI(session, runMessageInput()));
+      expect(events.at(-1)).toMatchObject({ type: AGUIEventType.RUN_FINISHED });
+    } finally {
+      blocked.resolve();
+      await turn.close();
+    }
+  });
+});
+
 describe("approval bookkeeping failures (R10, R56)", () => {
   it("rejects gated tools at once in a scheduled turn, with no approval row", async () => {
     const { factory, resumes } = makeInterruptingFactory({
