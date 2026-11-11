@@ -45,7 +45,7 @@ export type AttachOverlaysInput = {
   uploadAdmission: Pick<UploadAdmission, "begin" | "admit">;
   stores: {
     auditEvents: Pick<AuditEventStore, "create">;
-    integrationStates: Pick<IntegrationStateStore, "get" | "upsert">;
+    integrationStates: Pick<IntegrationStateStore, "get" | "upsert" | "applyChanges">;
   };
   // Per-app registry. Attach live probes and OAuth routes here; the static
   // catalog (`registerIntegration`) stays module-global for auth allowlists.

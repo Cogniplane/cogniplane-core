@@ -180,6 +180,22 @@ class InMemoryIntegrationStateStore {
     this.rows.set(key, next);
     return { tenantId, integrationId, ...next };
   }
+
+  // The merge of IntegrationStateStore.applyChanges: an omitted toggle keeps
+  // its value, and the keys in configChanges replace only those keys.
+  async applyChanges(
+    tenantId: string,
+    integrationId: string,
+    changes: { readsEnabled?: boolean; writesEnabled?: boolean; configChanges: Record<string, unknown>; updatedBy: string }
+  ) {
+    const current = await this.get(tenantId, integrationId);
+    return this.upsert(tenantId, integrationId, {
+      readsEnabled: changes.readsEnabled,
+      writesEnabled: changes.writesEnabled,
+      config: { ...(current?.config ?? {}), ...changes.configChanges },
+      updatedBy: changes.updatedBy
+    });
+  }
 }
 
 const TEST_ENTRA_TENANT_ID = "11111111-2222-3333-4444-555555555555";
@@ -736,11 +752,13 @@ test("hasConnection returns false when access token is expired and there is no r
   expect(await service.hasConnection("tenant-1", "user-1")).toBe(false);
 });
 
-test("setTenantMicrosoftConfig writes the merged config to tenant_integrations", async () => {
+test("setTenantMicrosoftConfig changes only the given fields and records the editor", async () => {
   const config = createTestConfig({ API_ORIGIN: "http://localhost:3000" });
   const store = new InMemoryMicrosoftConnectionStore();
   const integrationStates = new InMemoryIntegrationStateStore();
-  integrationStates.seed(createMicrosoftTenantConfig(config.DATA_ENCRYPTION_SECRET));
+  const seeded = createMicrosoftTenantConfig(config.DATA_ENCRYPTION_SECRET);
+  integrationStates.seed(seeded);
+  await integrationStates.upsert("tenant-1", "microsoft", { readsEnabled: true, updatedBy: "owner-1" });
 
   const service = new MicrosoftConnectionService(
     config,
@@ -750,12 +768,18 @@ test("setTenantMicrosoftConfig writes the merged config to tenant_integrations",
     integrationStates
   );
 
-  await service.setTenantMicrosoftConfig("tenant-1", { clientId: "rotated-client" });
+  await service.setTenantMicrosoftConfig("tenant-1", { clientId: "rotated-client" }, "admin-1");
 
   const row = await integrationStates.get("tenant-1", "microsoft");
-  expect(row).toBeTruthy();
-  expect((row!.config as Record<string, unknown>).clientId).toBe("rotated-client");
-  expect((row!.config as Record<string, unknown>).entraTenantId).toBe(TEST_ENTRA_TENANT_ID);
+  expect(row).toMatchObject({ readsEnabled: true, writesEnabled: false, updatedBy: "admin-1" });
+  expect(row?.config).toEqual({ ...seeded, clientId: "rotated-client" });
+
+  await service.setTenantMicrosoftConfig("tenant-1", { clientSecret: "rotated-secret" }, "admin-2");
+
+  const rotated = await integrationStates.get("tenant-1", "microsoft");
+  expect(rotated?.updatedBy).toBe("admin-2");
+  expect(rotated?.config.clientSecret).not.toBe("rotated-secret");
+  expect(decrypt(String(rotated?.config.clientSecret), config.DATA_ENCRYPTION_SECRET)).toBe("rotated-secret");
 });
 
 test("isValidEntraTenantId accepts GUIDs, well-known aliases, and onmicrosoft domains", () => {
@@ -788,7 +812,7 @@ test("setTenantMicrosoftConfig rejects an invalid entraTenantId", async () => {
       clientId: "c",
       clientSecret: "s",
       entraTenantId: "common/oauth2/v2.0/token"
-    })
+    }, "admin-1")
   ).rejects.toThrow(MicrosoftInvalidEntraTenantError);
 });
 

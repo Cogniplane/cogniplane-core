@@ -11,13 +11,13 @@ afterEach(async () => {
   for (const app of apps.splice(0)) await app.close();
 });
 
-async function buildApp() {
+async function buildApp(role: "owner" | "admin" | "member" = "owner") {
   const auditEvents = new InMemoryAuditEventStore();
   // The audit events that the service writes in the change's transaction.
   const changeAudits: AuditEventInput[] = [];
   const invalidateTenantRuntimes = vi.fn(async () => ["runtime-1"]);
   const microsoftConnections = {
-    setTenantMicrosoftConfig: vi.fn(async (_tenantId: string, _patch: unknown, audit?: () => AuditEventInput) => {
+    setTenantMicrosoftConfig: vi.fn(async (_tenantId: string, _patch: unknown, _updatedBy: string, audit?: () => AuditEventInput) => {
       if (audit) changeAudits.push(audit());
     }),
     removeTenantMicrosoftConfig: vi.fn(async () => {})
@@ -25,7 +25,7 @@ async function buildApp() {
   const app = Fastify();
   apps.push(app);
   app.addHook("preHandler", async (request) => {
-    request.auth = { userId: "admin-1", tenantId: "tenant-1", isAdmin: true, role: "owner" };
+    request.auth = { userId: "admin-1", tenantId: "tenant-1", isAdmin: role !== "member", role };
   });
   registerMicrosoftTenantRoutes(app, {
     microsoftConnections, auditEvents, runtimeInvalidator: { invalidateTenantRuntimes }, dataRoutes: devDataRoutes()
@@ -53,6 +53,60 @@ describe("Microsoft tenant settings routes", () => {
     });
     expect(JSON.stringify(changeAudits)).not.toContain("super-secret-value");
     expect(invalidateTenantRuntimes).not.toHaveBeenCalled();
+  });
+
+  test("PUT saves as the signed-in admin, not as a user that the body names", async () => {
+    const { app, microsoftConnections } = await buildApp();
+
+    const response = await app.inject({
+      method: "PUT",
+      url: "/tenant/settings/microsoft",
+      payload: { clientId: "client-1", updatedBy: "someone-else", userId: "someone-else" }
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(microsoftConnections.setTenantMicrosoftConfig).toHaveBeenCalledWith(
+      "tenant-1",
+      { clientId: "client-1", clientSecret: undefined, entraTenantId: undefined },
+      "admin-1",
+      expect.any(Function)
+    );
+  });
+
+  test("PUT trims the fields and leaves out a blank one, so a blank secret keeps the saved secret", async () => {
+    const { app, changeAudits, microsoftConnections } = await buildApp();
+
+    const response = await app.inject({
+      method: "PUT",
+      url: "/tenant/settings/microsoft",
+      payload: { clientId: "  client-1  ", clientSecret: "   ", entraTenantId: " common " }
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(microsoftConnections.setTenantMicrosoftConfig.mock.calls[0]?.[1])
+      .toEqual({ clientId: "client-1", clientSecret: undefined, entraTenantId: "common" });
+    expect(changeAudits[0]?.payload).toMatchObject({ changedFields: ["clientId", "entraTenantId"] });
+  });
+
+  test.each([
+    ["only blank fields", { clientId: " ", clientSecret: "", entraTenantId: "  " }, 400],
+    ["an invalid Directory (tenant) ID", { clientId: "client-1", entraTenantId: "common/oauth2/v2.0/token" }, 400]
+  ])("PUT with %s answers %i and saves nothing", async (_case, payload, status) => {
+    const { app, microsoftConnections } = await buildApp();
+
+    const response = await app.inject({ method: "PUT", url: "/tenant/settings/microsoft", payload });
+
+    expect(response.statusCode).toBe(status);
+    expect(microsoftConnections.setTenantMicrosoftConfig).not.toHaveBeenCalled();
+  });
+
+  test("PUT by a member answers 403 and saves nothing", async () => {
+    const { app, microsoftConnections } = await buildApp("member");
+
+    const response = await app.inject({ method: "PUT", url: "/tenant/settings/microsoft", payload: { clientId: "client-1" } });
+
+    expect(response.statusCode).toBe(403);
+    expect(microsoftConnections.setTenantMicrosoftConfig).not.toHaveBeenCalled();
   });
 
   test("DELETE writes an audit event and resets the tenant's runtimes", async () => {

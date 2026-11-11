@@ -117,6 +117,11 @@ return result.artifact;
   reply, action)` with an action from `OVERLAY_STEP_UP_ACTIONS`, and puts
   `controls.dataRoutes.ownerNotice(...)` on the change's audit event ([data
   routes](architecture/sensitive-changes.md#data-routes)).
+- A route that saves integration settings writes with
+  `input.stores.integrationStates.applyChanges`. It writes only the keys that
+  the request sets, onto the locked row, and records the signed-in user as
+  `updatedBy`. A toggle or key that another admin changed meanwhile stays.
+  Example: `setTenantMicrosoftConfig` in the SharePoint overlay.
 - Fetch a user-supplied URL only with the public-host checks, `undici` `fetch`
   and `ssrfSafeAgent` ([outbound requests](security.md#outbound-requests)).
 - To expose a value to core (for example "is Microsoft configured?"), add an

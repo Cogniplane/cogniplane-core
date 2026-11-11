@@ -219,7 +219,7 @@ export class MicrosoftConnectionService {
     >,
     private readonly auditEvents: Pick<AuditEventStore, "create"> | undefined,
     private readonly runtimeManager: RuntimeInvalidator | undefined,
-    private readonly integrationStates: Pick<IntegrationStateStore, "get" | "upsert">,
+    private readonly integrationStates: Pick<IntegrationStateStore, "get" | "upsert" | "applyChanges">,
     private readonly redirectUri?: string,
     private readonly oauthStates: Pick<IntegrationOAuthStateStore, "issue" | "consume"> =
       new IntegrationOAuthStateStore()
@@ -242,14 +242,22 @@ export class MicrosoftConnectionService {
   }
 
   /**
-   * Stores the tenant's Microsoft app. The audit event, when given, commits
-   * in the same transaction as the change, with its owner notice.
+   * Stores the fields of the tenant's Microsoft app that the patch has, and
+   * records `updatedBy` as the editor. The write goes onto the locked row
+   * (IntegrationStateStore.applyChanges): the toggles and an omitted field
+   * keep their current value, also when another save changed them after this
+   * save started. The audit event, when given, commits in the same
+   * transaction as the change, with its owner notice.
    */
   async setTenantMicrosoftConfig(
     tenantId: string,
     patch: Partial<MicrosoftTenantConfig>,
+    updatedBy: string,
     audit?: () => AuditEventInput
   ): Promise<void> {
+    // This check reads the row before the write locks it. If a removal
+    // commits between the two, the row gets only the patched fields, and
+    // getTenantMicrosoftConfig reads it as not configured.
     const existing = await this.getTenantMicrosoftConfig(tenantId);
 
     if (!existing && (!patch.clientId || !patch.clientSecret || !patch.entraTenantId)) {
@@ -260,21 +268,12 @@ export class MicrosoftConnectionService {
       assertValidEntraTenantId(patch.entraTenantId);
     }
 
-    const merged: MicrosoftTenantConfig = {
-      clientId: patch.clientId ?? existing!.clientId,
-      clientSecret: patch.clientSecret
-        ? encrypt(patch.clientSecret, this.config.DATA_ENCRYPTION_SECRET)
-        : existing!.clientSecret,
-      entraTenantId: patch.entraTenantId ?? existing!.entraTenantId
-    };
+    const configChanges: Partial<MicrosoftTenantConfig> = {};
+    if (patch.clientId !== undefined) configChanges.clientId = patch.clientId;
+    if (patch.clientSecret) configChanges.clientSecret = encrypt(patch.clientSecret, this.config.DATA_ENCRYPTION_SECRET);
+    if (patch.entraTenantId !== undefined) configChanges.entraTenantId = patch.entraTenantId;
 
-    const existingState = await this.integrationStates.get(tenantId, "microsoft");
-    await this.integrationStates.upsert(tenantId, "microsoft", {
-      readsEnabled: existingState?.readsEnabled ?? false,
-      writesEnabled: existingState?.writesEnabled ?? false,
-      config: merged as unknown as Record<string, unknown>,
-      updatedBy: existingState?.updatedBy ?? null
-    }, audit);
+    await this.integrationStates.applyChanges(tenantId, "microsoft", { configChanges, updatedBy }, audit);
   }
 
   async removeTenantMicrosoftConfig(tenantId: string): Promise<void> {

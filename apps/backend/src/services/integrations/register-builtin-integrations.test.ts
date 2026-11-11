@@ -46,7 +46,11 @@ function connectorInput(
     },
     stores: {
       auditEvents: { async create() {} },
-      integrationStates: { async get() { return null; }, async upsert() { throw new Error("unexpected write"); } }
+      integrationStates: {
+        async get() { return null; },
+        async upsert() { throw new Error("unexpected write"); },
+        async applyChanges() { throw new Error("unexpected write"); }
+      }
     },
     integrationDescriptors,
     loadIntegrationEnablement: async () => {
