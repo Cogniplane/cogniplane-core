@@ -86,4 +86,31 @@ describe.skipIf(!adminDatabaseUrl())("session Trash retention", () => {
     expect(await store.remove(tenant, sessionId, user)).toEqual({ releasedSandboxId: null });
     expect((await store.restoreDeleted(tenant, sessionId, user))?.status).toBe("archived");
   });
+
+  test("deletes the objects of both artifact key layouts by their stored keys", async () => {
+    // New objects have a tenant segment first. Rows written before it keep
+    // `<userId>/<sessionId>/...`, and the sweep deletes each key as stored.
+    const tenant = await seedTenant();
+    const user = await seedUser();
+    const sessionId = await seedSession(tenant, user);
+    const legacyArtifactId = await seedArtifact(tenant, user, sessionId);
+    const tenantArtifactId = await seedArtifact(tenant, user, sessionId);
+    const legacyKey = `${user}/${sessionId}/${legacyArtifactId}.txt`;
+    const tenantKey = `${tenant}/${user}/${sessionId}/${tenantArtifactId}.txt`;
+    await superuserPool().query("UPDATE artifacts SET storage_key=$1 WHERE artifact_id=$2", [legacyKey, legacyArtifactId]);
+    await superuserPool().query("UPDATE artifacts SET storage_key=$1 WHERE artifact_id=$2", [tenantKey, tenantArtifactId]);
+    const store = new SessionStore(appPool(), maintenancePool());
+    await store.remove(tenant, sessionId, user);
+    await superuserPool().query(
+      "UPDATE sessions SET deleted_at=NOW() - INTERVAL '31 days' WHERE session_id=$1",
+      [sessionId],
+    );
+
+    const storageDelete = vi.fn(async (_storageKey: string) => undefined);
+    await store.cleanupExpired({ delete: storageDelete });
+
+    expect(storageDelete).toHaveBeenCalledWith(legacyKey);
+    expect(storageDelete).toHaveBeenCalledWith(tenantKey);
+    expect((await superuserPool().query("SELECT 1 FROM session_storage_gc WHERE session_id=$1", [sessionId])).rowCount).toBe(0);
+  });
 });

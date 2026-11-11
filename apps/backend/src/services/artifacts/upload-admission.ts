@@ -74,7 +74,7 @@ export class UploadAdmission {
       throw error;
     }
     const stored = await this.deps.storage.put({
-      storageKey: buildArtifactStorageKey({ userId, sessionId, artifactName: input.artifactName }),
+      storageKey: buildArtifactStorageKey({ tenantId, userId, sessionId, artifactName: input.artifactName }),
       stream: input.stream
     });
 

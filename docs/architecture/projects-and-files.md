@@ -50,7 +50,11 @@ selections. Routes: `routes/projects.ts`, `project-files.ts`,
   route returns 400 `invalid_multipart` for a missing boundary or truncated
   body and rethrows other errors to the app error handler. Unexpected stream
   failures remain opaque 500 responses.
-- Storage key: `{userId}/{sessionId}/{uuidv7}{safeExtension}`.
+- Storage key: `{tenantId}/{userId}/{sessionId}/{uuidv7}{safeExtension}`, from
+  `buildArtifactStorageKey` (`services/artifacts/artifact-storage-key.ts`).
+  Uploads and `write_artifact` both use it. Rows written before the tenant
+  segment keep `{userId}/{sessionId}/...`. Every read, download and delete uses
+  the key stored on the row, so those objects need no migration.
   `ARTIFACT_STORAGE_BACKEND` is `local` or `bucket` (S3-compatible).
 - An upload stays `pending` until its [PII](pii.md) verdict. No download token
   is issued before the artifact is `ready`.
