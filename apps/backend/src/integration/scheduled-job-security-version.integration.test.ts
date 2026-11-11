@@ -291,7 +291,9 @@ describe.skipIf(!adminDatabaseUrl())("scheduled jobs after a security change of 
         for (const sessionId of sessionIds) aborts.get(sessionId)!(options?.reason);
         stopped.push(`${tenantId}/${userId}`);
         return sessionIds;
-      }
+      },
+      // A scheduled turn here saves no sandbox, so the change takes none.
+      destroySandbox: async () => { throw new Error("no sandbox to kill"); }
     };
     const worker = scopedWorker(owner.tenantId, {
       stream: (session) => (async function* (): AsyncGenerator<BaseEvent> {

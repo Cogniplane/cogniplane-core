@@ -9,7 +9,7 @@ The rules are in the [security model](security.md).
 | Credential leak through the model | Model-blind tool context; gateway injects credentials ([tools](architecture/tools.md#mcp-gateway)) | `redactSecrets` on saved data; upstream secret scrubbing |
 | Stolen access token | Short TTL; memory-only storage ([auth](architecture/auth.md#tokens-and-cookies)) | Step-up and owner notices for sensitive changes |
 | Refresh token replay | Atomic `jti` rotation ([auth](architecture/auth.md#tokens-and-cookies)) | Family revocation on reuse |
-| Account takeover after password change | Security version on tokens and tool contexts ([local accounts](architecture/local-accounts.md#security-version-and-revocation)) | Suspended connections and paused jobs |
+| Account takeover after password change | Security version on tokens and tool contexts ([local accounts](architecture/local-accounts.md#security-version-and-revocation)) | Suspended connections and paused jobs; sandboxes of the account's chats killed |
 | Forged MCP calls | Runtime token; trusted `_meta` context ([tools](architecture/tools.md#mcp-gateway)) | Proxy HMAC signature with nonce and body hash |
 | Unapproved tool action | Interrupt before execution; single-use bound proof ([approvals](architecture/approvals.md)) | Policy Center enforce mode; approval TTL |
 | Sandbox escape or exfiltration | E2B VM per session; default-deny network ([sandbox](architecture/sandbox.md)) | Workspace path guard; timeouts; no secrets in sandbox |

@@ -121,7 +121,7 @@ from build arguments). Frontend variables are in `apps/frontend/.env.example`
 | `UTILITY_LLM_DISABLE_THINKING` | boolean | `false` | [models](architecture/models.md) |
 | `UTILITY_LLM_TIMEOUT_MS` | number, integer, > 0 | `10000` | [models](architecture/models.md) |
 | `RUNTIME_GATEWAY_BASE_URL` | string, URL | `"http://localhost:3001"` | [startup rules](#startup-rules), [tools](architecture/tools.md) |
-| `RUNTIME_IDLE_TIMEOUT_MS` | number, integer, > 0 | `300000` | [runtime](architecture/runtime.md) |
+| `RUNTIME_IDLE_TIMEOUT_MS` | number, integer, > 0 | `300000` | [runtime](architecture/runtime.md), [sandbox](architecture/sandbox.md) |
 | `RUNTIME_TURN_TIMEOUT_MS` | number, integer, >= 0 | `1200000` | [startup rules](#startup-rules), [runtime](architecture/runtime.md) |
 | `RUNTIME_TOKEN_TTL_MS` | number, integer, > 0 | `86400000` | [tools](architecture/tools.md) |
 | `TOOL_CONTEXT_TTL_MS` | number, integer, > 0 | `2100000` | [startup rules](#startup-rules), [tools](architecture/tools.md) |

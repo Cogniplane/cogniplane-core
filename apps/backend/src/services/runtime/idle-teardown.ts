@@ -13,7 +13,12 @@ export function clearIdleTimer(host: IdleTimerHost): void {
 /**
  * (Re-)arm the RUNTIME_IDLE_TIMEOUT_MS teardown timer for a runtime session:
  * cleared at turn start, re-armed at turn end and at session creation, so an
- * idle sandbox doesn't bill until the E2B hard timeout.
+ * idle runtime does not hold memory and its MCP connections.
+ * The teardown kills only a sandbox with no saved record (a project chat). The
+ * saved sandbox of a normal chat stays on purpose: the next turn, on any
+ * replica, reconnects to it with its files. It runs until E2B expires it
+ * (E2B_SANDBOX_TIMEOUT_MS after the last turn start), or until archive,
+ * delete, purge or a security change of the account kills it.
  * Skipped while the session is busy or already torn down — onIdle must never
  * fire mid-turn.
  */

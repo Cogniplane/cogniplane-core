@@ -1,6 +1,6 @@
 // Thin structural interface over the E2B SDK's Sandbox. Every consumer that talks to
-// an E2B sandbox uses it (today: the Deep Agents execution backend, and the kill of the
-// sandbox of a disposed session in e2b-sandbox-disposal.ts).
+// an E2B sandbox uses it (today: the Deep Agents execution backend, and the kill of a
+// sandbox that a session gave up in e2b-sandbox-disposal.ts).
 
 /** Session workspaces are rooted here inside every sandbox template. */
 export const E2B_WORKSPACE_BASE = "/home/user/workspace";

@@ -4,6 +4,7 @@ import { uuidv7 } from "../lib/uuid.js";
 import { requireProjectAccess } from "./project-access.js";
 import { sessionUploadAccessSql } from "./session-upload-access.js";
 import { AuditEventStore } from "./audit-event-store.js";
+import type { ReleasedSandbox } from "./runtime/e2b-sandbox-disposal.js";
 
 export type ExecutionActor = { tenantId: string; sessionId: string; userId: string };
 export type SessionExecution = ExecutionActor & {
@@ -55,6 +56,66 @@ export function interactiveContextExecutionSql(context: string): string {
 async function lockSessionRow(db: Pick<PoolClient, "query">, execution: ExecutionActor): Promise<void> {
   await db.query("SELECT session_id FROM sessions WHERE tenant_id=$1 AND session_id=$2 FOR UPDATE",
     [execution.tenantId, execution.sessionId]);
+}
+
+/** A sandbox that a security change took from a chat of the account. The account is for the log. */
+export type ReleasedAccountSandbox = ReleasedSandbox & { userId: string };
+
+/**
+ * Locks, in session order, the chats of the accounts that releaseAccountSandboxes changes:
+ * each chat that names a sandbox, and each normal chat with a lease, whose turn can save
+ * its first sandbox. A record write (bindSandboxId, releaseSandboxId) locks the same row
+ * first, so it either commits before the security change reads the row, or it waits
+ * until the change commits and then finds its lease stopped.
+ *
+ * Turn admission (SessionExecutionStore.acquire) locks the session row, then the
+ * membership row of the user. So a transaction that locks a membership row of the account
+ * (the role and removal routes) must call this first, or the two can deadlock.
+ */
+export async function lockAccountChats(db: Pick<PoolClient, "query">, tenantId: string, userIds: string[]): Promise<void> {
+  await db.query(`SELECT s.session_id FROM sessions s
+    WHERE s.tenant_id=$1 AND s.user_id = ANY($2::text[])
+      AND (s.sandbox_id IS NOT NULL OR (s.project_id IS NULL AND EXISTS (
+        SELECT 1 FROM session_executions e
+        WHERE e.tenant_id=s.tenant_id AND e.session_id=s.session_id AND e.status='active')))
+    ORDER BY s.session_id FOR UPDATE OF s`, [tenantId, userIds]);
+}
+
+/**
+ * Part of a security change (services/auth/security-change.ts), in its transaction. For
+ * each account:
+ *
+ * - stops the lease of each normal chat, so an older turn on any replica can no longer
+ *   load, save or release a sandbox record (stop_reason `security_change`);
+ * - takes the sandbox id that each chat names, and clears the record. Only a normal chat
+ *   saves a sandbox, for its owner. A chat that moved into a project keeps the id of the
+ *   sandbox it had as a normal chat, and no project turn loads it, so it is the
+ *   account's own sandbox, not one that the project shares.
+ *
+ * After the commit no turn can adopt a taken sandbox, so the caller kills it by id with
+ * no lease check. A turn that starts after the commit finds no record and starts a new
+ * sandbox, which this transaction did not take. Project turns save no sandbox, so their
+ * leases go on here; the other layers of the security change stop them.
+ */
+export async function releaseAccountSandboxes(
+  db: Pick<PoolClient, "query">, tenantId: string, userIds: string[]
+): Promise<ReleasedAccountSandbox[]> {
+  if (userIds.length === 0) return [];
+  await lockAccountChats(db, tenantId, userIds);
+  await db.query(`UPDATE session_executions e SET status='stopped', stop_reason='security_change', updated_at=NOW()
+    FROM sessions s WHERE s.tenant_id=e.tenant_id AND s.session_id=e.session_id
+      AND e.tenant_id=$1 AND e.status='active' AND s.user_id = ANY($2::text[]) AND s.project_id IS NULL`,
+  [tenantId, userIds]);
+  const taken = await db.query<{ user_id: string; session_id: string; sandbox_id: string }>(
+    `WITH taken AS (
+       SELECT session_id, user_id, sandbox_id FROM sessions
+       WHERE tenant_id=$1 AND user_id = ANY($2::text[]) AND sandbox_id IS NOT NULL
+     )
+     UPDATE sessions s SET sandbox_id=NULL, sandbox_network_policy=NULL
+     FROM taken WHERE s.tenant_id=$1 AND s.session_id=taken.session_id
+     RETURNING taken.user_id, taken.session_id, taken.sandbox_id`,
+    [tenantId, userIds]);
+  return taken.rows.map((row) => ({ tenantId, userId: row.user_id, sessionId: row.session_id, sandboxId: row.sandbox_id }));
 }
 
 export class SessionExecutionStore {
@@ -263,6 +324,20 @@ export class SessionExecutionStore {
       [tenantId, sessionId]);
       const row = result.rows[0];
       return row ? { executionId: row.execution_id, ownerId: row.owner_id } : null;
+    });
+  }
+
+  /**
+   * True when a security change of the owner's account stopped this lease
+   * (releaseAccountSandboxes). The turn then reports the reason `security_change`,
+   * as the tool context check does, and not the error of a lease that ended.
+   */
+  async stoppedBySecurityChange(execution: Pick<SessionExecution, "tenantId" | "sessionId" | "executionId">): Promise<boolean> {
+    return withTenantScope(this.pool, execution.tenantId, async db => {
+      const result = await db.query(`SELECT 1 FROM session_executions
+        WHERE tenant_id=$1 AND session_id=$2 AND execution_id=$3 AND status='stopped' AND stop_reason='security_change'`,
+      [execution.tenantId, execution.sessionId, execution.executionId]);
+      return Boolean(result.rows[0]);
     });
   }
 

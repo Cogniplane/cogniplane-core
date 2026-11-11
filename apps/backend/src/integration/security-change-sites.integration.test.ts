@@ -5,9 +5,11 @@
 // has a case here.
 //
 // Each case runs the production service or route against real Postgres and
-// checks three things: the after-commit handler gets the changed accounts,
-// once; the version moved; and a tool context that the account had before the
-// change is refused (the gateway's lookup, on every replica).
+// checks four things: the after-commit handler gets the changed accounts,
+// once; the version moved; a tool context that the account had before the
+// change is refused (the gateway's lookup, on every replica); and the sandbox
+// that a running turn of the account saved is taken from its chat, for the
+// handler to kill, and that turn's lease is stopped.
 
 import { randomUUID } from "node:crypto";
 import Fastify from "fastify";
@@ -23,6 +25,7 @@ import { LocalMfaService } from "../services/auth/local-mfa-service.js";
 import { LocalPasskeyService } from "../services/auth/local-passkey-service.js";
 import { type AfterSecurityChange, stopActiveWork } from "../services/auth/security-change.js";
 import { ToolExecutionContextStore } from "../services/auth/tool-execution-context-store.js";
+import { SessionExecutionStore } from "../services/session-execution-store.js";
 import { TenantOrgSettingsStore } from "../services/tenant-org-settings-store.js";
 import { recordSecurityChanges, SECURITY_CHANGE_SITES, type SecurityChangeSite } from "../test-helpers/security-change.js";
 import { SoftAuthenticator } from "../test-helpers/soft-authenticator.js";
@@ -85,6 +88,16 @@ async function liveContext(tenantId: string, userId: string): Promise<string> {
   });
   expect(await store.get(tenantId, context.toolContextId)).not.toBeNull();
   return context.toolContextId;
+}
+
+/** A running turn of the account in a normal chat, which saved a sandbox. */
+async function runningTurnWithSandbox(tenantId: string, userId: string) {
+  const sessionId = await seedSession(tenantId, userId);
+  const executions = new SessionExecutionStore(appPool(), "replica-b");
+  const execution = await executions.acquire({ tenantId, sessionId, userId }, 30_000);
+  const sandboxId = `sandbox-${randomUUID()}`;
+  await executions.bindSandboxId(execution, null, sandboxId, "policy-a");
+  return { released: { tenantId, userId, sessionId, sandboxId }, isCurrent: () => executions.isCurrent(execution) };
 }
 
 /** The tenant routes, called by the owner's local session, with a step-up that passes. */
@@ -223,11 +236,17 @@ describe.skipIf(!adminDatabaseUrl())("every security change stops the account's 
     const { act, changed } = await CASES[site](t, s);
     const before = new Map(await Promise.all(changed.map(async (userId) => [userId, await versionOf(userId)] as const)));
     const contexts = await Promise.all(changed.map((userId) => liveContext(t.tenantId, userId)));
+    const turns = await Promise.all(changed.map((userId) => runningTurnWithSandbox(t.tenantId, userId)));
     recorder.calls.length = 0;
 
     await act();
 
-    expect(recorder.calls).toEqual([{ tenantId: t.tenantId, userIds: [...changed].sort() }]);
+    expect(recorder.calls).toEqual([{
+      tenantId: t.tenantId,
+      userIds: [...changed].sort(),
+      releasedSandboxes: turns.map((turn) => turn.released).sort((a, b) => a.sandboxId.localeCompare(b.sandboxId))
+    }]);
+    for (const turn of turns) expect(await turn.isCurrent()).toBe(false);
     for (const userId of changed) expect(await versionOf(userId)).toBeGreaterThan(before.get(userId)!);
     const store = new ToolExecutionContextStore(appPool());
     for (const toolContextId of contexts) {
@@ -251,10 +270,13 @@ describe.skipIf(!adminDatabaseUrl())("every security change stops the account's 
 describe.skipIf(!adminDatabaseUrl())("a failure to stop the runtimes", () => {
   test("does not undo the security change, and the caller gets its result", async () => {
     const t = await fixture();
-    const logger = { error: vi.fn(), info: vi.fn() };
+    const logger = { error: vi.fn(), info: vi.fn(), warn: vi.fn() };
     const unreachable = new Error("runtime did not stop");
     const s = services(stopActiveWork({
-      runtimes: { invalidateRuntimesForUser: async () => { throw unreachable; } },
+      runtimes: {
+        invalidateRuntimesForUser: async () => { throw unreachable; },
+        destroySandbox: async () => { throw new Error("no sandbox to kill"); }
+      },
       logger
     }));
     const before = await versionOf(t.memberId);

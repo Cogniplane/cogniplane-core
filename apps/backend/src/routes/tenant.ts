@@ -438,9 +438,11 @@ export async function registerTenantRoutes(
       // The tenant's membership lock first, as every manager change takes it
       // (services/member-authority.ts): a role change and any other manager
       // change in this tenant run one at a time. Then the local identity, then
-      // the membership.
+      // the member's chats (a promotion can be a security change, which takes
+      // their sandboxes), then the membership.
       await lockTenantMembership(client, tenantId);
       const localStatus = await lockLocalIdentityForMembershipChange(client, tenantId, targetUserId);
+      await change.lockChatsBeforeMembership(targetUserId);
       const target = await client.query(
         `SELECT role FROM tenant_memberships WHERE tenant_id = $1 AND user_id = $2 FOR UPDATE`,
         [tenantId, targetUserId]
@@ -540,15 +542,18 @@ export async function registerTenantRoutes(
     // fresh proof, like reset and disable.
     if (!(await requireStepUpForLocalTarget(request, reply, targetUserId, "DELETE /tenant/members/:userId"))) return reply;
 
-    // After the commit, the member's live interactive and scheduled turns stop
+    // After the commit, the member's live interactive and scheduled turns stop,
+    // and the sandboxes of the member's chats are killed
     // (services/auth/security-change.ts). Runtime admission also checks the
     // membership, so a claimed job that races the removal before its session
     // exists cannot start either.
     const outcome = await withSecurityChange(db, tenantId, afterSecurityChange, async (client, change) => {
       // Same lock order as every other manager change: the tenant's
-      // membership lock, then identity, then membership, then scheduled jobs.
+      // membership lock, then identity, then the member's chats (the removal
+      // takes their sandboxes), then membership, then scheduled jobs.
       await lockTenantMembership(client, tenantId);
       await lockLocalIdentityForMembershipChange(client, tenantId, targetUserId);
+      await change.lockChatsBeforeMembership(targetUserId);
       const target = await client.query(
         `SELECT role, user_auth_source FROM tenant_memberships WHERE tenant_id = $1 AND user_id = $2 FOR UPDATE`,
         [tenantId, targetUserId]

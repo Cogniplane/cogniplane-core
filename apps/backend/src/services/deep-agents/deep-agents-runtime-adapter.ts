@@ -138,7 +138,7 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
   private readonly activeTurns = new Set<string>();
   private readonly pendingIntegrationInvalidations = new Set<string>();
   private readonly approvalCoordinator: ApprovalCoordinator;
-  /** Kills the sandbox of a disposed session (destroySandbox). Null without E2B_API_KEY. */
+  /** Kills the sandbox that a session gave up (destroySandbox). Null without E2B_API_KEY. */
   private readonly sandboxDisposal: Pick<E2bSandboxDisposal, "destroy"> | null;
   private readonly pendingWorkspaceResetNotices = new Map<
     string,
@@ -167,7 +167,7 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
     private readonly stores: {
       approvals: ApprovalStore;
       executions: Pick<SessionExecutionStore, "isCurrent" | "bindRuntime"> &
-        Partial<Pick<SessionExecutionStore, "sandboxBinding" | "bindSandboxId" | "releaseSandboxId">>;
+        Partial<Pick<SessionExecutionStore, "sandboxBinding" | "bindSandboxId" | "releaseSandboxId" | "stoppedBySecurityChange">>;
       conversationMessages?: Pick<MessageStore, "listBySession">;
       sessions: Pick<import("../session-store.js").SessionStore, "getReadable">;
       auditEvents: AuditEventStore;
@@ -213,7 +213,7 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
        * while still live, letting a second turn start on the same session.
        */
       activeTurns?: Pick<ActiveTurnsRegistry, "keepAlive" | "snapshot">;
-      /** Test-only: the kill of a disposed session's sandbox. Built from E2B_API_KEY otherwise. */
+      /** Test-only: the kill of a sandbox that a session gave up. Built from E2B_API_KEY otherwise. */
       sandboxDisposal?: Pick<E2bSandboxDisposal, "destroy">;
     },
     private readonly providerCredentials?: ProviderCredentials,
@@ -225,7 +225,7 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
       approvals: stores.approvals, auditEvents: stores.auditEvents, logger: log,
       ttlMs: config.APPROVAL_REQUEST_TTL_MS
     });
-    // The kill of a disposed session's sandbox has the limits of the kill of a replaced one.
+    // The kill of a sandbox that a session gave up has the limits of the kill of a replaced one.
     this.sandboxDisposal = stores.sandboxDisposal ?? (config.E2B_API_KEY
       ? new E2bSandboxDisposal({
           apiKey: config.E2B_API_KEY,
@@ -493,8 +493,14 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
         if (!current || current.runtimeId !== runtimeId || !current.execution)
           throw new SessionExecutionError("execution_stopped", 403);
         await this.requireRuntimeSessionAccess(current);
-        if (!await this.stores.executions!.isCurrent(current.execution, runtimeId))
+        if (!await this.stores.executions!.isCurrent(current.execution, runtimeId)) {
+          if (await this.stoppedBySecurityChange(current)) {
+            this.log.warn({ sessionId, runtimeId }, "A security change stopped the execution lease; the turn stops");
+            await current.activeTurnInterrupt.current?.("security_change");
+            throw toolAccessEndedError();
+          }
           throw new SessionExecutionError("execution_stopped", 403);
+        }
       } } : {}),
       ...(this.stores.toolContexts ? {
         requireLiveToolContext: () => this.requireLiveToolContext(sessionId, runtimeId)
@@ -1366,16 +1372,16 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
   }
 
   /**
-   * Kill the sandbox that archive, delete or purge took from the session row. See
-   * RuntimeAdapter.destroySandbox. A runtime of the session that this replica still
-   * holds keeps a dead sandbox in memory: at its next use it reads the empty record
-   * and starts a new one.
+   * Kill the sandbox that archive, delete, purge or a security change took from the
+   * session row. See RuntimeAdapter.destroySandbox. A runtime of the session that this
+   * replica still holds keeps a dead sandbox in memory: at its next use it reads the
+   * empty record and starts a new one.
    */
   async destroySandbox(input: ReleasedSandbox): Promise<SandboxDisposalOutcome> {
     if (!this.sandboxDisposal) {
       this.log.warn(
         { sessionId: input.sessionId, sandboxId: input.sandboxId },
-        "The sandbox of a disposed session was not killed: E2B is not configured. It runs until the provider expires it"
+        "The released sandbox of a session was not killed: E2B is not configured. It runs until the provider expires it"
       );
       return "skipped";
     }
@@ -1810,14 +1816,28 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
     const liveness = await this.readLiveness(state.tenantId, sessionId, toolContextId);
     if (liveness === "live") return;
     // A turn with an execution whose access already ended keeps its own
-    // error, as at the approval round.
-    if (state.execution) await this.requireCurrentExecution(state);
+    // error, as at the approval round. A lease that the security change
+    // stopped is not such an end: the turn reports the security change.
+    if (state.execution && !await this.stoppedBySecurityChange(state)) await this.requireCurrentExecution(state);
     const reason = turnStopReasonForEndedContext(liveness);
     this.log.warn({ sessionId, toolContextId, reason }, "Tool context is no longer live; the turn stops");
     await state.activeTurnInterrupt.current?.(reason);
     // The abort above ends the turn with an interrupted RUN_FINISHED. This
     // error stops the model call in all cases.
-    throw Object.assign(new Error("This turn stopped because its tool access ended."), { statusCode: 403 });
+    throw toolAccessEndedError();
+  }
+
+  /**
+   * True when a security change of the owner's account stopped the lease of the
+   * turn (releaseAccountSandboxes). A failed read counts as false: the turn then
+   * stops with the error of an ended lease.
+   */
+  private async stoppedBySecurityChange(state: DeepAgentsSessionState): Promise<boolean> {
+    if (!state.execution || !this.stores.executions?.stoppedBySecurityChange) return false;
+    return this.stores.executions.stoppedBySecurityChange(state.execution).catch((err: unknown) => {
+      this.log.warn({ err, sessionId: state.sessionId }, "Failed to read why the execution lease stopped");
+      return false;
+    });
   }
 
   /**
@@ -1909,6 +1929,11 @@ class ToolContextUnverifiedError extends Error {
     super("This turn stopped because its tool access could not be checked. Send the message again.");
     this.name = "ToolContextUnverifiedError";
   }
+}
+
+/** Stops the model call or tool of a turn that was already interrupted with its reason. */
+function toolAccessEndedError(): Error {
+  return Object.assign(new Error("This turn stopped because its tool access ended."), { statusCode: 403 });
 }
 
 /**

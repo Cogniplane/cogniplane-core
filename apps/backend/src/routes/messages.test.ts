@@ -610,6 +610,7 @@ test("lost execution releases admission even when runtime abort and streaming ar
     expect(h.activeTurns.snapshot().has(SESSION_ID)).toBe(true);
     await vi.advanceTimersByTimeAsync(5_000);
     expect(abort).toHaveBeenCalledWith(expect.objectContaining({ executionId: "execution-test" }));
+    expect(abort).not.toHaveBeenCalledWith(expect.objectContaining({ reason: expect.anything() }));
     expect(h.stores.executions.release).toHaveBeenCalledTimes(1);
     expect(h.activeTurns.snapshot().has(SESSION_ID)).toBe(false);
     await vi.advanceTimersByTimeAsync(30_000);
@@ -622,6 +623,33 @@ test("lost execution releases admission even when runtime abort and streaming ar
     await response;
   }
   expect(h.stores.executions.release).toHaveBeenCalledTimes(1);
+});
+
+test("a lease that a security change stopped ends the turn with that reason", async () => {
+  let start!: () => void;
+  const started = new Promise<void>(resolve => { start = resolve; });
+  let finish!: () => void;
+  const gate = new Promise<void>(resolve => { finish = resolve; });
+  const h = makeStores({ gateRuntime: async () => { start(); await gate; } });
+  vi.mocked(h.stores.executions.heartbeat).mockResolvedValue(false);
+  const stoppedBySecurityChange = vi.fn(async () => true);
+  Object.assign(h.stores.executions, { stoppedBySecurityChange });
+  const abort = vi.fn(async () => {});
+  h.stores.runtimeAdapter.abortSession = abort;
+  activeApp = await buildApp(h.stores);
+  vi.useFakeTimers({ toFake: ["setInterval", "clearInterval", "setTimeout", "clearTimeout", "performance"] });
+  const response = activeApp.inject({ method: "POST", url: "/messages", payload: { sessionId: SESSION_ID, text: "Hello" } }).then(result => result);
+  try {
+    await started;
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(stoppedBySecurityChange).toHaveBeenCalledWith(expect.objectContaining({ executionId: "execution-test" }));
+    expect(abort).toHaveBeenCalledWith(expect.objectContaining({ executionId: "execution-test", reason: "security_change" }));
+    expect(h.stores.executions.release).toHaveBeenCalledTimes(1);
+  } finally {
+    finish();
+    vi.useRealTimers();
+    await response;
+  }
 });
 
 test("a tenant with a spending limit keeps the local titler but not the paid fallback", async () => {

@@ -9,7 +9,11 @@ export function recordSecurityChanges(): { after: AfterSecurityChange; calls: Ch
   return {
     calls,
     after: async (changed) => {
-      calls.push({ tenantId: changed.tenantId, userIds: [...changed.userIds].sort() });
+      calls.push({
+        tenantId: changed.tenantId,
+        userIds: [...changed.userIds].sort(),
+        releasedSandboxes: [...changed.releasedSandboxes].sort((a, b) => a.sandboxId.localeCompare(b.sandboxId))
+      });
     }
   };
 }
