@@ -3,7 +3,13 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { AdminMcpServer } from "@cogniplane/shared-types";
 
-import { listAdminMcpServers, saveAdminMcpConnection, setInheritedAdminMcpAudience, type McpAudience } from "../lib/admin-api";
+import {
+  listAdminMcpServers,
+  saveAdminMcpConnection,
+  setInheritedAdminMcpAudience,
+  type McpAudience,
+  type McpConnectionEdit
+} from "../lib/admin-api";
 import { toErrorMessage } from "../lib/error-utils";
 import { queryKeys } from "../lib/query-keys";
 
@@ -36,8 +42,8 @@ export function useAdminMcpData() {
   });
 
   const submitMutation = useMutation({
-    mutationFn: async ({ input, editingId }: { input: SubmitInput; editingId: string | null }) => {
-      await saveAdminMcpConnection(input, editingId);
+    mutationFn: async ({ input, editing }: { input: SubmitInput; editing: McpConnectionEdit | null }) => {
+      await saveAdminMcpConnection(input, editing);
     },
     // Refresh the effective state after an error too. Another admin may have changed it.
     onSettled: () => invalidate()
@@ -64,9 +70,9 @@ export function useAdminMcpData() {
     saveError: saveError ? toErrorMessage(saveError, "Failed to save MCP availability.") : null,
     // The page shows one save error for both actions, so starting one action
     // clears the other's old error.
-    handleSubmit: async (input: SubmitInput, editingId: string | null): Promise<void> => {
+    handleSubmit: async (input: SubmitInput, editing: McpConnectionEdit | null): Promise<void> => {
       inheritedMutation.reset();
-      await submitMutation.mutateAsync({ input, editingId });
+      await submitMutation.mutateAsync({ input, editing });
     },
     handleSetInheritedAudience: async (serverId: string, audience: McpAudience): Promise<void> => {
       submitMutation.reset();

@@ -14,12 +14,13 @@ import {
   SelectValue
 } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
+import { ApiError } from "@/lib/api-client";
 import { useAuth } from "@/lib/auth-context";
 import { toErrorMessage } from "@/lib/error-utils";
 import { useConfirmLeave } from "@/hooks/use-confirm-leave";
 import { DisclosureRow } from "../overview-row";
-import type { McpAudience } from "../../../lib/admin-api";
-import { deriveMcpServerId, getMcpAvailability, getMcpUpstreamWarnings, mustReenterMcpSecret } from "./admin-mcp-card.logic";
+import type { McpAudience, McpConnectionEdit } from "../../../lib/admin-api";
+import { deriveMcpServerId, getMcpAvailability, getMcpUpstreamWarnings, mcpReviewRows, mustReenterMcpSecret } from "./admin-mcp-card.logic";
 import { AdminMcpConnectionTestCard, reachabilityLabel } from "./admin-mcp-connection-test";
 import { focusMcpElement, MCP_TEXT_FOCUS } from "./admin-mcp-focus";
 
@@ -109,7 +110,7 @@ function AdminMcpEditor({ headingRef, ...props }: {
       upstreamAuthSecret?: string | null;
       audience: McpAudience;
     },
-    editingId: string | null
+    editing: McpConnectionEdit | null
   ) => Promise<void>;
   onSetInheritedAudience: (serverId: string, audience: McpAudience) => Promise<void>;
   onTested?: () => void;
@@ -123,6 +124,11 @@ function AdminMcpEditor({ headingRef, ...props }: {
   const targetServer = props.mcpServers.find((server) => server.serverId === props.targetServerId);
   const [mcpDraft, setMcpDraft] = useState<McpDraft>(() => targetServer ? draftForServer(targetServer) : emptyMcpDraft);
   const [editingMcpServerId, setEditingMcpServerId] = useState<string | null>(targetServer?.serverId ?? null);
+  // The saved connection that the draft started from. A save sends its version
+  // and never takes a newer one on its own: the admin reviews it first.
+  const [openedServer, setOpenedServer] = useState<AdminMcpServer | null>(targetServer ?? null);
+  // A save answered that another version was saved first.
+  const [staleSave, setStaleSave] = useState(false);
   const [showForm, setShowForm] = useState(Boolean(targetServer));
   // The open row. It stays open after a save, so the admin can test the saved version.
   const [expandedId, setExpandedId] = useState<string | null>(targetServer?.serverId ?? null);
@@ -284,6 +290,8 @@ function AdminMcpEditor({ headingRef, ...props }: {
     }
     setShowForm(false);
     setEditingMcpServerId(null);
+    setOpenedServer(null);
+    setStaleSave(false);
     setMcpDraft(emptyMcpDraft);
     setInitialDraft(JSON.stringify(emptyMcpDraft));
     setLocalError(null);
@@ -293,11 +301,32 @@ function AdminMcpEditor({ headingRef, ...props }: {
   function handleEdit(server: AdminMcpServer) {
     if (savingRef.current) return;
     setEditingMcpServerId(server.serverId);
+    setOpenedServer(server);
+    setStaleSave(false);
     setMcpDraft(draftForServer(server));
     setShowForm(true);
     setInitialDraft(JSON.stringify(draftForServer(server)));
     setLocalError(null);
     setReloadError(null);
+  }
+
+  // The draft keeps its values and now starts from `server`. The next save
+  // sends that version.
+  function keepDraft(server: AdminMcpServer) {
+    setOpenedServer(server);
+    setInitialDraft(JSON.stringify(draftForServer(server)));
+    setStaleSave(false);
+    setReloadError(null);
+    formRef.current?.focus({ preventScroll: true });
+  }
+
+  function takeSavedValues(server: AdminMcpServer) {
+    setOpenedServer(server);
+    setMcpDraft(draftForServer(server));
+    setInitialDraft(JSON.stringify(draftForServer(server)));
+    setStaleSave(false);
+    setReloadError(null);
+    formRef.current?.focus({ preventScroll: true });
   }
 
   function requestEditorChange(action: () => void, reason: string, anchor: DecisionAnchor = "form", requestFocus = true) {
@@ -331,14 +360,19 @@ function AdminMcpEditor({ headingRef, ...props }: {
     revealEditorStart(form);
   }, [showForm, editingMcpServerId]);
 
-  const secretMustBeReentered = mustReenterMcpSecret(
-    editingMcpServerId ? props.mcpServers.find(server => server.serverId === editingMcpServerId) : undefined,
-    mcpDraft
-  );
+  const savedServer = editingMcpServerId ? props.mcpServers.find(server => server.serverId === editingMcpServerId) : undefined;
+  const secretMustBeReentered = mustReenterMcpSecret(savedServer, mcpDraft);
+  // A list refresh or a refused save shows a newer saved version. A save writes
+  // every field of the draft, so Save waits until the admin chooses the values.
+  // Hidden while this editor's own save runs: the page reloads the list before
+  // the save returns.
+  const newerServer = openedServer && savedServer && savedServer.version !== openedServer.version ? savedServer : null;
+  const reviewing = showForm && !saving && !inheritedServer && !editorMissing && (staleSave || newerServer !== null);
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>): Promise<void> {
     event.preventDefault();
-    if (savingRef.current || props.busyKey !== null || decision) return;
+    if (savingRef.current || props.busyKey !== null || decision || reviewing) return;
+    if (!inheritedServer && editingMcpServerId && !openedServer) return;
     savingRef.current = true;
     setSaving(true);
     setLocalError(null);
@@ -368,7 +402,7 @@ function AdminMcpEditor({ headingRef, ...props }: {
               : mcpDraft.upstreamAuthSecret || (editingMcpServerId ? undefined : null),
           audience: mcpDraft.audience
         },
-        editingMcpServerId
+        editingMcpServerId && openedServer ? { serverId: editingMcpServerId, expectedVersion: openedServer.version } : null
         );
       }
       if (!alive.current) return;
@@ -379,7 +413,9 @@ function AdminMcpEditor({ headingRef, ...props }: {
       setShowForm(false);
       setInitialDraft(JSON.stringify(emptyMcpDraft));
     } catch (error) {
-      if (alive.current) setLocalError(`${toErrorMessage(error, "This connection could not be saved.")} Your changes were kept. Save again to retry.`);
+      if (!alive.current) return;
+      if (error instanceof ApiError && error.status === 409 && error.code === "mcp_server_conflict") setStaleSave(true);
+      else setLocalError(`${toErrorMessage(error, "This connection could not be saved.")} Your changes were kept. Save again to retry.`);
     } finally {
       savingRef.current = false;
       if (alive.current) setSaving(false);
@@ -394,6 +430,45 @@ function AdminMcpEditor({ headingRef, ...props }: {
       <Button type="button" variant="outline" className="min-h-10" onClick={() => { const next = nextEditor.current; nextEditor.current = null; discardFocus.current = { control: invokingControl.current, serverId: editingMcpServerId }; editorFocusRequested.current = true; setDecision(false); next?.(); }}>Discard changes</Button>
     </div>
   </div> : null;
+
+  const reviewRows = newerServer && openedServer ? mcpReviewRows(openedServer, newerServer, mcpDraft) : [];
+  const review = !reviewing ? null : newerServer && openedServer ? (
+    <section aria-labelledby="mcp-review-heading" className="mt-3 space-y-3 rounded-lg border border-warning/40 bg-warning-surface p-4 text-sm text-on-surface">
+      <h3 id="mcp-review-heading" className="font-semibold">A newer version of this connection is saved</h3>
+      <p role="alert">Version {newerServer.version} was saved after you opened version {openedServer.version}. Your draft is kept. Compare the changed settings, then choose the values to keep.</p>
+      {reviewRows.length > 0 ? (
+        <table className="w-full table-fixed border-collapse text-left">
+          <thead>
+            <tr className="text-on-surface-variant">
+              <th scope="col" className="w-1/4 py-1 pr-2 font-medium">Setting</th>
+              <th scope="col" className="py-1 pr-2 font-medium">Saved now</th>
+              <th scope="col" className="py-1 font-medium">Your draft</th>
+            </tr>
+          </thead>
+          <tbody>
+            {reviewRows.map((row) => (
+              <tr key={row.setting} className="border-t border-outline-variant align-top">
+                <th scope="row" className="break-words py-1 pr-2 font-medium">{row.setting}</th>
+                <td className="break-words py-1 pr-2">{row.saved}</td>
+                <td className="break-words py-1">{row.draft}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      ) : <p>The settings in this form did not change.</p>}
+      <div className="flex flex-wrap gap-2">
+        <Button type="button" onClick={() => takeSavedValues(newerServer)}>Use saved values</Button>
+        <Button type="button" variant="outline" onClick={() => keepDraft(newerServer)}>Keep my draft</Button>
+      </div>
+    </section>
+  ) : (
+    <section aria-labelledby="mcp-review-heading" className="mt-3 space-y-3 rounded-lg border border-warning/40 bg-warning-surface p-4 text-sm text-on-surface">
+      <h3 id="mcp-review-heading" className="font-semibold">This connection changed after you opened it</h3>
+      <p role="alert">Your draft is kept. Load the saved connection to compare it with your draft.</p>
+      {reloadError ? <p className="text-danger">{reloadError}</p> : null}
+      {props.onReload ? <Button type="button" variant="outline" aria-disabled={reloading} onClick={event => void reloadConnections(event.currentTarget)}>{reloading ? "Loading saved connection…" : "Load saved connection"}</Button> : null}
+    </section>
+  );
 
   const form = showForm ? (
           <form
@@ -631,13 +706,14 @@ function AdminMcpEditor({ headingRef, ...props }: {
                 <Button type="button" variant="ghost" onClick={() => requestEditorChange(handleCancel, "close this editor")}>
                   Cancel
                 </Button>
-                <Button type="submit" disabled={Boolean(editingMcpServerId && !props.mcpServers.some(server => server.serverId === editingMcpServerId)) || props.busyKey === "mcp" || (mcpDraft.mode === "proxy" && mcpDraft.credentialScope === "personal" && mcpDraft.upstreamAuthType === "none") || (mcpDraft.mode === "proxy" && mcpDraft.credentialScope === "organization" && mcpDraft.upstreamAuthType !== "none" && !mcpDraft.upstreamAuthSecret && (!editingMcpServerId || props.mcpServers.find((server) => server.serverId === editingMcpServerId)?.credentialScope === "personal"))}>
+                <Button type="submit" disabled={reviewing || Boolean(editingMcpServerId && !props.mcpServers.some(server => server.serverId === editingMcpServerId)) || props.busyKey === "mcp" || (mcpDraft.mode === "proxy" && mcpDraft.credentialScope === "personal" && mcpDraft.upstreamAuthType === "none") || (mcpDraft.mode === "proxy" && mcpDraft.credentialScope === "organization" && mcpDraft.upstreamAuthType !== "none" && !mcpDraft.upstreamAuthSecret && (!editingMcpServerId || props.mcpServers.find((server) => server.serverId === editingMcpServerId)?.credentialScope === "personal"))}>
                   {saving ? "Saving connection…" : inheritedServer ? "Save availability" : editingMcpServerId ? "Save connection" : "Add connection"}
                 </Button>
               </div>
             </div>
             </section>
             </fieldset>
+            {review}
             {decisionAnchor === "form" ? discardDecision : null}
             <p id="mcp-save-error" ref={errorRef} tabIndex={-1} role={localError ? "alert" : "status"} className={`mt-3 text-sm ${MCP_TEXT_FOCUS} ${localError ? "text-danger" : "text-on-surface-variant"}`}>
               {saving ? "Saving this connection. Wait before editing or opening another connection." : localError || "Changes apply only after you submit this form."}

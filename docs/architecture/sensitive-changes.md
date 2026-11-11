@@ -48,8 +48,9 @@ checks and before the change:
   field.
 - The integration route writes only the keys that differ, onto the row it locks
   (`IntegrationStateStore.applyChanges`).
-- Checks that cannot spend a token run first: a missing MCP server answers 404
-  before the step-up check.
+- Checks that cannot spend a token run first: a missing MCP server answers 404,
+  and an MCP connection edit from an older version answers 409
+  `mcp_server_conflict`, before the step-up check.
 - Data routes outside `/admin/` use the admin rate limit (`admin_query`).
 
 ## Weaker controls and skill releases

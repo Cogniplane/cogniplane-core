@@ -83,3 +83,16 @@ required). Gateway rules: [tools](architecture/tools.md#mcp-gateway).
 4. As a member: save a credential if the scope is `personal`, then check that
    the connector shows in a chat's capability picker and that one tool call
    works.
+
+To change a connection, open its row and save the form (`PUT
+/admin/mcp-servers/:serverId/setup`, step-up required). The save writes every
+field, the audience too, so it sends `expectedVersion`: the saved version that
+the form opened. When the connection has another version, the backend writes
+nothing (no field, audience, audit event or owner notice) and returns 409
+`mcp_server_conflict` before the step-up check. The store compares the version
+again under the row lock (`McpServerStore.updateMcpServer`). The form keeps the
+draft and shows each setting that the newer version changed next to the draft
+value; it never shows a typed secret. The Save button stays disabled until the
+admin clicks one of the review buttons, Use saved values or Keep my draft. The
+next save sends the newer version (`components/admin/mcp/admin-mcp-card.tsx`).
+The legacy `PUT /admin/mcp-servers/:serverId` has no version check.

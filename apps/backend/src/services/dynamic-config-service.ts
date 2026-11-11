@@ -463,16 +463,20 @@ export class DynamicConfigService {
     // An edit keeps each omitted upstream field. A create uses the defaults.
     input: UpdateMcpServerPayload & { actorUserId: string },
     audience: "off" | "test_users" | "members",
-    editingId?: string,
+    // An edit saves a full draft, so it names the saved version that the draft
+    // started from. Another version throws McpServerVersionConflictError, and
+    // the transaction writes nothing.
+    editing?: { serverId: string; expectedVersion: number },
     audit?: (server: AdminMcpServerRecord) => AuditEventInput
   ): Promise<AdminMcpServerRecord | null> {
-    validateMcpServerInput(input, { requireUrlAndSecret: !editingId });
+    validateMcpServerInput(input, { requireUrlAndSecret: !editing });
     const enabled = audience !== "off";
     return this.stores.mcpServers.withTransaction(tenantId, async (client) => {
-      const saved = editingId
+      const saved = editing
         ? await this.stores.mcpServers.updateMcpServer(tenantId, {
             ...input,
-            serverId: editingId,
+            serverId: editing.serverId,
+            expectedVersion: editing.expectedVersion,
             enabled
           }, client)
         : await this.stores.mcpServers.createMcpServer(tenantId, {

@@ -2,7 +2,7 @@ import { beforeEach, expect, it, vi } from "vitest";
 
 import { DEFAULT_PII_PROTECTION, type PiiRecentResponse } from "@cogniplane/shared-types";
 
-import { changeAdminMcpWidgetDomain, changeMemberRole, getAdminMcpWidgetDomains, getAdminPiiRecent, listAdminSessions, listPolicyDecisions, updateTenantPiiProtection } from "./admin-api";
+import { changeAdminMcpWidgetDomain, changeMemberRole, getAdminMcpWidgetDomains, getAdminPiiRecent, listAdminSessions, listPolicyDecisions, saveAdminMcpConnection, updateTenantPiiProtection } from "./admin-api";
 import { request, requestOptionalOn404 } from "./api-client";
 
 vi.mock("./api-client", () => ({ request: vi.fn(), requestOptionalOn404: vi.fn() }));
@@ -163,4 +163,30 @@ it("sends the step-up token with a role change only when there is one", async ()
     method: "PUT", body: JSON.stringify({ role: "owner" }), headers: { "X-Step-Up": "step-up-token" }
   }]);
   expect(vi.mocked(request).mock.calls[1]).toEqual(["/tenant/members/lee/role", { method: "PUT", body: JSON.stringify({ role: "admin" }) }]);
+});
+
+// An edit saves the whole draft, so it names the saved version that the draft
+// started from; the backend refuses an older one. A new connection has none.
+it("sends the draft's saved version with a connection edit and none with a create", async () => {
+  const saved = {
+    serverId: "research", serverName: "Research", description: null, transportKind: "http", mode: "proxy",
+    routePath: "/mcp/research", upstreamUrl: "https://research.example/mcp", upstreamAuthType: "none",
+    upstreamAuthName: null, upstreamAuthConfigured: false, version: 6, configHash: "h", enabled: true,
+    isPublished: true, createdBy: "u1", createdAt: "2026-11-01T00:00:00.000Z", updatedAt: "2026-11-01T00:00:00.000Z"
+  };
+  vi.mocked(request).mockResolvedValue({ mcpServer: saved });
+  const input = {
+    serverId: "research", serverName: "Research", mode: "proxy" as const, routePath: "/mcp/research",
+    upstreamUrl: "https://research.example/mcp", audience: "members" as const
+  };
+
+  await saveAdminMcpConnection(input, { serverId: "research", expectedVersion: 4 });
+  await saveAdminMcpConnection(input, null);
+
+  expect(vi.mocked(request).mock.calls[0]).toEqual(["/admin/mcp-servers/research/setup", {
+    method: "PUT", body: JSON.stringify({ ...input, expectedVersion: 4 })
+  }]);
+  expect(vi.mocked(request).mock.calls[1]).toEqual(["/admin/mcp-servers/setup", {
+    method: "POST", body: JSON.stringify(input)
+  }]);
 });

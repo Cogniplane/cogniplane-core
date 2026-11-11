@@ -138,7 +138,7 @@ const CASES: Record<StepUpRoute, Case> = {
   "PUT /admin/mcp-servers/:serverId": { url: `/admin/mcp-servers/${MCP_SERVER_ID}`, payload: MCP_BODY },
   "POST /admin/mcp-servers/setup": { url: "/admin/mcp-servers/setup", payload: { ...MCP_BODY, audience: "members" } },
   "PUT /admin/mcp-servers/:serverId/setup": {
-    url: `/admin/mcp-servers/${MCP_SERVER_ID}/setup`, payload: { ...MCP_BODY, audience: "members" }
+    url: `/admin/mcp-servers/${MCP_SERVER_ID}/setup`, payload: { ...MCP_BODY, audience: "members", expectedVersion: 1 }
   },
   "PUT /admin/mcp-servers/:serverId/inherited-availability": {
     url: `/admin/mcp-servers/${SHARED_SERVER_ID}/inherited-availability`, payload: { audience: "members" }
@@ -702,7 +702,7 @@ describe("step-up routes", () => {
   // step-up check, so the user's proof stays usable.
   test.each([
     ["PUT /admin/mcp-servers/:serverId", "/admin/mcp-servers/no-such-server", { ...MCP_BODY, serverId: "no-such-server" }],
-    ["PUT /admin/mcp-servers/:serverId/setup", "/admin/mcp-servers/no-such-server/setup", { ...MCP_BODY, serverId: "no-such-server", audience: "members" }],
+    ["PUT /admin/mcp-servers/:serverId/setup", "/admin/mcp-servers/no-such-server/setup", { ...MCP_BODY, serverId: "no-such-server", audience: "members", expectedVersion: 1 }],
     ["PUT /admin/mcp-servers/:serverId/inherited-availability", `/admin/mcp-servers/${MCP_SERVER_ID}/inherited-availability`, { audience: "members" }],
     ["POST /admin/mcp-servers/:serverId/publish", "/admin/mcp-servers/no-such-server/publish", undefined]
   ] as const)("%s: a missing server answers 404 and does not spend the step-up token", async (route, url, payload) => {
@@ -717,6 +717,27 @@ describe("step-up routes", () => {
     expect(consume).not.toHaveBeenCalled();
     expect(notices).toEqual([]);
     // The same token still works for the server that exists.
+    expect((await send(app, route, token)).statusCode).toBeLessThan(300);
+  });
+
+  // A connection edit from an old draft answers 409 before the step-up check,
+  // so the user's proof stays usable for the save after the review.
+  test("PUT /admin/mcp-servers/:serverId/setup: a stale version answers 409 and does not spend the step-up token", async () => {
+    const route = "PUT /admin/mcp-servers/:serverId/setup";
+    const { app, consume, stepUp, notices } = await buildApp();
+    const { token } = await stepUp.create({
+      userId: IDENTITY.userId, tenantId: IDENTITY.tenantId, familyId: "family-1",
+      securityVersion: IDENTITY.securityVersion, action: STEP_UP_ROUTES[route]
+    }, ["pwd", "otp"]);
+    const stale = await app.inject({
+      method: "PUT", url: `/admin/mcp-servers/${MCP_SERVER_ID}/setup`,
+      payload: { ...MCP_BODY, audience: "off", expectedVersion: MCP_SERVER.version + 1 },
+      headers: { origin: ORIGIN, "x-step-up": token }
+    });
+    expect(stale.statusCode).toBe(409);
+    expect(stale.json()).toMatchObject({ error: "mcp_server_conflict" });
+    expect(consume).not.toHaveBeenCalled();
+    expect(notices).toEqual([]);
     expect((await send(app, route, token)).statusCode).toBeLessThan(300);
   });
 

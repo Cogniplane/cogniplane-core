@@ -38,7 +38,7 @@ it.each([true, false])("retains saved personal audience on a description-only sa
   expect(screen.queryByLabelText("Secret")).toBeNull();
   fireEvent.change(screen.getByLabelText("Description"), { target: { value: "Description only" } });
   fireEvent.click(screen.getByRole("button", { name: "Save connection" }));
-  await waitFor(() => expect(onSubmit).toHaveBeenCalledWith(expect.objectContaining({ audience: published ? "members" : "test_users", upstreamAuthSecret: null }), "sample"));
+  await waitFor(() => expect(onSubmit).toHaveBeenCalledWith(expect.objectContaining({ audience: published ? "members" : "test_users", upstreamAuthSecret: null }), { serverId: "sample", expectedVersion: 3 }));
 });
 
 it("distinguishes unavailable counts from returned zero and positive counts", () => {
@@ -468,7 +468,7 @@ it("shows both warnings and still submits a local HTTP MCP upstream", async () =
   fireEvent.click(submit);
   await waitFor(() => expect(onSubmit).toHaveBeenCalledWith(
     expect.objectContaining({ upstreamUrl: "http://100.108.24.234:3108/mcp" }),
-    "local"
+    { serverId: "local", expectedVersion: 1 }
   ));
 });
 
@@ -587,7 +587,7 @@ it("requires authentication for each member and never asks the admin for a share
   fireEvent.click(screen.getByRole("button", { name: "Save connection" }));
   await waitFor(() => expect(onSubmit).toHaveBeenCalledWith(expect.objectContaining({
     credentialScope: "personal", upstreamAuthType: "bearer", upstreamAuthSecret: null
-  }), "research"));
+  }), { serverId: "research", expectedVersion: 1 }));
 });
 
 it("rejects personal scope without authentication", () => {

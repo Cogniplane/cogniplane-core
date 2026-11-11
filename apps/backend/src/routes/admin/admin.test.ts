@@ -638,7 +638,7 @@ class InMemoryAdminConfig implements AdminDynamicConfig {
     _tenantId: string,
     input: Parameters<DynamicConfigService["saveMcpServerWithAudience"]>[1],
     audience: Parameters<DynamicConfigService["saveMcpServerWithAudience"]>[2],
-    _editingId?: string,
+    _editing?: Parameters<DynamicConfigService["saveMcpServerWithAudience"]>[3],
     audit?: Parameters<DynamicConfigService["saveMcpServerWithAudience"]>[4]
   ) {
     const saved = {
@@ -1489,7 +1489,8 @@ test("MCP creates validate required IDs and pass defaulted fields to the store",
       mode: "proxy",
       routePath: "/mcp/setup-server",
       upstreamUrl: "https://vendor.example/mcp",
-      audience: "off"
+      audience: "off",
+      expectedVersion: 1
     }
   });
   expect(offResponse.statusCode).toBe(200);
@@ -1498,7 +1499,7 @@ test("MCP creates validate required IDs and pass defaulted fields to the store",
     "admin-tenant",
     expect.objectContaining({ serverId: "setup-server" }),
     "off",
-    "setup-server",
+    { serverId: "setup-server", expectedVersion: 1 },
     expect.any(Function)
   );
   // An edit parses with the update schema. Omitted auth fields stay omitted,
@@ -1507,6 +1508,7 @@ test("MCP creates validate required IDs and pass defaulted fields to the store",
   expect(editInput).not.toHaveProperty("upstreamAuthType");
   expect(editInput).not.toHaveProperty("credentialScope");
   expect(editInput).not.toHaveProperty("upstreamAuthName");
+  expect(editInput).not.toHaveProperty("expectedVersion");
   expect(auditEvents.events.at(-1)?.payload).toEqual({
     serverId: "setup-server",
     credentialScope: "organization",
@@ -1526,7 +1528,8 @@ test("MCP creates validate required IDs and pass defaulted fields to the store",
       mode: "proxy",
       routePath: "/mcp/setup-server",
       upstreamUrl: "https://vendor.example/mcp",
-      audience: "members"
+      audience: "members",
+      expectedVersion: 1
     }
   });
   expect(membersResponse.statusCode).toBe(200);

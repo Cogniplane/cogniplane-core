@@ -3,6 +3,7 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { z } from "zod";
 import {
   AdminMcpConnectionTestRequestSchema,
+  AdminMcpServerSetupEditSchema,
   AdminMcpWidgetDomainChangeRequestSchema
 } from "@cogniplane/shared-types";
 import { describeCspSourceError, parseCspSource } from "@cogniplane/shared-types/csp-sources";
@@ -23,6 +24,7 @@ import type { DataRouteControl } from "../../services/data-route-control.js";
 import type { DataSettingChange } from "../../services/mail/setting-change-notices.js";
 import type { DynamicConfigService } from "../../services/dynamic-config-service.js";
 import type { McpAppCspStore } from "../../services/mcp/mcp-app-csp-store.js";
+import { MCP_SERVER_CONFLICT_MESSAGE, McpServerVersionConflictError } from "../../services/mcp-server-store.js";
 import {
   McpConnectionTestConflictError,
   McpConnectionTestNotFoundError,
@@ -31,6 +33,11 @@ import {
 import { apiError } from "../../lib/http-errors.js";
 
 const serverIdParamsSchema = z.object({ serverId: adminIdSchema });
+
+function respondMcpServerConflict(reply: FastifyReply) {
+  reply.code(409);
+  return apiError("mcp_server_conflict", MCP_SERVER_CONFLICT_MESSAGE);
+}
 
 export async function registerAdminMcpServerRoutes(
   app: FastifyInstance,
@@ -64,8 +71,9 @@ export async function registerAdminMcpServerRoutes(
   const audienceSchema = z.object({ audience: z.enum(["off", "test_users", "members"]) });
   const setupCreateBodySchema = z.intersection(mcpCreateBodySchema, audienceSchema);
   // An edit uses the update schema. It has no defaults, so an omitted
-  // upstreamAuthType or credentialScope keeps the stored value.
-  const setupUpdateBodySchema = z.intersection(mcpUpdateBodySchema, audienceSchema);
+  // upstreamAuthType or credentialScope keeps the stored value. It also names
+  // the saved version that its draft started from.
+  const setupUpdateBodySchema = z.intersection(mcpUpdateBodySchema, audienceSchema.extend(AdminMcpServerSetupEditSchema.shape));
 
   function auditPayload(
     mcpServer: AdminMcpServerRecord,
@@ -200,10 +208,10 @@ export async function registerAdminMcpServerRoutes(
   // server that does not exist answers 404 and does not spend the token.
   // `own`: the tenant's own server, which an edit changes. `inherited`: a
   // shared system server, whose availability the tenant chooses.
-  async function serverExists(request: FastifyRequest, serverId: string, owner: "own" | "inherited") {
+  async function findServer(request: FastifyRequest, serverId: string, owner: "own" | "inherited") {
     const servers = await stores.dynamicConfig.listMcpServers(request.auth.tenantId, true);
-    return servers.some((server) => server.serverId === serverId &&
-      (owner === "own" ? server.ownerTenantId === request.auth.tenantId : server.ownerTenantId === "system"));
+    return servers.find((server) => server.serverId === serverId &&
+      (owner === "own" ? server.ownerTenantId === request.auth.tenantId : server.ownerTenantId === "system")) ?? null;
   }
 
   app.get("/admin/mcp-servers/:serverId/widget-domains", withAdmin(app, async (request, reply) => {
@@ -288,17 +296,20 @@ export async function registerAdminMcpServerRoutes(
     reply: FastifyReply,
     editingId?: string
   ) {
-    let body: z.infer<typeof setupUpdateBodySchema>;
+    let body: Omit<z.infer<typeof setupUpdateBodySchema>, "expectedVersion">;
     let serverId: string;
+    let editing: { serverId: string; expectedVersion: number } | undefined;
     if (editingId) {
       const bodyResult = parseRequestInput(reply, setupUpdateBodySchema, request.body);
       if (!bodyResult.ok) return bodyResult.response;
-      if (bodyResult.value.serverId !== editingId) {
+      const { expectedVersion, ...fields } = bodyResult.value;
+      if (fields.serverId !== editingId) {
         reply.code(400);
         return configError("serverId must match the route parameter.");
       }
-      body = bodyResult.value;
+      body = fields;
       serverId = editingId;
+      editing = { serverId: editingId, expectedVersion };
     } else {
       const bodyResult = parseRequestInput(reply, setupCreateBodySchema, request.body);
       if (!bodyResult.ok) return bodyResult.response;
@@ -306,7 +317,13 @@ export async function registerAdminMcpServerRoutes(
       serverId = bodyResult.value.serverId;
     }
     const audience = body.audience;
-    if (editingId && !(await serverExists(request, editingId, "own"))) return respondAdminNotFound(reply, "mcpServer_not_found");
+    if (editing) {
+      const saved = await findServer(request, editing.serverId, "own");
+      if (!saved) return respondAdminNotFound(reply, "mcpServer_not_found");
+      // An old draft answers 409 here, so it does not spend the step-up token.
+      // The store compares again under the row lock.
+      if (saved.version !== editing.expectedVersion) return respondMcpServerConflict(reply);
+    }
     if (!(await stores.dataRoutes.requireStepUp(
       request,
       reply,
@@ -325,7 +342,7 @@ export async function registerAdminMcpServerRoutes(
           enabled: audience !== "off"
         },
         audience,
-        editingId,
+        editing,
         (saved) => auditInput(
           request,
           editingId ? "admin.mcp_server.updated" : "admin.mcp_server.created",
@@ -341,6 +358,7 @@ export async function registerAdminMcpServerRoutes(
       }
       return { mcpServer };
     } catch (error) {
+      if (error instanceof McpServerVersionConflictError) return respondMcpServerConflict(reply);
       return respondAdminMutationError(reply, error, "MCP connection could not be saved.");
     }
   }
@@ -364,7 +382,7 @@ export async function registerAdminMcpServerRoutes(
       request.body
     );
     if (!bodyResult.ok) return bodyResult.response;
-    if (!(await serverExists(request, paramsResult.value.serverId, "inherited"))) {
+    if (!(await findServer(request, paramsResult.value.serverId, "inherited"))) {
       return respondAdminNotFound(reply, "mcpServer_not_found");
     }
     // Turns a shared server on or off for the tenant's members.
@@ -459,7 +477,7 @@ export async function registerAdminMcpServerRoutes(
       reply.code(400);
       return configError("serverId must match the route parameter.");
     }
-    if (!(await serverExists(request, paramsResult.value.serverId, "own"))) return respondAdminNotFound(reply, "mcpServer_not_found");
+    if (!(await findServer(request, paramsResult.value.serverId, "own"))) return respondAdminNotFound(reply, "mcpServer_not_found");
     if (!(await stores.dataRoutes.requireStepUp(request, reply, "PUT /admin/mcp-servers/:serverId"))) return reply;
 
     try {
@@ -521,7 +539,7 @@ export async function registerAdminMcpServerRoutes(
       // Publish sends the tool calls of every member to the server's upstream: a data
       // route, like a change of the audience. Unpublish sends data nowhere new.
       if (isPublished) {
-        if (!(await serverExists(request, paramsResult.value.serverId, "own"))) {
+        if (!(await findServer(request, paramsResult.value.serverId, "own"))) {
           return respondAdminNotFound(reply, "mcp_server_not_found");
         }
         if (!(await stores.dataRoutes.requireStepUp(request, reply, "POST /admin/mcp-servers/:serverId/publish"))) {
