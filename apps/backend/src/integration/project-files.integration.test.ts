@@ -1118,6 +1118,52 @@ describe.skipIf(!adminDatabaseUrl())("versioned project files", () => {
       .toBe(originalDraft.version.versionId);
   });
 
+  test("agent update writes skip a trashed draft and keep iterating the live draft", async () => {
+    const h = await setup();
+    const published = await h.add({ text: "Original" });
+    await h.projects.setAgentFileMode(h.actor.tenantId, h.actor.userId, h.actor.projectId, "read-write");
+    const write = (text: string, actor = h.actor) =>
+      h.files.createAgentDraftFromContent({
+        actor,
+        name: published.name,
+        folderId: published.folderId,
+        targetFileId: published.fileId,
+        baseVersionId: published.version.versionId,
+        mimeType: "text/plain",
+        content: new TextEncoder().encode(text),
+        storage: h.storage,
+        maxBytes: 10_000,
+        createdByType: "agent",
+      });
+
+    const trashed = await write("First");
+    const trashedLatest = await write("Second");
+    expect(trashedLatest).toMatchObject({ fileId: trashed.fileId, version: { versionNumber: 2 } });
+    await h.files.trash(h.actor, trashed.fileId);
+
+    const live = await write("Third");
+    expect(live.fileId).not.toBe(trashed.fileId);
+    expect(live).toMatchObject({ kind: "draft", trashedAt: null, version: { versionNumber: 1 } });
+    expect(await write("Fourth")).toMatchObject({ fileId: live.fileId, version: { versionNumber: 2 } });
+    expect((await h.files.list(h.actor)).files.find((file) => file.fileId === trashed.fileId)).toMatchObject({
+      trashedAt: expect.any(String),
+      version: { versionId: trashedLatest.version.versionId },
+    });
+
+    // The reuse lookup relies on the target check to stay in one project.
+    const other = await h.projects.create(h.actor.tenantId, h.actor.userId, "Other");
+    await h.projects.setAgentFileMode(h.actor.tenantId, h.actor.userId, other.projectId, "read-write");
+    await expect(write("Cross-project", { ...h.actor, projectId: other.projectId }))
+      .rejects.toMatchObject({ code: "project_file_not_found", status: 404 });
+
+    const promoted = await h.files.promote(h.actor, live.fileId);
+    expect(promoted).toMatchObject({ fileId: published.fileId, version: { versionNumber: 2 } });
+    const download = await h.app.inject(
+      `${h.url}/files/${promoted.fileId}/versions/${promoted.version.versionId}/content`,
+    );
+    expect(download.body).toBe("Fourth");
+  });
+
   test("agent drafts enforce the MIME allow-list and PII blocking gate", async () => {
     const h = await setup();
     const put = vi.spyOn(h.storage, "put");
