@@ -981,10 +981,11 @@ export class ProjectFileStore {
         // Repeated agent writes for one published target are iterations of the
         // same reviewable draft. Keep one draft row and append an immutable
         // version instead of creating several drafts that all conflict at
-        // promotion time.
+        // promotion time. The lookup skips drafts in Trash, so the write starts
+        // a new live draft and the user can still restore the trashed draft.
         if (input.targetFileId && input.createdByType === "agent") {
           const existing = await db.query(
-            `${joinedFiles} AND f.kind = 'draft' AND f.target_file_id = $3
+            `${joinedFiles} AND f.kind = 'draft' AND f.trashed_at IS NULL AND f.target_file_id = $3
              AND f.base_version_id = $4 AND f.folder_id IS NOT DISTINCT FROM $5
              AND lower(f.name) = lower($6) AND f.created_by_type = 'agent'
              ORDER BY f.updated_at DESC, f.file_id LIMIT 1 FOR UPDATE OF f`,
