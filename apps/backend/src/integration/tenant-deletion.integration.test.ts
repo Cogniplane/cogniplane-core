@@ -163,6 +163,12 @@ describe.skipIf(!adminDatabaseUrl())("tenant offboarding", () => {
     expect(flushRedis).toHaveBeenCalledTimes(1);
     expect(await checkpointer!.getTuple(checkpointConfig)).toBeUndefined();
 
+    // A replay of the completed request does no work and returns the same
+    // receipt, completion time included.
+    expect(await service.execute(deletionInput)).toEqual(receipt);
+    expect(deleteArtifact).toHaveBeenCalledTimes(2);
+    expect(flushRedis).toHaveBeenCalledTimes(1);
+
     expect((await superuserPool().query(`SELECT 1 FROM tenants WHERE tenant_id = $1`, [targetTenant])).rowCount).toBe(0);
     expect((await superuserPool().query(`SELECT 1 FROM tenants WHERE tenant_id = $1`, [otherTenant])).rowCount).toBe(1);
     expect((await superuserPool().query(`SELECT 1 FROM users WHERE user_id = $1`, [targetUser])).rowCount).toBe(0);

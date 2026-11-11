@@ -1,6 +1,6 @@
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 
-import { parseDeleteTenantArguments } from "./delete-tenant-lib.js";
+import { parseDeleteTenantArguments, runDeleteTenant } from "./delete-tenant-lib.js";
 
 const complete = [
   "--tenant-id", "t1",
@@ -30,12 +30,19 @@ describe("parseDeleteTenantArguments", () => {
       tenantId: "t1",
       requestId: "OPS-42",
       thirdPartyDisposition: "No third-party data.",
-      backupDisposition: "Backups expire in 30 days."
+      backupDisposition: "Backups expire in 30 days.",
+      flushRedis: false
     };
 
     expect(parseDeleteTenantArguments(complete)).toEqual(expected);
     // The bare flag can come anywhere.
     expect(parseDeleteTenantArguments(["--maintenance-confirmed", ...complete.slice(0, -1)])).toEqual(expected);
+  });
+
+  test("flushes Redis only when --flush-redis is given", () => {
+    expect(parseDeleteTenantArguments(complete).flushRedis).toBe(false);
+    expect(parseDeleteTenantArguments([...complete, "--flush-redis"]).flushRedis).toBe(true);
+    expect(parseDeleteTenantArguments(["--flush-redis", ...complete]).flushRedis).toBe(true);
   });
 
   test("refuses a confirmation that does not repeat the tenant id, before it checks maintenance", () => {
@@ -59,9 +66,29 @@ describe("parseDeleteTenantArguments", () => {
     ["a flag is unknown", [...complete, "--dry-run", "yes"]],
     ["a flag is repeated", [...complete, "--tenant-id", "t1"]],
     ["the maintenance flag is repeated", [...complete, "--maintenance-confirmed"]],
+    ["the flush flag is repeated", [...complete, "--flush-redis", "--flush-redis"]],
+    ["the flush flag has a value", [...complete, "--flush-redis", "yes"]],
+    ["the flush flag has an inline value", [...complete, "--flush-redis=yes"]],
     // pnpm passes a literal "--" on to the script.
     ["the arguments start with --", ["--", ...complete]]
   ])("prints usage when %s", (_case, argv) => {
     expect(() => parseDeleteTenantArguments(argv)).toThrow(/^Usage: delete-tenant/);
+  });
+});
+
+describe("runDeleteTenant", () => {
+  // The refusal comes before the command opens the database or Redis, so this
+  // test needs neither. The integration suite shows that the tenant stays.
+  test("refuses --flush-redis when REDIS_URL is not configured", async () => {
+    const connectRedis = vi.fn();
+    const print = vi.fn();
+
+    await expect(runDeleteTenant([...complete, "--flush-redis"], {
+      MIGRATION_DATABASE_URL: "postgres://unused@127.0.0.1:1/unused"
+    }, { connectRedis, print })).rejects.toThrow(
+      "--flush-redis needs REDIS_URL, but REDIS_URL is not configured. Nothing was deleted."
+    );
+    expect(connectRedis).not.toHaveBeenCalled();
+    expect(print).not.toHaveBeenCalled();
   });
 });

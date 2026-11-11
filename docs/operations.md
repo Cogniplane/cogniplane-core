@@ -140,8 +140,8 @@ retention policy.
 `tenant:delete` (`services/tenant-deletion-service.ts`) first deletes the
 tenant's rows and writes a receipt (`tenant_deletion_receipts`) in one
 transaction, then removes storage objects and checkpoint threads, which are
-queued in `tenant_deletion_cleanup`. It flushes the whole Redis database of
-`REDIS_URL`, so it signs out every user of the environment. It kills no E2B
+queued in `tenant_deletion_cleanup`. It does not change Redis unless you add
+`--flush-redis` ([Redis](#redis-and-tenant-deletion)). It kills no E2B
 sandbox: a sandbox of the tenant runs until E2B expires it
 (`E2B_SANDBOX_TIMEOUT_MS` after its last turn start).
 
@@ -161,7 +161,54 @@ queue is empty: the tenant's rows, storage objects and checkpoint threads are
 deleted. Older versions in a versioned bucket stay until its lifecycle rule
 removes them. Any other status exits 1 and means some objects or threads are
 still queued: run the command again with the same `--request-id`. A new request
-id fails after the rows are gone, because the tenant no longer exists.
+id fails after the rows are gone, because the tenant no longer exists. A run
+for a completed request does nothing and prints the same receipt.
+
+### Redis and tenant deletion
+
+Without `--flush-redis`, the command does not connect to Redis. The command
+cannot remove only the deleted tenant's Redis keys: most keys do not name a
+tenant (for example `refresh_family:<id>`). The tenant's keys (refresh-token
+families, sign-in flows, rate-limit and quota counters) stay until they
+expire. They give no access: token refresh and each request check the
+membership in PostgreSQL (`checkAuthAdmission`, `lib/auth-admission.ts`), and
+the membership is deleted. The receipt's `redisDisposition` starts with
+`Redis not flushed`.
+
+`--flush-redis` adds `FLUSHDB` on the database number that `REDIS_URL` selects
+(`/2` in `redis://host:6379/2`; no number means `0`). It removes every key in
+that database, for all tenants:
+
+- Every user of every tenant is signed out.
+- All rate-limit and daily turn quota counters start again from zero.
+- Sign-in flows, step-up tokens and token-reuse detections that are not yet in
+  the audit log are lost ([what Redis holds](architecture/data.md#redis)).
+- Another service that uses the same database number loses its data.
+
+Other database numbers on the same server do not change. Use the flag only
+when the environment has its own Redis database and you accept these effects.
+Without `REDIS_URL`, the command refuses `--flush-redis` before it deletes
+anything.
+
+Only the run that deletes the rows can request a flush. The receipt tells what
+happened:
+
+| `redisDisposition` starts with | Meaning |
+|---|---|
+| `REDIS_URL was not configured` | No Redis; nothing to flush. |
+| `Redis not flushed: --flush-redis was not given` | Redis did not change. |
+| `Redis flush requested` | The flush is queued and did not run yet. |
+| `Redis database flushed` | The flush ran. |
+| `Redis flush failed` | The flush is still queued. |
+| `Redis not flushed: a flush is queued` | A run without `--flush-redis` found a queued flush and did not run it. |
+
+To finish a queued flush, run the command again with the same `--request-id`
+and `--flush-redis`. A run without the flag never flushes: it keeps the flush
+queued and exits 1. This is also true for a request from a version before
+`--flush-redis`. Such a version queued a flush whenever `REDIS_URL` was set,
+and wrote `Dedicated environment Redis database flushed` before the flush ran.
+A replay with `--flush-redis` for a request that has no queued flush does not
+flush; it prints a note to stderr.
 
 ## Monitor
 

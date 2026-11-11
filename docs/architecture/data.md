@@ -189,8 +189,9 @@ Fields that agents change most often (the full list is `TenantSettingsSchema` in
 
 With `REDIS_URL`, replicas share this short-lived state; without it, each
 process keeps it in memory. Redis holds no durable business data: losing or
-flushing it costs only the effects below. Give each environment its own Redis
-database ([tenant deletion flushes it](../operations.md#delete-a-tenant)).
+flushing it costs only the effects below, for all tenants. Give each
+environment its own Redis database: `tenant:delete --flush-redis` flushes it
+([tenant deletion](../operations.md#redis-and-tenant-deletion)).
 
 | State | Code | Loss or flush |
 |---|---|---|

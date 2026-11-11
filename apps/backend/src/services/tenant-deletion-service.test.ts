@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { describe, expect, test, vi } from "vitest";
 
 import type { Pool } from "../lib/db.js";
-import { TenantDeletionService } from "./tenant-deletion-service.js";
+import { REDIS_DISPOSITION, TenantDeletionService } from "./tenant-deletion-service.js";
 
 // Unit tests for the operator offboarding path. They use an in-memory stand-in
 // for the privileged pool, so they prove the service's own decisions: replay
@@ -171,6 +171,7 @@ class OffboardingDatabase {
         if (kind === "runtime_thread") {
           receipt.purged_runtime_thread_count = Number(receipt.purged_runtime_thread_count) + 1;
         }
+        if (kind === "redis_database") receipt.redis_disposition = values[4];
       }
       return this.result([], index >= 0 ? 1 : 0);
     }
@@ -187,10 +188,12 @@ class OffboardingDatabase {
       return this.result([{ count: String(this.queue.filter(item => item.requestId === values[0]).length) }]);
     }
     if (sql.startsWith("UPDATE tenant_deletion_receipts") && sql.includes("SET status")) {
-      Object.assign(this.receipts.get(String(values[0]))!, {
+      const receipt = this.receipts.get(String(values[0]))!;
+      Object.assign(receipt, {
         status: values[1],
-        completed_at: values[1] === "completed" ? "2026-10-01T00:00:02.000Z" : null,
-        last_error: values[2]
+        completed_at: values[1] === "completed" ? receipt.completed_at ?? "2026-10-01T00:00:02.000Z" : null,
+        last_error: values[2],
+        redis_disposition: values[3] ?? receipt.redis_disposition
       });
       return this.result([], 1);
     }
@@ -267,6 +270,7 @@ describe("TenantDeletionService", () => {
       deletedObjectCount: 2,
       retainedSharedObjectCount: 1,
       purgedRuntimeThreadCount: 1,
+      redisDisposition: REDIS_DISPOSITION.flushed,
       lastError: null
     });
     expect(receipt.rowCounts).toEqual({ sessions: 1, tenant_memberships: 2, orphaned_users: 1 });
@@ -368,7 +372,8 @@ describe("TenantDeletionService", () => {
       lastError: "artifact: object store unavailable",
       deletedObjectCount: 1,
       retainedSharedObjectCount: 1,
-      purgedRuntimeThreadCount: 1
+      purgedRuntimeThreadCount: 1,
+      redisDisposition: "No dedicated Redis database."
     });
     expect(db.queue).toEqual([{
       requestId: "request-1",
@@ -377,8 +382,8 @@ describe("TenantDeletionService", () => {
       attempts: 1,
       lastError: "artifact: object store unavailable"
     }]);
-    // Without a Redis client, no Redis flush is queued at all.
-    expect(db.ran("'redis_database'")).toBe(false);
+    // Without a flush function, no Redis flush is queued at all.
+    expect(db.ran("VALUES ($1, 'redis_database'")).toBe(false);
   });
 
   test("resumes cleanup for a replay by the same tenant without deleting database rows again", async () => {
@@ -398,19 +403,71 @@ describe("TenantDeletionService", () => {
     expect(db.ran("DELETE FROM tenants")).toBe(false);
   });
 
-  test("fails a queued Redis flush when this run has no Redis client", async () => {
+  // Older versions queued a flush whenever REDIS_URL was set and wrote
+  // "flushed" before it ran. A run without --flush-redis has no flush function.
+  test("keeps a queued Redis flush and says it did not run when the run has no flush permission", async () => {
     const db = new OffboardingDatabase();
-    db.receipts.set("request-1", receiptRow("request-1", "tenant-1"));
-    db.queue.push({ requestId: "request-1", kind: "redis_database", locator: "dedicated-environment-database", attempts: 0, lastError: null });
+    db.receipts.set("request-1", receiptRow("request-1", "tenant-1", {
+      redis_disposition: "Dedicated environment Redis database flushed; all sessions and rate-limit state invalidated."
+    }));
+    db.queue.push({ requestId: "request-1", kind: "redis_database", locator: "dedicated-environment-database", attempts: 1, lastError: "x" });
     const service = new TenantDeletionService({ db: db.asPool(), ...storage() });
 
     const receipt = await service.execute(input("request-1", "tenant-1"));
 
     expect(receipt).toMatchObject({
       status: "cleanup_failed",
-      lastError: "redis_database: Redis cleanup was queued but no Redis client was configured."
+      completedAt: null,
+      redisDisposition: REDIS_DISPOSITION.flushNotAllowed,
+      lastError: "redis_database: A Redis flush is queued for this request. " +
+        "Run the command again with --flush-redis to flush the whole Redis database."
     });
     expect(db.queue).toHaveLength(1);
-    expect(db.queue[0]!.attempts).toBe(1);
+    expect(db.queue[0]!.attempts).toBe(2);
+  });
+
+  test("keeps a failed flush queued, then records the flush when a later run succeeds", async () => {
+    const db = new OffboardingDatabase();
+    seedTenant(db, "tenant-1");
+    const deps = storage();
+    const flushRedis = vi.fn(async () => undefined).mockRejectedValueOnce(new Error("Connection is closed."));
+    const service = new TenantDeletionService({ db: db.asPool(), ...deps, flushRedis });
+
+    const failed = await service.execute({ ...input("request-1", "tenant-1"), redisDisposition: REDIS_DISPOSITION.flushQueued });
+
+    expect(failed).toMatchObject({
+      status: "cleanup_failed",
+      redisDisposition: REDIS_DISPOSITION.flushFailed,
+      lastError: "redis_database: Connection is closed."
+    });
+    expect(db.queue.map(item => item.kind)).toEqual(["redis_database"]);
+
+    const completed = await service.execute(input("request-1", "tenant-1"));
+
+    expect(completed).toMatchObject({ status: "completed", redisDisposition: REDIS_DISPOSITION.flushed, lastError: null });
+    expect(flushRedis).toHaveBeenCalledTimes(2);
+    expect(db.queue).toEqual([]);
+  });
+
+  test("a replay with flush permission and no queued flush neither flushes nor changes the receipt", async () => {
+    const db = new OffboardingDatabase();
+    const stored = receiptRow("request-1", "tenant-1", {
+      status: "completed",
+      completed_at: "2026-10-01T00:00:05.000Z",
+      redis_disposition: REDIS_DISPOSITION.notRequested
+    });
+    db.receipts.set("request-1", { ...stored });
+    const flushRedis = vi.fn(async () => undefined);
+    const service = new TenantDeletionService({ db: db.asPool(), ...storage(), flushRedis });
+
+    const receipt = await service.execute(input("request-1", "tenant-1"));
+
+    expect(flushRedis).not.toHaveBeenCalled();
+    expect(db.receipts.get("request-1")).toEqual(stored);
+    expect(receipt).toMatchObject({
+      status: "completed",
+      completedAt: "2026-10-01T00:00:05.000Z",
+      redisDisposition: REDIS_DISPOSITION.notRequested
+    });
   });
 });
