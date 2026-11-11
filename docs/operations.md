@@ -178,6 +178,14 @@ queued in `tenant_deletion_cleanup`. It flushes the whole Redis database of
 sandbox: a sandbox of the tenant runs until E2B expires it
 (`E2B_SANDBOX_TIMEOUT_MS` after its last turn start).
 
+User rows: the transaction finds each user that a row of the tenant names,
+also a former member with no membership left, and locks these `users` rows.
+After the tenant's rows are deleted, it deletes each of these users that no
+other row names (`row_counts.orphaned_users`). A user that a row of another
+tenant still names keeps the `users` row, for example a member removed from
+that tenant whose sessions or audit events stay there. User ids in JSON
+payloads (for example `audit_events.payload`) are not checked.
+
 ```bash
 MIGRATION_DATABASE_URL=... pnpm --filter @cogniplane/backend tenant:delete \
   --tenant-id <id> --confirm <same id> --request-id <ticket> \

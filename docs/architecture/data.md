@@ -44,6 +44,11 @@ The SQL in `apps/backend/db/migrations/` is authoritative for the schema.
    lacks either.
 5. If the table holds storage keys, add them to the cleanup list in
    `services/tenant-deletion-service.ts`.
+6. If a column stores a user id without a foreign key to `users`, add it to
+   `USER_ID_COLUMNS_WITHOUT_FOREIGN_KEY` in the same file. Tenant deletion
+   reads foreign keys to `users` from the catalog. A `user_id`, `*_user_id` or
+   `*_by` column that is in neither fails
+   `tenant-deletion.integration.test.ts`.
 
 ## Database pools
 
