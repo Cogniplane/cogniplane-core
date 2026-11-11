@@ -167,10 +167,14 @@ delete). Limits: `SCHEDULED_JOB_CREATE_LIMIT_*` and
 `SCHEDULED_JOB_MAX_ACTIVE_PER_USER`.
 
 - `services/scheduler-worker.ts` polls `scheduled_jobs` every
-  `SCHEDULER_POLL_INTERVAL_MS`, claims each due job with one conditional `UPDATE
-  ... RETURNING` (`UserSettingsStore.claimJob`), and runs each as an unattended
-  agent turn. Results go to `scheduled_job_runs`. Many replicas can run the
-  worker.
+  `SCHEDULER_POLL_INTERVAL_MS` and runs each due job as an unattended agent
+  turn. Many replicas can run the worker.
+- The claim (`UserSettingsStore.claimJob`) is one conditional `UPDATE ...
+  RETURNING` and the insert of a `pending` row in `scheduled_job_runs`, in one
+  transaction as `app_user` in the job's tenant. Only one replica gets the job,
+  and each claim leaves one run row. The worker then links the run to its new
+  session and writes the outcome, also when the session or the turn cannot
+  start. After a crash, the stale-run sweep marks the run `failed`.
 - Limits: `SCHEDULER_MAX_CONCURRENT_JOBS`, `SCHEDULER_JOB_TIMEOUT_MS`,
   `SCHEDULER_MAX_CONSECUTIVE_FAILURES` (disables a failing job).
 - A scheduled turn cannot pause for approval: an enforced Policy Center

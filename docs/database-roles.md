@@ -39,7 +39,9 @@ the startup checks. Deployment steps are in
 only list of grants. The code that uses them reads through `privilegedDb` (`git
 grep privilegedDb apps/backend/src`).
 
-- Tenant workers switch back to `app_user` after a claim.
+- Tenant workers use `app_user` when they have a tenant scope. Scheduled-job
+  claims already know the tenant and use `app_user` to commit the claim and
+  its pending run together.
 - Retention relies on foreign-key cascades; the role has no direct DELETE on
   every child table.
 - A new cross-tenant worker adds its grants to `MAINTENANCE_GRANTS` and covers

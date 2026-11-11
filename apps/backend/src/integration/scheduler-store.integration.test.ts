@@ -60,7 +60,8 @@ describe.skipIf(!adminDatabaseUrl())("scheduler persistence", () => {
     const tenant = await seedTenantGraph();
     const runId = randomUUID();
     const store = new UserSettingsStore(appPool(), maintenancePool());
-    await store.createJobRun({ ...tenant, runId });
+    await store.claimJob(tenant.tenantId, tenant.jobId, null, runId);
+    await store.attachJobRunSession({ tenantId: tenant.tenantId, runId, sessionId: tenant.sessionId });
 
     const pending = await superuserPool().query("SELECT * FROM scheduled_job_runs WHERE run_id = $1", [runId]);
     expect(pending.rows[0]).toMatchObject({ status: "pending", job_id: tenant.jobId, session_id: tenant.sessionId });

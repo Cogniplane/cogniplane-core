@@ -113,65 +113,75 @@ describe("UserSettingsStore – scheduler methods", () => {
   });
 
   describe("claimJob", () => {
-    it("returns the job when successfully claimed", async () => {
+    const isClaim = (sql: string) => sql.includes("UPDATE") && sql.includes("scheduled_jobs");
+    const isRunInsert = (sql: string) => sql.includes("INSERT") && sql.includes("scheduled_job_runs");
+
+    it("claims the job and writes its pending run in one tenant transaction", async () => {
       const claimed = fakeJobRow({
+        tenant_id: "tenant-1",
         job_id: "job-1",
+        user_id: "user-1",
         last_run_at: "2026-03-18T09:00:00.000Z",
         next_run_at: "2026-03-19T09:00:00.000Z"
       });
-      db.onQuery((sql) => {
-        if (sql.includes("UPDATE") && sql.includes("scheduled_jobs") && sql.includes("RETURNING")) {
-          return { rows: [claimed], rowCount: 1 };
-        }
-        return { rows: [], rowCount: 0 };
-      });
+      db.onQuery((sql) => (isClaim(sql) ? { rows: [claimed], rowCount: 1 } : { rows: [], rowCount: 0 }));
 
-      const result = await store.claimJob("tenant-1", "job-1", "2026-03-19T09:00:00.000Z");
+      const result = await store.claimJob("tenant-1", "job-1", "2026-03-19T09:00:00.000Z", "run-1");
 
-      expect(result).toBeTruthy();
-      expect(result!.jobId).toBe("job-1");
-      expect(result!.nextRunAt).toBe("2026-03-19T09:00:00.000Z");
+      expect(result).toMatchObject({ jobId: "job-1", nextRunAt: "2026-03-19T09:00:00.000Z", runId: "run-1" });
+      expect(db.calls.map((call) => call.sql.trim().split(/\s+/)[0])).toEqual(["BEGIN", "SELECT", "UPDATE", "INSERT", "COMMIT"]);
+      expect(db.calls[1]?.params).toEqual(["tenant-1"]);
+      // The run takes its tenant, job and owner from the claimed row.
+      const insert = db.calls.find((call) => isRunInsert(call.sql));
+      expect(insert?.sql).toContain("'pending'");
+      expect(insert?.params).toEqual(["tenant-1", "run-1", "job-1", "user-1"]);
     });
 
-    it("returns null when the job was already claimed (no rows)", async () => {
+    it("writes no run when the job was already claimed (no rows)", async () => {
       db.onQuery(() => ({ rows: [], rowCount: 0 }));
 
-      const result = await store.claimJob("tenant-1", "job-1", "2026-03-19T09:00:00.000Z");
+      const result = await store.claimJob("tenant-1", "job-1", "2026-03-19T09:00:00.000Z", "run-1");
 
       expect(result).toBe(null);
+      expect(db.calls.some((call) => isRunInsert(call.sql))).toBe(false);
     });
 
-    it("scopes the RLS-bypassing claim to tenantId and passes jobId + nextRunAt", async () => {
+    it("keeps the tenant predicate in the claim and passes jobId + nextRunAt", async () => {
       db.onQuery(() => ({ rows: [], rowCount: 0 }));
 
-      await store.claimJob("tenant-42", "job-42", "2026-03-20T00:00:00.000Z");
+      await store.claimJob("tenant-42", "job-42", "2026-03-20T00:00:00.000Z", "run-42");
 
-      const call = db.calls[0];
+      const call = db.calls.find((entry) => isClaim(entry.sql));
       expect(call).toBeTruthy();
-      // tenant_id MUST be the first predicate — it is the only isolation
-      // guarantee on the BYPASSRLS scheduler pool.
-      expect(call.sql).toContain("tenant_id = $1");
-      expect(call.params[0]).toBe("tenant-42");
-      expect(call.params[1]).toBe("job-42");
-      expect(call.params[2]).toBe("2026-03-20T00:00:00.000Z");
+      expect(call!.sql).toContain("tenant_id = $1");
+      expect(call!.params).toEqual(["tenant-42", "job-42", "2026-03-20T00:00:00.000Z"]);
     });
   });
 
-  describe("createJobRun + completeJobRun", () => {
-    it("maps returned pending and completed run rows", async () => {
-      // createJobRun handler
+  describe("parkJob", () => {
+    it("clears next_run_at of the tenant's due job and writes no run", async () => {
+      await store.parkJob("tenant-1", "job-1");
+
+      expect(db.calls).toHaveLength(1);
+      expect(db.calls[0]?.sql).toContain("next_run_at = NULL");
+      expect(db.calls[0]?.sql).toContain("tenant_id = $1");
+      expect(db.calls[0]?.sql).not.toContain("scheduled_job_runs");
+      expect(db.calls[0]?.params).toEqual(["tenant-1", "job-1"]);
+    });
+  });
+
+  describe("attachJobRunSession + completeJobRun", () => {
+    it("links the session and maps the completed run", async () => {
       db.onQuery((sql) => {
-        if (sql.includes("INSERT") && sql.includes("scheduled_job_runs")) {
-          return {
-            rows: [fakeRunRow({ run_id: "run-abc", job_id: "job-1", user_id: "user-1", session_id: "sess-1", status: "pending" })],
-            rowCount: 1
-          };
+        if (sql.includes("SET session_id")) {
+          return { rows: [], rowCount: 1 };
         }
         if (sql.includes("UPDATE") && sql.includes("scheduled_job_runs")) {
           return {
             rows: [
               fakeRunRow({
                 run_id: "run-abc",
+                session_id: "sess-1",
                 status: "completed",
                 completed_at: "2026-03-18T09:01:00.000Z",
                 duration_ms: 1500,
@@ -186,17 +196,9 @@ describe("UserSettingsStore – scheduler methods", () => {
         return { rows: [], rowCount: 0 };
       });
 
-      const created = await store.createJobRun({
-        tenantId: "test-tenant",
-        runId: "run-abc",
-        jobId: "job-1",
-        userId: "user-1",
-        sessionId: "sess-1"
-      });
-
-      expect(created.runId).toBe("run-abc");
-      expect(created.status).toBe("pending");
-      expect(created.sessionId).toBe("sess-1");
+      expect(await store.attachJobRunSession({ tenantId: "test-tenant", runId: "run-abc", sessionId: "sess-1" })).toBe(true);
+      const attach = db.calls.find((call) => call.sql.includes("SET session_id"));
+      expect(attach?.params).toEqual(["test-tenant", "run-abc", "sess-1"]);
 
       const completed = await store.completeJobRun({
         tenantId: "test-tenant",
@@ -209,12 +211,31 @@ describe("UserSettingsStore – scheduler methods", () => {
         summary: "All done"
       });
 
-      expect(completed.runId).toBe("run-abc");
-      expect(completed.status).toBe("completed");
-      expect(completed.durationMs).toBe(1500);
-      expect(completed.inputTokens).toBe(200);
-      expect(completed.outputTokens).toBe(300);
-      expect(completed.summary).toBe("All done");
+      expect(completed).toMatchObject({
+        runId: "run-abc",
+        sessionId: "sess-1",
+        status: "completed",
+        durationMs: 1500,
+        inputTokens: 200,
+        outputTokens: 300,
+        summary: "All done"
+      });
+    });
+
+    it("reports a missing run row as false and null", async () => {
+      db.onQuery(() => ({ rows: [], rowCount: 0 }));
+
+      expect(await store.attachJobRunSession({ tenantId: "test-tenant", runId: "gone", sessionId: "sess-1" })).toBe(false);
+      expect(await store.completeJobRun({
+        tenantId: "test-tenant",
+        runId: "gone",
+        status: "failed",
+        durationMs: 1,
+        inputTokens: 0,
+        outputTokens: 0,
+        errorMessage: "timeout",
+        summary: null
+      })).toBeNull();
     });
 
     it("maps a returned failed run", async () => {
@@ -247,8 +268,8 @@ describe("UserSettingsStore – scheduler methods", () => {
         summary: null
       });
 
-      expect(completed.status).toBe("failed");
-      expect(completed.errorMessage).toBe("timeout");
+      expect(completed?.status).toBe("failed");
+      expect(completed?.errorMessage).toBe("timeout");
     });
   });
 

@@ -11,8 +11,10 @@ import type { ClaimedScheduledJob } from "./user-settings-store.js";
 import { PiiProtectionServiceError, type PiiDecision } from "./pii/pii-protection-service.js";
 import type { PiiFinding } from "./pii/pii-provider.js";
 import { textEvaluation } from "../test-helpers/pii-evaluation.js";
+import { GENERIC_TURN_FAILURE } from "./turn-transcript.js";
 import {
   OWNER_SECURITY_CHANGED_RUN_ERROR,
+  SCHEDULER_STOPPED_RUN_ERROR,
   SchedulerWorker,
   type SchedulerRuntimeResolution,
   type SchedulerRuntimeAdapter,
@@ -68,6 +70,7 @@ function makeFakeJob(overrides: Partial<ClaimedScheduledJob> = {}): ClaimedSched
     createdAt: "2026-01-01T00:00:00.000Z",
     updatedAt: "2026-01-01T00:00:00.000Z",
     ownerSecurityVersion: null,
+    runId: "run-1",
     ...overrides
   };
 }
@@ -144,6 +147,10 @@ function createFakeDeps(options?: {
   updateContentReturnsNull?: boolean;
   /** Hold the usage read that runs before the final transcript write. */
   getOwnedGate?: Promise<void>;
+  /** What `attachJobRunSession` answers. Default true (the run row exists). */
+  attachReturns?: boolean;
+  /** Make `completeJobRun` find no run row. */
+  completeReturnsNull?: boolean;
 }) {
   const dueJobs = options?.dueJobs ?? [];
   const claimReturns = options?.claimReturns ?? dueJobs.map((j) => j);
@@ -163,8 +170,11 @@ function createFakeDeps(options?: {
   let runtimeCallIndex = 0;
 
   const sessionsCreated: Array<{ userId: string; sessionName: string; options?: { purpose?: string } }> = [];
-  const claimsCalled: Array<{ tenantId: string; jobId: string; nextRunAt: string | null }> = [];
+  const claimsCalled: Array<{ tenantId: string; jobId: string; nextRunAt: string | null; runId: string }> = [];
+  // Pending runs that successful claims wrote.
   const jobRunsCreated: Array<{ runId: string; jobId: string; userId: string; sessionId: string | null }> = [];
+  const runSessionsAttached: Array<{ tenantId: string; runId: string; sessionId: string }> = [];
+  const parkCalls: Array<{ tenantId: string; jobId: string }> = [];
   const jobRunsCompleted: Array<{
     runId: string;
     status: string;
@@ -256,32 +266,24 @@ function createFakeDeps(options?: {
     runtimeAdapter,
     settings: {
       listDueJobs: async (limit: number) => dueJobs.slice(0, limit),
-      claimJob: async (tenantId, jobId, nextRunAt) => {
-        claimsCalled.push({ tenantId, jobId, nextRunAt });
+      claimJob: async (tenantId, jobId, nextRunAt, runId) => {
+        claimsCalled.push({ tenantId, jobId, nextRunAt, runId });
         const result = claimReturns[claimIndex] ?? null;
         claimIndex += 1;
-        return result;
+        if (!result) return null;
+        jobRunsCreated.push({ runId, jobId: result.jobId, userId: result.userId, sessionId: null });
+        return { ...result, runId };
       },
-      createJobRun: async (input) => {
-        jobRunsCreated.push(input);
-        return {
-          runId: input.runId,
-          jobId: input.jobId,
-          userId: input.userId,
-          sessionId: input.sessionId,
-          status: "pending",
-          startedAt: new Date().toISOString(),
-          completedAt: null,
-          durationMs: null,
-          inputTokens: 0,
-          outputTokens: 0,
-          errorMessage: null,
-          summary: null,
-          createdAt: new Date().toISOString()
-        };
+      parkJob: async (tenantId, jobId) => {
+        parkCalls.push({ tenantId, jobId });
+      },
+      attachJobRunSession: async (input) => {
+        runSessionsAttached.push(input);
+        return options?.attachReturns ?? true;
       },
       completeJobRun: async (input) => {
         jobRunsCompleted.push(input);
+        if (options?.completeReturnsNull) return null;
         return {
           runId: input.runId,
           jobId: "job-1",
@@ -443,6 +445,8 @@ function createFakeDeps(options?: {
     sessionsCreated,
     claimsCalled,
     jobRunsCreated,
+    runSessionsAttached,
+    parkCalls,
     jobRunsCompleted,
     messagesCreated,
     messagesUpdated,
@@ -550,9 +554,9 @@ describe("SchedulerWorker", () => {
       }
     });
     const claim = deps.settings.claimJob.bind(deps.settings);
-    deps.settings.claimJob = async (tenantId, jobId, nextRunAt) => {
+    deps.settings.claimJob = async (tenantId, jobId, nextRunAt, runId) => {
       if (jobId === "job-2") throw new Error("claim failed");
-      return claim(tenantId, jobId, nextRunAt);
+      return claim(tenantId, jobId, nextRunAt, runId);
     };
     const worker = new SchedulerWorker(deps, { maxConcurrentJobs: 5, jobTimeoutMs: 60_000 });
 
@@ -584,7 +588,9 @@ describe("SchedulerWorker", () => {
     await tick;
     await expect(worker.drain(5_000)).resolves.toBe(true);
     expect(turns).toBe(0);
-    expect(jobRunsCompleted).toEqual([expect.objectContaining({ status: "failed" })]);
+    expect(jobRunsCompleted).toEqual([
+      expect.objectContaining({ status: "failed", errorMessage: SCHEDULER_STOPPED_RUN_ERROR })
+    ]);
   });
 
   test("a worker stopped while it lists due jobs claims none of them", async () => {
@@ -604,8 +610,10 @@ describe("SchedulerWorker", () => {
 
   test("tick claims and executes a due job", async () => {
     const job = makeFakeJob();
-    const { deps, sessionsCreated, jobRunsCreated, jobRunsCompleted, messagesCreated, toolContextsCreated, auditEvents } =
-      createFakeDeps({ dueJobs: [job] });
+    const {
+      deps, sessionsCreated, claimsCalled, jobRunsCreated, runSessionsAttached, jobRunsCompleted,
+      messagesCreated, toolContextsCreated, auditEvents
+    } = createFakeDeps({ dueJobs: [job] });
     const worker = new SchedulerWorker(deps, { maxConcurrentJobs: 5, jobTimeoutMs: 60_000 });
     await worker.tick();
 
@@ -619,8 +627,14 @@ describe("SchedulerWorker", () => {
     expect(jobRunsCreated.length).toBe(1);
     expect(jobRunsCreated[0].jobId).toBe("job-1");
     expect(jobRunsCreated[0].userId).toBe("user-1");
+    // One run id from the claim to the session link and the outcome.
+    const runId = claimsCalled[0].runId;
+    expect(runId).toEqual(expect.any(String));
+    expect(jobRunsCreated[0].runId).toBe(runId);
+    expect(runSessionsAttached).toEqual([{ tenantId: "test-tenant", runId, sessionId: "session-1" }]);
 
     expect(jobRunsCompleted.length).toBe(1);
+    expect(jobRunsCompleted[0].runId).toBe(runId);
     expect(jobRunsCompleted[0].status).toBe("completed");
     expect(jobRunsCompleted[0].summary?.includes("Hello from scheduler")).toBeTruthy();
 
@@ -1100,7 +1114,7 @@ describe("SchedulerWorker", () => {
 
   test("tick disables a job with an invalid cron expression instead of running it", async () => {
     const job = makeFakeJob({ cronExpression: "not-a-cron" });
-    const { deps, sessionsCreated, jobRunsCompleted, auditEvents } = createFakeDeps({
+    const { deps, claimsCalled, parkCalls, sessionsCreated, jobRunsCompleted, auditEvents } = createFakeDeps({
       dueJobs: [job]
     });
 
@@ -1115,6 +1129,8 @@ describe("SchedulerWorker", () => {
 
     // The job is disabled, never claimed for execution, and never run.
     expect(disabled).toEqual(["job-1"]);
+    expect(claimsCalled).toHaveLength(0);
+    expect(parkCalls).toHaveLength(0);
     expect(sessionsCreated.length).toBe(0);
     expect(jobRunsCompleted.length).toBe(0);
 
@@ -1127,7 +1143,7 @@ describe("SchedulerWorker", () => {
 
   test("tick parks an invalid-cron job dormant when no disable capability is wired", async () => {
     const job = makeFakeJob({ cronExpression: "not-a-cron" });
-    const { deps, claimsCalled, sessionsCreated, auditEvents } = createFakeDeps({
+    const { deps, claimsCalled, parkCalls, jobRunsCreated, sessionsCreated, auditEvents } = createFakeDeps({
       dueJobs: [job]
     });
     // No deps.disableJob wired — fall back to parking the job with next_run_at = NULL.
@@ -1135,8 +1151,10 @@ describe("SchedulerWorker", () => {
 
     await worker.tick();
 
-    expect(claimsCalled.length).toBe(1);
-    expect(claimsCalled[0].nextRunAt).toBe(null);
+    // Parked, not claimed: a claim would write a run that nothing completes.
+    expect(parkCalls).toEqual([{ tenantId: "test-tenant", jobId: "job-1" }]);
+    expect(claimsCalled).toHaveLength(0);
+    expect(jobRunsCreated).toHaveLength(0);
     expect(sessionsCreated.length).toBe(0);
 
     const disabledAudit = auditEvents.find((e) => e.type === "scheduler.job.disabled");
@@ -1630,11 +1648,11 @@ describe("SchedulerWorker", () => {
       releaseClaim = resolve;
     });
     const originalClaim = deps.settings.claimJob.bind(deps.settings);
-    deps.settings.claimJob = async (tenantId, jobId, nextRunAt) => {
+    deps.settings.claimJob = async (tenantId, jobId, nextRunAt, runId) => {
       if (jobId === "job-1") {
         await claimGate;
       }
-      return originalClaim(tenantId, jobId, nextRunAt);
+      return originalClaim(tenantId, jobId, nextRunAt, runId);
     };
 
     const worker = new SchedulerWorker(deps, { maxConcurrentJobs: 1, jobTimeoutMs: 60_000 });
@@ -1928,6 +1946,98 @@ describe("SchedulerWorker", () => {
 
     const worker = new SchedulerWorker(deps, { maxConcurrentJobs: 2, jobTimeoutMs: 60_000 });
     await expect(worker.tick()).resolves.toBeUndefined();
+  });
+});
+
+describe("SchedulerWorker run history", () => {
+  // The claim writes the pending run. Every path after it must complete that
+  // run, also when the job fails before its session exists.
+  beforeEach(() => {
+    messageIdCounter = 0;
+  });
+
+  test("a session that cannot be created fails the claimed run with a safe message", async () => {
+    const fakes = createFakeDeps({ dueJobs: [makeFakeJob()] });
+    fakes.deps.sessions.create = async () => {
+      throw new Error("connect ECONNREFUSED 10.0.0.7:5432");
+    };
+
+    await new SchedulerWorker(fakes.deps, { maxConcurrentJobs: 1, jobTimeoutMs: 60_000 }).tick();
+
+    const runId = fakes.claimsCalled[0]?.runId;
+    expect(fakes.runSessionsAttached).toEqual([]);
+    expect(fakes.resolveRuntimeCalls).toEqual([]);
+    expect(fakes.jobRunsCompleted).toEqual([
+      expect.objectContaining({ runId, status: "failed", errorMessage: GENERIC_TURN_FAILURE })
+    ]);
+    expect(fakes.auditEvents).toContainEqual(expect.objectContaining({
+      type: "scheduler.job.run.failed",
+      sessionId: null,
+      payload: expect.objectContaining({ runId, errorMessage: GENERIC_TURN_FAILURE })
+    }));
+    expect(fakes.recordOutcomeCalls).toEqual([{ tenantId: "test-tenant", jobId: "job-1", succeeded: false }]);
+  });
+
+  test("a shutdown right after the claim fails the run before a session exists", async () => {
+    const fakes = createFakeDeps({ dueJobs: [makeFakeJob()] });
+    const worker = new SchedulerWorker(fakes.deps, { maxConcurrentJobs: 1, jobTimeoutMs: 60_000 });
+    const claim = fakes.deps.settings.claimJob;
+    fakes.deps.settings.claimJob = async (...args) => {
+      const claimed = await claim(...args);
+      worker.refuseNewTurns();
+      return claimed;
+    };
+
+    await worker.tick();
+    await expect(worker.drain(5_000)).resolves.toBe(true);
+
+    expect(fakes.sessionsCreated).toHaveLength(0);
+    expect(fakes.jobRunsCompleted).toEqual([expect.objectContaining({
+      runId: fakes.claimsCalled[0]?.runId, status: "failed", errorMessage: SCHEDULER_STOPPED_RUN_ERROR
+    })]);
+  });
+
+  test("session creation that outlives the timeout fails the run before the runtime resolves", async () => {
+    vi.useFakeTimers();
+    try {
+      const fakes = createFakeDeps({ dueJobs: [makeFakeJob()] });
+      const create = fakes.deps.sessions.create;
+      fakes.deps.sessions.create = async (...args) => {
+        await new Promise((resolve) => setTimeout(resolve, 40));
+        return create(...args);
+      };
+      const worker = new SchedulerWorker(fakes.deps, { maxConcurrentJobs: 1, jobTimeoutMs: 10, abortSettleGraceMs: 500 });
+
+      const tick = worker.tick();
+      await vi.advanceTimersByTimeAsync(50);
+      await tick;
+
+      // The session exists, so the run links it; nothing else starts.
+      expect(fakes.runSessionsAttached).toEqual([expect.objectContaining({ sessionId: "session-1" })]);
+      expect(fakes.resolveRuntimeCalls).toEqual([]);
+      expect(fakes.messagesCreated).toEqual([]);
+      expect(fakes.jobRunsCompleted).toEqual([expect.objectContaining({
+        runId: fakes.claimsCalled[0]?.runId, status: "failed", errorMessage: "Scheduled job timed out after 10ms"
+      })]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("a run whose row is gone starts no turn, and its completion does not throw", async () => {
+    const warnings: string[] = [];
+    const fakes = createFakeDeps({ dueJobs: [makeFakeJob()], attachReturns: false, completeReturnsNull: true });
+    fakes.deps.logger.warn = (_payload, message) => {
+      warnings.push(message);
+    };
+
+    await new SchedulerWorker(fakes.deps, { maxConcurrentJobs: 1, jobTimeoutMs: 60_000 }).tick();
+
+    expect(fakes.resolveRuntimeCalls).toEqual([]);
+    expect(fakes.runMessageCalls).toEqual([]);
+    expect(fakes.jobRunsCompleted).toEqual([expect.objectContaining({ status: "failed", errorMessage: GENERIC_TURN_FAILURE })]);
+    expect(warnings).toContain("Scheduled job run record is missing; outcome not saved");
+    expect(fakes.auditEvents).toContainEqual(expect.objectContaining({ type: "scheduler.job.run.failed" }));
   });
 });
 

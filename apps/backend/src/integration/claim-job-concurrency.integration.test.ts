@@ -1,5 +1,5 @@
 // `claimJob` is the scheduler's atomic gate: two workers polling the same tick
-// must not both run one job.
+// must not both run one job, and the job gets exactly one pending run.
 //
 // Every test here calls the production `UserSettingsStore.claimJob`, on
 // purpose. A concurrency test that races its own copy of the SQL tests nothing.
@@ -9,13 +9,22 @@
 // calls overlapped. Holding a row lock open forces the blocking interleaving
 // deterministically but is not what production does. Both run.
 
+import { randomUUID } from "node:crypto";
 import { beforeAll, describe, expect, test } from "vitest";
 import pg from "pg";
 
 import { UserSettingsStore } from "../services/user-settings-store.js";
 
-import { adminDatabaseUrl, runMaintenanceUrl, superuserPool } from "./support/database.js";
+import { adminDatabaseUrl, appPool, maintenancePool, runAppUserUrl, runMaintenanceUrl, superuserPool } from "./support/database.js";
 import { seedScheduledJob, seedTenantGraph, type TenantFixture } from "./support/fixtures.js";
+
+async function runCount(jobId: string): Promise<number> {
+  const { rows: [row] } = await superuserPool().query<{ count: string }>(
+    "SELECT COUNT(*) AS count FROM scheduled_job_runs WHERE job_id = $1 AND status = 'pending'",
+    [jobId]
+  );
+  return Number(row?.count ?? 0);
+}
 
 describe.skipIf(!adminDatabaseUrl())("claimJob concurrency", () => {
   let tenant: TenantFixture;
@@ -38,29 +47,34 @@ describe.skipIf(!adminDatabaseUrl())("claimJob concurrency", () => {
     });
     const nextRun = new Date(Date.now() + 60 * 60 * 1000).toISOString();
 
-    const poolA = new pg.Pool({
-      connectionString: runMaintenanceUrl(),
-      max: 1,
-      // Bound the row-lock wait. Without it a stalled database turns a blocked
-      // claim into a hang that outlives Vitest's own timeout and then blocks
-      // pool teardown until the CI job timeout.
-      statement_timeout: 10_000,
-      application_name: "cogniplane-integration-claim-a"
-    });
-    const poolB = new pg.Pool({
-      connectionString: runMaintenanceUrl(),
-      max: 1,
-      statement_timeout: 10_000,
-      application_name: "cogniplane-integration-claim-b"
-    });
+    // The claim runs as app_user in the tenant's scope; the other scheduler
+    // methods use the maintenance pool. Each racer gets one connection of each.
+    const pools = ["a", "b"].flatMap((racer) => [
+      new pg.Pool({
+        connectionString: runAppUserUrl(),
+        max: 1,
+        // Bound the row-lock wait. Without it a stalled database turns a blocked
+        // claim into a hang that outlives Vitest's own timeout and then blocks
+        // pool teardown until the CI job timeout.
+        statement_timeout: 10_000,
+        application_name: `cogniplane-integration-claim-${racer}`
+      }),
+      new pg.Pool({
+        connectionString: runMaintenanceUrl(),
+        max: 1,
+        statement_timeout: 10_000,
+        application_name: `cogniplane-integration-claim-${racer}-maintenance`
+      })
+    ]);
+    const [appA, maintenanceA, appB, maintenanceB] = pools as [pg.Pool, pg.Pool, pg.Pool, pg.Pool];
 
     try {
-      const storeA = new UserSettingsStore(poolA, poolA);
-      const storeB = new UserSettingsStore(poolB, poolB);
+      const storeA = new UserSettingsStore(appA, maintenanceA);
+      const storeB = new UserSettingsStore(appB, maintenanceB);
 
       const [first, second] = await Promise.all([
-        storeA.claimJob(tenant.tenantId, jobId, nextRun),
-        storeB.claimJob(tenant.tenantId, jobId, nextRun)
+        storeA.claimJob(tenant.tenantId, jobId, nextRun, randomUUID()),
+        storeB.claimJob(tenant.tenantId, jobId, nextRun, randomUUID())
       ]);
 
       // Exactly one winner. Which one is nondeterministic, so the assertion is
@@ -68,8 +82,10 @@ describe.skipIf(!adminDatabaseUrl())("claimJob concurrency", () => {
       const winners = [first, second].filter((claim) => claim !== null);
       expect(winners).toHaveLength(1);
       expect(winners[0]?.jobId).toBe(jobId);
+      // The loser's run insert never ran, so the job has one pending run.
+      expect(await runCount(jobId)).toBe(1);
     } finally {
-      await Promise.all([poolA.end(), poolB.end()]);
+      await Promise.all(pools.map((pool) => pool.end()));
     }
   });
 
@@ -90,8 +106,9 @@ describe.skipIf(!adminDatabaseUrl())("claimJob concurrency", () => {
     const nextRun = new Date(Date.now() + 60 * 60 * 1000).toISOString();
 
     const blocker = await superuserPool().connect();
+    // The claim runs on the store's app_user pool.
     const loserPool = new pg.Pool({
-      connectionString: runMaintenanceUrl(),
+      connectionString: runAppUserUrl(),
       max: 1,
       // Two independent bounds on the blocked claim. `lock_timeout` caps the
       // row-lock wait specifically; `statement_timeout` caps the statement
@@ -120,7 +137,8 @@ describe.skipIf(!adminDatabaseUrl())("claimJob concurrency", () => {
       loser = new UserSettingsStore(loserPool, loserPool).claimJob(
         tenant.tenantId,
         jobId,
-        nextRun
+        nextRun,
+        randomUUID()
       );
 
       await expect.poll(async () => {
@@ -140,6 +158,7 @@ describe.skipIf(!adminDatabaseUrl())("claimJob concurrency", () => {
       await blocker.query("COMMIT");
 
       expect(await loser).toBeNull();
+      expect(await runCount(jobId)).toBe(0);
     } finally {
       // Roll back before release: a client returned mid-transaction would carry
       // it to the next borrower.
@@ -153,21 +172,24 @@ describe.skipIf(!adminDatabaseUrl())("claimJob concurrency", () => {
   test("a claimed job is not claimable again through the store", async () => {
     // The same invariant at the level callers actually use, so a refactor of
     // claimJob's SQL that broke the gate would fail here too.
-    const store = new UserSettingsStore(superuserPool(), superuserPool());
+    const store = new UserSettingsStore(appPool(), maintenancePool());
     const jobId = await seedScheduledJob({
       tenantId: tenant.tenantId,
       userId: tenant.userId
     });
     const nextRun = new Date(Date.now() + 60 * 60 * 1000).toISOString();
 
-    expect((await store.claimJob(tenant.tenantId, jobId, nextRun))?.jobId).toBe(jobId);
-    expect(await store.claimJob(tenant.tenantId, jobId, nextRun)).toBeNull();
+    expect((await store.claimJob(tenant.tenantId, jobId, nextRun, randomUUID()))?.jobId).toBe(jobId);
+    expect(await store.claimJob(tenant.tenantId, jobId, nextRun, randomUUID())).toBeNull();
+    expect(await runCount(jobId)).toBe(1);
   });
 
   test("a job whose owner lost tenant membership cannot be claimed", async () => {
     // claimJob re-checks membership rather than trusting listDueJobs, so a tick
     // that listed a job just before its owner was removed cannot still run it.
-    const store = new UserSettingsStore(superuserPool(), superuserPool());
+    // The claim runs under RLS, as in production, so this also checks that
+    // the membership check sees the tenant's rows.
+    const store = new UserSettingsStore(appPool(), maintenancePool());
     const departing = await seedTenantGraph();
     const jobId = await seedScheduledJob({
       tenantId: departing.tenantId,
@@ -179,6 +201,7 @@ describe.skipIf(!adminDatabaseUrl())("claimJob concurrency", () => {
       [departing.tenantId, departing.userId]
     );
 
-    expect(await store.claimJob(departing.tenantId, jobId, null)).toBeNull();
+    expect(await store.claimJob(departing.tenantId, jobId, null, randomUUID())).toBeNull();
+    expect(await runCount(jobId)).toBe(0);
   });
 });
