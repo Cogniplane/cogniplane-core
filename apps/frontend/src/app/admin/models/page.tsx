@@ -45,7 +45,6 @@ export default function AdminModelsPage() {
   const writeLock = useRef(false);
   const [operation, setOperation] = useState<string | null>(null);
   const [conflictReadFailed, setConflictReadFailed] = useState(false);
-  const [recoveredVersion, setRecoveredVersion] = useState<number | null>(null);
   const beginWrite = (name: string) => {
     if (writeLock.current) return false;
     writeLock.current = true;
@@ -101,10 +100,10 @@ export default function AdminModelsPage() {
   const pageError = (providerKeyFailed || tenantLoadError ? null : error) ??
     (removeModelMutation.error ? toErrorMessage(removeModelMutation.error, "Failed to remove the custom model.") : null);
   const modelReadFailed = catalogQuery.isError || settingsQuery.isError || conflictReadFailed;
+  // The card rebases its draft on the settings that this read returns.
   const retrySettings = async () => {
     const result = await settingsQuery.refetch();
     if (result.isError || !result.data) return;
-    if (conflictReadFailed) setRecoveredVersion(result.data.version);
     setConflictReadFailed(false);
   };
 
@@ -132,7 +131,6 @@ export default function AdminModelsPage() {
         settings={settingsQuery.data ?? null}
         saving={availabilityMutation.isPending}
         writesBlocked={modelReadFailed || Boolean(operation && operation !== "availability")}
-        recoveredVersion={recoveredVersion}
         readError={modelReadFailed ? "Model changes are paused because the latest data could not load. Your draft is kept." : null}
         retryingRead={catalogQuery.isFetching || settingsQuery.isFetching}
         onRetryRead={async () => {
@@ -147,7 +145,7 @@ export default function AdminModelsPage() {
             return { saved };
           } catch (error) {
             if (!(error instanceof ApiError && error.status === 409)) return false;
-            // Another save moved the settings version. Load it so the draft can rebase.
+            // Another save moved the settings version. Load it so the card can rebase the draft on it.
             const reloaded = await settingsQuery.refetch();
             if (reloaded.isError || !reloaded.data) { setConflictReadFailed(true); return false; }
             return reloaded.data.version > input.expectedVersion ? { conflict: reloaded.data } : false;

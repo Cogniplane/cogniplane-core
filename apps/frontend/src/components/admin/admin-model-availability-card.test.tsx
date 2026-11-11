@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import type { ComponentProps } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type {
@@ -109,29 +110,6 @@ afterEach(() => {
   Element.prototype.scrollIntoView = originalScrollIntoView;
 });
 
-it("keeps the draft version after a background refetch", async () => {
-  const onSave = vi.fn(async () => false);
-  const props = {
-    catalog,
-    saving: false,
-    onSave,
-    adding: false,
-    addError: null,
-    openRouterModels: null,
-    openRouterLoadError: null,
-    onNeedOpenRouterModels: () => {},
-    onAddModel: async () => true,
-    onRemoveModel: async () => settings,
-    providerKeys,
-    saveError: null
-  };
-  const view = render(<AdminModelAvailabilityCard {...props} settings={settings} />);
-  fireEvent.change(screen.getByLabelText("Default model"), { target: { value: CUSTOM_MODEL_ID } });
-  view.rerender(<AdminModelAvailabilityCard {...props} settings={{ ...settings, version: 2, defaultModelId: "deepagents/claude-sonnet-5" }} />);
-  fireEvent.click(screen.getByRole("button", { name: "Save model availability" }));
-  await waitFor(() => expect(onSave).toHaveBeenCalledWith(expect.objectContaining({ expectedVersion: 1, defaultModelId: CUSTOM_MODEL_ID })));
-});
-
 it("explains the effective fallback when a saved default is unavailable", async () => {
   renderCard({ settings: { ...settings, defaultModelId: "openai/retired" } });
   expect(await screen.findByText(/The saved default is unavailable. New chats use Claude Sonnet 5/)).toBeTruthy();
@@ -139,20 +117,32 @@ it("explains the effective fallback when a saved default is unavailable", async 
 
 describe("AdminModelAvailabilityCard custom-model removal", () => {
   it("clears the organization default when its custom model is removed", async () => {
-    const { onSave } = renderCard({ settings: { ...settings, defaultModelId: CUSTOM_MODEL_ID } });
+    // The backend clears the default and prunes the model from the list in the same save.
+    const { onSave } = renderCard({
+      settings: { ...settings, defaultModelId: CUSTOM_MODEL_ID },
+      onRemoveModel: async () => ({ ...settings, version: 2, defaultModelId: null, enabledModelIds: ["deepagents/claude-sonnet-5"] })
+    });
     fireEvent.click(screen.getByRole("checkbox", { name: /OpenAI/i }));
     fireEvent.click(screen.getByRole("button", { name: "Choose models" }));
     fireEvent.click(screen.getByRole("button", { name: "Remove Kimi K3 (OpenRouter)" }));
     fireEvent.click(screen.getByRole("button", { name: "Confirm model removal" }));
     await waitFor(() => expect((screen.getByLabelText("Default model") as HTMLSelectElement).value).toBe(""));
     fireEvent.click(screen.getByRole("button", { name: "Save model availability" }));
-    await waitFor(() => expect(onSave).toHaveBeenCalledWith(expect.objectContaining({ defaultModelId: null })));
+    await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+    // The saved settings already have no default, so the save does not send one.
+    expect(onSave.mock.calls[0][0]).toEqual({ expectedVersion: 2, enabledProviders: ["anthropic", "google", "openrouter", "zai"] });
   });
 
   it("strips a removed custom model from a dirty draft so Save cannot submit it", async () => {
     const { onSave, onRemoveModel } = renderCard({
-      // The removal saves tenant settings, so their version moves.
-      onRemoveModel: async () => ({ ...settings, version: 7 }),
+      // The removal saves tenant settings, so their version moves, and prunes
+      // the model from the list and the efforts.
+      onRemoveModel: async () => ({
+        ...settings,
+        version: 7,
+        enabledModelIds: ["deepagents/claude-sonnet-5"],
+        modelDefaultEfforts: { "deepagents/claude-sonnet-5": "medium" }
+      }),
       catalog: {
         ...catalog,
         models: catalog.models.map((model) => model.id === CUSTOM_MODEL_ID
@@ -181,15 +171,12 @@ describe("AdminModelAvailabilityCard custom-model removal", () => {
 
     fireEvent.click(screen.getByRole("button", { name: /Save model availability/i }));
     await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
-    const saved = onSave.mock.calls[0][0] as {
-      expectedVersion: number;
-      enabledModelIds: string[] | null;
-      modelDefaultEfforts: Record<string, string>;
-    };
-    // Without the new version the save gets a 409 that only Cancel can clear.
-    expect(saved.expectedVersion).toBe(7);
-    expect(saved.enabledModelIds).toEqual(["deepagents/claude-sonnet-5"]);
-    expect(saved.modelDefaultEfforts).toEqual({ "deepagents/claude-sonnet-5": "medium" });
+    // Without the new version the save gets a 409. The list and the efforts
+    // are not edits of this draft, so the save cannot send the removed id.
+    expect(onSave.mock.calls[0][0]).toEqual({
+      expectedVersion: 7,
+      enabledProviders: ["anthropic", "google", "openrouter", "zai"]
+    });
   });
 
   it("keeps the draft intact when removal fails", async () => {
@@ -201,11 +188,12 @@ describe("AdminModelAvailabilityCard custom-model removal", () => {
     fireEvent.click(screen.getByRole("button", { name: "Confirm model removal" }));
     await waitFor(() => expect(onRemoveModel).toHaveBeenCalled());
 
+    // Removal failed server-side, so the model stays in the allowlist and the
+    // save does not change the list.
+    expect((screen.getByRole("checkbox", { name: "Kimi K3 (OpenRouter)" }) as HTMLInputElement).checked).toBe(true);
     fireEvent.click(screen.getByRole("button", { name: /Save model availability/i }));
     await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
-    const saved = onSave.mock.calls[0][0] as { enabledModelIds: string[] | null };
-    // Removal failed server-side, so the model must stay in the allowlist.
-    expect(saved.enabledModelIds).toContain(CUSTOM_MODEL_ID);
+    expect(onSave.mock.calls[0][0]).toEqual({ expectedVersion: 1, enabledProviders: ["anthropic", "google", "openrouter", "zai"] });
   });
 });
 
@@ -546,5 +534,290 @@ it.each([null, []] as const)("keeps the saved all-model versus empty-list distin
   const { onSave } = renderCard({ settings: { ...settings, enabledModelIds: enabledModelIds as string[] | null } });
   fireEvent.click(screen.getByRole("checkbox", { name: "Use OpenAI" }));
   fireEvent.click(screen.getByRole("button", { name: "Save model availability" }));
-  await waitFor(() => expect(onSave).toHaveBeenCalledWith(expect.objectContaining({ enabledModelIds })));
+  await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+  // An untouched selection is not sent, so neither form can turn into the other.
+  expect(onSave.mock.calls[0][0]).not.toHaveProperty("enabledModelIds");
+  expect(screen.getByText(enabledModelIds === null ? "2 of 2 models available from 2 providers." : "No models selected. Members have nothing to pick.")).toBeTruthy();
+});
+
+describe("AdminModelAvailabilityCard concurrent changes", () => {
+  const SONNET = "deepagents/claude-sonnet-5";
+  const GPT = "deepagents/gpt-6";
+  const REGION = "Settings saved after your draft began";
+  const v7 = { ...settings, version: 7, enabledModelIds: null } as TenantSettings;
+  // Another administrator turned OpenRouter off and allowed only one model.
+  const restrictedV8 = {
+    ...v7,
+    version: 8,
+    enabledProviders: ["anthropic", "openai", "google", "zai"],
+    enabledModelIds: [SONNET]
+  } as TenantSettings;
+  const catalogWithGpt: AdminModelCatalogResponse = {
+    ...catalog,
+    models: [...catalog.models, {
+      id: GPT,
+      displayName: "GPT-6",
+      description: "Builtin model.",
+      isDefault: false,
+      provider: "openai",
+      supportedEfforts: ["low", "medium", "high"],
+      defaultEffort: "medium",
+      contextWindow: 400_000,
+      source: "builtin"
+    }]
+  };
+
+  type CardProps = ComponentProps<typeof AdminModelAvailabilityCard>;
+  function renderView(overrides: Partial<CardProps> = {}) {
+    const base: CardProps = {
+      catalog,
+      settings: v7,
+      saving: false,
+      onSave: async () => true,
+      adding: false,
+      addError: null,
+      openRouterModels: null,
+      openRouterLoadError: null,
+      onNeedOpenRouterModels: () => {},
+      onAddModel: async () => true,
+      onRemoveModel: async () => null,
+      providerKeys,
+      saveError: null,
+      ...overrides
+    };
+    const view = render(<AdminModelAvailabilityCard {...base} />);
+    return { rerender: (next: Partial<CardProps>) => view.rerender(<AdminModelAvailabilityCard {...base} {...next} />) };
+  }
+
+  async function chooseEffort(model: string, effort: string) {
+    Element.prototype.scrollIntoView = vi.fn();
+    const name = `Default effort for ${model}`;
+    if (!screen.queryByRole("combobox", { name })) fireEvent.click(screen.getByRole("button", { name: "Edit effort" }));
+    fireEvent.click(screen.getByRole("combobox", { name }));
+    fireEvent.click(await screen.findByRole("option", { name: effort }));
+  }
+
+  const saveButton = () => screen.getByRole("button", { name: "Save model availability" }) as HTMLButtonElement;
+
+  it("keeps another administrator's provider and model limits when a save conflict rebases an effort edit", async () => {
+    const onSave = vi.fn<(input: unknown) => Promise<ModelAvailabilitySaveResult>>()
+      .mockResolvedValueOnce({ conflict: restrictedV8 })
+      .mockResolvedValue(true);
+    renderView({ onSave });
+    await chooseEffort("Claude Sonnet 5", "high");
+    fireEvent.click(saveButton());
+    await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+
+    // The administrator sees the restriction before the next save, and the draft holds it.
+    const changes = await screen.findByRole("region", { name: REGION });
+    expect(changes.textContent).toContain("OpenRouter");
+    expect(changes.textContent).toContain("Available models");
+    expect((screen.getByRole("checkbox", { name: "Use OpenRouter" }) as HTMLInputElement).checked).toBe(false);
+    expect(screen.queryByRole("button", { name: /Keep my edits/ })).toBeNull();
+
+    fireEvent.click(saveButton());
+    await waitFor(() => expect(onSave).toHaveBeenCalledTimes(2));
+    // Only the edited setting goes out. The v7 providers and model list do not.
+    expect(onSave.mock.calls[1][0]).toEqual({ expectedVersion: 8, modelDefaultEfforts: { [SONNET]: "high" } });
+  });
+
+  it("blocks Save until the administrator keeps or discards an edit to a setting that the newer version changed", async () => {
+    const onSave = vi.fn<(input: unknown) => Promise<ModelAvailabilitySaveResult>>()
+      .mockResolvedValueOnce({ conflict: { ...v7, version: 8, defaultModelId: SONNET } })
+      .mockResolvedValue(true);
+    renderView({ onSave });
+    fireEvent.change(screen.getByLabelText("Default model"), { target: { value: CUSTOM_MODEL_ID } });
+    fireEvent.click(saveButton());
+
+    const changes = await screen.findByRole("region", { name: REGION });
+    expect(changes.textContent).toContain("Default model");
+    expect(changes.textContent).toContain("Claude Sonnet 5");
+    expect(saveButton().disabled).toBe(true);
+    fireEvent.click(saveButton());
+    expect(onSave).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(within(changes).getByRole("button", { name: "Keep my edits on v8" }));
+    expect((screen.getByLabelText("Default model") as HTMLSelectElement).value).toBe(CUSTOM_MODEL_ID);
+    fireEvent.click(saveButton());
+    await waitFor(() => expect(onSave).toHaveBeenCalledTimes(2));
+    expect(onSave.mock.calls[1][0]).toEqual({ expectedVersion: 8, defaultModelId: CUSTOM_MODEL_ID });
+  });
+
+  it("discards the conflicting edit for the newer version when asked", async () => {
+    renderView({ onSave: async () => ({ conflict: { ...v7, version: 8, defaultModelId: SONNET } }) });
+    fireEvent.change(screen.getByLabelText("Default model"), { target: { value: CUSTOM_MODEL_ID } });
+    fireEvent.click(saveButton());
+    const changes = await screen.findByRole("region", { name: REGION });
+    fireEvent.click(within(changes).getByRole("button", { name: "Discard my edits" }));
+    expect((screen.getByLabelText("Default model") as HTMLSelectElement).value).toBe(SONNET);
+    expect(screen.queryByRole("button", { name: "Save model availability" })).toBeNull();
+    expect(screen.queryByRole("region", { name: REGION })).toBeNull();
+  });
+
+  it("keeps a restriction from the newer version when the draft also changed the provider list", async () => {
+    const onSave = vi.fn<(input: unknown) => Promise<ModelAvailabilitySaveResult>>()
+      .mockResolvedValueOnce({ conflict: { ...v7, version: 8, enabledProviders: ["anthropic", "openai", "zai"] } })
+      .mockResolvedValue(true);
+    renderView({ settings: { ...v7, enabledProviders: ["anthropic", "openai", "openrouter", "zai"] }, onSave });
+    fireEvent.click(screen.getByRole("checkbox", { name: "Use Google" }));
+    fireEvent.click(saveButton());
+
+    const changes = await screen.findByRole("region", { name: REGION });
+    expect(changes.textContent).toContain("OpenRouter");
+    fireEvent.click(within(changes).getByRole("button", { name: "Keep my edits on v8" }));
+    expect((screen.getByRole("checkbox", { name: "Use OpenRouter" }) as HTMLInputElement).checked).toBe(false);
+    fireEvent.click(saveButton());
+    await waitFor(() => expect(onSave).toHaveBeenCalledTimes(2));
+    const input = onSave.mock.calls[1][0] as { expectedVersion: number; enabledProviders: string[] };
+    expect(input.expectedVersion).toBe(8);
+    expect([...input.enabledProviders].sort()).toEqual(["anthropic", "google", "openai", "zai"]);
+  });
+
+  it("asks before it drops a default model choice that the newer version makes unavailable", async () => {
+    renderView({ onSave: async () => ({ conflict: restrictedV8 }) });
+    fireEvent.change(screen.getByLabelText("Default model"), { target: { value: CUSTOM_MODEL_ID } });
+    fireEvent.click(saveButton());
+
+    const changes = await screen.findByRole("region", { name: REGION });
+    expect(changes.textContent).toContain("Kimi K3 (OpenRouter) is not available in v8.");
+    expect(saveButton().disabled).toBe(true);
+    fireEvent.click(within(changes).getByRole("button", { name: "Keep my edits on v8" }));
+    // The only edit could not be kept, so the draft has nothing left to save.
+    expect((screen.getByLabelText("Default model") as HTMLSelectElement).value).toBe("");
+    expect(screen.queryByRole("button", { name: "Save model availability" })).toBeNull();
+  });
+
+  it("does not warn about the default when the draft did not change it", async () => {
+    renderView({
+      settings: { ...v7, enabledProviders: ["anthropic", "openai", "openrouter", "zai"] },
+      onSave: async () => ({ conflict: { ...restrictedV8, enabledProviders: ["anthropic", "openai", "zai"], defaultModelId: SONNET } })
+    });
+    fireEvent.click(screen.getByRole("checkbox", { name: "Use Google" }));
+    fireEvent.click(saveButton());
+    const changes = await screen.findByRole("region", { name: REGION });
+    expect(within(changes).getByRole("button", { name: "Keep my edits on v8" })).toBeTruthy();
+    expect(changes.textContent).not.toContain("is not available");
+  });
+
+  it("merges default efforts model by model", async () => {
+    const onSave = vi.fn<(input: unknown) => Promise<ModelAvailabilitySaveResult>>()
+      .mockResolvedValueOnce({ conflict: { ...v7, version: 8, modelDefaultEfforts: { [GPT]: "low" } } })
+      .mockResolvedValue(true);
+    renderView({ catalog: catalogWithGpt, onSave });
+    await chooseEffort("Claude Sonnet 5", "high");
+    fireEvent.click(saveButton());
+    const changes = await screen.findByRole("region", { name: REGION });
+    expect(changes.textContent).toContain("GPT-6");
+    fireEvent.click(saveButton());
+    await waitFor(() => expect(onSave).toHaveBeenCalledTimes(2));
+    expect(onSave.mock.calls[1][0]).toEqual({ expectedVersion: 8, modelDefaultEfforts: { [SONNET]: "high", [GPT]: "low" } });
+  });
+
+  it("rebases on settings that an explicit read recovers after a failed conflict refresh", async () => {
+    const onSave = vi.fn<(input: unknown) => Promise<ModelAvailabilitySaveResult>>()
+      .mockResolvedValueOnce(false)
+      .mockResolvedValue(true);
+    const view = renderView({ onSave });
+    await chooseEffort("Claude Sonnet 5", "high");
+    fireEvent.click(saveButton());
+    await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+    // The page could not read the newer version, so it pauses writes.
+    view.rerender({ readError: "Changes paused.", writesBlocked: true });
+    // The administrator retried, and the read returned v8.
+    view.rerender({ settings: restrictedV8, readError: null, writesBlocked: false });
+
+    expect(await screen.findByRole("region", { name: REGION })).toBeTruthy();
+    fireEvent.click(saveButton());
+    await waitFor(() => expect(onSave).toHaveBeenCalledTimes(2));
+    expect(onSave.mock.calls[1][0]).toEqual({ expectedVersion: 8, modelDefaultEfforts: { [SONNET]: "high" } });
+  });
+
+  it("rebases on the settings that a custom model removal returns", async () => {
+    // v8: another administrator turned Google off. v9: this removal pruned the model.
+    const afterRemoval = { ...settings, version: 9, enabledProviders: ["anthropic", "openai", "openrouter", "zai"], enabledModelIds: [SONNET] } as TenantSettings;
+    const onSave = vi.fn<(input: unknown) => Promise<ModelAvailabilitySaveResult>>(async () => true);
+    renderView({ settings: { ...settings, version: 7 }, onSave, onRemoveModel: async () => afterRemoval });
+    await chooseEffort("Claude Sonnet 5", "high");
+    fireEvent.click(screen.getByRole("button", { name: "Choose models" }));
+    fireEvent.click(screen.getByRole("button", { name: "Remove Kimi K3 (OpenRouter)" }));
+    fireEvent.click(screen.getByRole("button", { name: "Confirm model removal" }));
+
+    // The removal is this administrator's own change, so only Google shows as saved elsewhere.
+    const changes = await screen.findByRole("region", { name: REGION });
+    expect(changes.textContent).toContain("Google");
+    expect(changes.textContent).not.toContain("Kimi");
+    fireEvent.click(saveButton());
+    await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+    expect(onSave.mock.calls[0][0]).toEqual({ expectedVersion: 9, modelDefaultEfforts: { [SONNET]: "high" } });
+  });
+
+  it("rebases on a newer version that arrives while the draft has edits", async () => {
+    const onSave = vi.fn<(input: unknown) => Promise<ModelAvailabilitySaveResult>>(async () => true);
+    const view = renderView({ onSave });
+    await chooseEffort("Claude Sonnet 5", "high");
+    view.rerender({ settings: restrictedV8 });
+
+    expect((await screen.findByRole("region", { name: REGION })).textContent).toContain("OpenRouter");
+    expect((screen.getByRole("checkbox", { name: "Use OpenRouter" }) as HTMLInputElement).checked).toBe(false);
+    fireEvent.click(saveButton());
+    await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+    expect(onSave.mock.calls[0][0]).toEqual({ expectedVersion: 8, modelDefaultEfforts: { [SONNET]: "high" } });
+  });
+
+  it("does not take a newer version that changed the same setting as the draft without a decision", async () => {
+    const onSave = vi.fn<(input: unknown) => Promise<ModelAvailabilitySaveResult>>(async () => true);
+    const view = renderView({ onSave });
+    fireEvent.change(screen.getByLabelText("Default model"), { target: { value: CUSTOM_MODEL_ID } });
+    view.rerender({ settings: { ...v7, version: 8, defaultModelId: SONNET } });
+
+    const changes = await screen.findByRole("region", { name: REGION });
+    expect(screen.getByRole("status").textContent).toContain("v8");
+    expect(saveButton().disabled).toBe(true);
+    fireEvent.click(saveButton());
+    expect(onSave).not.toHaveBeenCalled();
+    fireEvent.click(within(changes).getByRole("button", { name: "Keep my edits on v8" }));
+    fireEvent.click(saveButton());
+    await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+    expect(onSave.mock.calls[0][0]).toEqual({ expectedVersion: 8, defaultModelId: CUSTOM_MODEL_ID });
+  });
+
+  it("keeps edits made while a save is in flight and sends only them next", async () => {
+    let finish!: (value: ModelAvailabilitySaveResult) => void;
+    const onSave = vi.fn<(input: unknown) => Promise<ModelAvailabilitySaveResult>>()
+      .mockReturnValueOnce(new Promise(resolve => { finish = resolve; }))
+      .mockResolvedValue(true);
+    renderView({ onSave });
+    await chooseEffort("Claude Sonnet 5", "high");
+    fireEvent.click(saveButton());
+    fireEvent.change(screen.getByLabelText("Default model"), { target: { value: CUSTOM_MODEL_ID } });
+    await act(async () => finish({ saved: { ...v7, version: 8, modelDefaultEfforts: { [SONNET]: "high" } } }));
+
+    expect(screen.getByText("Unsaved changes")).toBeTruthy();
+    fireEvent.click(saveButton());
+    await waitFor(() => expect(onSave).toHaveBeenCalledTimes(2));
+    expect(onSave.mock.calls[1][0]).toEqual({ expectedVersion: 8, defaultModelId: CUSTOM_MODEL_ID });
+  });
+
+  it("puts edits made during a refused save on the newer version", async () => {
+    let finish!: (value: ModelAvailabilitySaveResult) => void;
+    const onSave = vi.fn<(input: unknown) => Promise<ModelAvailabilitySaveResult>>()
+      .mockReturnValueOnce(new Promise(resolve => { finish = resolve; }))
+      .mockResolvedValue(true);
+    const view = renderView({ onSave });
+    await chooseEffort("Claude Sonnet 5", "high");
+    fireEvent.click(saveButton());
+    fireEvent.click(screen.getByRole("checkbox", { name: "Show reasoning effort in the chat picker" }));
+    // The page reloads the settings before it reports the conflict.
+    view.rerender({ settings: restrictedV8 });
+    await act(async () => finish({ conflict: restrictedV8 }));
+
+    expect((await screen.findByRole("region", { name: REGION })).textContent).toContain("OpenRouter");
+    fireEvent.click(saveButton());
+    await waitFor(() => expect(onSave).toHaveBeenCalledTimes(2));
+    expect(onSave.mock.calls[1][0]).toEqual({
+      expectedVersion: 8,
+      modelDefaultEfforts: { [SONNET]: "high" },
+      showEffortSelector: false
+    });
+  });
 });
