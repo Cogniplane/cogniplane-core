@@ -922,36 +922,44 @@ export class ProjectFileStore {
       if (mode === "create-only" && input.targetFileId)
         throw new ProjectFileError("project_agent_create_only", "Create-only mode cannot update an existing project file.");
     });
-    if (this.piiProtection) {
-      const piiProtection = this.piiProtection;
-      const decision = await piiProtection.evaluateArtifact({
-        tenantId: actor.tenantId,
-        artifact: {
-          artifactId: `project-draft:${uuidv7()}`,
-          contentType: mimeType,
-          entityTypes: [],
-          // Project drafts get no OCR: their image coverage is not stored yet.
-          readContent: async (signal) =>
-            (await toScannableText(mimeType, Buffer.from(input.content), { extractPdfText: this.extractPdfText }, signal)).text
-        },
-        // Project drafts are new bytes entering the shared library, so they
-        // follow the tenant's existing upload PII scope and blocking policy.
-        subject: { kind: "upload" }
-      }).catch((error: unknown) => {
-        // A file the scan cannot read is a client error the agent can act on,
-        // for example by writing a text version instead.
-        if (error instanceof PiiProtectionServiceError && PERMANENT_PII_ERROR_CODES.has(error.code)) {
-          throw new ProjectFileError(error.code, error.message, 422);
-        }
-        throw error;
-      });
-      if (decision.action === "block") {
-        throw new ProjectFileError(
-          "pii_block",
-          "The project draft was blocked by organization policy.",
-          422,
-        );
+    // The PII service decides, also when the tenant policy is off. A store
+    // without the service refuses the draft: a wiring fault must not skip the
+    // scan.
+    const piiProtection = this.piiProtection;
+    if (!piiProtection) {
+      throw new ProjectFileError(
+        "pii_protection_unavailable",
+        "Project drafts are unavailable. Contact your administrator.",
+        503,
+      );
+    }
+    const decision = await piiProtection.evaluateArtifact({
+      tenantId: actor.tenantId,
+      artifact: {
+        artifactId: `project-draft:${uuidv7()}`,
+        contentType: mimeType,
+        entityTypes: [],
+        // Project drafts get no OCR: their image coverage is not stored yet.
+        readContent: async (signal) =>
+          (await toScannableText(mimeType, Buffer.from(input.content), { extractPdfText: this.extractPdfText }, signal)).text
+      },
+      // Project drafts are new bytes entering the shared library, so they
+      // follow the tenant's existing upload PII scope and blocking policy.
+      subject: { kind: "upload" }
+    }).catch((error: unknown) => {
+      // A file the scan cannot read is a client error the agent can act on,
+      // for example by writing a text version instead.
+      if (error instanceof PiiProtectionServiceError && PERMANENT_PII_ERROR_CODES.has(error.code)) {
+        throw new ProjectFileError(error.code, error.message, 422);
       }
+      throw error;
+    });
+    if (decision.action === "block") {
+      throw new ProjectFileError(
+        "pii_block",
+        "The project draft was blocked by organization policy.",
+        422,
+      );
     }
     const stored = await input.storage.put({
       storageKey: `project-files/${actor.projectId}/${uuidv7()}`,

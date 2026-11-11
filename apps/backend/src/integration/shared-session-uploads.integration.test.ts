@@ -7,6 +7,7 @@ import { describe, expect, onTestFinished, test, vi } from "vitest";
 import { DEFAULT_PII_PROTECTION, type PiiProtectionSettings } from "@cogniplane/shared-types";
 import { registerArtifactRoutes } from "../routes/artifacts.js";
 import { registerProjectFileRoutes } from "../routes/project-files.js";
+import { ProjectFileStore } from "../services/project-file-store.js";
 import { ProjectStore } from "../services/project-store.js";
 import { ProjectMemberStore } from "../services/project-member-store.js";
 import { SessionStore } from "../services/session-store.js";
@@ -88,8 +89,9 @@ async function setup(mode: PiiProtectionSettings["mode"] = "off") {
   const processor = new ArtifactProcessor({ config, storage, logger: app.log });
   await registerArtifactRoutes(app, { sessions, artifacts, storage, processor, auditEvents,
     piiScanEnqueuer: enqueuer, limits: { consumeRateLimit: async () => null } });
+  // These routes publish uploads and read versions; neither needs the PII service.
   await registerProjectFileRoutes(app, { artifactStorage: storage, artifactProcessor: processor,
-    limits: { consumeRateLimit: async () => null } as never });
+    limits: { consumeRateLimit: async () => null } as never, projectFiles: new ProjectFileStore(appPool(), app.log) });
   onTestFinished(async () => { await app.close(); await rm(root, { recursive: true, force: true }); });
   const upload = async (target = project.referenceSessionId, text = "Shared report", mime = "text/plain") => {
     const form = new FormData();

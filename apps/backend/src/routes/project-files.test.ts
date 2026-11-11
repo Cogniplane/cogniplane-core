@@ -4,7 +4,6 @@ import { afterEach, describe, expect, onTestFinished, test, vi } from "vitest";
 
 import { handleAppError } from "../app.js";
 import { registerProjectFileRoutes } from "./project-files.js";
-import { ProjectFileStore } from "../services/project-file-store.js";
 import { RequestLimitsUnavailableError } from "../services/redis-request-limits.js";
 import { FakePool } from "../test-helpers/fake-pool.js";
 
@@ -16,18 +15,41 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
+const auth = { userId: "user-1", tenantId: "tenant-A", isAdmin: false, role: "member" } as const;
+
+describe("project file route dependencies", () => {
+  test("the routes use the injected project file store and build no store of their own", async () => {
+    const list = vi.fn(async () => ({ files: [], folders: [], truncated: false }));
+    const app = Fastify();
+    onTestFinished(() => app.close());
+    // A store built from app.db would send a query that this pool has no handler for.
+    app.decorate("db", new FakePool().asPool());
+    app.addHook("preHandler", async (request) => {
+      request.auth = auth;
+    });
+    await registerProjectFileRoutes(app, {
+      artifactStorage: {},
+      artifactProcessor: {},
+      limits: {},
+      projectFiles: { list }
+    } as never);
+
+    const response = await app.inject({ method: "GET", url: `/projects/${projectId}/library` });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({ files: [], folders: [] });
+    expect(list).toHaveBeenCalledExactlyOnceWith({ ...auth, projectId });
+  });
+});
+
 async function download(name: string) {
   // The store's SQL is covered by the integration suite; this test is about the
   // header the route builds from the stored name.
-  vi.spyOn(ProjectFileStore.prototype, "content").mockResolvedValue({
-    name,
-    mimeType: "text/plain",
-    storageKey: "stored-key"
-  } as never);
+  const content = vi.fn(async () => ({ name, mimeType: "text/plain", storageKey: "stored-key" }));
   const app = Fastify();
   app.decorate("db", new FakePool().asPool());
   app.addHook("preHandler", async (request) => {
-    request.auth = { userId: "user-1", tenantId: "tenant-A", isAdmin: false, role: "member" };
+    request.auth = auth;
   });
   await registerProjectFileRoutes(app, {
     artifactStorage: {
@@ -36,7 +58,8 @@ async function download(name: string) {
       }
     },
     artifactProcessor: {},
-    limits: {}
+    limits: {},
+    projectFiles: { content }
   } as never);
   await app.ready();
   const response = await app.inject({
@@ -77,11 +100,7 @@ describe("GET /projects/:projectId/library/files/:fileId/versions/:versionId/pre
 
   async function preview(consumeRateLimit: () => Promise<unknown>) {
     // The store's SQL and access rules are covered by the integration suite.
-    const content = vi.spyOn(ProjectFileStore.prototype, "content").mockResolvedValue({
-      name: "plan.pdf",
-      mimeType: "application/pdf",
-      storageKey: "stored-key"
-    } as never);
+    const content = vi.fn(async () => ({ name: "plan.pdf", mimeType: "application/pdf", storageKey: "stored-key" }));
     const extractArtifactText = vi.fn(async () => "PDF TEXT");
     const limits = { consumeRateLimit: vi.fn(consumeRateLimit) };
     const app = Fastify();
@@ -89,12 +108,13 @@ describe("GET /projects/:projectId/library/files/:fileId/versions/:versionId/pre
     app.setErrorHandler(handleAppError);
     app.decorate("db", new FakePool().asPool());
     app.addHook("preHandler", async (request) => {
-      request.auth = { userId: "user-1", tenantId: "tenant-A", isAdmin: false, role: "member" };
+      request.auth = auth;
     });
     await registerProjectFileRoutes(app, {
       artifactStorage: {},
       artifactProcessor: { extractArtifactText },
-      limits
+      limits,
+      projectFiles: { content }
     } as never);
     const response = await app.inject({ method: "GET", url });
     return { response, content, extractArtifactText, limits };
