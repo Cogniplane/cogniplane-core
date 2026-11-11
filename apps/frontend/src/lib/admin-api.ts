@@ -51,6 +51,7 @@ import type {
   AdminMcpServer,
   AdminMcpConnectionTest,
   AdminMcpServerCreateRequest,
+  AdminMcpServerSetupEdit,
   AdminMcpServerUpdateRequest,
   AdminMcpWidgetDomainChangeRequest,
   AdminMcpWidgetDomains,
@@ -283,18 +284,26 @@ export async function createAdminMcpServer(
 
 export type McpAudience = "off" | "test_users" | "members";
 
+/** An edit of a saved connection: its ID and the saved version that the draft started from. */
+export type McpConnectionEdit = { serverId: string } & AdminMcpServerSetupEdit;
+
+/**
+ * Creates a connection (`editing` null) or saves an edit. The backend refuses
+ * an edit whose `expectedVersion` is not the saved version with 409
+ * `mcp_server_conflict`.
+ */
 export async function saveAdminMcpConnection(
   input: AdminMcpServerCreateRequest & { audience: McpAudience },
-  editingId: string | null
+  editing: McpConnectionEdit | null
 ): Promise<AdminMcpServer> {
-  const path = editingId
-    ? `/admin/mcp-servers/${encodeURIComponent(editingId)}/setup`
+  const path = editing
+    ? `/admin/mcp-servers/${encodeURIComponent(editing.serverId)}/setup`
     : "/admin/mcp-servers/setup";
   const raw = await request<unknown>(path, {
-    method: editingId ? "PUT" : "POST",
-    body: JSON.stringify(input)
+    method: editing ? "PUT" : "POST",
+    body: JSON.stringify(editing ? { ...input, expectedVersion: editing.expectedVersion } : input)
   });
-  return parseResponse(AdminMcpServerEnvelopeSchema, raw, `${editingId ? "PUT" : "POST"} ${path}`)
+  return parseResponse(AdminMcpServerEnvelopeSchema, raw, `${editing ? "PUT" : "POST"} ${path}`)
     .mcpServer;
 }
 

@@ -93,6 +93,52 @@ function urlOrigin(url: string | null | undefined): string {
   }
 }
 
+/** The draft fields that the review of a newer saved version shows. */
+export type McpReviewDraft = McpSecretTarget & {
+  serverName: string;
+  description: string;
+  routePath: string;
+  upstreamAuthSecret: string;
+  audience: McpAudience;
+};
+
+export type McpReviewRow = { setting: string; saved: string; draft: string };
+
+const AUTH_LABEL: Record<AdminMcpServer["upstreamAuthType"], string> = {
+  none: "None", bearer: "Bearer token", header: "Custom header", query: "Query parameter"
+};
+const SCOPE_LABEL = { organization: "Organization account", personal: "Each member connects" } as const;
+const AUDIENCE_LABEL: Record<McpAudience, string> = { off: "Off", test_users: "Test users", members: "All members" };
+
+/**
+ * The settings that a newer saved version changed after the draft opened its
+ * version: the newer value and the value that a save of the draft sends. A
+ * secret row tells only whether a secret is saved or typed, never the secret.
+ */
+export function mcpReviewRows(opened: AdminMcpServer, saved: AdminMcpServer, draft: McpReviewDraft): McpReviewRow[] {
+  const or = (value: string | null | undefined, empty: string) => value || empty;
+  const proxy = draft.mode === "proxy";
+  const authType = proxy ? draft.upstreamAuthType : "none";
+  const scope = proxy ? draft.credentialScope : "organization";
+  const named = authType === "header" || authType === "query";
+  const settings: Array<[string, (server: AdminMcpServer) => string, string]> = [
+    ["Name", (server) => server.serverName, draft.serverName],
+    ["Description", (server) => or(server.description, "No description"), or(draft.description, "No description")],
+    ["Mode", (server) => server.mode === "proxy" ? "Proxy" : "Managed", proxy ? "Proxy" : "Managed"],
+    ["Route path", (server) => server.routePath, draft.routePath],
+    ["URL", (server) => or(server.upstreamUrl, "None"), proxy ? or(draft.upstreamUrl, "None") : "None"],
+    ["Account", (server) => SCOPE_LABEL[server.credentialScope ?? "organization"], SCOPE_LABEL[scope]],
+    ["Upstream authentication", (server) => AUTH_LABEL[server.upstreamAuthType], AUTH_LABEL[authType]],
+    ["Header or parameter name", (server) => or(server.upstreamAuthName, "None"), named ? or(draft.upstreamAuthName, "None") : "None"],
+    ["Secret", (server) => server.upstreamAuthConfigured ? "Saved" : "Not saved",
+      scope === "organization" && authType !== "none" && draft.upstreamAuthSecret ? "New secret entered" : "No new secret"],
+    ["Availability", (server) => AUDIENCE_LABEL[getMcpAvailability(server).audience], AUDIENCE_LABEL[draft.audience]]
+  ];
+  return settings
+    .filter(([, read]) => read(opened) !== read(saved))
+    .map(([setting, read, draftValue]) => ({ setting, saved: read(saved), draft: draftValue }));
+}
+
 /**
  * True when an edit sends the saved organization secret to another origin, or by
  * another auth method. The backend then refuses a blank secret, so the form asks

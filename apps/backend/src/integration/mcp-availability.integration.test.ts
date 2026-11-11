@@ -163,7 +163,8 @@ describe.skipIf(!adminDatabaseUrl())("MCP connection availability", () => {
     expect((await service.getOrCreateTenantSettings(owner.tenantId)).enabledMcpServerIds).toContain(serverId);
     expect((await service.listMcpServers(other.tenantId)).some((server) => server.serverId === serverId)).toBe(false);
 
-    const off = await service.saveMcpServerWithAudience(owner.tenantId, input, "off", serverId);
+    const off = await service.saveMcpServerWithAudience(owner.tenantId, input, "off",
+      { serverId, expectedVersion: members!.version });
     expect(off).toMatchObject({ enabled: false, isPublished: false });
     expect((await service.getOrCreateTenantSettings(owner.tenantId)).enabledMcpServerIds).not.toContain(serverId);
     expect((await service.getOrCreateTenantSettings(other.tenantId)).enabledMcpServerIds).not.toContain(serverId);
@@ -207,8 +208,9 @@ describe.skipIf(!adminDatabaseUrl())("MCP connection availability", () => {
     );
     expect(afterFailedCreate.rows).toHaveLength(0);
 
-    await makeService().saveMcpServerWithAudience(owner.tenantId, input, "members");
-    await expect(makeService(true).saveMcpServerWithAudience(owner.tenantId, input, "off", serverId))
+    const saved = await makeService().saveMcpServerWithAudience(owner.tenantId, input, "members");
+    await expect(makeService(true).saveMcpServerWithAudience(owner.tenantId, input, "off",
+      { serverId, expectedVersion: saved!.version }))
       .rejects.toThrow("settings write failed");
     const afterFailedDisable = await new McpServerStore(appPool(), ENCRYPTION_SECRET)
       .getMcpServer(owner.tenantId, serverId);
@@ -318,7 +320,7 @@ describe.skipIf(!adminDatabaseUrl())("MCP connection availability", () => {
       const edited = await app.inject({
         method: "PUT",
         url: `/admin/mcp-servers/${serverId}/setup`,
-        payload: { ...base, serverName: "Setup renamed" }
+        payload: { ...base, serverName: "Setup renamed", expectedVersion: created.json().mcpServer.version }
       });
       expect(edited.statusCode).toBe(200);
       expect(edited.json().mcpServer).toMatchObject({
@@ -334,7 +336,7 @@ describe.skipIf(!adminDatabaseUrl())("MCP connection availability", () => {
       const off = await app.inject({
         method: "PUT",
         url: `/admin/mcp-servers/${serverId}/setup`,
-        payload: { ...base, audience: "off" }
+        payload: { ...base, audience: "off", expectedVersion: unpublished.json().mcpServer.version }
       });
       expect(off.statusCode).toBe(200);
       const disabled = await app.inject({ method: "POST", url: `/admin/mcp-servers/${serverId}/disable` });

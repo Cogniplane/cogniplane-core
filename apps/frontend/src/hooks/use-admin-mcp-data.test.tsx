@@ -79,9 +79,9 @@ it("saves a connection, marks the page busy, and refreshes everything that depen
   const invalidate = vi.spyOn(client, "invalidateQueries");
 
   let saving!: Promise<void>;
-  act(() => { saving = result.current.handleSubmit(input, "docs"); });
+  act(() => { saving = result.current.handleSubmit(input, { serverId: "docs", expectedVersion: 1 }); });
   await waitFor(() => expect(result.current.busyKey).toBe("mcp"));
-  expect(saveAdminMcpConnection).toHaveBeenCalledWith(input, "docs");
+  expect(saveAdminMcpConnection).toHaveBeenCalledWith(input, { serverId: "docs", expectedVersion: 1 });
   expect(invalidate).not.toHaveBeenCalled();
 
   await act(async () => { finish(); await saving; });
@@ -152,7 +152,7 @@ it("clears a failed audience change once a connection save succeeds", async () =
   await act(async () => { await result.current.handleSetInheritedAudience("search", "members").catch(() => undefined); });
   await waitFor(() => expect(result.current.saveError).toBe("Server is not inherited."));
 
-  await act(async () => { await result.current.handleSubmit(input, "docs"); });
+  await act(async () => { await result.current.handleSubmit(input, { serverId: "docs", expectedVersion: 1 }); });
 
   await waitFor(() => expect(result.current.saveError).toBeNull());
 });

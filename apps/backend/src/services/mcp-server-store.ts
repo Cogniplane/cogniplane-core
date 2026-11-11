@@ -65,6 +65,18 @@ export function pendingLegacyQueryAuth(server: Pick<AdminMcpServerRecord,
 export const MCP_SECRET_REENTRY_MESSAGE =
   "Enter the secret again. The address or the authentication method changed, and the saved secret is not sent to a new destination.";
 
+/** The public text of an edit whose draft started from an older saved version. */
+export const MCP_SERVER_CONFLICT_MESSAGE =
+  "This connection changed after you opened it. Review the saved connection before you save again.";
+
+/** An edit named a saved version that is not the current one. The edit wrote nothing. */
+export class McpServerVersionConflictError extends Error {
+  constructor() {
+    super(MCP_SERVER_CONFLICT_MESSAGE);
+    this.name = "McpServerVersionConflictError";
+  }
+}
+
 /** The origin of an upstream URL; the text itself when it is not a URL (validation rejects it later). */
 function urlOrigin(url: string | null): string | null {
   if (!url) return null;
@@ -370,6 +382,8 @@ export class McpServerStore {
     upstreamAuthSecret?: string | null;
     credentialScope?: "organization" | "personal";
     enabled: boolean;
+    /** The saved version that the edit started from. Omitted: no check (the legacy update route). */
+    expectedVersion?: number;
   }, transactionClient?: PoolClient): Promise<AdminMcpServerRecord | null> {
     if (input.mode === "managed" && input.upstreamUrl) {
       throw new AdminConfigError("Managed MCP servers cannot configure an upstreamUrl.");
@@ -377,7 +391,7 @@ export class McpServerStore {
     const update = async (client: PoolClient) => {
       const existing = await client.query(
         `SELECT upstream_url, upstream_auth_type, upstream_auth_name,
-                upstream_auth_secret_encrypted, credential_scope, credential_binding_id
+                upstream_auth_secret_encrypted, credential_scope, credential_binding_id, version
          FROM admin_mcp_servers
          WHERE server_id = $1 AND tenant_id = $2
          LIMIT 1
@@ -385,6 +399,12 @@ export class McpServerStore {
         [input.serverId, tenantId]
       );
       if (!existing.rows[0]) return null;
+      // Compared under the row lock, before the checks below read the row: a
+      // concurrent save waits here, and an old draft gets the conflict, not a
+      // message about the newer row.
+      if (input.expectedVersion !== undefined && Number(existing.rows[0].version) !== input.expectedVersion) {
+        throw new McpServerVersionConflictError();
+      }
 
       const upstreamUrl = input.mode === "managed"
         ? null

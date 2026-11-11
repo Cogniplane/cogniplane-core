@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { AdminMcpServer } from "@cogniplane/shared-types";
-import { deriveMcpServerId, getMcpAvailability, getMcpUpstreamWarnings, mustReenterMcpSecret } from "./admin-mcp-card.logic";
+import { deriveMcpServerId, getMcpAvailability, getMcpUpstreamWarnings, mcpReviewRows, mustReenterMcpSecret, type McpReviewDraft } from "./admin-mcp-card.logic";
 
 describe("MCP setup", () => {
   it("derives a unique ID from the name", () => {
@@ -91,5 +91,45 @@ describe("mustReenterMcpSecret", () => {
     const header = { ...saved, upstreamAuthType: "header", upstreamAuthName: "X-API-Key" } as AdminMcpServer;
     expect(mustReenterMcpSecret(header, { ...draft, upstreamAuthType: "header", upstreamAuthName: "X-API-Key" })).toBe(false);
     expect(mustReenterMcpSecret(header, { ...draft, upstreamAuthType: "header", upstreamAuthName: "X-Other" })).toBe(true);
+  });
+});
+
+describe("review of a newer saved version", () => {
+  const opened = {
+    serverId: "vendor", serverName: "Vendor", description: null, mode: "proxy", routePath: "/mcp/vendor",
+    upstreamUrl: "https://vendor.example/mcp", upstreamAuthType: "header", upstreamAuthName: "X-Key",
+    upstreamAuthConfigured: true, credentialScope: "organization", enabled: true, isAllowed: true, isPublished: true, version: 2
+  } as AdminMcpServer;
+  const draft: McpReviewDraft = {
+    serverName: "Vendor", description: "", mode: "proxy", routePath: "/mcp/vendor", upstreamUrl: "https://vendor.example/mcp",
+    upstreamAuthType: "header", upstreamAuthName: "X-Key", credentialScope: "organization", upstreamAuthSecret: "", audience: "members"
+  };
+
+  it("lists nothing when the newer version changed no setting in the form", () => {
+    expect(mcpReviewRows(opened, { ...opened, version: 4, configHash: "other" }, draft)).toEqual([]);
+  });
+
+  it("lists each changed setting in form order with the value that a save of the draft sends", () => {
+    const saved = {
+      ...opened, version: 5, description: "Frozen", upstreamUrl: "https://replacement.example/mcp",
+      upstreamAuthType: "bearer", upstreamAuthName: null, isPublished: false
+    } as AdminMcpServer;
+    expect(mcpReviewRows(opened, saved, { ...draft, upstreamAuthSecret: "typed-secret" })).toEqual([
+      { setting: "Description", saved: "Frozen", draft: "No description" },
+      { setting: "URL", saved: "https://replacement.example/mcp", draft: "https://vendor.example/mcp" },
+      { setting: "Upstream authentication", saved: "Bearer token", draft: "Custom header" },
+      { setting: "Header or parameter name", saved: "None", draft: "X-Key" },
+      { setting: "Availability", saved: "Test users", draft: "All members" }
+    ]);
+  });
+
+  it("shows what a managed draft sends and never the typed secret", () => {
+    const saved = { ...opened, version: 3, upstreamAuthConfigured: false, credentialScope: "personal" } as AdminMcpServer;
+    const rows = mcpReviewRows(opened, saved, { ...draft, mode: "managed", upstreamAuthSecret: "typed-secret" });
+    expect(rows).toEqual([
+      { setting: "Account", saved: "Each member connects", draft: "Organization account" },
+      { setting: "Secret", saved: "Not saved", draft: "No new secret" }
+    ]);
+    expect(JSON.stringify(mcpReviewRows(opened, saved, { ...draft, upstreamAuthSecret: "typed-secret" }))).not.toContain("typed-secret");
   });
 });

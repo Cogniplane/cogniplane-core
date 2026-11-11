@@ -85,6 +85,17 @@ export const AdminMcpServerUpdateRequestSchema = z.object({
 });
 export type AdminMcpServerUpdateRequest = z.input<typeof AdminMcpServerUpdateRequestSchema>;
 
+/**
+ * The field that an edit in Admin > Connections (`PUT
+ * /admin/mcp-servers/:serverId/setup`) adds to its body: the saved version
+ * that the draft started from. When the connection has another version, the
+ * backend refuses the save with 409 `mcp_server_conflict` and writes nothing.
+ */
+export const AdminMcpServerSetupEditSchema = z.object({
+  expectedVersion: z.number().int().positive()
+});
+export type AdminMcpServerSetupEdit = z.infer<typeof AdminMcpServerSetupEditSchema>;
+
 export const AdminMcpServersListResponseSchema = z.object({
   mcpServers: z.array(AdminMcpServerSchema)
 }).passthrough();
