@@ -75,7 +75,8 @@ function buildTestApp(microsoftConfig: Record<string, unknown> | null): TestApp 
       auditEvents: { create: vi.fn() },
       integrationStates: {
         get: vi.fn(async () => (microsoftConfig ? integrationState(microsoftConfig) : null)),
-        upsert: vi.fn()
+        upsert: vi.fn(),
+        applyChanges: vi.fn()
       }
     },
     integrationDescriptors: registry,

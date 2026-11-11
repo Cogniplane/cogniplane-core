@@ -79,8 +79,8 @@ async function buildApp(authSource: "local" | "workos" = "local") {
   });
   // The integration store writes the change's audit event in its
   // transaction, which runs the owner notice.
-  const upsert = vi.fn(async (_tenantId: string, _integrationId: string, patch: { config?: Record<string, unknown> }, audit?: (saved: never) => AuditEventInput) => {
-    const saved = { ...patch } as never;
+  const applyChanges = vi.fn(async (_tenantId: string, _integrationId: string, changes: { configChanges: Record<string, unknown> }, audit?: (saved: never) => AuditEventInput) => {
+    const saved = { config: changes.configChanges } as never;
     await audit?.(saved).alsoInTransaction?.(CHANGE_TRANSACTION as never);
     return saved;
   });
@@ -88,7 +88,7 @@ async function buildApp(authSource: "local" | "workos" = "local") {
     config: createTestConfig(),
     db: emptyPool(),
     uploadAdmission: { begin: vi.fn(), admit: vi.fn() },
-    stores: { auditEvents: { create: vi.fn() }, integrationStates: { get: vi.fn(async () => null), upsert } },
+    stores: { auditEvents: { create: vi.fn() }, integrationStates: { get: vi.fn(async () => null), upsert: vi.fn(), applyChanges } },
     integrationDescriptors: new IntegrationRegistry(),
     loadIntegrationEnablement: vi.fn(async () => ({
       tenantEnabled: true, tenantReadsEnabled: true, tenantWritesEnabled: false, platformConfigured: true
@@ -121,7 +121,7 @@ async function buildApp(authSource: "local" | "workos" = "local") {
   await app.ready();
   const token = async (action: "integration.overlay_settings" | "integration.update") =>
     (await stepUp.create({ userId: USER_ID, tenantId: TENANT_ID, familyId: "family-1", securityVersion: 1, action }, ["pwd"])).token;
-  return { app, routes, upsert, notices, token };
+  return { app, routes, applyChanges, notices, token };
 }
 
 const apps: Array<Awaited<ReturnType<typeof buildApp>>["app"]> = [];
@@ -145,39 +145,39 @@ async function harness(authSource: "local" | "workos" = "local") {
 
 describe("overlay step-up routes", () => {
   test("the Microsoft app refuses a request that carries only an access token", async () => {
-    const { app, upsert, notices } = await harness();
+    const { app, applyChanges, notices } = await harness();
     const res = await app.inject({ method: "PUT", url: "/tenant/settings/microsoft", payload: CONFIG });
     expect(res.statusCode).toBe(403);
     expect(res.json()).toEqual({ error: "step_up_required", action: "integration.overlay_settings" });
-    expect(upsert).not.toHaveBeenCalled();
+    expect(applyChanges).not.toHaveBeenCalled();
     expect(notices).toEqual([]);
   });
 
   test("the Microsoft app refuses a step-up token for another action", async () => {
-    const { app, upsert, token } = await harness();
+    const { app, applyChanges, token } = await harness();
     const res = await app.inject({
       method: "PUT", url: "/tenant/settings/microsoft", payload: CONFIG, headers: { "x-step-up": await token("integration.update") }
     });
     expect(res.statusCode).toBe(403);
-    expect(upsert).not.toHaveBeenCalled();
+    expect(applyChanges).not.toHaveBeenCalled();
   });
 
   test("with a step-up token the Microsoft app changes, and the owner notice goes with the change, without the secret", async () => {
-    const { app, upsert, notices, token } = await harness();
+    const { app, applyChanges, notices, token } = await harness();
     const res = await app.inject({
       method: "PUT", url: "/tenant/settings/microsoft", payload: CONFIG, headers: { "x-step-up": await token("integration.overlay_settings") }
     });
     expect(res.statusCode, res.body).toBe(200);
-    expect(upsert).toHaveBeenCalledTimes(1);
+    expect(applyChanges).toHaveBeenCalledTimes(1);
     expect(notices).toEqual([{ client: CHANGE_TRANSACTION, change: NOTICE }]);
     expect(JSON.stringify(notices)).not.toContain(CONFIG.clientSecret);
   });
 
   test("a WorkOS session changes the Microsoft app with no step-up, and the owners get the notice", async () => {
-    const { app, upsert, notices } = await harness("workos");
+    const { app, applyChanges, notices } = await harness("workos");
     const res = await app.inject({ method: "PUT", url: "/tenant/settings/microsoft", payload: CONFIG });
     expect(res.statusCode, res.body).toBe(200);
-    expect(upsert).toHaveBeenCalledTimes(1);
+    expect(applyChanges).toHaveBeenCalledTimes(1);
     expect(notices).toEqual([{ client: CHANGE_TRANSACTION, change: NOTICE }]);
   });
 

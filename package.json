@@ -16,7 +16,7 @@
     "test:coverage:imported": "COVERAGE_SCOPE=imported pnpm --filter @cogniplane/backend exec node ../../scripts/run-vitest.mjs run --coverage",
     "test:coverage:frontend": "pnpm --filter @cogniplane/frontend exec node ../../scripts/run-vitest.mjs run --coverage",
     "test:coverage:frontend:imported": "COVERAGE_SCOPE=imported pnpm --filter @cogniplane/frontend exec node ../../scripts/run-vitest.mjs run --coverage",
-    "test:integration": "node scripts/require-integration-db.mjs && pnpm --filter @cogniplane/backend exec node ../../scripts/run-vitest.mjs run --config vitest.integration.config.ts && pnpm --filter @cogniplane-private/sharepoint-overlay-backend exec node ../../scripts/run-vitest.mjs run src/services/microsoft-connection-store.integration.test.ts",
+    "test:integration": "node scripts/require-integration-db.mjs && pnpm --filter @cogniplane/backend exec node ../../scripts/run-vitest.mjs run --config vitest.integration.config.ts && pnpm --filter @cogniplane-private/sharepoint-overlay-backend exec node ../../scripts/run-vitest.mjs run src/services/microsoft-connection-store.integration.test.ts src/routes/microsoft-tenant-routes.integration.test.ts",
     "test:coverage:integration": "node scripts/require-integration-db.mjs && pnpm --filter @cogniplane/backend exec node ../../scripts/run-vitest.mjs run --config vitest.integration.config.ts --coverage",
     "test:coverage:merged": "pnpm test:coverage:integration && tsx scripts/merge-coverage.ts",
     "test:e2e:local": "node scripts/e2e-local-stack.mjs",

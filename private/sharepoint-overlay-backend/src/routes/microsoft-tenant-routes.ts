@@ -74,7 +74,7 @@ export function registerMicrosoftTenantRoutes(
     // The audit event and the owner notice commit with the change. Neither
     // carries a value: only which fields changed.
     const changedFields = (Object.keys(FIELD_LABELS) as Array<keyof typeof FIELD_LABELS>).filter((key) => patch[key] !== undefined);
-    await deps.microsoftConnections.setTenantMicrosoftConfig(tenantId, patch, () => ({
+    await deps.microsoftConnections.setTenantMicrosoftConfig(tenantId, patch, request.auth.userId, () => ({
       tenantId,
       sessionId: null,
       userId: request.auth.userId,
