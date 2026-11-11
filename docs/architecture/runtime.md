@@ -173,6 +173,14 @@ delete). Limits: `SCHEDULED_JOB_CREATE_LIMIT_*` and
   worker.
 - Limits: `SCHEDULER_MAX_CONCURRENT_JOBS`, `SCHEDULER_JOB_TIMEOUT_MS`,
   `SCHEDULER_MAX_CONSECUTIVE_FAILURES` (disables a failing job).
+- Turn order (`UserSettingsStore.listDueJobs`): the free slots go to one due
+  job per tenant in each round. The tenant whose last run started first goes
+  first. In a tenant, members take turns in the same way. A member's own jobs
+  go oldest due first. The claim records the run start (`last_run_at`), so the
+  next list on any replica reflects committed claims. A replica can still
+  use a list it read before another replica claimed a job, so dispatch order
+  across replicas is not strict. The order counts runs, not run time,
+  and a due job still waits for a free slot.
 - A scheduled turn cannot pause for approval: an enforced Policy Center
   `require_approval` match is denied, and so is every call that needs user
   consent ([memory](memory.md)).

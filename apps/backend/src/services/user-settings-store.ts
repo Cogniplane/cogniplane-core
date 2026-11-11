@@ -474,23 +474,80 @@ export class UserSettingsStore {
     });
   }
 
+  /**
+   * The due jobs that the next `limit` free slots take, in turn order:
+   *
+   * - One job per tenant in each round. Tenants go in the order of their last
+   *   run start (the latest `last_run_at` of all their jobs), oldest first,
+   *   and a tenant with no run yet goes first.
+   * - In a tenant's turns, its members take turns in the same way, by the
+   *   latest `last_run_at` of their own jobs.
+   * - A member's own jobs go oldest `next_run_at` first.
+   *
+   * `claimJob` sets `last_run_at` in the UPDATE that takes the job. After a
+   * claim on any replica, the next list puts that tenant after the other
+   * tenants of the round, and that member after the other members of the
+   * tenant. Each fresh list reflects committed claims. A replica can still
+   * use a list it read before another replica claimed a job, so this is not
+   * a strict cross-replica dispatch order. The order counts runs, not run
+   * time, and a due job still waits for a free slot.
+   *
+   * All jobs of a tenant or member count, also disabled ones, so turning a job
+   * off does not give an earlier turn. Runs on the RLS-bypassing scheduler
+   * pool; each row and each aggregate stays keyed by its own tenant_id.
+   */
   async listDueJobs(limit: number): Promise<ScheduledJobRecord[]> {
     const result = await this.schedulerDb.query(
       `
+        WITH due AS (
+          SELECT *
+          FROM scheduled_jobs
+          WHERE enabled = TRUE
+            AND next_run_at IS NOT NULL
+            AND next_run_at <= NOW()
+            -- The job's owner must still be a member of the tenant. Member
+            -- removal disables their jobs directly; this is the standing guard
+            -- for rows that predate that fix or that a failed removal missed.
+            AND EXISTS (
+              SELECT 1 FROM tenant_memberships m
+              WHERE m.tenant_id = scheduled_jobs.tenant_id
+                AND m.user_id = scheduled_jobs.user_id
+            )
+        ),
+        last_runs AS (
+          SELECT
+            tenant_id,
+            user_id,
+            MAX(last_run_at) AS member_last_run_at,
+            MAX(MAX(last_run_at)) OVER (PARTITION BY tenant_id) AS tenant_last_run_at
+          FROM scheduled_jobs
+          WHERE tenant_id IN (SELECT tenant_id FROM due)
+          GROUP BY tenant_id, user_id
+        ),
+        member_turns AS (
+          SELECT
+            due.*,
+            last_runs.member_last_run_at,
+            last_runs.tenant_last_run_at,
+            ROW_NUMBER() OVER (
+              PARTITION BY due.tenant_id, due.user_id
+              ORDER BY due.next_run_at, due.job_id
+            ) AS member_turn
+          FROM due
+          JOIN last_runs USING (tenant_id, user_id)
+        ),
+        tenant_turns AS (
+          SELECT
+            member_turns.*,
+            ROW_NUMBER() OVER (
+              PARTITION BY tenant_id
+              ORDER BY member_turn, member_last_run_at ASC NULLS FIRST, next_run_at, user_id
+            ) AS tenant_turn
+          FROM member_turns
+        )
         SELECT *
-        FROM scheduled_jobs
-        WHERE enabled = TRUE
-          AND next_run_at IS NOT NULL
-          AND next_run_at <= NOW()
-          -- The job's owner must still be a member of the tenant. Member
-          -- removal disables their jobs directly; this is the standing guard
-          -- for rows that predate that fix or that a failed removal missed.
-          AND EXISTS (
-            SELECT 1 FROM tenant_memberships m
-            WHERE m.tenant_id = scheduled_jobs.tenant_id
-              AND m.user_id = scheduled_jobs.user_id
-          )
-        ORDER BY next_run_at ASC
+        FROM tenant_turns
+        ORDER BY tenant_turn, tenant_last_run_at ASC NULLS FIRST, next_run_at, tenant_id, job_id
         LIMIT $1
       `,
       [limit]
@@ -508,6 +565,10 @@ export class UserSettingsStore {
    *
    * A job whose owner had a security change since the job was saved is not
    * claimed. The worker then pauses it with `pauseJobForSecurityChange`.
+   *
+   * `last_run_at = NOW()` is the record of the claim that `listDueJobs` uses
+   * for the turn order of tenants and members. Keep it in this UPDATE, so a
+   * claim and its turn record commit together.
    */
   async claimJob(
     tenantId: string,
