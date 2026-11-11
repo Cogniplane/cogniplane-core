@@ -1398,6 +1398,26 @@ it("enables shell after an initially disabled policy and retains the handle acro
   await runtime.dispose();
 });
 
+it("tells the model that a project chat workspace lasts one turn", async () => {
+  const project = makeRuntime({ e2b: e2bOptions(), workspaceLifetime: "turn" });
+  const personal = makeRuntime({ e2b: e2bOptions(), workspaceLifetime: "session" });
+  try {
+    await project.getAgentForModel("deepagents/claude-sonnet-5");
+    const projectPrompt = String(lastDeepAgentConfig()!.systemPrompt);
+    expect(projectPrompt).toContain("Your working directory");
+    expect(projectPrompt).toContain("This is a project chat. Each turn starts with a new workspace");
+    expect(projectPrompt).toContain("Files written in earlier turns are gone");
+
+    await personal.getAgentForModel("deepagents/claude-sonnet-5");
+    const personalPrompt = String(lastDeepAgentConfig()!.systemPrompt);
+    expect(personalPrompt).toContain("Your working directory");
+    expect(personalPrompt).not.toContain("project chat");
+  } finally {
+    await project.dispose();
+    await personal.dispose();
+  }
+});
+
 it("hands the start of a turn to the sandbox, for as long as command execution is on", async () => {
   // The adapter calls `beginTurn` on the sandbox at every turn or job. The first
   // operation of the turn then reads the live network of the sandbox once. It

@@ -1619,7 +1619,8 @@ describe("DeepAgentsRuntimeAdapter runMessageAGUI (AG-UI)", () => {
     const messages = Array.from({ length: 601 }, (_, index) => ({
       messageId: `message-${index}`,
       role: index % 2 === 0 ? "user" : "assistant",
-      content: `turn-${index}`
+      content: `turn-${index}`,
+      toolResults: []
     }));
     let requestedOptions: unknown;
     const executions = {
@@ -3631,6 +3632,189 @@ it("requires a project execution before opening checkpoints and rejects private 
     await expect(collect(adapter.runMessageAGUI(privateRuntime, runMessageInput()))).rejects.toMatchObject({ code: "session_unavailable" });
     expect(runtime.streamInputs).toHaveLength(0);
   } finally { await adapter.close(); }
+});
+
+describe("project chat workspace lifetime", () => {
+  // Rows as MessageStore.listBySession returns them. Only the fields the
+  // adapter reads are set.
+  type SavedTool = { toolName: string; kind?: "command" | "mcp"; status?: "completed" | "failed" | "declined" | "in_progress" };
+  type SavedMessage = { messageId: string; role: "user" | "assistant"; content: string; toolResults?: SavedTool[] };
+
+  const saved = (messages: SavedMessage[]) => messages.map((message) => ({
+    ...message,
+    toolResults: (message.toolResults ?? []).map((tool) => ({ kind: "command" as const, status: "completed" as const, ...tool }))
+  }));
+  const notices = (events: AGUIBaseEvent[]) => events
+    .filter((event) => event.type === AGUIEventType.CUSTOM && (event as { name?: string }).name === "runtime_notice")
+    .map((event) => (event as { value?: unknown }).value);
+
+  // The first turn wrote chart.png. Its runtime and sandbox ended when the next turn started.
+  const afterWorkspaceTurn: SavedMessage[] = [
+    { messageId: "u1", role: "user", content: "make a chart from sales.csv" },
+    { messageId: "a1", role: "assistant", content: "Saved chart.png in the workspace.",
+      toolResults: [{ toolName: "execute" }, { toolName: "write_file" }] },
+    { messageId: "u2", role: "user", content: "change the colours of that chart" },
+    { messageId: "a2", role: "assistant", content: "" }
+  ];
+
+  function projectAdapter(transcript: { current: SavedMessage[] }) {
+    const runtime = makeRuntimeFactory(() => scriptedChatStream());
+    let currentExecutionId = "";
+    const adapter = makeAdapter({
+      factory: runtime.factory,
+      executions: {
+        isCurrent: async (execution: { executionId: string }) => execution.executionId === currentExecutionId,
+        bindRuntime: async () => {}
+      },
+      sessions: {
+        getReadable: async (...args) => ({ ...await fakeSessionAccess.getReadable(...args), projectId: "project-1" })
+      },
+      conversationMessages: {
+        async listBySession() { return { messages: saved(transcript.current), hasMore: false }; }
+      }
+    });
+    const start = async (userId: string, executionId: string) => {
+      currentExecutionId = executionId;
+      const execution = { ...sessionInput, userId, executionId, ownerId: "replica-1", projectId: "project-1",
+        expiresAt: new Date(Date.now() + 30_000).toISOString() };
+      return adapter.createSession({ ...sessionInput, userId, execution });
+    };
+    const run = async (session: Awaited<ReturnType<typeof start>>, assistantMessageId: string) =>
+      collect(adapter.runMessageAGUI(session, { ...runMessageInput(), assistantMessageId }));
+    return { adapter, runtime, start, run };
+  }
+
+  it.each([
+    ["the same member", "user-1"],
+    ["another project member", "user-2"]
+  ])("reports the lost workspace when %s runs the next turn", async (_label, nextUserId) => {
+    const transcript: { current: SavedMessage[] } = { current: afterWorkspaceTurn.slice(0, 2).map((message) => ({ ...message, toolResults: [] })) };
+    const { adapter, runtime, start, run } = projectAdapter(transcript);
+    try {
+      const first = await run(await start("user-1", "execution-1"), "a1");
+      expect(notices(first)).toEqual([]);
+
+      transcript.current = afterWorkspaceTurn;
+      const next = await run(await start(nextUserId, "execution-2"), "a2");
+
+      expect(notices(next)).toEqual([{
+        noticeId: "project-workspace-reset:a1",
+        level: "warning",
+        title: "Workspace reset",
+        message: expect.stringContaining("Each turn of a project chat starts with a new workspace"),
+        createdAt: expect.any(String)
+      }]);
+      // The isolation stays: the next turn has its own runtime under its own
+      // identity, the previous runtime is disposed, and no sandbox is bound to
+      // the session for reuse.
+      expect(runtime.dispose).toHaveBeenCalledTimes(1);
+      expect(runtime.factoryCalls.map((call) => call.userId)).toEqual(["user-1", nextUserId]);
+      expect(runtime.factoryCalls.every((call) => call.sandboxBinding === undefined)).toBe(true);
+      expect(runtime.factoryCalls.every((call) => call.workspaceLifetime === "turn")).toBe(true);
+    } finally { await adapter.close(); }
+  });
+
+  it("finds the evidence in the saved transcript on a replica that did not run the previous turn", async () => {
+    const { adapter, runtime, start, run } = projectAdapter({ current: afterWorkspaceTurn });
+    try {
+      const events = await run(await start("user-2", "execution-2"), "a2");
+      expect(runtime.dispose).not.toHaveBeenCalled();
+      expect(notices(events)).toEqual([expect.objectContaining({ noticeId: "project-workspace-reset:a1", title: "Workspace reset" })]);
+    } finally { await adapter.close(); }
+  });
+
+  it.each<[string, SavedMessage[]]>([
+    ["on the first turn", [
+      { messageId: "u1", role: "user", content: "hello" },
+      { messageId: "a2", role: "assistant", content: "" }
+    ]],
+    ["after a turn that used no tool", [
+      { messageId: "u1", role: "user", content: "hello" },
+      { messageId: "a1", role: "assistant", content: "Hi" },
+      { messageId: "u2", role: "user", content: "again" },
+      { messageId: "a2", role: "assistant", content: "" }
+    ]],
+    ["after a turn that only read files and used project tools", [
+      { messageId: "u1", role: "user", content: "summarize sales.csv" },
+      { messageId: "a1", role: "assistant", content: "Summary",
+        toolResults: [{ toolName: "ls" }, { toolName: "read_file" }, { toolName: "project_write_file", kind: "mcp" }] },
+      { messageId: "u2", role: "user", content: "thanks" },
+      { messageId: "a2", role: "assistant", content: "" }
+    ]],
+    ["after a declined shell command", [
+      { messageId: "u1", role: "user", content: "clean up" },
+      { messageId: "a1", role: "assistant", content: "Declined", toolResults: [{ toolName: "execute", status: "declined" }] },
+      { messageId: "u2", role: "user", content: "ok" },
+      { messageId: "a2", role: "assistant", content: "" }
+    ]],
+    ["when the turn before already reported the loss", [
+      ...afterWorkspaceTurn.slice(0, 3),
+      { messageId: "a2", role: "assistant", content: "Recolored chart.png." },
+      { messageId: "u3", role: "user", content: "thanks" },
+      { messageId: "a3", role: "assistant", content: "" }
+    ]]
+  ])("does not report a reset %s", async (_label, messages) => {
+    const { adapter, start, run } = projectAdapter({ current: messages });
+    try {
+      const events = await run(await start("user-1", "execution-1"), messages.at(-1)!.messageId);
+      expect(notices(events)).toEqual([]);
+    } finally { await adapter.close(); }
+  });
+
+  it("does not report the same workspace twice on one runtime", async () => {
+    const transcript: { current: SavedMessage[] } = { current: afterWorkspaceTurn };
+    const { adapter, start, run } = projectAdapter(transcript);
+    try {
+      const session = await start("user-1", "execution-2");
+      expect(notices(await run(session, "a2"))).toHaveLength(1);
+      // A second turn on the same runtime still has its sandbox: nothing was lost.
+      transcript.current = [...afterWorkspaceTurn.slice(0, 3),
+        { messageId: "a2", role: "assistant", content: "Done", toolResults: [{ toolName: "write_file" }] },
+        { messageId: "u3", role: "user", content: "and again" },
+        { messageId: "a3", role: "assistant", content: "" }];
+      expect(notices(await run(session, "a3"))).toEqual([]);
+    } finally { await adapter.close(); }
+  });
+
+  it("shows one reset notice when a configuration reset is also pending", async () => {
+    const transcript: { current: SavedMessage[] } = { current: afterWorkspaceTurn.slice(0, 2).map((message) => ({ ...message, toolResults: [] })) };
+    const { adapter, start, run } = projectAdapter(transcript);
+    try {
+      await run(await start("user-1", "execution-1"), "a1");
+      await adapter.invalidateTenantRuntimes("test-tenant", { workspaceResetReason: "Configuration changed." });
+      transcript.current = afterWorkspaceTurn;
+      const events = await run(await start("user-1", "execution-2"), "a2");
+      expect(notices(events)).toEqual([expect.objectContaining({ title: "Workspace reset", message: "Configuration changed." })]);
+    } finally { await adapter.close(); }
+  });
+
+  it("keeps a personal session's workspace across turns and shows no reset", async () => {
+    const runtime = makeRuntimeFactory(() => scriptedChatStream());
+    let currentExecutionId = "";
+    const listBySession = vi.fn(async () => ({ messages: saved(afterWorkspaceTurn), hasMore: false }));
+    const adapter = makeAdapter({
+      factory: runtime.factory,
+      checkpointer: { deleteThread: async () => {} },
+      executions: {
+        isCurrent: async (execution: { executionId: string }) => execution.executionId === currentExecutionId,
+        bindRuntime: async () => {}
+      },
+      conversationMessages: { listBySession }
+    });
+    try {
+      for (const [executionId, assistantMessageId] of [["execution-1", "a1"], ["execution-2", "a2"]] as const) {
+        currentExecutionId = executionId;
+        const execution = { ...sessionInput, executionId, ownerId: "replica-1", projectId: null,
+          expiresAt: new Date(Date.now() + 30_000).toISOString() };
+        const session = await adapter.createSession({ ...sessionInput, execution });
+        expect(notices(await collect(adapter.runMessageAGUI(session, { ...runMessageInput(), assistantMessageId })))).toEqual([]);
+      }
+      expect(runtime.factoryCalls).toHaveLength(1);
+      expect(runtime.factoryCalls[0]?.workspaceLifetime).toBe("session");
+      expect(runtime.dispose).not.toHaveBeenCalled();
+      expect(listBySession).not.toHaveBeenCalled();
+    } finally { await adapter.close(); }
+  });
 });
 
 

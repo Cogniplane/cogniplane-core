@@ -257,6 +257,13 @@ export type DeepAgentsRuntimeFactory = (init: {
   skillsLibraryFiles?: SkillsLibraryFiles | null;
   /** Sandbox workspace root (e.g. /home/user/workspace/<sessionId>). */
   workspacePath: string;
+  /**
+   * How long the workspace files stay. `turn` is for a project chat. Each turn
+   * of a project chat builds a new runtime and a new sandbox, so the files of a
+   * turn are gone at the next one, and the workspace note in the system prompt
+   * tells the model. `session` (the default) keeps the workspace across turns.
+   */
+  workspaceLifetime?: "session" | "turn";
   /** E2B wiring for the lazy code-execution sandbox; null disables execute. */
   e2b: DeepAgentsE2bOptions | null;
   sandboxBinding?: DeepAgentsSandboxBinding;
@@ -363,6 +370,12 @@ export type DeepAgentsSessionState = {
    * Drained into the stream as soon as the hook is installed.
    */
   pendingTurnEvents: BaseEvent[];
+  /**
+   * True once a turn started on this runtime. A later turn on the same runtime
+   * has the same workspace, so only the first turn can report that the
+   * workspace of an earlier project turn is gone.
+   */
+  turnStarted: boolean;
   /** Per-turn toolContextId, read by MCP tool wrappers at call time. */
   toolContextRef: { current: string | null };
   policyContextRef: {

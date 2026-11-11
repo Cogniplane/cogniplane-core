@@ -81,7 +81,9 @@ selections. Routes: `routes/projects.ts`, `project-files.ts`,
   an excerpt of readable text and PDF text, within `PER_ARTIFACT_EXCERPT_CHARS`
   and `MAX_ARTIFACT_BUDGET_CHARS`, and only metadata for other formats.
 - The selection is prompt context only: the agent keeps file access to every
-  artifact already copied to the workspace.
+  artifact already copied to the workspace. In a project chat the workspace
+  lasts one turn, so it holds only the artifacts selected for the current turn
+  ([session types](runtime.md#session-types)).
 - PDF text: `ArtifactProcessor.extractArtifactText`
   (`services/artifacts/artifact-processor.ts`) runs `pdftotext`. It serves the
   turn input and `GET /artifacts/:artifactId/preview-text` (`not_a_pdf`,

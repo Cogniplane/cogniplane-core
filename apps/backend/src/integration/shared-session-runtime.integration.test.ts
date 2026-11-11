@@ -221,6 +221,47 @@ describe.skipIf(!adminDatabaseUrl())("shared message HTTP and runtime", () => {
     );
   });
 
+  test("the next member's turn on another replica reports that the previous turn's workspace is gone", async () => {
+    const h = await setup();
+    const notices = (body: string) => body.split("\n").filter(line => line.startsWith("data: "))
+      .map(line => JSON.parse(line.slice(6))).filter(event => event.type === "CUSTOM" && event.name === "runtime_notice")
+      .map(event => event.value);
+    modelControl.writeFile = true;
+    modelControl.afterOutput = async () => { modelControl.writeFile = false; };
+    const turn = h.send("Write a file");
+    let approvalId = "";
+    await vi.waitFor(async () => {
+      const pending = await h.approvals.listPending(h.tenantId, h.sessionId, h.editorId);
+      expect(pending).toHaveLength(1);
+      approvalId = pending[0]!.approvalId;
+    }, { timeout: 5000 });
+    expect((await h.app.inject({ method: "POST", url: `/approvals/${approvalId}/decision`, payload: { decision: "approve" } })).statusCode).toBe(200);
+    const first = await turn;
+    expect(first.body).not.toContain('"type":"RUN_ERROR"');
+    expect(h.toolsStarted).toContain("write_file");
+    expect(notices(first.body)).toEqual([]);
+    const writer = (await h.messages.listBySession(h.tenantId, h.sessionId, h.editorId)).messages.at(-1)!;
+    expect(writer.toolResults).toContainEqual(expect.objectContaining({ toolName: "write_file", status: "completed" }));
+
+    // The replica never ran the first turn: the evidence comes from the saved transcript.
+    h.authenticate(h.ownerId);
+    const second = await h.send("Change that file", h.replica);
+    expect(second.statusCode, second.body).toBe(200);
+    expect(notices(second.body)).toEqual([expect.objectContaining({
+      noticeId: `project-workspace-reset:${writer.messageId}`, level: "warning", title: "Workspace reset"
+    })]);
+    expect(h.created.map(init => init.userId)).toEqual([h.editorId, h.ownerId]);
+    expect(h.created.every(init => init.workspaceLifetime === "turn" && init.sandboxBinding === undefined)).toBe(true);
+
+    // The notice is saved with the turn that showed it, and the next turn does not repeat it.
+    const third = await h.send("Continue", h.replica);
+    expect(notices(third.body)).toEqual([]);
+    const history = await h.messages.listBySession(h.tenantId, h.sessionId, h.viewerId);
+    expect(history.messages.filter(message => message.role === "assistant")
+      .map(message => (message as { detail?: { runtimeNotices?: Array<{ noticeId: string }> } }).detail?.runtimeNotices?.map(n => n.noticeId) ?? []))
+      .toEqual([[], [`project-workspace-reset:${writer.messageId}`], []]);
+  });
+
   test("another owner can cancel an approval wait across replicas without allowing its resume", async () => {
     const h = await setup();
     modelControl.writeFile = true;

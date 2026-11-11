@@ -16,8 +16,10 @@ the variables named here.
   error. The check is lexical: it does not resolve symlinks. `delete` also
   guards against a symlinked path (`deep-agents-e2b-backend.ts`); other file
   tools rely on the E2B VM boundary.
-- The sandbox is created at the first shell or workspace file call and kept per
-  session.
+- The sandbox is created at the first shell or workspace file call. In a normal
+  chat it is kept across turns. In a project chat it ends with the runtime of
+  its turn, and the next turn starts a new one ([session
+  types](runtime.md#session-types)).
 - Archive, delete and purge of a normal chat kill its saved sandbox. The session
   store reads `sessions.sandbox_id` under the session row lock and clears it in
   the transaction that changes the status. The status change also stops the

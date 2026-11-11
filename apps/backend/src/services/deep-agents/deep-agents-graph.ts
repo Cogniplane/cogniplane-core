@@ -371,6 +371,17 @@ export const createDeepAgentsSessionRuntime: DeepAgentsRuntimeFactory = (init) =
         "`sales.csv`, `artifacts/chart.png`) in both shell commands and file tools",
         "so they refer to the same files. Never write to filesystem-root paths",
         'like "/file.txt".',
+        // The transcript of a project chat can name files that an earlier turn
+        // wrote, and those files are gone (createOrRefreshSession in the adapter).
+        ...(init.workspaceLifetime === "turn"
+          ? [
+              "",
+              "This is a project chat. Each turn starts with a new workspace. It holds only",
+              "the artifacts copied in for this turn. Files written in earlier turns are gone,",
+              "even when earlier messages name them. Create a file again before you use it.",
+              "To keep a file after this turn, save it as an artifact or in the project library."
+            ]
+          : []),
         ...(skillsFiles
           ? [
               "",
