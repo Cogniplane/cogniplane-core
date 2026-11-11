@@ -321,6 +321,109 @@ describe("ProjectMemberStore.setMember", () => {
   });
 });
 
+// Issue #42: the page warned before the last owner left only when its cached
+// member list held one owner. The store counts the owners again after the
+// project lock and asks for `confirmNoOwner` when no owner stays.
+describe("ProjectMemberStore.setMember without an owner after the change", () => {
+  test.each([
+    ["leaves", null],
+    ["becomes an editor", "editor"],
+    ["becomes a viewer", "viewer"]
+  ] as const)("asks to confirm when the only owner %s, then makes the confirmed change", async (_label, role) => {
+    const world = new ProjectWorld();
+
+    const error = await refusedWithoutWrite(world, world.store().setMember(actor, "owner-1", role));
+    expect(error).toMatchObject({ code: "project_no_owner_confirmation_required", status: 409 });
+    expect(world.project.explicit.get("owner-1")).toBe("owner");
+
+    expect(await world.store().setMember(actor, "owner-1", role, { confirmNoOwner: true })).toMatchObject({ role });
+    expect(world.project.explicit.get("owner-1")).toBe(role ?? undefined);
+    expect(world.audits).toEqual([{
+      userId: "owner-1",
+      type: "project_member_changed",
+      payload: { projectId: "project-1", memberUserId: "owner-1", previousRole: "owner", role, effectiveRole: role }
+    }]);
+    expect(world.ended()).toBe("COMMIT");
+  });
+
+  test("counts the owners after the project lock, and holds their organization membership", async () => {
+    const world = new ProjectWorld();
+
+    await world.store().setMember(actor, "owner-1", null).catch(() => undefined);
+
+    const texts = world.pool.queries.map(query => query.text);
+    const owners = texts.findIndex(text => text.includes("FROM project_memberships pm") && text.includes("pm.role='owner'"));
+    expect(owners).toBeGreaterThan(texts.findIndex(text => text.includes("FROM projects WHERE tenant_id=$1 AND project_id=$2 FOR UPDATE")));
+    expect(texts[owners]).toContain("FOR KEY SHARE OF tm");
+    expect(world.pool.queries[owners]?.values).toEqual(["tenant-a", "project-1"]);
+  });
+
+  test("needs no confirmation while another owner stays", async () => {
+    const world = new ProjectWorld();
+    world.project.explicit.set("member-1", "owner");
+
+    expect(await world.store().setMember(actor, "owner-1", null)).toEqual({ role: null, effectiveRole: null });
+    expect(world.project.explicit.get("member-1")).toBe("owner");
+  });
+
+  test("does not count an owner who left the organization", async () => {
+    const world = new ProjectWorld();
+    world.project.explicit.set("gone-1", "owner");
+
+    const error = await refusedWithoutWrite(world, world.store().setMember(actor, "owner-1", "viewer"));
+    expect(error).toMatchObject({ code: "project_no_owner_confirmation_required", status: 409 });
+  });
+
+  test("needs no confirmation to remove an owner who left the organization, or a member who is not an owner", async () => {
+    const world = new ProjectWorld();
+    world.project.explicit.set("gone-1", "owner");
+
+    expect(await world.store().setMember(actor, "gone-1", null)).toEqual({ role: null, effectiveRole: null });
+    expect(await world.store().setMember(actor, "editor-1", null)).toEqual({ role: null, effectiveRole: null });
+    expect(await world.store().setMember({ ...actor, userId: "viewer-1" }, "viewer-1", null)).toEqual({ role: null, effectiveRole: null });
+  });
+
+  // The role check runs first, so the refusal does not tell a person who is
+  // not an owner how many owners the project has.
+  test.each([
+    ["an editor", "editor-1", { code: "project_role_required", status: 403 }],
+    ["a former organization member", "gone-1", { code: "project_not_found", status: 404 }]
+  ])("refuses %s who removes the only owner, with or without the confirmation", async (_label, userId, expected) => {
+    for (const confirmNoOwner of [false, true]) {
+      const world = new ProjectWorld();
+      world.project.explicit.set("gone-1", "owner");
+
+      const error = await refusedWithoutWrite(world, world.store().setMember({ ...actor, userId }, "owner-1", null, { confirmNoOwner }));
+      expect(error).toMatchObject(expected);
+      expect(world.project.explicit.get("owner-1")).toBe("owner");
+    }
+  });
+
+  test("asks for the retained organization role first, then for the missing owner", async () => {
+    const world = new ProjectWorld();
+    world.project.visibility = "organization";
+    world.project.organizationRole = "editor";
+
+    const retained = await refusedWithoutWrite(world, world.store().setMember(actor, "owner-1", null, { confirmNoOwner: true }));
+    expect(retained).toMatchObject({ code: "project_organization_access_retained", status: 409 });
+    const noOwner = await refusedWithoutWrite(world, world.store().setMember(actor, "owner-1", null, { confirmRetainedRole: "editor" }));
+    expect(noOwner).toMatchObject({ code: "project_no_owner_confirmation_required", status: 409 });
+
+    expect(await world.store().setMember(actor, "owner-1", null, { confirmRetainedRole: "editor", confirmNoOwner: true }))
+      .toEqual({ role: null, effectiveRole: "editor" });
+  });
+
+  test("asks to confirm in an archived project too, where a reduction is allowed", async () => {
+    const world = new ProjectWorld();
+    world.project.archived = true;
+
+    const error = await refusedWithoutWrite(world, world.store().setMember(actor, "owner-1", "viewer"));
+    expect(error).toMatchObject({ code: "project_no_owner_confirmation_required", status: 409 });
+    expect(await world.store().setMember(actor, "owner-1", "viewer", { confirmNoOwner: true }))
+      .toEqual({ role: "viewer", effectiveRole: "viewer" });
+  });
+});
+
 describe("ProjectMemberStore owner recovery", () => {
   test.each([
     ["a non-administrator", (world: ProjectWorld) => world.project.explicit.delete("owner-1"), "owner-1",

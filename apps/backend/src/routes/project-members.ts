@@ -36,6 +36,7 @@ export async function registerProjectMemberRoutes(app: FastifyInstance, members:
     });
     // A null explicit role removes membership. The response also names any
     // organization role that still grants access, including after self-removal.
+    // A change that leaves no owner needs `confirmNoOwner` (409 otherwise).
     routes.put("/projects/:projectId/members/:userId", async (request, reply) => {
       const params = parseRequestInput(reply, memberParams, request.params);
       if (!params.ok) return params.response;
@@ -43,7 +44,7 @@ export async function registerProjectMemberRoutes(app: FastifyInstance, members:
       if (!body.ok) return body.response;
       return serialize(ProjectMemberUpdateResponseSchema, await members.setMember(
         { ...request.auth, projectId: params.value.projectId }, params.value.userId, body.value.role,
-        { confirmRetainedRole: body.value.confirmRetainedRole }
+        { confirmRetainedRole: body.value.confirmRetainedRole, confirmNoOwner: body.value.confirmNoOwner }
       ));
     });
     routes.get("/admin/projects/ownerless", async (request) => {

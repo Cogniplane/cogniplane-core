@@ -70,11 +70,28 @@ describe.skipIf(!adminDatabaseUrl())("project member HTTP authorization", () => 
     } finally { await h.app.close(); }
   });
 
+  test("returns a classified 409 when the last owner leaves without the confirmation, and leaves after it", async () => {
+    const h = await setup();
+    const url = `/projects/${h.projectId}/members/${h.ownerId}`;
+    try {
+      const refused = await h.app.inject({ method: "PUT", url, payload: { role: "viewer" } });
+      expect(refused.statusCode).toBe(409);
+      expect(refused.json()).toMatchObject({ error: "project_no_owner_confirmation_required" });
+      expect((await h.app.inject({ method: "PUT", url, payload: { role: "viewer", confirmNoOwner: "yes" } })).statusCode).toBe(400);
+      expect((await h.app.inject({ method: "GET", url: `/projects/${h.projectId}/members` })).json())
+        .toMatchObject({ members: [{ userId: h.ownerId, role: "owner" }] });
+      const audit = await superuserPool().query("SELECT id FROM audit_events WHERE tenant_id=$1 AND event_type='project_member_changed'", [h.tenantId]);
+      expect(audit.rows).toEqual([]);
+      const accepted = await h.app.inject({ method: "PUT", url, payload: { role: "viewer", confirmNoOwner: true } });
+      expect(accepted.json()).toEqual({ role: "viewer", effectiveRole: "viewer" });
+    } finally { await h.app.close(); }
+  });
+
   test("permits ownerless projects and audited recovery without granting the administrator project content", async () => {
     const h = await setup();
     const url = `/projects/${h.projectId}`;
     try {
-      expect((await h.app.inject({ method: "PUT", url: `${url}/members/${h.ownerId}`, payload: { role: null } })).statusCode).toBe(200);
+      expect((await h.app.inject({ method: "PUT", url: `${url}/members/${h.ownerId}`, payload: { role: null, confirmNoOwner: true } })).statusCode).toBe(200);
       expect((await h.app.inject({ method: "GET", url: "/admin/projects/ownerless" })).statusCode).toBe(403);
       h.authenticate(h.adminId);
       const list = await h.app.inject({ method: "GET", url: "/admin/projects/ownerless" });

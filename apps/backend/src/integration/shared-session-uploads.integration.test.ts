@@ -162,7 +162,7 @@ describe.skipIf(!adminDatabaseUrl())("shared session uploads", () => {
     await seedMembership(otherTenant, h.editorId);
     h.authenticate(h.editorId, otherTenant);
     expect((await h.upload()).statusCode).toBe(404);
-    await h.members.setMember(h.actor, h.ownerId, null);
+    await h.members.setMember(h.actor, h.ownerId, null, { confirmNoOwner: true });
     h.authenticate(h.ownerId);
     expect((await h.upload()).statusCode).toBe(404);
     expect(h.put).not.toHaveBeenCalled();

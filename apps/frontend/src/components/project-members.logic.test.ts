@@ -67,7 +67,27 @@ describe("describeMemberChange", () => {
     const notice = describeMemberChange(access(members), { member: members[0]!, role: "viewer" }, true);
 
     expect(notice.noOwnerWarning).toBeNull();
+    expect(notice.confirmNoOwner).toBeUndefined();
     expect(notice.details).toContain("You will no longer be able to manage this project.");
+  });
+
+  it("confirms the missing owner with the warning", () => {
+    const members = [member("ana", "owner", "Ana")];
+    const notice = describeMemberChange(access(members), { member: members[0]!, role: null }, true);
+
+    expect(notice.noOwnerWarning).toBe(NO_OWNER_WARNING);
+    expect(notice.confirmNoOwner).toBe(true);
+  });
+
+  // Issue #42: the cached list can still show an owner who left. The backend
+  // counts the current owners, and its refusal sets `backendNoOwner`.
+  it("warns and confirms when the backend found no other owner, also when the cached list shows one", () => {
+    const members = [member("ana", "owner", "Ana"), member("cy", "owner", "Cy")];
+    const notice = describeMemberChange(access(members), { member: members[0]!, role: "viewer" }, true, { backendNoOwner: true });
+
+    expect(notice.noOwnerWarning).toBe(NO_OWNER_WARNING);
+    expect(notice.confirmNoOwner).toBe(true);
+    expect(notice.details).not.toContain("You will no longer be able to manage this project.");
   });
 
   it("names another member and warns about nothing for a member who is not an owner", () => {

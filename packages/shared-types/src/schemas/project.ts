@@ -66,9 +66,13 @@ export const ProjectSharingUpdateSchema = ProjectSharingStateSchema.extend({
   confirmAudience: z.boolean().default(false)
 }).strict();
 export type ProjectSharingUpdate = z.input<typeof ProjectSharingUpdateSchema>;
+/** `confirmNoOwner` confirms that the project can have no owner after the
+ *  change. Without it, the backend counts the current owners and refuses that
+ *  change (409 `project_no_owner_confirmation_required`). */
 export const ProjectMemberUpdateSchema = z.object({
   role: ProjectRoleSchema.nullable(),
-  confirmRetainedRole: z.enum(["viewer", "editor"]).optional()
+  confirmRetainedRole: z.enum(["viewer", "editor"]).optional(),
+  confirmNoOwner: z.boolean().optional()
 }).strict();
 export const ProjectMembersResponseSchema = z.object({
   visibility: z.enum(["private", "organization"]),

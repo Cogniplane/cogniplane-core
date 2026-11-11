@@ -546,7 +546,7 @@ describe.skipIf(!adminDatabaseUrl())("project instructions", () => {
       const intercepted = vi.spyOn(h.projects, "getOwned").mockImplementationOnce(async (...args) => {
         const project = await getOwned(...args);
         if (change === "archived") await h.projects.setArchived(h.tenantId, h.userId, h.project.projectId, true);
-        else await memberships.setMember(actor, h.userId, change === "removed" ? null : "viewer");
+        else await memberships.setMember(actor, h.userId, change === "removed" ? null : "viewer", { confirmNoOwner: true });
         return project;
       });
       try {

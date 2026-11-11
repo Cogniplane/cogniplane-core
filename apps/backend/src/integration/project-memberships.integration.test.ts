@@ -143,7 +143,7 @@ describe.skipIf(!adminDatabaseUrl())("project membership authorization", () => {
     await expect(h.members.setMember(h.actor, h.actor.userId, null))
       .rejects.toMatchObject({ code: "project_organization_access_retained" });
     expect((await h.access()).role).toBe("owner");
-    expect(await h.members.setMember(h.actor, h.actor.userId, null, { confirmRetainedRole: "editor" }))
+    expect(await h.members.setMember(h.actor, h.actor.userId, null, { confirmRetainedRole: "editor", confirmNoOwner: true }))
       .toEqual({ role: null, effectiveRole: "editor" });
     expect((await h.access()).role).toBe("editor");
     await expect(h.members.setMember(h.actor, h.actor.userId, null))
@@ -192,7 +192,7 @@ describe.skipIf(!adminDatabaseUrl())("project membership authorization", () => {
     await h.members.setMember(second, editor.userId, "editor");
     await expect(h.members.recoverOwner(admin, admin.userId)).rejects.toMatchObject({ code: "project_has_owner" });
     await h.members.setMember(second, h.actor.userId, null);
-    await h.members.setMember(second, second.userId, null);
+    await h.members.setMember(second, second.userId, null, { confirmNoOwner: true });
     await expect(h.access()).rejects.toMatchObject({ status: 404 });
     expect((await h.access(editor)).role).toBe("editor");
     await expect(h.members.recoverOwner(editor, editor.userId)).rejects.toMatchObject({ status: 403 });
@@ -231,9 +231,179 @@ describe.skipIf(!adminDatabaseUrl())("project membership authorization", () => {
     await expect(h.members.setSharing(h.actor, { ...sharedViewer, confirmAudience: true, expected: privateViewer }))
       .rejects.toMatchObject({ code: "project_archived" });
     await h.members.setMember(h.actor, viewer.userId, "viewer");
-    await h.members.setMember(h.actor, h.actor.userId, null);
+    await h.members.setMember(h.actor, h.actor.userId, null, { confirmNoOwner: true });
     await h.members.recoverOwner(admin, viewer.userId);
     expect((await h.access(viewer)).role).toBe("owner");
+  });
+
+  // Issue #42: owners A and B both loaded the member list. B left. A's page
+  // still shows two owners, so it does not warn before A leaves or loses the
+  // role. The store counts the owners again under the project lock.
+  describe("the last owner leaves from a stale member list", () => {
+    async function twoOwners() {
+      const h = await setup();
+      const second = await h.member();
+      const admin = await h.member("admin");
+      await h.members.setMember(h.actor, second.userId, "owner");
+      const memberAudits = async () => (await superuserPool().query(
+        "SELECT payload FROM audit_events WHERE tenant_id=$1 AND event_type='project_member_changed' ORDER BY id",
+        [h.actor.tenantId])).rows.map(row => row.payload as Record<string, unknown>);
+      const explicit = async () => Object.fromEntries((await superuserPool().query(
+        "SELECT user_id, role FROM project_memberships WHERE tenant_id=$1 AND project_id=$2",
+        [h.actor.tenantId, h.actor.projectId])).rows.map(row => [String(row.user_id), String(row.role)]));
+      const ownerless = async () => (await h.members.listOwnerless(admin.tenantId, admin.userId))
+        .some(project => project.projectId === h.actor.projectId);
+      return { ...h, second, memberAudits, explicit, ownerless };
+    }
+
+    // Hold the first change open after its audit row, so the second change
+    // must wait for the project lock.
+    async function whileHeld(first: () => Promise<unknown>, second: () => Promise<unknown>) {
+      let release!: () => void;
+      let reached!: (pid: number) => void;
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      const holding = new Promise<number>(resolve => { reached = resolve; });
+      const original = AuditEventStore.createInTransaction;
+      const audit = vi.spyOn(AuditEventStore, "createInTransaction").mockImplementationOnce(async (db, input) => {
+        await original(db, input);
+        reached(Number((await db.query("SELECT pg_backend_pid() AS pid")).rows[0].pid));
+        await gate;
+      });
+      const held = first();
+      let waiting: Promise<unknown> | undefined;
+      try {
+        const pid = await holding;
+        waiting = second();
+        waiting.catch(() => undefined);
+        await vi.waitFor(async () => {
+          const blocked = await superuserPool().query(
+            "SELECT count(*)::int AS count FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))", [pid]);
+          expect(blocked.rows[0].count).toBeGreaterThan(0);
+        });
+        release();
+        return await Promise.allSettled([held, waiting]);
+      } finally {
+        release();
+        await Promise.allSettled([held, waiting]);
+        audit.mockRestore();
+      }
+    }
+
+    test.each([
+      ["leaves", null],
+      ["becomes an editor", "editor"],
+      ["becomes a viewer", "viewer"]
+    ] as const)("refuses without a write or audit when the other owner left first and A %s, then accepts the confirmation", async (_label, role) => {
+      const h = await twoOwners();
+      await h.members.setMember(h.second, h.second.userId, null);
+      const audits = await h.memberAudits();
+
+      await expect(h.members.setMember(h.actor, h.actor.userId, role))
+        .rejects.toMatchObject({ code: "project_no_owner_confirmation_required", status: 409 });
+      expect(await h.explicit()).toEqual({ [h.actor.userId]: "owner" });
+      expect(await h.memberAudits()).toEqual(audits);
+      expect(await h.ownerless()).toBe(false);
+
+      expect(await h.members.setMember(h.actor, h.actor.userId, role, { confirmNoOwner: true })).toMatchObject({ role });
+      expect(await h.explicit()).toEqual(role ? { [h.actor.userId]: role } : {});
+      expect((await h.memberAudits()).at(-1)).toMatchObject({ memberUserId: h.actor.userId, previousRole: "owner", role });
+      expect(await h.ownerless()).toBe(true);
+    });
+
+    test("does not count an owner who left the organization", async () => {
+      const h = await twoOwners();
+      await superuserPool().query("DELETE FROM tenant_memberships WHERE tenant_id=$1 AND user_id=$2", [h.second.tenantId, h.second.userId]);
+
+      await expect(h.members.setMember(h.actor, h.actor.userId, null))
+        .rejects.toMatchObject({ code: "project_no_owner_confirmation_required", status: 409 });
+      expect((await h.access()).role).toBe("owner");
+    });
+
+    test("refuses a person outside the project or the tenant before it counts the owners", async () => {
+      const h = await twoOwners();
+      await h.members.setMember(h.second, h.second.userId, null);
+      const editor = await h.member();
+      await h.members.setMember(h.actor, editor.userId, "editor");
+      const audits = await h.memberAudits();
+      const otherTenant = await seedTenant();
+      await seedMembership(otherTenant, h.actor.userId, "owner");
+
+      for (const confirmNoOwner of [false, true]) {
+        await expect(h.members.setMember(editor, h.actor.userId, null, { confirmNoOwner }))
+          .rejects.toMatchObject({ code: "project_role_required", status: 403 });
+        await expect(h.members.setMember({ ...h.actor, tenantId: otherTenant }, h.actor.userId, null, { confirmNoOwner }))
+          .rejects.toMatchObject({ code: "project_not_found", status: 404 });
+      }
+      expect((await h.access()).role).toBe("owner");
+      expect(await h.memberAudits()).toEqual(audits);
+    });
+
+    test("asks for the retained organization role, then for the missing owner, in an archived shared project", async () => {
+      const h = await setup();
+      await h.members.setSharing(h.actor, { ...sharedEditor, confirmAudience: true, expected: privateViewer });
+      await h.projects.setArchived(h.actor.tenantId, h.actor.userId, h.actor.projectId, true);
+
+      await expect(h.members.setMember(h.actor, h.actor.userId, null, { confirmNoOwner: true }))
+        .rejects.toMatchObject({ code: "project_organization_access_retained", status: 409 });
+      await expect(h.members.setMember(h.actor, h.actor.userId, null, { confirmRetainedRole: "editor" }))
+        .rejects.toMatchObject({ code: "project_no_owner_confirmation_required", status: 409 });
+      expect((await h.access()).role).toBe("owner");
+
+      expect(await h.members.setMember(h.actor, h.actor.userId, null, { confirmRetainedRole: "editor", confirmNoOwner: true }))
+        .toEqual({ role: null, effectiveRole: "editor" });
+      expect((await h.access()).role).toBe("editor");
+    });
+
+    test.each([
+      ["B leaves while A becomes a viewer", null, "viewer"],
+      ["B becomes an editor while A leaves", "editor", null]
+    ] as const)("serializes two owners who change at the same time: %s", async (_label, secondRole, actorRole) => {
+      const h = await twoOwners();
+      const audits = await h.memberAudits();
+
+      const [first, second] = await whileHeld(
+        () => h.members.setMember(h.second, h.second.userId, secondRole),
+        () => h.members.setMember(h.actor, h.actor.userId, actorRole));
+
+      expect(first.status).toBe("fulfilled");
+      expect(second).toMatchObject({ status: "rejected", reason: { code: "project_no_owner_confirmation_required", status: 409 } });
+      expect(await h.explicit()).toEqual({ [h.actor.userId]: "owner", ...(secondRole ? { [h.second.userId]: secondRole } : {}) });
+      expect(await h.memberAudits()).toHaveLength(audits.length + 1);
+      expect(await h.ownerless()).toBe(false);
+
+      await h.members.setMember(h.actor, h.actor.userId, actorRole, { confirmNoOwner: true });
+      expect(await h.memberAudits()).toHaveLength(audits.length + 2);
+      expect(await h.ownerless()).toBe(true);
+    });
+
+    // The other owner's organization removal commits while A's change waits
+    // for its row. A's count then sees no other owner.
+    test("waits for the other owner's organization departure, then asks to confirm", async () => {
+      const h = await twoOwners();
+      const audits = await h.memberAudits();
+      const departing = await superuserPool().connect();
+      let change: Promise<unknown> | undefined;
+      try {
+        await departing.query("BEGIN");
+        const pid = Number((await departing.query("SELECT pg_backend_pid() AS pid")).rows[0].pid);
+        await departing.query("DELETE FROM tenant_memberships WHERE tenant_id=$1 AND user_id=$2", [h.second.tenantId, h.second.userId]);
+        change = h.members.setMember(h.actor, h.actor.userId, "viewer");
+        change.catch(() => undefined);
+        await vi.waitFor(async () => {
+          const blocked = await superuserPool().query(
+            "SELECT count(*)::int AS count FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))", [pid]);
+          expect(blocked.rows[0].count).toBeGreaterThan(0);
+        });
+        await departing.query("COMMIT");
+        await expect(change).rejects.toMatchObject({ code: "project_no_owner_confirmation_required", status: 409 });
+      } finally {
+        await departing.query("ROLLBACK").catch(() => undefined);
+        await Promise.allSettled([change]);
+        departing.release();
+      }
+      expect((await h.access()).role).toBe("owner");
+      expect(await h.memberAudits()).toEqual(audits);
+    });
   });
 
   // Issue #42: owner A loaded "organization, viewer". Owner B then made the
