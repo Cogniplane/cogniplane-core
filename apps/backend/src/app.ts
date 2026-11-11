@@ -365,6 +365,7 @@ export async function buildApp() {
     projectFiles: deps.projectFiles,
     projectFileStorage: deps.artifactStorage,
     sessionTrash: deps.sessions,
+    scheduledSessions: deps.sessions,
     sessionStorage: deps.artifactStorage,
     logger: app.log
   });

@@ -175,6 +175,22 @@ test("loadConfig reads the shared resource read limits, accepts 0 and rejects a 
     .toThrow(/RESOURCE_READ_LIMIT_PER_TENANT_PER_WINDOW/);
 });
 
+test("loadConfig keeps scheduled sessions 30 days by default and refuses a window under one day", () => {
+  const defaults = loadConfig(devConfig());
+  expect(defaults.SCHEDULED_SESSION_RETENTION_ENABLED).toBe(true);
+  expect(defaults.SCHEDULED_SESSION_RETENTION_DAYS).toBe(30);
+  const overridden = loadConfig(devConfig({
+    SCHEDULED_SESSION_RETENTION_ENABLED: "false",
+    SCHEDULED_SESSION_RETENTION_DAYS: "90"
+  }));
+  expect(overridden.SCHEDULED_SESSION_RETENTION_ENABLED).toBe(false);
+  expect(overridden.SCHEDULED_SESSION_RETENTION_DAYS).toBe(90);
+  for (const invalid of ["0", "-1", "1.5"]) {
+    expect(() => loadConfig(devConfig({ SCHEDULED_SESSION_RETENTION_DAYS: invalid })))
+      .toThrow(/SCHEDULED_SESSION_RETENTION_DAYS/);
+  }
+});
+
 test("loadConfig rejects SKILL_BUNDLE_STORAGE_BACKEND=bucket without SKILL_BUNDLE_BUCKET_NAME", () => {
   expect(() => loadConfig({ SKILL_BUNDLE_STORAGE_BACKEND: "bucket" })).toThrow(/SKILL_BUNDLE_BUCKET_NAME is required when SKILL_BUNDLE_STORAGE_BACKEND=bucket/);
 });

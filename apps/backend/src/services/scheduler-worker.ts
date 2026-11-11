@@ -11,7 +11,7 @@ import type { PiiScanJobRecord, PiiScanJobStore } from "./pii/pii-scan-job-store
 import type { ArtifactStorage } from "./artifacts/artifact-storage.js";
 import type { ProjectFileStore } from "./project-file-store.js";
 import type { RuntimeAdapter, RuntimeReasoningEffort } from "../runtime-contracts.js";
-import type { SessionStore } from "./session-store.js";
+import type { SessionStore, SessionTrashCleanupOptions } from "./session-store.js";
 import { redactSecrets } from "./redact-secrets.js";
 import {
   GENERIC_TURN_FAILURE,
@@ -99,6 +99,8 @@ export type SchedulerWorkerDeps = {
   projectFiles?: Pick<ProjectFileStore, "cleanupExpired">;
   projectFileStorage?: Pick<ArtifactStorage, "delete">;
   sessionTrash?: Pick<SessionStore, "cleanupExpired">;
+  /** Retention of the sessions that scheduled runs create. Also needs `sessionStorage`. */
+  scheduledSessions?: Pick<SessionStore, "cleanupExpiredScheduled">;
   sessionStorage?: Pick<ArtifactStorage, "delete">;
   /**
    * Disables a job (sets enabled = FALSE) so it permanently leaves the
@@ -141,6 +143,11 @@ export type SchedulerWorkerOptions = {
   /** Max time to wait for an aborted, timed-out turn to settle before releasing
    * the slot. Defaults to ABORT_SETTLE_GRACE_MS; overridable for tests. */
   abortSettleGraceMs?: number;
+  /**
+   * Days after its last activity that a scheduled session is deleted
+   * (SCHEDULED_SESSION_RETENTION_DAYS). Without it, scheduled sessions stay.
+   */
+  scheduledSessionRetentionDays?: number;
 };
 
 /**
@@ -186,6 +193,7 @@ export class SchedulerWorker {
   private activePiiCount = 0;
   private projectCleanupInFlight = false;
   private sessionCleanupInFlight = false;
+  private scheduledSessionCleanupInFlight = false;
   // Set by stop(): no new job or PII scan is claimed after it.
   private stopping = false;
   // Set by refuseNewTurns(): a claimed job still preparing fails instead of
@@ -263,6 +271,7 @@ export class SchedulerWorker {
 
     void this.track(this.cleanupExpiredProjectFiles());
     void this.track(this.cleanupExpiredSessions());
+    void this.track(this.cleanupExpiredScheduledSessions());
 
     const schedulingEnabled = this.options.schedulingEnabled ?? true;
     if (schedulingEnabled) {
@@ -330,22 +339,27 @@ export class SchedulerWorker {
     await Promise.allSettled(executions);
   }
 
+  // Both session retention jobs purge through the runtime adapter.
+  private sessionPurgeHandlers(): SessionTrashCleanupOptions {
+    return {
+      purgeRuntime: (input) => this.deps.runtimeAdapter.purgeSessionData(input),
+      // The adapter logs a failed kill. This catches only an unexpected throw: the row is gone, so nothing tries again.
+      destroySandbox: async (input) => {
+        try {
+          await this.deps.runtimeAdapter.destroySandbox(input);
+        } catch (error) {
+          this.deps.logger.error({ error, sessionId: input.sessionId, sandboxId: input.sandboxId },
+            "Failed to kill the sandbox of a purged session; it runs until the provider expires it");
+        }
+      },
+    };
+  }
+
   private async cleanupExpiredSessions(): Promise<void> {
     if (!this.deps.sessionTrash || !this.deps.sessionStorage || this.sessionCleanupInFlight) return;
     this.sessionCleanupInFlight = true;
     try {
-      const result = await this.deps.sessionTrash.cleanupExpired(this.deps.sessionStorage, {
-        purgeRuntime: (input) => this.deps.runtimeAdapter.purgeSessionData(input),
-        // The adapter logs a failed kill. This catches only an unexpected throw: the row is gone, so nothing tries again.
-        destroySandbox: async (input) => {
-          try {
-            await this.deps.runtimeAdapter.destroySandbox(input);
-          } catch (error) {
-            this.deps.logger.error({ error, sessionId: input.sessionId, sandboxId: input.sandboxId },
-              "Failed to kill the sandbox of a purged session; it runs until the provider expires it");
-          }
-        },
-      });
+      const result = await this.deps.sessionTrash.cleanupExpired(this.deps.sessionStorage, this.sessionPurgeHandlers());
       if (result.deletedSessions || result.deletedObjects || result.purgedRuntimes) {
         this.deps.logger.info(result, "Expired session Trash cleaned up");
       }
@@ -353,6 +367,26 @@ export class SchedulerWorker {
       this.deps.logger.error({ error }, "Expired session Trash cleanup failed; will retry");
     } finally {
       this.sessionCleanupInFlight = false;
+    }
+  }
+
+  private async cleanupExpiredScheduledSessions(): Promise<void> {
+    const retentionDays = this.options.scheduledSessionRetentionDays;
+    if (!this.deps.scheduledSessions || !this.deps.sessionStorage || !retentionDays) return;
+    if (this.scheduledSessionCleanupInFlight) return;
+    this.scheduledSessionCleanupInFlight = true;
+    try {
+      const result = await this.deps.scheduledSessions.cleanupExpiredScheduled(this.deps.sessionStorage, {
+        ...this.sessionPurgeHandlers(),
+        retentionDays,
+      });
+      if (result.deletedSessions || result.deletedObjects || result.purgedRuntimes) {
+        this.deps.logger.info(result, "Expired scheduled sessions cleaned up");
+      }
+    } catch (error) {
+      this.deps.logger.error({ error }, "Expired scheduled session cleanup failed; will retry");
+    } finally {
+      this.scheduledSessionCleanupInFlight = false;
     }
   }
 
@@ -996,10 +1030,10 @@ export class SchedulerWorker {
    * that thread is pure garbage. Session or project deletion normally calls
    * `purgeSessionData`.
    *
-   * The `sessions` / `messages` rows are deliberately KEPT: `scheduled_job_runs`
-   * references the session id and the run-detail UI reads the transcript. Their
-   * one-row-per-run growth is inherent to the feature and needs a retention
-   * policy, not a teardown here.
+   * The `sessions` / `messages` rows stay: `scheduled_job_runs` references the
+   * session id, and the owner can read the transcript and continue the chat.
+   * Scheduled session retention (`cleanupExpiredScheduledSessions`) deletes
+   * them after SCHEDULED_SESSION_RETENTION_DAYS without activity.
    *
    * Best-effort throughout — reclamation must never change a run's recorded
    * outcome.

@@ -93,13 +93,14 @@ export function buildSchedulerWorker(
     projectFiles?: Pick<ProjectFileStore, "cleanupExpired">;
     projectFileStorage?: Pick<ArtifactStorage, "delete">;
     sessionTrash?: Pick<SessionStore, "cleanupExpired">;
+    scheduledSessions?: Pick<SessionStore, "cleanupExpiredScheduled">;
     sessionStorage?: Pick<ArtifactStorage, "delete">;
     logger: FastifyBaseLogger;
   }
 ) {
   // The worker drives independent workloads: the cron scheduler, the async
-  // PII scan-job drain, project-file retention, and session Trash retention.
-  // Any one alone is reason enough to run it.
+  // PII scan-job drain, project-file retention, session Trash retention, and
+  // scheduled session retention. Any one alone is reason enough to run it.
   //
   // The PII drain runs whenever its deps exist. The rule detector queues
   // artifact scans without the remote provider, so gating on
@@ -113,7 +114,17 @@ export function buildSchedulerWorker(
   const sessionRetentionEnabled =
     config.SESSION_TRASH_RETENTION_ENABLED &&
     Boolean(input.sessionTrash && input.sessionStorage);
-  if (!config.SCHEDULER_ENABLED && !piiDrainEnabled && !projectRetentionEnabled && !sessionRetentionEnabled) {
+  // Not gated on SCHEDULER_ENABLED: sessions of earlier runs still expire.
+  const scheduledSessionRetentionEnabled =
+    config.SCHEDULED_SESSION_RETENTION_ENABLED &&
+    Boolean(input.scheduledSessions && input.sessionStorage);
+  if (
+    !config.SCHEDULER_ENABLED &&
+    !piiDrainEnabled &&
+    !projectRetentionEnabled &&
+    !sessionRetentionEnabled &&
+    !scheduledSessionRetentionEnabled
+  ) {
     return null;
   }
 
@@ -135,7 +146,8 @@ export function buildSchedulerWorker(
       projectFiles: projectRetentionEnabled ? input.projectFiles : undefined,
       projectFileStorage: projectRetentionEnabled ? input.projectFileStorage : undefined,
       sessionTrash: sessionRetentionEnabled ? input.sessionTrash : undefined,
-      sessionStorage: sessionRetentionEnabled ? input.sessionStorage : undefined,
+      scheduledSessions: scheduledSessionRetentionEnabled ? input.scheduledSessions : undefined,
+      sessionStorage: sessionRetentionEnabled || scheduledSessionRetentionEnabled ? input.sessionStorage : undefined,
       runtimeAdapter: input.runtimeAdapter,
       // Poison-job disable is backed by UserSettingsStore.disableJob; thread it
       // in so the worker can permanently drop invalid-cron / repeatedly-failing
@@ -150,7 +162,8 @@ export function buildSchedulerWorker(
       maxConcurrentJobs: config.SCHEDULER_MAX_CONCURRENT_JOBS,
       maxConcurrentPiiJobs: config.PII_SCAN_MAX_CONCURRENT_JOBS,
       jobTimeoutMs: config.SCHEDULER_JOB_TIMEOUT_MS,
-      maxConsecutiveFailures: config.SCHEDULER_MAX_CONSECUTIVE_FAILURES
+      maxConsecutiveFailures: config.SCHEDULER_MAX_CONSECUTIVE_FAILURES,
+      scheduledSessionRetentionDays: config.SCHEDULED_SESSION_RETENTION_DAYS
     }
   );
 }

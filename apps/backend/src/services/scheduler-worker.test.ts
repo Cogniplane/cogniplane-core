@@ -16,7 +16,8 @@ import {
   SchedulerWorker,
   type SchedulerRuntimeResolution,
   type SchedulerRuntimeAdapter,
-  type SchedulerWorkerDeps
+  type SchedulerWorkerDeps,
+  type SchedulerWorkerOptions
 } from "./scheduler-worker.js";
 
 function makeFakeSessionRef(sessionId: string): RuntimeSessionRef {
@@ -2113,6 +2114,17 @@ describe("SchedulerWorker retention cleanup", () => {
       failed: "Expired session Trash cleanup failed; will retry"
     },
     {
+      name: "scheduled sessions",
+      wire: (deps, cleanupExpired, storage) => {
+        deps.scheduledSessions = { cleanupExpiredScheduled: cleanupExpired } as unknown as SchedulerWorkerDeps["scheduledSessions"];
+        deps.sessionStorage = storage;
+      },
+      removed: { deletedSessions: 6, deletedObjects: 2, purgedRuntimes: 6 },
+      nothing: { deletedSessions: 0, deletedObjects: 0, purgedRuntimes: 0 },
+      logged: "Expired scheduled sessions cleaned up",
+      failed: "Expired scheduled session cleanup failed; will retry"
+    },
+    {
       name: "project files",
       wire: (deps, cleanupExpired, storage) => {
         deps.projectFiles = { cleanupExpired } as unknown as SchedulerWorkerDeps["projectFiles"];
@@ -2125,15 +2137,21 @@ describe("SchedulerWorker retention cleanup", () => {
     }
   ];
 
-  function setup(cleanupCase: CleanupCase, cleanupExpired: ReturnType<typeof vi.fn>, withStorage = true) {
+  function setup(
+    cleanupCase: CleanupCase,
+    cleanupExpired: ReturnType<typeof vi.fn>,
+    withStorage = true,
+    options: Partial<SchedulerWorkerOptions> = { scheduledSessionRetentionDays: 30 }
+  ) {
     const fake = createFakeDeps({ dueJobs: [] });
     const logger = { warn: vi.fn(), error: vi.fn(), info: vi.fn() };
     fake.deps.logger = logger;
     const storage = withStorage ? { delete: async () => undefined } : undefined;
     cleanupCase.wire(fake.deps, cleanupExpired, storage);
-    const worker = new SchedulerWorker(fake.deps, { maxConcurrentJobs: 1, jobTimeoutMs: 60_000 });
+    const worker = new SchedulerWorker(fake.deps, { maxConcurrentJobs: 1, jobTimeoutMs: 60_000, ...options });
     return { worker, logger, storage, fake };
   }
+  const scheduledCase = cases.find(({ name }) => name === "scheduled sessions")!;
 
   test.each(cases)("hands the storage to the $name cleanup and logs what it removed", async (cleanupCase) => {
     const cleanupExpired = vi.fn(async (_storage: unknown, _options?: unknown) => cleanupCase.removed);
@@ -2235,5 +2253,53 @@ describe("SchedulerWorker retention cleanup", () => {
     expect(logger.error).toHaveBeenCalledWith(
       { error: failure, sessionId: "session-1", sandboxId: "sandbox-one" },
       "Failed to kill the sandbox of a purged session; it runs until the provider expires it");
+  });
+
+  test("gives the scheduled session cleanup its window and the runtime adapter", async () => {
+    const target = { tenantId: "tenant-a", sessionId: "scheduled-1", userId: "user-1" };
+    const released = { tenantId: "tenant-a", sessionId: "scheduled-1", sandboxId: "sandbox-two" };
+    type Options = {
+      retentionDays: number;
+      purgeRuntime: (input: typeof target) => Promise<void>;
+      destroySandbox: (input: typeof released) => Promise<void>;
+    };
+    const cleanupExpired = vi.fn(async (_storage: unknown, options: Options) => {
+      await options.purgeRuntime(target);
+      await options.destroySandbox(released);
+      return scheduledCase.removed;
+    });
+    const { worker, fake, logger } = setup(scheduledCase, cleanupExpired, true, { scheduledSessionRetentionDays: 45 });
+    const destroySandbox = vi.fn(async (_input: typeof released) => "killed" as const);
+    fake.deps.runtimeAdapter.destroySandbox = destroySandbox;
+
+    await worker.tick();
+
+    await vi.waitFor(() => expect(logger.info).toHaveBeenCalledWith(scheduledCase.removed, scheduledCase.logged));
+    expect(cleanupExpired.mock.calls[0]![1]).toMatchObject({ retentionDays: 45 });
+    expect(fake.purgeSessionDataCalls).toEqual([target]);
+    expect(destroySandbox.mock.calls).toEqual([[released]]);
+  });
+
+  test("skips the scheduled session cleanup when no retention window is set", async () => {
+    const cleanupExpired = vi.fn(async () => scheduledCase.removed);
+    const { worker } = setup(scheduledCase, cleanupExpired, true, {});
+
+    await worker.tick();
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(cleanupExpired).not.toHaveBeenCalled();
+  });
+
+  test("runs the scheduled session cleanup when the cron half is off", async () => {
+    const cleanupExpired = vi.fn(async () => scheduledCase.nothing);
+    const { worker, fake } = setup(scheduledCase, cleanupExpired, true,
+      { schedulingEnabled: false, scheduledSessionRetentionDays: 30 });
+    const listDueJobs = vi.fn(fake.deps.settings.listDueJobs);
+    fake.deps.settings.listDueJobs = listDueJobs;
+
+    await worker.tick();
+
+    await vi.waitFor(() => expect(cleanupExpired).toHaveBeenCalledTimes(1));
+    expect(listDueJobs).not.toHaveBeenCalled();
   });
 });
