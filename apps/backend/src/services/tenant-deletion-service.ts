@@ -7,9 +7,32 @@ import type { SkillBundleStorage } from "./skills/skill-bundle-storage.js";
 
 type CleanupKind = "artifact" | "skill_bundle" | "runtime_thread" | "redis_database";
 
+/**
+ * Texts for the receipt's `redisDisposition`. The command writes the first
+ * text when it deletes the rows. Cleanup replaces it when it runs a queued
+ * flush, so the receipt tells what happened, not what was requested. Receipts
+ * from older versions can hold "Dedicated environment Redis database flushed;
+ * ...", written before the flush ran.
+ */
+export const REDIS_DISPOSITION = {
+  notConfigured: "REDIS_URL was not configured; Redis was not contacted.",
+  notRequested:
+    "Redis not flushed: --flush-redis was not given. Sessions and counters of other tenants are unchanged. " +
+    "Keys of the deleted tenant stay in Redis until they expire.",
+  flushQueued: "Redis flush requested with --flush-redis; it has not run yet.",
+  flushed:
+    "Redis database flushed (--flush-redis): all keys in the database that REDIS_URL selects were removed, " +
+    "for all tenants. All users were signed out and all rate-limit and quota counters were reset.",
+  flushFailed: "Redis flush failed and stays queued. Run the command again with --flush-redis.",
+  flushNotAllowed:
+    "Redis not flushed: a flush is queued for this request, but this run did not have --flush-redis. " +
+    "Run the command again with --flush-redis to flush the whole Redis database."
+} as const;
+
 export type TenantDeletionInput = {
   requestId: string;
   tenantId: string;
+  /** Recorded when this request deletes the rows; a replay keeps the stored text. */
   redisDisposition: string;
   thirdPartyDisposition: string;
   backupDisposition: string;
@@ -39,6 +62,12 @@ type TenantDeletionDependencies = {
   artifactStorage: Pick<ArtifactStorage, "delete">;
   skillBundleStorage: Pick<SkillBundleStorage, "deleteBundle">;
   purgeRuntimeThread(threadId: string): Promise<void>;
+  /**
+   * Flushes the whole Redis database, for every tenant. Give it only when the
+   * operator asked for that (--flush-redis). A new deletion then queues a
+   * flush, and a replay runs a flush that an earlier run queued. Without it,
+   * the service never queues or runs a flush; a queued flush stays queued.
+   */
   flushRedis?: () => Promise<void>;
 };
 
@@ -394,10 +423,14 @@ export class TenantDeletionService {
       [requestId]
     );
     const failures: string[] = [];
+    // Set when a queued Redis flush did not run or failed in this run.
+    let redisDisposition: string | null = null;
 
     for (const item of pending.rows) {
       try {
         const outcome = await this.cleanupItem(item);
+        // Queue removal and its receipt update share one statement. Redis
+        // itself is outside this transaction; a failed update leaves a retry.
         await this.deps.db.query(
           `
             WITH removed AS (
@@ -412,16 +445,23 @@ export class TenantDeletionService {
                   (SELECT COUNT(*) FROM removed WHERE kind IN ('artifact', 'skill_bundle') AND $4 = 'retained_shared'),
                 purged_runtime_thread_count = purged_runtime_thread_count +
                   (SELECT COUNT(*) FROM removed WHERE kind = 'runtime_thread'),
+                redis_disposition = CASE
+                  WHEN EXISTS (SELECT 1 FROM removed WHERE kind = 'redis_database') THEN $5
+                  ELSE redis_disposition
+                END,
                 last_error = NULL
             WHERE request_id = $1
           `,
-          [requestId, item.kind, item.locator, outcome]
+          [requestId, item.kind, item.locator, outcome, REDIS_DISPOSITION.flushed]
         );
       } catch (error) {
         // The queue already retains the locator needed for retry. Keep it out
         // of the durable receipt because object keys can contain tenant data.
         const message = `${item.kind}: ${errorMessage(error)}`;
         failures.push(message);
+        if (item.kind === "redis_database") {
+          redisDisposition = this.deps.flushRedis ? REDIS_DISPOSITION.flushFailed : REDIS_DISPOSITION.flushNotAllowed;
+        }
         await this.deps.db.query(
           `
             UPDATE tenant_deletion_cleanup
@@ -438,18 +478,22 @@ export class TenantDeletionService {
       [requestId]
     );
     const remainingCount = Number(remaining.rows[0]?.count ?? 0);
+    // A replay of a completed request keeps its completion time: the replay
+    // did no work, so the receipt must not change.
     await this.deps.db.query(
       `
         UPDATE tenant_deletion_receipts
         SET status = $2,
-            completed_at = CASE WHEN $2 = 'completed' THEN NOW() ELSE NULL END,
-            last_error = $3
+            completed_at = CASE WHEN $2 = 'completed' THEN COALESCE(completed_at, NOW()) ELSE NULL END,
+            last_error = $3,
+            redis_disposition = COALESCE($4::text, redis_disposition)
         WHERE request_id = $1
       `,
       [
         requestId,
         remainingCount === 0 ? "completed" : "cleanup_failed",
-        failures.length > 0 ? failures.join("\n") : null
+        failures.length > 0 ? failures.join("\n") : null,
+        redisDisposition
       ]
     );
   }
@@ -483,8 +527,12 @@ export class TenantDeletionService {
       await this.deps.purgeRuntimeThread(item.locator);
       return "purged";
     }
+    // Only an explicit --flush-redis allows a flush, also for a flush that an
+    // older version queued without asking.
     if (!this.deps.flushRedis) {
-      throw new Error("Redis cleanup was queued but no Redis client was configured.");
+      throw new Error(
+        "A Redis flush is queued for this request. Run the command again with --flush-redis to flush the whole Redis database."
+      );
     }
     await this.deps.flushRedis();
     return "purged";
