@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import type { ProjectCapabilities as Capabilities } from "@cogniplane/shared-types";
 import { ApiError } from "@/lib/api-client";
 import { ProjectCapabilities } from "./project-capabilities";
 import { getProjectCapabilities, updateProjectCapabilities } from "@/lib/project-api";
@@ -16,6 +17,20 @@ beforeEach(() => {
 });
 afterEach(cleanup);
 const show = (canManage = true) => render(<ProjectCapabilities projectId="p1" archived={false} canManage={canManage} />);
+const custom = { ...catalog, selection: { skillIds: ["pdf"], connectorIds: ["docs"] } };
+// A project skill release adds Notes to the saved custom selection.
+const released = { ...custom, version: 3,
+  skills: [...catalog.skills, { id: "project-skill", name: "Notes", description: "Project notes", source: "project" as const }],
+  selection: { skillIds: ["pdf", "project-skill"], connectorIds: ["docs"] } };
+const refresh = (view: ReturnType<typeof show>, refreshRevision: number) =>
+  view.rerender(<ProjectCapabilities projectId="p1" archived={false} canManage refreshRevision={refreshRevision} />);
+const review = () => screen.queryByText(/settings changed while you were editing/)?.parentElement?.textContent;
+const saveButton = () => screen.getByRole("button", { name: "Save changes" }) as HTMLButtonElement;
+function deferred() {
+  let resolve!: (value: Capabilities) => void;
+  const promise = new Promise<Capabilities>((done) => { resolve = done; });
+  return { promise, resolve };
+}
 
 it("shows the owner's connection state without treating it as a project credential", async () => {
   vi.mocked(getProjectCapabilities).mockResolvedValue({ ...catalog, connectors: [
@@ -133,20 +148,179 @@ it("blocks a save that restores a connection another owner removed", async () =>
   }));
 });
 
-it("refreshes available skills after a project skill release without dropping unsaved choices", async () => {
-  vi.mocked(getProjectCapabilities).mockResolvedValueOnce({ ...catalog,
-    selection: { skillIds: ["pdf"], connectorIds: ["docs"] } });
+it("requires a review before a dirty draft replaces a selection that a skill release changed", async () => {
+  vi.mocked(getProjectCapabilities).mockResolvedValueOnce(custom);
+  const view = show();
+  fireEvent.click(await screen.findByRole("button", { name: "Remove PDF from this project" }));
+  vi.mocked(getProjectCapabilities).mockResolvedValue(released);
+  refresh(view, 1);
+  expect(await screen.findByText("Notes")).toBeTruthy();
+  fireEvent.click(saveButton());
+  expect(updateProjectCapabilities).not.toHaveBeenCalled();
+  expect(screen.getByText("No skills selected.")).toBeTruthy();
+  expect(review()).toContain("Added elsewhere: Notes");
+  expect(review()).toContain("Your save removes: PDF, Notes");
+  expect(saveButton().disabled).toBe(true);
+  // The review follows later edits.
+  fireEvent.click(screen.getByRole("button", { name: "Add Notes to this project" }));
+  expect(review()).toContain("Your save removes: PDF");
+  expect(review()).not.toContain("PDF, Notes");
+  expect(saveButton().disabled).toBe(true);
+  fireEvent.click(screen.getByRole("button", { name: "Keep my changes" }));
+  fireEvent.click(saveButton());
+  await waitFor(() => expect(updateProjectCapabilities).toHaveBeenCalledWith("p1", {
+    version: 3, selection: { skillIds: ["project-skill"], connectorIds: ["docs"] }
+  }));
+});
+
+it("requires a review when a reload finds connections that another owner changed", async () => {
+  vi.mocked(getProjectCapabilities).mockResolvedValueOnce(custom);
+  show();
+  fireEvent.click(await screen.findByRole("button", { name: "Remove PDF from this project" }));
+  vi.mocked(updateProjectCapabilities).mockRejectedValueOnce(new Error("Offline"));
+  fireEvent.click(saveButton());
+  await screen.findByRole("alert");
+  // Another owner added the Wiki connection.
+  vi.mocked(getProjectCapabilities).mockResolvedValue({ ...custom, version: 3,
+    connectors: [...catalog.connectors, { id: "wiki", name: "Wiki", description: "Team wiki" }],
+    selection: { skillIds: ["pdf"], connectorIds: ["docs", "wiki"] } });
+  fireEvent.click(screen.getByRole("button", { name: "Reload capabilities" }));
+  expect(await screen.findByText("Wiki")).toBeTruthy();
+  fireEvent.click(saveButton());
+  expect(updateProjectCapabilities).toHaveBeenCalledTimes(1);
+  expect(review()).toContain("Added elsewhere: Wiki");
+  expect(review()).toContain("Your save removes: PDF, Wiki");
+});
+
+it("keeps a valid draft without a review when a refresh changes only the version", async () => {
+  vi.mocked(getProjectCapabilities).mockResolvedValueOnce(custom);
+  const view = show();
+  fireEvent.click(await screen.findByRole("button", { name: "Remove PDF from this project" }));
+  vi.mocked(getProjectCapabilities).mockResolvedValue({ ...custom, version: 3 });
+  refresh(view, 1);
+  await waitFor(() => expect(getProjectCapabilities).toHaveBeenCalledTimes(2));
+  await waitFor(() => expect(saveButton().disabled).toBe(false));
+  expect(review()).toBeUndefined();
+  expect(screen.queryByText(/selection changed while you were editing/)).toBeNull();
+  fireEvent.click(saveButton());
+  await waitFor(() => expect(updateProjectCapabilities).toHaveBeenCalledWith("p1", {
+    version: 3, selection: { skillIds: [], connectorIds: ["docs"] }
+  }));
+});
+
+it("reviews later refreshes against the selection that the draft started from", async () => {
+  vi.mocked(getProjectCapabilities).mockResolvedValueOnce(custom);
+  const view = show();
+  fireEvent.click(await screen.findByRole("button", { name: "Remove PDF from this project" }));
+  vi.mocked(getProjectCapabilities).mockResolvedValue(released);
+  refresh(view, 1);
+  await screen.findByText(/settings changed while you were editing/);
+  // Another owner removes Docs before the next refresh.
+  const withoutDocs = { ...released, version: 4, selection: { skillIds: ["pdf", "project-skill"], connectorIds: [] } };
+  vi.mocked(getProjectCapabilities).mockResolvedValue(withoutDocs);
+  refresh(view, 2);
+  await waitFor(() => expect(review()).toContain("Removed elsewhere, your save restores: Docs"));
+  expect(review()).toContain("Added elsewhere: Notes");
+  expect(saveButton().disabled).toBe(true);
+  fireEvent.click(screen.getByRole("button", { name: "Keep my changes" }));
+  // After Keep, a refresh with no new change does not open the review again.
+  refresh(view, 3);
+  await waitFor(() => expect(getProjectCapabilities).toHaveBeenCalledTimes(4));
+  await waitFor(() => expect(saveButton().disabled).toBe(false));
+  expect(review()).toBeUndefined();
+  // A newer change after Keep is compared with the kept version only.
+  vi.mocked(getProjectCapabilities).mockResolvedValue({ ...withoutDocs, version: 5, selection: { skillIds: ["project-skill"], connectorIds: [] } });
+  refresh(view, 4);
+  await waitFor(() => expect(review()).toContain("Your save removes: Notes"));
+  expect(review()).not.toContain("Added elsewhere");
+  expect(review()).not.toContain("PDF");
+  fireEvent.click(screen.getByRole("button", { name: "Keep my changes" }));
+  fireEvent.click(saveButton());
+  await waitFor(() => expect(updateProjectCapabilities).toHaveBeenCalledWith("p1", {
+    version: 5, selection: { skillIds: [], connectorIds: ["docs"] }
+  }));
+  expect(updateProjectCapabilities).toHaveBeenCalledTimes(1);
+});
+
+it("keeps an edit made while a refresh is pending and reviews the newer selection", async () => {
+  const first = deferred();
+  const second = deferred();
+  vi.mocked(getProjectCapabilities).mockResolvedValueOnce(custom)
+    .mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise);
   const view = show();
   await screen.findByText("Custom project selection");
-  fireEvent.click(screen.getByRole("button", { name: "Remove PDF from this project" }));
-  vi.mocked(getProjectCapabilities).mockResolvedValue({ ...catalog, version: 3,
-    selection: { skillIds: ["pdf", "project-skill"], connectorIds: ["docs"] },
-    skills: [...catalog.skills, { id: "project-skill", name: "Notes", description: "Project notes", source: "project" as const }] });
-  view.rerender(<ProjectCapabilities projectId="p1" archived={false} canManage refreshRevision={1} />);
-  expect(await screen.findByText("Notes")).toBeTruthy();
+  refresh(view, 1);
+  await waitFor(() => expect(getProjectCapabilities).toHaveBeenCalledTimes(2));
+  refresh(view, 2);
+  await waitFor(() => expect(getProjectCapabilities).toHaveBeenCalledTimes(3));
+  await act(async () => { first.resolve(custom); await first.promise; });
+  const remove = screen.getByRole("button", { name: "Remove PDF from this project" }) as HTMLButtonElement;
+  await waitFor(() => expect(remove.disabled).toBe(false));
+  fireEvent.click(remove);
+  await act(async () => { second.resolve(released); await second.promise; });
   expect(screen.getByText("No skills selected.")).toBeTruthy();
-  expect(screen.getByText(/The current selection changed while you were editing/)).toBeTruthy();
-  expect(screen.getByRole("button", { name: "Save changes" })).toBeTruthy();
+  expect(review()).toContain("Added elsewhere: Notes");
+  expect(saveButton().disabled).toBe(true);
+  // Cancel takes the newer saved selection and closes the review.
+  fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+  expect(screen.getByRole("button", { name: "Remove Notes from this project" })).toBeTruthy();
+  expect(review()).toBeUndefined();
+  expect(screen.queryByRole("button", { name: "Save changes" })).toBeNull();
+});
+
+it("ignores an older refresh that finishes after a newer one", async () => {
+  const first = deferred();
+  const second = deferred();
+  vi.mocked(getProjectCapabilities).mockResolvedValueOnce(custom)
+    .mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise);
+  const view = show();
+  await screen.findByText("Custom project selection");
+  refresh(view, 1);
+  await waitFor(() => expect(getProjectCapabilities).toHaveBeenCalledTimes(2));
+  refresh(view, 2);
+  await waitFor(() => expect(getProjectCapabilities).toHaveBeenCalledTimes(3));
+  await act(async () => { second.resolve(released); await second.promise; });
+  expect(screen.getByRole("button", { name: "Remove Notes from this project" })).toBeTruthy();
+  await act(async () => { first.resolve(custom); await first.promise; });
+  expect(screen.getByRole("button", { name: "Remove Notes from this project" })).toBeTruthy();
+  expect(screen.queryByRole("button", { name: "Save changes" })).toBeNull();
+});
+
+it("ignores a refresh for the previous project after the project changes", async () => {
+  const pending = deferred();
+  vi.mocked(getProjectCapabilities).mockResolvedValueOnce(custom).mockReturnValueOnce(pending.promise)
+    .mockResolvedValueOnce({ ...catalog, skills: [{ id: "sheets", name: "Sheets", description: "Spreadsheets" }] });
+  const view = show();
+  await screen.findByText("Custom project selection");
+  refresh(view, 1);
+  await waitFor(() => expect(getProjectCapabilities).toHaveBeenCalledTimes(2));
+  view.rerender(<ProjectCapabilities projectId="p2" archived={false} canManage refreshRevision={1} />);
+  expect(await screen.findByText("Sheets")).toBeTruthy();
+  await act(async () => { pending.resolve(released); await pending.promise; });
+  expect(screen.queryByText("Notes")).toBeNull();
+  expect(screen.getByText("Sheets")).toBeTruthy();
+  expect(screen.getByText("Using organization defaults")).toBeTruthy();
+});
+
+it("keeps the review while the project is archived and after it is restored", async () => {
+  vi.mocked(getProjectCapabilities).mockResolvedValueOnce(custom);
+  const view = show();
+  fireEvent.click(await screen.findByRole("button", { name: "Remove PDF from this project" }));
+  vi.mocked(getProjectCapabilities).mockResolvedValue({ ...released, canEdit: false });
+  view.rerender(<ProjectCapabilities projectId="p1" archived canManage />);
+  await waitFor(() => expect(review()).toContain("Added elsewhere: Notes"));
+  expect(screen.getByText("Restore this project to change its selection.")).toBeTruthy();
+  expect(screen.queryByRole("button", { name: "Save changes" })).toBeNull();
+  vi.mocked(getProjectCapabilities).mockResolvedValue(released);
+  view.rerender(<ProjectCapabilities projectId="p1" archived={false} canManage />);
+  await waitFor(() => expect(getProjectCapabilities).toHaveBeenCalledTimes(3));
+  await waitFor(() => expect(review()).toContain("Added elsewhere: Notes"));
+  expect(saveButton().disabled).toBe(true);
+  fireEvent.click(screen.getByRole("button", { name: "Keep my changes" }));
+  fireEvent.click(saveButton());
+  await waitFor(() => expect(updateProjectCapabilities).toHaveBeenCalledWith("p1", {
+    version: 3, selection: { skillIds: [], connectorIds: ["docs"] }
+  }));
 });
 
 it("adopts a newly released skill when the custom selection has no unsaved edits", async () => {
@@ -161,6 +335,7 @@ it("adopts a newly released skill when the custom selection has no unsaved edits
   expect(await screen.findByText("Notes")).toBeTruthy();
   expect(screen.getByRole("button", { name: "Remove Notes from this project" })).toBeTruthy();
   expect(screen.queryByRole("button", { name: "Save changes" })).toBeNull();
+  expect(review()).toBeUndefined();
 });
 
 it("preserves a dirty draft when project ownership changes", async () => {

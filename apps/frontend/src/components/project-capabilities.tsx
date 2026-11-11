@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { ProjectCapabilities, SessionCapabilitySelection } from "@cogniplane/shared-types";
 import { ApiError } from "@/lib/api-client";
 import { getProjectCapabilities, updateProjectCapabilities } from "@/lib/project-api";
@@ -26,10 +26,16 @@ export function ProjectCapabilities({ projectId, archived, canManage, refreshRev
   const [error, setError] = useState<string | null>(null);
   const [accessFailure, setAccessFailure] = useState(false);
   const [conflict, setConflict] = useState(false);
-  // Differences found after a 409. Save stays blocked until the user keeps their changes.
+  // Differences found after a 409 or a reload. Save stays blocked until the user keeps their changes.
   const [conflictDetails, setConflictDetails] = useState<CapabilityConflict | null>(null);
+  // The saved state from before the changes that the open review lists. Null when no review is open.
+  const reviewBase = useRef<ProjectCapabilities | null>(null);
   const [selectionChanged, setSelectionChanged] = useState(false);
   const [search, setSearch] = useState("");
+  // A read compares its result with the state when it ends, not when it starts. Code that applies
+  // a server result also sets it at once, so a read that ends before the next render sees that result.
+  const latest = useRef({ projectId, data, draft });
+  useLayoutEffect(() => { latest.current = { projectId, data, draft }; });
 
   useEffect(() => {
     let active = true;
@@ -39,6 +45,8 @@ export function ProjectCapabilities({ projectId, archived, canManage, refreshRev
       setDraft(result.selection);
       setError(null);
       setConflict(false);
+      setConflictDetails(null);
+      reviewBase.current = null;
       setSelectionChanged(false);
     }).catch((cause: unknown) => {
       if (active) setError(cause instanceof Error ? cause.message : "Could not load project capabilities.");
@@ -51,17 +59,29 @@ export function ProjectCapabilities({ projectId, archived, canManage, refreshRev
     setError(null);
     try {
       const result = await getProjectCapabilities(projectId);
-      const hasUnsavedChoices = keepDraft && data !== null && !sameSelection(data.selection, draft);
-      setSelectionChanged(hasUnsavedChoices && !sameSelection(data.selection, result.selection));
+      const { projectId: currentProjectId, data: previous, draft: current } = latest.current;
+      if (currentProjectId !== projectId) return null;
+      // Versions only go up. An older read that ends after a newer one changes nothing.
+      if (previous && result.version < previous.version) return previous;
+      const base = reviewBase.current ?? previous;
+      const unsaved = keepDraft && base !== null && previous !== null &&
+        !sameSelection(previous.selection, current) && !sameSelection(result.selection, current);
+      // A draft from an older selection must not save with the new version until the user reviews it.
+      const changed = unsaved && !sameSelection(base.selection, result.selection);
+      const details = changed ? capabilityConflict(base, result, current) : null;
+      reviewBase.current = details ? base : null;
+      latest.current = { projectId, data: result, draft: unsaved ? current : result.selection };
+      setConflictDetails(details);
+      setSelectionChanged(changed && !details);
       setData(result);
-      if (!hasUnsavedChoices) { setDraft(result.selection); setConflictDetails(null); }
+      if (!unsaved) setDraft(result.selection);
       setConflict(false);
       return result;
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Could not load project capabilities.");
       return null;
     } finally { setLoading(false); }
-  }, [projectId, data, draft]);
+  }, [projectId]);
   const previousAccess = useRef({ projectId, canManage, archived });
   const previousRevision = useRef(refreshRevision);
   useEffect(() => {
@@ -80,11 +100,19 @@ export function ProjectCapabilities({ projectId, archived, canManage, refreshRev
   }, [projectId, canManage, archived, data, reload]);
   const editable = Boolean(data?.canEdit) && canManage && !archived;
   const dirty = Boolean(data && !sameSelection(data.selection, draft));
+  // An open review follows the draft, so it lists what Save would change now.
+  const changeDraft = (next: SessionCapabilitySelection | null) => {
+    setDraft(next);
+    if (!reviewBase.current || !data) return;
+    const details = sameSelection(data.selection, next) ? null : capabilityConflict(reviewBase.current, data, next);
+    if (!details) reviewBase.current = null;
+    setConflictDetails(details);
+  };
   const toggle = (key: CatalogKey, id: string) => {
     setConflict(false);
-    setDraft((current) => current && ({ ...current,
-      [key]: current[key].includes(id) ? current[key].filter((value) => value !== id) : [...current[key], id]
-    }));
+    if (draft) changeDraft({ ...draft,
+      [key]: draft[key].includes(id) ? draft[key].filter((value) => value !== id) : [...draft[key], id]
+    });
   };
   const save = async () => {
     if (!data || !editable || !dirty || saving || loading || (conflict && error) || conflictDetails) return;
@@ -92,18 +120,22 @@ export function ProjectCapabilities({ projectId, archived, canManage, refreshRev
     setError(null);
     try {
       const result = await updateProjectCapabilities(projectId, { selection: draft, version: data.version });
+      latest.current = { projectId, data: result, draft: result.selection };
       setData(result);
       setDraft(result.selection);
       setSearch("");
       setAccessFailure(false);
       setSelectionChanged(false);
       setConflictDetails(null);
+      reviewBase.current = null;
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Could not save project capabilities.");
       if (cause instanceof ApiError && cause.status === 409 && cause.code !== "project_archived") {
         const reloaded = await reload(true);
+        const details = reloaded ? capabilityConflict(data, reloaded, draft) : null;
+        reviewBase.current = details ? data : null;
         setConflict(true);
-        setConflictDetails(reloaded ? capabilityConflict(data, reloaded, draft) : null);
+        setConflictDetails(details);
         if (!reloaded) setError("The project changed, but its current settings could not be loaded. Reload before saving.");
       } else if (cause instanceof ApiError && (cause.status === 403 || cause.code === "project_archived")) {
         setAccessFailure(true);
@@ -120,7 +152,7 @@ export function ProjectCapabilities({ projectId, archived, canManage, refreshRev
         <p className="mt-1 max-w-2xl text-sm text-on-surface-variant">Choose which skills and connections project sessions can use. Each member connects their own account where required. Project selection does not share personal credentials.</p>
       </div>
       {data && editable && draft === null ? <Button size="sm" variant="outline" onClick={() => {
-        setDraft({ skillIds: data.skills.map((item) => item.id), connectorIds: data.connectors.map((item) => item.id) });
+        changeDraft({ skillIds: data.skills.map((item) => item.id), connectorIds: data.connectors.map((item) => item.id) });
       }} disabled={saving || loading}>Customize</Button> : null}
     </div>
     {loading && !data ? <div role="status" aria-label="Loading project capabilities" className="mt-4 space-y-2"><Skeleton className="h-10" /><Skeleton className="h-10" /></div> : null}
@@ -167,7 +199,7 @@ export function ProjectCapabilities({ projectId, archived, canManage, refreshRev
             {editable && available.length === 0 && search ? <p className="text-sm text-on-surface-variant">No matching resources.</p> : null}
           </div>;
         })}
-        {editable ? <Button size="sm" variant="ghost" disabled={saving || loading} onClick={() => setDraft(null)}>Reset to organization defaults</Button> : null}
+        {editable ? <Button size="sm" variant="ghost" disabled={saving || loading} onClick={() => changeDraft(null)}>Reset to organization defaults</Button> : null}
       </> : <div className="space-y-4">
         {([ ["Skills", data.skills], ["Connections", data.connectors] ] as const).map(([label, items]) =>
           <div key={label} className="space-y-2"><h4 className="text-sm font-semibold">{label}</h4>
@@ -179,9 +211,9 @@ export function ProjectCapabilities({ projectId, archived, canManage, refreshRev
       {editable && dirty ? <div className="flex flex-wrap items-center gap-2 border-t border-outline-variant pt-4">
         <span className="text-sm text-on-surface-variant">Unsaved changes</span>
         <Button size="sm" aria-busy={saving} disabled={saving || loading || (conflict && Boolean(error)) || conflictDetails !== null} onClick={() => void save()}>{saving ? "Saving..." : "Save changes"}</Button>
-        <Button size="sm" variant="outline" disabled={saving || loading} onClick={() => { setDraft(data.selection); setSearch(""); setConflict(false); setConflictDetails(null); setSelectionChanged(false); setError(null); }}>Cancel</Button>
+        <Button size="sm" variant="outline" disabled={saving || loading} onClick={() => { setDraft(data.selection); setSearch(""); setConflict(false); setConflictDetails(null); reviewBase.current = null; setSelectionChanged(false); setError(null); }}>Cancel</Button>
       </div> : null}
-      {conflictDetails && dirty ? <CapabilityConflictNotice conflict={conflictDetails} disabled={saving || loading} onKeep={() => setConflictDetails(null)} /> : null}
+      {conflictDetails && dirty ? <CapabilityConflictNotice conflict={conflictDetails} disabled={saving || loading} onKeep={() => { reviewBase.current = null; setConflictDetails(null); }} /> : null}
       {conflict && !error && !conflictDetails ? <p role="status" className="text-sm text-on-surface-variant">The project changed while you were editing. The current settings are loaded and your choices are still here. Review them, then save again.</p> : null}
       {selectionChanged && !conflict ? <p role="status" className="text-sm text-on-surface-variant">The current selection changed while you were editing. Your unsaved choices are still here. Review them before saving.</p> : null}
       {draft !== null ? <p className="text-xs text-on-surface-variant">Removing a selection leaves the skill or connection itself unchanged.</p> : null}
