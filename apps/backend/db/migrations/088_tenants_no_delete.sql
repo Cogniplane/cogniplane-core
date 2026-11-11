@@ -1,0 +1,16 @@
+-- The application role must not delete a tenant.
+--
+-- Every tenant table cascades from tenants (038). Foreign-key cascades run as
+-- the table owner and ignore row security. Thus one DELETE of the tenants row
+-- removes all rows of the tenant, also the append-only audit_events rows.
+-- tenants_self_isolation (001) applies to every command, so it let the tenant
+-- delete its own row.
+--
+-- A RESTRICTIVE policy is AND-ed with every permissive policy. USING (false)
+-- refuses DELETE to every role under row security, whatever grants the role
+-- has. The migration runner also revokes DELETE and TRUNCATE on tenants from
+-- app_user (ensureAppUserRole); TRUNCATE ignores row security.
+--
+-- Tenant deletion is the operator command tenant:delete. It runs as the
+-- migration role, which bypasses row security, so this policy does not stop it.
+CREATE POLICY tenants_no_delete ON public.tenants AS RESTRICTIVE FOR DELETE USING (false);

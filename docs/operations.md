@@ -157,7 +157,9 @@ scheduled session retention deletes their session (foreign-key cascade, [data
 retention](architecture/data.md#retention-and-deletion)), or when the tenant is
 deleted. A
 restrictive RLS policy forbids deletes of `audit_events` for `app_user`, and
-`maintenance_user` has only INSERT on it (`MAINTENANCE_GRANTS`). Run retention
+`maintenance_user` has only INSERT on it (`MAINTENANCE_GRANTS`). `app_user`
+also cannot delete the tenant row, whose cascade would delete them ([tenant
+deletion boundary](database-roles.md#tenant-deletion-boundary)). Run retention
 as the migration role, in batches, on a schedule:
 
 ```sql
