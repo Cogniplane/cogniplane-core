@@ -6,6 +6,7 @@ The rules are in the [security model](security.md).
 | Threat | Primary control | Second control |
 |---|---|---|
 | Cross-tenant data access | RLS with `withTenantScope` ([data](architecture/data.md#tenant-isolation)) | Explicit `tenant_id` predicates; restricted maintenance grants |
+| Tenant data and audit trail erased through the application | No DELETE or TRUNCATE on `tenants` for `app_user` ([database roles](database-roles.md#tenant-deletion-boundary)) | Restrictive policy `tenants_no_delete` |
 | Credential leak through the model | Model-blind tool context; gateway injects credentials ([tools](architecture/tools.md#mcp-gateway)) | `redactSecrets` on saved data; upstream secret scrubbing |
 | Stolen access token | Short TTL; memory-only storage ([auth](architecture/auth.md#tokens-and-cookies)) | Step-up and owner notices for sensitive changes |
 | Refresh token replay | Atomic `jti` rotation ([auth](architecture/auth.md#tokens-and-cookies)) | Family revocation on reuse |

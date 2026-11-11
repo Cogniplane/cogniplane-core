@@ -142,7 +142,9 @@ Fields that agents change most often (the full list is `TenantSettingsSchema` in
   ([skills](skills.md#import-and-lifecycle)).
 - Spending records stay when sessions or messages are deleted.
 - Tenant deletion is an operator command. See
-  [operations](../operations.md#delete-a-tenant).
+  [operations](../operations.md#delete-a-tenant). `app_user` cannot delete a
+  `tenants` row ([tenant deletion
+  boundary](../database-roles.md#tenant-deletion-boundary)).
 
 ## Persistence
 

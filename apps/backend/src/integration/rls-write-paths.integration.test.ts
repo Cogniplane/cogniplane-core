@@ -112,6 +112,12 @@ type WritePath = {
    */
   ownerUpdate?: "append-only" | "immutable";
   /**
+   * The application role has no DELETE privilege on the table, so the peer's
+   * DELETE fails with SQLSTATE 42501 before any policy runs.
+   * tenant-root-delete.integration.test.ts tests the policy behind it.
+   */
+  noDeletePrivilege?: true;
+  /**
    * The tenant that owns the row, when it is not the shared WorkOS owner:
    * local accounts exist only in a tenant whose login type is local.
    */
@@ -570,6 +576,7 @@ const WRITE_PATHS: Record<string, WritePath> = {
     reason:
       "The auth callback creates the tenant before any tenant scope exists, so production runs it " +
       "on the BYPASSRLS maintenance pool (app.ts). The application pool is refused below.",
+    noDeletePrivilege: true,
     write: async () => ({})
   },
   tenant_memberships: {
@@ -1530,7 +1537,7 @@ describe.skipIf(!adminDatabaseUrl())("RLS through production write paths", () =>
     });
   });
 
-  describe.each(CASES)("$table ← $path", ({ table, ownerUpdate }) => {
+  describe.each(CASES)("$table ← $path", ({ table, ownerUpdate, noDeletePrivilege }) => {
     let key: RowKey;
     let owner: Member;
     let peer: Member;
@@ -1565,7 +1572,14 @@ describe.skipIf(!adminDatabaseUrl())("RLS through production write paths", () =>
         });
 
       expect(await afterPeer(`UPDATE ${table} SET tenant_id = $1`, [peer.tenantId]), "peer UPDATE").toBe(1);
-      expect(await afterPeer(`DELETE FROM ${table}`), "peer DELETE").toBe(1);
+      if (noDeletePrivilege) {
+        await expect(afterPeer(`DELETE FROM ${table}`), "peer DELETE").rejects.toMatchObject({
+          code: INSUFFICIENT_PRIVILEGE,
+          message: `permission denied for table ${table}`
+        });
+      } else {
+        expect(await afterPeer(`DELETE FROM ${table}`), "peer DELETE").toBe(1);
+      }
     });
 
     test("WITH CHECK stops the owner moving or copying the row to the peer", async () => {

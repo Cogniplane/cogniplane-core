@@ -6,7 +6,7 @@ the startup checks. Deployment steps are in
 
 | Variable | Role | Authority | Used by |
 |---|---|---|---|
-| `DATABASE_URL` | `app_user` | DML on application tables under tenant RLS, and on [checkpoint tables](architecture/runtime.md#checkpointer) | Backend (`db`) |
+| `DATABASE_URL` | `app_user` | DML on application tables under tenant RLS (no DELETE on `tenants`: [tenant deletion boundary](#tenant-deletion-boundary)), and on [checkpoint tables](architecture/runtime.md#checkpointer) | Backend (`db`) |
 | `MAINTENANCE_DATABASE_URL` | `maintenance_user` | BYPASSRLS with explicit DML grants | Backend (`privilegedDb`) |
 | `MIGRATION_DATABASE_URL` | Superuser | Schema changes, role provisioning | Migration job and operator commands only |
 
@@ -33,6 +33,24 @@ the startup checks. Deployment steps are in
 - BYPASSRLS allows cross-tenant access within these grants ([tenant data
   invariant](security.md#tenant-data)).
 
+## Tenant deletion boundary
+
+Only the [tenant deletion command](operations.md#delete-a-tenant) deletes a
+tenant. Every tenant table cascades from `tenants`, and a foreign-key cascade
+ignores RLS. Thus a DELETE of the `tenants` row removes all rows of the tenant,
+also the append-only `audit_events` rows. Two controls keep `app_user` out:
+
+- Privilege: after its bulk grant, the migration runner revokes DELETE and
+  TRUNCATE on `tenants` from `app_user`, on each run (`ensureAppUserRole` in
+  `migrate-lib.ts`). TRUNCATE ignores RLS.
+- RLS: the restrictive policy `tenants_no_delete` (migration `088`) refuses
+  DELETE to every role under RLS, also to a role that a bulk grant gave DELETE.
+
+`app_user` keeps SELECT and UPDATE on `tenants` (rename, MFA policy). It also
+keeps INSERT, which RLS limits to its own tenant id; the runtime has no path
+that uses it, because WorkOS sign-in creates tenants on `privilegedDb`.
+`maintenance_user` has no DELETE on `tenants` (`MAINTENANCE_GRANTS`).
+
 ## Maintenance grants
 
 `MAINTENANCE_GRANTS` in `apps/backend/src/scripts/maintenance-role.ts` is the
@@ -51,3 +69,6 @@ grep privilegedDb apps/backend/src`).
 disposable database. It covers claims, recovery, download checks, provider-key
 reads and retention, and checks that DDL, role creation, role switching,
 excluded tables and unsafe role setups are refused.
+`apps/backend/src/integration/tenant-root-delete.integration.test.ts` checks the
+[tenant deletion boundary](#tenant-deletion-boundary): after re-provisioning,
+after an upgrade, and with a bulk grant of DELETE.

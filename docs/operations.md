@@ -122,7 +122,9 @@ Restore into a stopped environment:
 No worker deletes `audit_events`. `tool_events` rows go only when their session
 is purged from trash (foreign-key cascade) or the tenant is deleted. A
 restrictive RLS policy forbids deletes of `audit_events` for `app_user`, and
-`maintenance_user` has only INSERT on it (`MAINTENANCE_GRANTS`). Run retention
+`maintenance_user` has only INSERT on it (`MAINTENANCE_GRANTS`). `app_user`
+also cannot delete the tenant row, whose cascade would delete them ([tenant
+deletion boundary](database-roles.md#tenant-deletion-boundary)). Run retention
 as the migration role, in batches, on a schedule:
 
 ```sql

@@ -241,6 +241,13 @@ export async function ensureAppUserRole(
 
   await client.query(`GRANT USAGE ON SCHEMA public TO ${role}`);
   await client.query(`GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO ${role}`);
+  // Only the operator command deletes a tenant. Every tenant table cascades
+  // from tenants, and the cascade ignores row security. Thus a DELETE of a
+  // tenants row removes all rows of the tenant, also the audit events. The
+  // revoke comes after the bulk grant, so each run removes the privilege again.
+  // TRUNCATE is not in the grant above; the revoke removes it if a later change
+  // adds it. The second control is policy tenants_no_delete (migration 088).
+  await client.query(`REVOKE DELETE, TRUNCATE ON public.tenants FROM ${role}`);
   await client.query(`GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO ${role}`);
   // The runtime Deep Agents checkpointer connects as this role; its tables live
   // in a dedicated schema (superuser-owned). No RLS there — tenant→thread
