@@ -52,6 +52,9 @@ The SQL in `apps/backend/db/migrations/` is authoritative for the schema.
   authorize: sign-in lookups before the tenant is known, worker claims,
   recovery, download tokens, retention. Rules: [tenant data
   invariant](../security.md#tenant-data).
+- The migration command has its own pool (`createMigrationDatabase` in
+  `lib/db.ts`): one connection, no 30-second statement timeout ([migration
+  limits](../operations.md#migration-limits)).
 - Roles, grants and startup checks: [database roles](../database-roles.md).
 
 ## Tenant settings

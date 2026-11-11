@@ -55,8 +55,16 @@ export async function applyMigrations(
 ): Promise<string[]> {
   const client = await db.connect();
   try {
-    // Bound both the deployment lock and DDL lock waits on this held connection.
+    // The session limits of every migration (docs/operations.md, "Migration
+    // limits"). A lock wait stops after 10 seconds, for the deployment lock and
+    // for DDL locks. A statement has no time limit: a validation or backfill
+    // on a large table can run for minutes, and a limit would roll the
+    // migration back on every run. The SET also clears a statement timeout
+    // that the pool, role or database gives the session. A migration file can
+    // still set its own with SET LOCAL. The connection is destroyed at the end,
+    // so these settings never reach another pool connection.
     await client.query("SET lock_timeout = '10s'");
+    await client.query("SET statement_timeout = 0");
     await client.query("SELECT pg_advisory_lock(1129270862, 1)");
     await client.query(`
       CREATE TABLE IF NOT EXISTS schema_migrations (

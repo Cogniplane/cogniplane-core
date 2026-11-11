@@ -29,6 +29,39 @@ are not tested against a newer schema. If the new backends fail `/ready`, fix
 forward, or stop the backends, restore the backup from step 1 and redeploy the
 previous images.
 
+### Migration limits
+
+The migration job runs the migrations, the role setup and the grants on one
+connection, with `application_name` `cogniplane-migrate`. `applyMigrations`
+(`apps/backend/src/scripts/migrate-lib.ts`) sets two limits on that connection:
+
+- No statement timeout. A constraint validation or a backfill on a large table
+  can run for many minutes. The 30-second statement timeout of the backend
+  pools (`lib/db.ts`) does not apply. The runner also clears a
+  `statement_timeout` that the server, the database or the role sets. A
+  migration file can set its own limit with `SET LOCAL statement_timeout`.
+- A lock wait stops after 10 seconds (`lock_timeout`). This applies to the
+  migration lock (another migration job) and to each table lock that a
+  migration waits for. The migration then rolls back and the job fails.
+  Migrations that committed before it stay applied, and the next run starts
+  at the failed file. Run the job again when the sessions that held the lock
+  have ended.
+
+A long migration keeps its table locks until it commits. Backend queries that
+conflict with those locks wait, and fail after their 30-second statement
+timeout. Run a long migration when traffic is low.
+
+To stop a running migration, cancel it on the server. The migration rolls back:
+
+```sql
+SELECT pg_cancel_backend(pid) FROM pg_stat_activity
+WHERE application_name = 'cogniplane-migrate';
+```
+
+If you stop only the job process, PostgreSQL can continue the statement until
+it ends. The Deep Agents checkpoint setup (`setupDeepAgentsCheckpointer`) uses
+a second, short-lived connection with the server's default limits.
+
 ## Scale out
 
 Run several backends behind a load balancer, with Redis and shared file storage
@@ -48,8 +81,8 @@ request:
   `privilegedDb`: `POOL_MAX` each in `lib/db.ts`; checkpointer:
   `CHECKPOINTER_POOL_MAX` in
   `services/deep-agents/deep-agents-checkpointer.ts`). Size PostgreSQL
-  `max_connections` for their sum per replica plus the migration job and
-  operator tools.
+  `max_connections` for their sum per replica plus the migration job (two
+  connections) and operator tools.
 
 ## Rotate secrets
 

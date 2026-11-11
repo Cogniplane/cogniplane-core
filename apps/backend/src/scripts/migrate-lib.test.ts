@@ -93,8 +93,11 @@ test("applyMigrations runs the real migration files on a single held client, eac
   expect(pool.connectCount).toBe(1);
   expect(pool.releaseCount).toBe(1);
   expect(pool.destroyed).toBe(true);
+  // The session limits come before the deployment lock and any migration SQL:
+  // lock waits stop after 10 seconds, statements have no time limit.
   expect(pool.queries[0]?.sql).toBe("SET lock_timeout = '10s'");
-  expect(pool.queries[1]?.sql).toBe("SELECT pg_advisory_lock(1129270862, 1)");
+  expect(pool.queries[1]?.sql).toBe("SET statement_timeout = 0");
+  expect(pool.queries[2]?.sql).toBe("SELECT pg_advisory_lock(1129270862, 1)");
   expect(pool.queries.every((q) => q.clientId === 1)).toBe(true);
 
   const firstFileSql = await readFile(path.join(realMigrationsDir, realFiles[0]!), "utf8");
