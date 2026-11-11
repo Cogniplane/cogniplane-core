@@ -342,11 +342,13 @@ describe.skipIf(!adminDatabaseUrl())("durable session execution", () => {
 
   test("retains an effective organization editor grant and fences when that grant is reduced", async () => {
     const h = await setup();
-    await h.members.setSharing(h.owner, { visibility: "organization", organizationRole: "editor", confirmAudience: true });
+    await h.members.setSharing(h.owner, { visibility: "organization", organizationRole: "editor", confirmAudience: true,
+      expected: { visibility: "private", organizationRole: "viewer" } });
     const execution = await h.executions.acquire(h.actor, 60_000);
     await h.members.setMember(h.owner, h.editorId, null, { confirmRetainedRole: "editor" });
     expect(await h.executions.isCurrent(execution)).toBe(true);
-    await h.members.setSharing(h.owner, { visibility: "organization", organizationRole: "viewer", confirmAudience: true });
+    await h.members.setSharing(h.owner, { visibility: "organization", organizationRole: "viewer", confirmAudience: true,
+      expected: { visibility: "organization", organizationRole: "editor" } });
     expect(await h.executions.isCurrent(execution)).toBe(false);
   });
 

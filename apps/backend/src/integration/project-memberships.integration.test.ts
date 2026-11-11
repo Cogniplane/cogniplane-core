@@ -8,6 +8,10 @@ import { withTenantScope } from "../lib/db.js";
 import { adminDatabaseUrl, appPool, superuserPool } from "./support/database.js";
 import { seedMembership, seedTenant, seedUser } from "./support/fixtures.js";
 
+const privateViewer = { visibility: "private", organizationRole: "viewer" } as const;
+const sharedViewer = { visibility: "organization", organizationRole: "viewer" } as const;
+const sharedEditor = { visibility: "organization", organizationRole: "editor" } as const;
+
 async function setup() {
   const tenantId = await seedTenant();
   const userId = await seedUser();
@@ -41,7 +45,7 @@ describe.skipIf(!adminDatabaseUrl())("project membership authorization", () => {
       await gate;
     });
     const change = operation === "sharing"
-      ? h.members.setSharing(h.actor, { visibility: "organization", organizationRole: "viewer", confirmAudience: true })
+      ? h.members.setSharing(h.actor, { ...sharedViewer, confirmAudience: true, expected: privateViewer })
       : h.members.setMember(h.actor, target.userId, "editor");
     const departing = await superuserPool().connect();
     let departure: Promise<unknown> | undefined;
@@ -91,18 +95,18 @@ describe.skipIf(!adminDatabaseUrl())("project membership authorization", () => {
     const viewer = await h.member();
     await h.members.setMember(h.actor, editor.userId, "editor");
     await h.members.setMember(h.actor, viewer.userId, "viewer");
-    await expect(h.members.setSharing(h.actor, { visibility: "organization", organizationRole: "viewer" }))
+    await expect(h.members.setSharing(h.actor, { ...sharedViewer, expected: privateViewer }))
       .rejects.toMatchObject({ code: "project_audience_confirmation_required" });
     expect((await h.access()).visibility).toBe("private");
-    await h.members.setSharing(h.actor, { visibility: "organization", organizationRole: "viewer", confirmAudience: true });
+    await h.members.setSharing(h.actor, { ...sharedViewer, confirmAudience: true, expected: privateViewer });
     expect((await h.access(editor)).role).toBe("editor");
     expect((await h.access(viewer)).role).toBe("viewer");
     expect((await h.access(await h.member())).role).toBe("viewer");
-    await h.members.setSharing(h.actor, { visibility: "organization", organizationRole: "editor", confirmAudience: true });
+    await h.members.setSharing(h.actor, { ...sharedEditor, confirmAudience: true, expected: sharedViewer });
     expect((await h.access(viewer)).role).toBe("editor");
     expect((await h.access()).role).toBe("owner");
     await expect(h.members.setMember(editor, viewer.userId, "owner")).rejects.toMatchObject({ status: 403 });
-    await expect(h.members.setSharing(editor, { visibility: "private", organizationRole: "viewer" })).rejects.toMatchObject({ status: 403 });
+    await expect(h.members.setSharing(editor, { ...privateViewer, expected: sharedEditor })).rejects.toMatchObject({ status: 403 });
   });
 
   test("allows editors to create or assign their sessions and denies viewer assignment", async () => {
@@ -128,7 +132,7 @@ describe.skipIf(!adminDatabaseUrl())("project membership authorization", () => {
     const h = await setup();
     const viewer = await h.member();
     await h.members.setMember(h.actor, viewer.userId, "editor");
-    await h.members.setSharing(h.actor, { visibility: "organization", organizationRole: "editor", confirmAudience: true });
+    await h.members.setSharing(h.actor, { ...sharedEditor, confirmAudience: true, expected: privateViewer });
     await expect(h.members.setMember(h.actor, viewer.userId, "viewer"))
       .rejects.toMatchObject({ code: "project_organization_access_retained", status: 409 });
     await expect(h.members.setMember(h.actor, viewer.userId, "viewer", { confirmRetainedRole: "viewer" }))
@@ -156,7 +160,7 @@ describe.skipIf(!adminDatabaseUrl())("project membership authorization", () => {
     const h = await setup();
     const departed = await h.member();
     await h.members.setMember(h.actor, departed.userId, "editor");
-    await h.members.setSharing(h.actor, { visibility: "organization", organizationRole: "editor", confirmAudience: true });
+    await h.members.setSharing(h.actor, { ...sharedEditor, confirmAudience: true, expected: privateViewer });
     await superuserPool().query("DELETE FROM tenant_memberships WHERE tenant_id=$1 AND user_id=$2", [departed.tenantId, departed.userId]);
     expect(await h.members.setMember(h.actor, departed.userId, null)).toEqual({ role: null, effectiveRole: null });
   });
@@ -224,11 +228,97 @@ describe.skipIf(!adminDatabaseUrl())("project membership authorization", () => {
     await h.members.setMember(h.actor, viewer.userId, "editor");
     await h.projects.setArchived(h.actor.tenantId, h.actor.userId, h.actor.projectId, true);
     await expect(h.members.setMember(h.actor, admin.userId, "viewer")).rejects.toMatchObject({ code: "project_archived" });
-    await expect(h.members.setSharing(h.actor, { visibility: "organization", organizationRole: "viewer", confirmAudience: true }))
+    await expect(h.members.setSharing(h.actor, { ...sharedViewer, confirmAudience: true, expected: privateViewer }))
       .rejects.toMatchObject({ code: "project_archived" });
     await h.members.setMember(h.actor, viewer.userId, "viewer");
     await h.members.setMember(h.actor, h.actor.userId, null);
     await h.members.recoverOwner(admin, viewer.userId);
     expect((await h.access(viewer)).role).toBe("owner");
+  });
+
+  // Issue #42: owner A loaded "organization, viewer". Owner B then made the
+  // project private. A's confirmation said that everyone already had access.
+  describe("sharing confirmed from stale access", () => {
+    async function staleOwners() {
+      const h = await setup();
+      const second = await h.member();
+      await h.members.setMember(h.actor, second.userId, "owner");
+      await h.members.setSharing(h.actor, { ...sharedViewer, confirmAudience: true, expected: privateViewer });
+      const sharingAudits = async () => (await superuserPool().query(
+        "SELECT payload FROM audit_events WHERE tenant_id=$1 AND event_type='project_sharing_changed' ORDER BY id",
+        [h.actor.tenantId])).rows.map(row => row.payload as Record<string, unknown>);
+      return { ...h, second, sharingAudits };
+    }
+
+    test("refuses the old request that confirms without naming the saved access", async () => {
+      const h = await staleOwners();
+      await h.members.setSharing(h.second, { ...privateViewer, expected: sharedViewer });
+      const unnamed = { ...sharedEditor, confirmAudience: true } as unknown as Parameters<ProjectMemberStore["setSharing"]>[1];
+
+      await expect(h.members.setSharing(h.actor, unnamed)).rejects.toMatchObject({ code: "invalid_project_sharing", status: 400 });
+      expect(await h.access()).toMatchObject(privateViewer);
+      expect(await h.sharingAudits()).toHaveLength(2);
+    });
+
+    test("refuses a change from a stale visibility or role without a write or audit, then accepts a fresh confirmation", async () => {
+      const h = await staleOwners();
+      await h.members.setSharing(h.second, { ...privateViewer, expected: sharedViewer });
+
+      await expect(h.members.setSharing(h.actor, { ...sharedEditor, confirmAudience: true, expected: sharedViewer }))
+        .rejects.toMatchObject({ code: "project_sharing_conflict", status: 409 });
+      expect(await h.access()).toMatchObject(privateViewer);
+
+      await h.members.setSharing(h.second, { ...sharedEditor, confirmAudience: true, expected: privateViewer });
+      await expect(h.members.setSharing(h.actor, { ...privateViewer, expected: sharedViewer }))
+        .rejects.toMatchObject({ code: "project_sharing_conflict", status: 409 });
+      expect(await h.access()).toMatchObject(sharedEditor);
+      expect(await h.sharingAudits()).toHaveLength(3);
+
+      await h.members.setSharing(h.actor, { ...sharedViewer, confirmAudience: true, expected: sharedEditor });
+      expect(await h.access()).toMatchObject(sharedViewer);
+      const audits = await h.sharingAudits();
+      expect(audits).toHaveLength(4);
+      expect(audits.at(-1)).toMatchObject({ previousVisibility: "organization", previousOrganizationRole: "editor",
+        visibility: "organization", organizationRole: "viewer" });
+    });
+
+    test("compares the saved access after the row lock, so the later of two changes from the same access fails", async () => {
+      const h = await staleOwners();
+      let release!: () => void;
+      let reached!: (pid: number) => void;
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      const holding = new Promise<number>(resolve => { reached = resolve; });
+      const original = AuditEventStore.createInTransaction;
+      const audit = vi.spyOn(AuditEventStore, "createInTransaction").mockImplementationOnce(async (db, input) => {
+        await original(db, input);
+        reached(Number((await db.query("SELECT pg_backend_pid() AS pid")).rows[0].pid));
+        await gate;
+      });
+      // Both owners loaded "organization, viewer". B makes the project private
+      // and holds its transaction open; A confirms edit access meanwhile.
+      const makePrivate = h.members.setSharing(h.second, { ...privateViewer, expected: sharedViewer });
+      let widen: Promise<unknown> | undefined;
+      try {
+        const pid = await holding;
+        widen = h.members.setSharing(h.actor, { ...sharedEditor, confirmAudience: true, expected: sharedViewer });
+        widen.catch(() => undefined);
+        await vi.waitFor(async () => {
+          const waiting = await superuserPool().query(
+            "SELECT count(*)::int AS count FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))", [pid]);
+          expect(waiting.rows[0].count).toBeGreaterThan(0);
+        });
+        release();
+        await makePrivate;
+        await expect(widen).rejects.toMatchObject({ code: "project_sharing_conflict", status: 409 });
+      } finally {
+        release();
+        await Promise.allSettled([makePrivate, widen]);
+        audit.mockRestore();
+      }
+      expect(await h.access()).toMatchObject(privateViewer);
+      const audits = await h.sharingAudits();
+      expect(audits).toHaveLength(2);
+      expect(audits.at(-1)).toMatchObject({ previousVisibility: "organization", visibility: "private" });
+    });
   });
 });

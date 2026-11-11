@@ -169,7 +169,8 @@ describe.skipIf(!adminDatabaseUrl())("shared session uploads", () => {
 
   test("uses the effective organization editor baseline", async () => {
     const h = await setup();
-    await h.members.setSharing(h.actor, { visibility: "organization", organizationRole: "editor", confirmAudience: true });
+    await h.members.setSharing(h.actor, { visibility: "organization", organizationRole: "editor", confirmAudience: true,
+      expected: { visibility: "private", organizationRole: "viewer" } });
     h.authenticate(h.viewerId);
     expect((await h.upload()).statusCode).toBe(201);
   });

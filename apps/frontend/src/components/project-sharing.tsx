@@ -17,13 +17,19 @@ import {
   AlertDialogTitle
 } from "@/components/ui/alert-dialog";
 import { Skeleton } from "@/components/ui/skeleton";
-import type { Project } from "@cogniplane/shared-types";
+import type { Project, ProjectSharingState } from "@cogniplane/shared-types";
 import { PROJECT_SELECT } from "@/lib/project-ui";
 import { ProjectMembers } from "./project-members";
-type SharingDraft = {
-  visibility: "private" | "organization";
-  organizationRole: "viewer" | "editor";
-};
+
+/** A sharing save: the saved access that the owner saw, and the access they chose. */
+type SharingChange = { expected: ProjectSharingState; next: ProjectSharingState };
+
+function needsAudienceConfirmation({ expected, next }: SharingChange) {
+  return next.visibility === "organization" &&
+    (expected.visibility !== "organization" || expected.organizationRole !== next.organizationRole);
+}
+
+const permission = (role: ProjectSharingState["organizationRole"]) => role === "editor" ? "edit" : "view";
 
 export function ProjectSharing({ project, canManage = true, currentUserId }: {
   project: Project;
@@ -37,7 +43,10 @@ export function ProjectSharing({ project, canManage = true, currentUserId }: {
     queryFn: () => getProjectAccess(project.projectId),
     retry: false
   });
-  const [draft, setDraft] = useState<SharingDraft | null>(null);
+  const [draft, setDraft] = useState<ProjectSharingState | null>(null);
+  // The change that the dialog describes. Confirm sends this change. The access
+  // query can refresh while the dialog is open, and then it no longer matches.
+  const [confirmation, setConfirmation] = useState<SharingChange | null>(null);
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [changedElsewhere, setChangedElsewhere] = useState(false);
 
@@ -47,16 +56,10 @@ export function ProjectSharing({ project, canManage = true, currentUserId }: {
   const savedVisibility = access.data?.visibility;
   const savedRole = access.data?.organizationRole;
   const changed = visibility !== savedVisibility || organizationRole !== savedRole;
-  const promoting = visibility === "organization" && savedVisibility !== "organization";
-  const changingOrganizationRole = visibility === "organization" &&
-    savedVisibility === "organization" && organizationRole !== savedRole;
-  const needsAudienceConfirmation = promoting || changingOrganizationRole;
+  const promoting = confirmation?.expected.visibility !== "organization";
   const save = useMutation({
-    mutationFn: (confirmAudience: boolean) => updateProjectSharing(project.projectId, {
-      visibility,
-      organizationRole: visibility === "organization" ? organizationRole : (savedRole ?? "viewer"),
-      confirmAudience
-    }),
+    mutationFn: ({ change, confirmAudience }: { change: SharingChange; confirmAudience: boolean }) =>
+      updateProjectSharing(project.projectId, { ...change.next, expected: change.expected, confirmAudience }),
     onSuccess: async () => {
       setDraft(null);
       setConfirmOpen(false);
@@ -65,7 +68,10 @@ export function ProjectSharing({ project, canManage = true, currentUserId }: {
       toast.success("Project access updated.");
     },
     onError: async (error) => {
-      if (error instanceof ApiError && error.code === "project_audience_confirmation_required") {
+      // The saved access is not the access that the owner saw. Show it and ask
+      // for a new change, which builds a new confirmation from it.
+      if (error instanceof ApiError &&
+          (error.code === "project_sharing_conflict" || error.code === "project_audience_confirmation_required")) {
         setConfirmOpen(false);
         await client.invalidateQueries({ queryKey: ["projects", project.projectId, "access"] });
         setChangedElsewhere(true);
@@ -110,8 +116,15 @@ export function ProjectSharing({ project, canManage = true, currentUserId }: {
           className="mt-5 space-y-4"
           onSubmit={(event) => {
             event.preventDefault();
-            if (needsAudienceConfirmation) setConfirmOpen(true);
-            else save.mutate(false);
+            if (!access.data) return;
+            const expected = { visibility: access.data.visibility, organizationRole: access.data.organizationRole };
+            // A members-only save keeps the saved organization role for a later share.
+            const change = { expected, next: { visibility,
+              organizationRole: visibility === "organization" ? organizationRole : expected.organizationRole } };
+            if (needsAudienceConfirmation(change)) {
+              setConfirmation(change);
+              setConfirmOpen(true);
+            } else save.mutate({ change, confirmAudience: false });
           }}
         >
           <div className="grid gap-4 sm:grid-cols-2">
@@ -171,7 +184,7 @@ export function ProjectSharing({ project, canManage = true, currentUserId }: {
           {changedElsewhere && access.data ? (
             <div role="alert" className="space-y-2 rounded-md border border-danger/40 bg-danger-surface px-3 py-2 text-sm text-danger">
               <p>
-                Project access changed in another tab. Your draft is preserved, but the saved setting is now {access.data.visibility === "organization"
+                Project access changed in another tab or by another owner. Your draft is preserved, but the saved setting is now {access.data.visibility === "organization"
                   ? `shared with the organization as ${access.data.organizationRole === "editor" ? "edit" : "view"}`
                   : "private"}.
               </p>
@@ -202,24 +215,24 @@ export function ProjectSharing({ project, canManage = true, currentUserId }: {
 
       <AlertDialog open={confirmOpen} onOpenChange={setConfirmOpen}>
         <AlertDialogContent>
-          <AlertDialogHeader>
+          {confirmation ? <AlertDialogHeader>
             <AlertDialogTitle>
               {promoting
                 ? "Share this project with your organization?"
-                : `Change organization access to ${organizationRole === "editor" ? "edit" : "view"}?`}
+                : `Change organization access to ${permission(confirmation.next.organizationRole)}?`}
             </AlertDialogTitle>
             <AlertDialogDescription>
               {promoting
-                ? `Everyone in your organization will get ${organizationRole === "editor" ? "edit" : "view"} access to this project. Its existing conversations, attachments, files, and drafts will be included. You can make the project private again later.`
-                : `Everyone in your organization already has access. This will change their permission to ${organizationRole === "editor" ? "edit" : "view"} for this project.`}
+                ? `Everyone in your organization will get ${permission(confirmation.next.organizationRole)} access to this project. Its existing conversations, attachments, files, and drafts will be included. You can make the project private again later.`
+                : `Everyone in your organization already has ${permission(confirmation.expected.organizationRole)} access. This will change their permission to ${permission(confirmation.next.organizationRole)} for this project.`}
             </AlertDialogDescription>
-          </AlertDialogHeader>
+          </AlertDialogHeader> : null}
           <AlertDialogFooter>
             <AlertDialogCancel disabled={save.isPending}>Cancel</AlertDialogCancel>
             <AlertDialogAction
               onClick={(event) => {
                 event.preventDefault();
-                save.mutate(true);
+                if (confirmation) save.mutate({ change: confirmation, confirmAudience: true });
               }}
               disabled={save.isPending}
             >

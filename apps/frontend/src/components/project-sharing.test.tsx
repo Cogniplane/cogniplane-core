@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import type { Project } from "@cogniplane/shared-types";
@@ -15,6 +15,8 @@ vi.mock("@/lib/project-api", () => ({
 }));
 vi.mock("sonner", () => ({ toast: { success: vi.fn() } }));
 
+const owner = { userId: "u1", role: "owner" as const, displayName: "Owner", email: "owner@example.com" };
+const accessKey = ["projects", "p1", "access"];
 const project: Project = {
   projectId: "p1",
   name: "Planning",
@@ -71,6 +73,7 @@ it("explains the audience change before sharing a project", async () => {
   await waitFor(() => expect(updateProjectSharing).toHaveBeenCalledWith("p1", {
     visibility: "organization",
     organizationRole: "editor",
+    expected: { visibility: "private", organizationRole: "viewer" },
     confirmAudience: true
   }));
 });
@@ -99,7 +102,7 @@ it("describes an organization permission change instead of a new disclosure", as
   fireEvent.click(screen.getByRole("button", { name: "Save access" }));
 
   expect(screen.getByRole("heading", { name: "Change organization access to edit?" })).toBeTruthy();
-  expect(screen.getByText(/already has access/)).toBeTruthy();
+  expect(screen.getByText(/already has view access/)).toBeTruthy();
   expect(screen.queryByText(/existing conversations, attachments, files, and drafts will be included/)).toBeNull();
 });
 
@@ -117,6 +120,7 @@ it("keeps the saved organization role when making a project private", async () =
   await waitFor(() => expect(updateProjectSharing).toHaveBeenCalledWith("p1", {
     visibility: "private",
     organizationRole: "editor",
+    expected: { visibility: "organization", organizationRole: "editor" },
     confirmAudience: false
   }));
 });
@@ -151,6 +155,68 @@ it("shows a changed-elsewhere notice when a concurrent change makes the audience
   expect(screen.getByText(/shared with the organization as edit/)).toBeTruthy();
   expect(screen.getByRole("button", { name: "Use saved access" })).toBeTruthy();
   await waitFor(() => expect(getProjectAccess).toHaveBeenCalledTimes(2));
+});
+
+// Issue #42: owner A loaded "organization, viewer"; owner B then made the
+// project private. A's request must carry the access that A's dialog described.
+it("sends the saved access that the open confirmation describes, even when the access query changes", async () => {
+  vi.mocked(getProjectAccess).mockResolvedValue({ visibility: "organization", organizationRole: "viewer", members: [owner] });
+  renderSharing();
+  fireEvent.change(await screen.findByLabelText("Organization access"), { target: { value: "editor" } });
+  fireEvent.click(screen.getByRole("button", { name: "Save access" }));
+  expect(screen.getByRole("heading", { name: "Change organization access to edit?" })).toBeTruthy();
+
+  // A background refetch returns the private access that owner B saved.
+  act(() => { client.setQueryData(accessKey, { visibility: "private", organizationRole: "viewer", members: [owner] }); });
+  expect(await screen.findByText("Members only")).toBeTruthy();
+  expect(screen.getByRole("heading", { name: "Change organization access to edit?" })).toBeTruthy();
+  expect(screen.getByText(/already has view access/)).toBeTruthy();
+
+  fireEvent.click(screen.getByRole("button", { name: "Confirm change" }));
+  await waitFor(() => expect(updateProjectSharing).toHaveBeenCalledWith("p1", {
+    visibility: "organization",
+    organizationRole: "editor",
+    expected: { visibility: "organization", organizationRole: "viewer" },
+    confirmAudience: true
+  }));
+});
+
+it("shows the changed-elsewhere notice on a sharing conflict and asks for a new confirmation from the saved access", async () => {
+  vi.mocked(getProjectAccess)
+    .mockResolvedValueOnce({ visibility: "organization", organizationRole: "viewer", members: [owner] })
+    .mockResolvedValue({ visibility: "private", organizationRole: "viewer", members: [owner] });
+  vi.mocked(updateProjectSharing).mockRejectedValueOnce(new ApiError({
+    status: 409,
+    code: "project_sharing_conflict",
+    method: "PUT",
+    path: "/projects/p1/sharing",
+    message: "Project access changed after you loaded it."
+  }));
+  renderSharing();
+  fireEvent.change(await screen.findByLabelText("Organization access"), { target: { value: "editor" } });
+  fireEvent.click(screen.getByRole("button", { name: "Save access" }));
+  fireEvent.click(screen.getByRole("button", { name: "Confirm change" }));
+
+  await screen.findByText(/Project access changed in another tab or by another owner/);
+  expect(screen.getByText(/the saved setting is now private/)).toBeTruthy();
+  expect(screen.queryByRole("alertdialog")).toBeNull();
+  expect((screen.getByRole("button", { name: "Save access" }) as HTMLButtonElement).disabled).toBe(true);
+  expect(updateProjectSharing).toHaveBeenCalledTimes(1);
+
+  // The owner edits the draft again. The new confirmation describes the saved
+  // private access and names it in the request.
+  fireEvent.change(screen.getByLabelText("Organization access"), { target: { value: "viewer" } });
+  fireEvent.change(screen.getByLabelText("Organization access"), { target: { value: "editor" } });
+  fireEvent.click(screen.getByRole("button", { name: "Save access" }));
+  expect(screen.getByRole("heading", { name: "Share this project with your organization?" })).toBeTruthy();
+  fireEvent.click(screen.getByRole("button", { name: "Confirm change" }));
+  await waitFor(() => expect(updateProjectSharing).toHaveBeenLastCalledWith("p1", {
+    visibility: "organization",
+    organizationRole: "editor",
+    expected: { visibility: "private", organizationRole: "viewer" },
+    confirmAudience: true
+  }));
+  expect(updateProjectSharing).toHaveBeenCalledTimes(2);
 });
 
 it("warns that the project will have no owner when the only owner leaves from the member list", async () => {

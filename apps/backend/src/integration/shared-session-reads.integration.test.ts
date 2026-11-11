@@ -153,7 +153,8 @@ describe.skipIf(!adminDatabaseUrl())("shared session reads", () => {
 
   test("rechecks access after PDF extraction and honors organization baseline departure", async () => {
     const h = await setup();
-    await h.members.setSharing(h.actor, { visibility: "organization", organizationRole: "viewer", confirmAudience: true });
+    await h.members.setSharing(h.actor, { visibility: "organization", organizationRole: "viewer", confirmAudience: true,
+      expected: { visibility: "private", organizationRole: "viewer" } });
     await h.members.setMember(h.actor, h.viewerId, null, { confirmRetainedRole: "viewer" });
     expect(await h.sessions.getReadable(h.tenantId, h.sessionId, h.viewerId)).not.toBeNull();
     h.extractArtifactText.mockImplementationOnce(async () => {

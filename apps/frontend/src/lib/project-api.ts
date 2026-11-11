@@ -11,7 +11,7 @@ import {
 } from "@cogniplane/shared-types";
 import { ProjectCapabilitiesSchema, type ProjectCapabilitiesUpdate } from "@cogniplane/shared-types";
 import { ArtifactsListResponseSchema } from "@cogniplane/shared-types";
-import type { ProjectAgentFileMode, ProjectApprovalMode } from "@cogniplane/shared-types";
+import type { ProjectAgentFileMode, ProjectApprovalMode, ProjectSharingUpdate } from "@cogniplane/shared-types";
 import { request } from "./api-client";
 import { parseResponse } from "./validate-response";
 import type { SessionList } from "./session-api";
@@ -128,11 +128,9 @@ export async function getProjectAccess(id: string) {
   );
 }
 
-export async function updateProjectSharing(id: string, input: {
-  visibility: "private" | "organization";
-  organizationRole: "viewer" | "editor";
-  confirmAudience?: boolean;
-}) {
+/** `input.expected` is the saved access that the owner saw and confirmed. The
+ *  backend returns 409 `project_sharing_conflict` when the saved access is different. */
+export async function updateProjectSharing(id: string, input: ProjectSharingUpdate) {
   await request(projectPath(id) + "/sharing", {
     method: "PUT",
     body: JSON.stringify({ ...input, confirmAudience: input.confirmAudience ?? false })

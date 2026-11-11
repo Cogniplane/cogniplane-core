@@ -13,6 +13,17 @@ selections. Routes: `routes/projects.ts`, `project-files.ts`,
 - Roles: `owner`, `editor`, `viewer` (`project_memberships`). With `visibility =
   'organization'`, every tenant member also gets `organization_role` (`viewer`
   or `editor`).
+- Sharing: an owner sets `visibility` and `organization_role` with `PUT
+  /projects/:projectId/sharing` (`services/project-member-store.ts`). The body
+  also has `expected`: the saved access that the owner saw. The store locks the
+  project row and compares it with `expected`. When they differ, it writes
+  nothing and returns 409 `project_sharing_conflict`. A change that shares the
+  project or changes `organization_role` while shared also needs
+  `confirmAudience: true` (409 `project_audience_confirmation_required`). The
+  frontend sends the access that its confirmation dialog showed. After a 409 it
+  shows the saved access, and the owner must change the draft again to get a new
+  confirmation (`components/project-sharing.tsx`). Audit event:
+  `project_sharing_changed`.
 - Ownerless project (no owner who is still a tenant member): a tenant owner or
   admin lists them in Admin > Project owners (`GET /admin/projects/ownerless`)
   and makes a current member the owner (`POST

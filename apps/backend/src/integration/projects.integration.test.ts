@@ -658,7 +658,8 @@ describe.skipIf(!adminDatabaseUrl())("project approval settings", () => {
     const members = new ProjectMemberStore(appPool());
     await members.setMember({ tenantId: h.tenantId, userId: h.userId, projectId: h.project.projectId }, viewerId, "viewer");
     await members.setSharing({ tenantId: h.tenantId, userId: h.userId, projectId: h.project.projectId }, {
-      visibility: "organization", organizationRole: "viewer", confirmAudience: true
+      visibility: "organization", organizationRole: "viewer", confirmAudience: true,
+      expected: { visibility: "private", organizationRole: "viewer" }
     });
     h.setAuth({ tenantId: h.tenantId, userId: viewerId, role: "member", isAdmin: false });
     // The viewer can read the project, so the refusal names the missing role.
