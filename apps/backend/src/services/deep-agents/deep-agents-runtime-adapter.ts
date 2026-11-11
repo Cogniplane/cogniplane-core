@@ -110,6 +110,33 @@ function sessionOwnershipMismatch(): Error & { statusCode: number } {
 export const USAGE_FLUSH_DEADLINE_MS = 5_000;
 export const WORKSPACE_RESET_NOTICE_TTL_MS = 24 * 60 * 60 * 1_000;
 
+/** Built-in tools that leave files in the workspace. A tool that only reads leaves nothing to lose. */
+const WORKSPACE_WRITE_TOOLS = new Set(["write_file", "edit_file", "execute"]);
+
+type SavedTurnMessage = Awaited<ReturnType<MessageStore["listBySession"]>>["messages"][number];
+
+/**
+ * The message id of the previous turn when that turn wrote to its workspace,
+ * else null. `earlier` is the saved transcript before the current user message.
+ *
+ * Each turn of a project chat builds a new runtime with a new workspace
+ * (createOrRefreshSession), so the files of the previous turn are gone. The
+ * saved tool results are the evidence. They give the same answer on every
+ * replica and after an idle teardown, which a flag in this process cannot. Only
+ * the previous turn counts: the notice of an older loss is already on the
+ * assistant message of the turn after it.
+ */
+function previousTurnWithWorkspaceWrites(earlier: readonly SavedTurnMessage[]): string | null {
+  for (let index = earlier.length - 1; index >= 0; index--) {
+    const message = earlier[index]!;
+    if (message.role !== "assistant") continue;
+    const wrote = message.toolResults.some((tool) =>
+      tool.kind !== "mcp" && tool.status !== "declined" && WORKSPACE_WRITE_TOOLS.has(tool.toolName ?? ""));
+    return wrote ? message.messageId : null;
+  }
+  return null;
+}
+
 /**
  * Awaits `flush` for at most {@link USAGE_FLUSH_DEADLINE_MS}. The flush itself
  * never rejects (persistTurnUsage swallows its own errors), so the race only
@@ -294,7 +321,11 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
           integrationAccounts: previous.configBundle.sources.integrationAccounts ?? {} };
       }
       if (input.execution.projectId) {
-        // Shared project turns rebuild the graph from the saved transcript.
+        // Shared project turns rebuild the graph from the saved transcript. A
+        // project runtime has no sandbox binding, so disposing it kills its
+        // sandbox, and no member's workspace carries over to the next turn.
+        // The first turn of the new runtime reports the loss
+        // (previousTurnWithWorkspaceWrites).
         if (previous) await this.abortSession({ tenantId: previous.tenantId, sessionId, userId: previous.userId });
         return this.buildSession(input);
       }
@@ -511,6 +542,8 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
       systemPrompt,
       skillsLibraryFiles,
       workspacePath,
+      // A project chat gets a new runtime at each turn (createOrRefreshSession).
+      workspaceLifetime: input.execution?.projectId ? "turn" : "session",
       mcpServers,
       toolContextRef,
       policyContextRef,
@@ -616,6 +649,7 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
       activeTurnPush: { current: null },
       activeTurnResponseId: { current: null },
       pendingTurnEvents: [],
+      turnStarted: false,
       toolContextRef,
       policyContextRef
     };
@@ -774,6 +808,8 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
     // failure, goes through the finally block at the end, and only that block
     // releases the slot.
     this.activeTurns.add(session.sessionId);
+    const firstTurnOfRuntime = !state.turnStarted;
+    state.turnStarted = true;
     try {
       state.lastActiveAt = new Date().toISOString();
       this.clearIdleTimer(state);
@@ -865,6 +901,8 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
       }
 
       let conversationMessages: Array<{ role: "user" | "assistant"; content: string }> = [];
+      // The previous project turn when it wrote files that this turn's new workspace does not have.
+      let lostWorkspaceTurnId: string | null = null;
       if (!turnAbort.signal.aborted && state.execution?.projectId && this.stores.conversationMessages) {
         // Project sessions do not use the LangGraph checkpointer for transcript
         // state. Read the complete durable transcript so a long-lived shared
@@ -880,10 +918,12 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
         // The current user message is already represented by promptText below.
         let lastUser = preceding.length - 1;
         while (lastUser >= 0 && preceding[lastUser]!.role !== "user") lastUser--;
-        conversationMessages = preceding.slice(0, lastUser < 0 ? preceding.length : lastUser)
+        const earlier = preceding.slice(0, lastUser < 0 ? preceding.length : lastUser);
+        conversationMessages = earlier
           .filter((message): message is typeof message & { role: "user" | "assistant" } =>
             (message.role === "user" || message.role === "assistant") && Boolean(message.content))
           .map(({ role, content }) => ({ role, content }));
+        if (firstTurnOfRuntime) lostWorkspaceTurnId = previousTurnWithWorkspaceWrites(earlier);
         if (!await this.stores.executions!.isCurrent(state.execution, state.runtimeId))
           throw new SessionExecutionError("execution_stopped", 403);
       }
@@ -932,6 +972,21 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
             level: "warning",
             title: "Workspace reset",
             message: pendingWorkspaceReset.message,
+            createdAt: new Date().toISOString()
+          })
+        );
+      } else if (lostWorkspaceTurnId) {
+        // One notice for one loss: a pending reset above already tells the user
+        // that the workspace is new. The id follows the lost turn, so the notice
+        // stays distinct in the saved history of the chat.
+        preRunEvents.push(
+          runtimeNoticeEvent({
+            noticeId: `project-workspace-reset:${lostWorkspaceTurnId}`,
+            level: "warning",
+            title: "Workspace reset",
+            message:
+              "Each turn of a project chat starts with a new workspace. Files that the previous " +
+              "turn wrote there are gone. Artifacts and files in the project library are kept.",
             createdAt: new Date().toISOString()
           })
         );

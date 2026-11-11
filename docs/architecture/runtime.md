@@ -43,8 +43,26 @@ variables named here.
 | | Normal chat | Project chat |
 |---|---|---|
 | Graph state | Postgres checkpointer, `thread_id` = session id | In-memory checkpoints for the life of the runtime; each turn rebuilds history from saved user and assistant messages |
-| Sandbox binding | Sandbox id saved; any replica reconnects while it exists; archive, delete and purge kill it ([sandbox](sandbox.md#e2b-sandbox)) | Not saved; a new runtime starts a new sandbox |
+| Runtime | Kept between turns until idle teardown or invalidation | New runtime for each turn, under the identity of the member who sends it |
+| Sandbox binding | Sandbox id saved; any replica reconnects while it exists; archive, delete and purge kill it ([sandbox](sandbox.md#e2b-sandbox)) | Not saved; disposing the runtime kills its sandbox |
+| Workspace files | Kept across turns while the sandbox exists | Kept for one turn only |
 | Personal skills and defaults | Yes | No |
+
+A project chat gives each turn its own runtime, runtime token and sandbox, also
+when the same member sends two turns in a row. So the files of a turn are gone
+at the next turn:
+
+- When command execution is on, the workspace note in the system prompt tells
+  the model (`workspaceLifetime: "turn"`, `deep-agents-graph.ts`).
+- When the saved tool results show that the previous turn ran `write_file`,
+  `edit_file` or `execute`, the first turn of the new runtime shows a
+  `Workspace reset` notice (`previousTurnWithWorkspaceWrites`,
+  `deep-agents-runtime-adapter.ts`). The check reads the saved transcript, so
+  it works on every replica and after an idle teardown. A reset notice that an
+  administrator action queued replaces it.
+- Limits: there is no notice when the previous turn has no saved tool results,
+  wrote files only through a subagent (subagent tool calls are not saved), or
+  failed before its run started.
 
 ## Checkpointer
 
