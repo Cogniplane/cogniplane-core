@@ -21,10 +21,7 @@ import {
 import { attachmentContentDisposition } from "../services/artifacts/artifact-filename.js";
 import { ProjectAccessError } from "../services/project-access.js";
 import type { AppDependencies } from "../app-dependencies.js";
-import {
-  ProjectFileError,
-  ProjectFileStore,
-} from "../services/project-file-store.js";
+import { ProjectFileError } from "../services/project-file-store.js";
 import { parseRequestInput } from "../lib/route-validation.js";
 import { consumeResourceRead } from "../lib/resource-read-limit.js";
 import { apiError } from "../lib/http-errors.js";
@@ -37,14 +34,15 @@ const versionParams = fileParams.extend({ versionId: z.string().uuid() });
 const folderParams = projectParams.extend({ folderId: z.string().uuid() });
 export type ProjectFileRouteStores = Pick<
   AppDependencies,
-  "artifactStorage" | "artifactProcessor" | "limits"
+  "artifactStorage" | "artifactProcessor" | "limits" | "projectFiles"
 >;
 
 export async function registerProjectFileRoutes(
   app: FastifyInstance,
   stores: ProjectFileRouteStores,
 ) {
-  const files = new ProjectFileStore(app.db, app.log);
+  // Use the app's store: it has the PII service and the maintenance pool.
+  const files = stores.projectFiles;
   // Scope the error handler to this plugin; existing project routes keep theirs.
   await app.register(async (routes) => {
     routes.setErrorHandler((error, request, reply) => {

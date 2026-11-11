@@ -13,6 +13,11 @@ import { ProjectFileStore } from "../services/project-file-store.js";
 import { LocalArtifactStorage } from "../services/artifacts/artifact-storage.js";
 import { ArtifactProcessor } from "../services/artifacts/artifact-processor.js";
 import { registerProjectFileRoutes } from "../routes/project-files.js";
+import { piiPolicyReader } from "../services/pii/build-pii-services.js";
+import { PiiProtectionService } from "../services/pii/pii-protection-service.js";
+import { RuleBasedPiiDetector } from "../services/pii/rule-based-pii-detector.js";
+import { TenantOrgSettingsStore } from "../services/tenant-org-settings-store.js";
+import { PII_SAVE_ALLOWED } from "../test-helpers/data-routes.js";
 import { createTestConfig } from "../test-helpers/test-config.js";
 import { Pool, withTenantScope } from "../lib/db.js";
 import {
@@ -23,7 +28,9 @@ import {
   superuserPool,
 } from "./support/database.js";
 import { seedTenant, seedUser, seedMembership } from "./support/fixtures.js";
-import type { ProjectFile } from "@cogniplane/shared-types";
+import { DEFAULT_PII_PROTECTION, type ProjectFile } from "@cogniplane/shared-types";
+
+const SETTINGS_SECRET = "project-files-integration-secret";
 
 async function setup() {
   const tenantId = await seedTenant(),
@@ -38,6 +45,14 @@ async function setup() {
   const storage = new LocalArtifactStorage(root);
   const app = Fastify();
   const files = new ProjectFileStore(appPool(), app.log, maintenancePool());
+  // As in app-dependencies.ts: the PII service reads the stored tenant policy
+  // with the privileged pool. The default policy is off.
+  const settings = new TenantOrgSettingsStore(appPool(), SETTINGS_SECRET);
+  files.setPiiProtection(new PiiProtectionService({
+    policyReader: piiPolicyReader(new TenantOrgSettingsStore(maintenancePool(), SETTINGS_SECRET)),
+    ruleDetector: new RuleBasedPiiDetector(),
+    timeoutMs: 5000,
+  }));
   const config = createTestConfig();
   app.decorate("db", appPool());
   app.decorate("config", config);
@@ -55,6 +70,7 @@ async function setup() {
     artifactStorage: storage,
     artifactProcessor: processor,
     limits: { consumeRateLimit: async () => null } as never,
+    projectFiles: files,
   });
   onTestFinished(async () => {
     await app.close();
@@ -110,6 +126,7 @@ async function setup() {
     sessions,
     artifacts,
     files,
+    settings,
     storage,
     processor,
     app,
@@ -1400,6 +1417,96 @@ describe.skipIf(!adminDatabaseUrl())("versioned project files", () => {
       `${h.url}/files/${promoted.fileId}/versions/${promoted.version.versionId}/content`,
     );
     expect(download.body).toBe("Fourth");
+  });
+
+  test("agent drafts follow the tenant's upload PII policy through the store that the routes use", async () => {
+    const h = await setup();
+    await h.projects.setAgentFileMode(h.actor.tenantId, h.actor.userId, h.actor.projectId, "read-write");
+    const put = vi.spyOn(h.storage, "put");
+    const write = (name: string, text: string) =>
+      h.files.createAgentDraftFromContent({
+        actor: h.actor,
+        name,
+        folderId: null,
+        targetFileId: null,
+        baseVersionId: null,
+        mimeType: "text/plain",
+        content: new TextEncoder().encode(text),
+        storage: h.storage,
+        maxBytes: 10_000,
+        createdByType: "agent",
+      });
+
+    // The default policy is off: the service allows the draft.
+    expect(await write("Off.txt", "Contact jane.doe@example.com")).toMatchObject({ kind: "draft" });
+
+    // Block mode without the uploads scope still allows it.
+    await h.settings.setPiiProtection(h.actor.tenantId, {
+      ...DEFAULT_PII_PROTECTION,
+      enabled: true,
+      mode: "block",
+      scopes: { ...DEFAULT_PII_PROTECTION.scopes, uploads: false },
+    }, PII_SAVE_ALLOWED);
+    expect(await write("Out of scope.txt", "Contact jane.doe@example.com")).toMatchObject({ kind: "draft" });
+
+    await h.settings.setPiiProtection(h.actor.tenantId, {
+      ...DEFAULT_PII_PROTECTION,
+      enabled: true,
+      mode: "block",
+      scopes: { ...DEFAULT_PII_PROTECTION.scopes, uploads: true },
+    }, PII_SAVE_ALLOWED);
+    put.mockClear();
+    await expect(write("Blocked.txt", "Contact jane.doe@example.com"))
+      .rejects.toMatchObject({ code: "pii_block", status: 422 });
+    expect(put).not.toHaveBeenCalled();
+    expect(await write("Clean.txt", "Quarterly totals")).toMatchObject({ kind: "draft" });
+
+    // The library route reads through the same store.
+    const list = vi.spyOn(h.files, "list");
+    const library = await h.app.inject(h.url);
+    expect(library.statusCode).toBe(200);
+    expect(list).toHaveBeenCalledOnce();
+    expect(library.json().files.map((file: ProjectFile) => file.name).sort())
+      .toEqual(["Clean.txt", "Off.txt", "Out of scope.txt"]);
+  });
+
+  test("a store without the PII service refuses an agent draft before storage or a database write", async () => {
+    const h = await setup();
+    await h.projects.setAgentFileMode(h.actor.tenantId, h.actor.userId, h.actor.projectId, "read-write");
+    const put = vi.spyOn(h.storage, "put");
+    // Built as the routes built their own store before: no setPiiProtection call.
+    const unwired = new ProjectFileStore(appPool(), h.app.log);
+
+    await expect(unwired.createAgentDraftFromContent({
+      actor: h.actor,
+      name: "Agent.txt",
+      folderId: null,
+      targetFileId: null,
+      baseVersionId: null,
+      mimeType: "text/plain",
+      content: new TextEncoder().encode("Contact jane.doe@example.com"),
+      storage: h.storage,
+      maxBytes: 10_000,
+      createdByType: "agent",
+    })).rejects.toMatchObject({
+      code: "pii_protection_unavailable",
+      status: 503,
+      message: "Project drafts are unavailable. Contact your administrator.",
+    });
+
+    expect(put).not.toHaveBeenCalled();
+    const [files, events] = await Promise.all([
+      superuserPool().query(
+        "SELECT file_id FROM project_files WHERE tenant_id = $1 AND project_id = $2",
+        [h.actor.tenantId, h.actor.projectId],
+      ),
+      superuserPool().query(
+        "SELECT event_type FROM audit_events WHERE tenant_id = $1 AND event_type LIKE 'project_draft_%'",
+        [h.actor.tenantId],
+      ),
+    ]);
+    expect(files.rows).toEqual([]);
+    expect(events.rows).toEqual([]);
   });
 
   test("agent drafts enforce the MIME allow-list and PII blocking gate", async () => {

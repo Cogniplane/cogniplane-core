@@ -53,6 +53,12 @@ shows provider status, scan metrics, queue state and the breaker timeline (`GET
   type the scan cannot read in any mode, the upload is scanned or rejected at
   once (`runSyncBlock`). In `detect` and `transform` modes a readable file is
   queued (`runAsync`).
+- Agent project drafts (`project_write_file`, `project_reconcile_conflict`):
+  `ProjectFileStore.createAgentDraftFromContent` scans the bytes at once with
+  the uploads scope and mode, before it stores them. A block refuses the draft
+  (422 `pii_block`). A store without the PII service refuses every draft (503
+  `pii_protection_unavailable`). `app-dependencies.ts` gives the service to the
+  app's store; the project file routes and tools use that store.
 - Async path: `pii_scan_runs` and `pii_scan_jobs` scan stored content,
   `PII_SCAN_MAX_CONCURRENT_JOBS` per worker tick. A file larger than
   `PII_ARTIFACT_MAX_BYTES` fails with `file_too_large` and is not retried.
