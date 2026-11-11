@@ -2,7 +2,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { loadConfig } from "../config.js";
-import { createDatabase } from "../lib/db.js";
+import { createMigrationDatabase } from "../lib/db.js";
 
 import { ensureMaintenanceRole, DEFAULT_MAINTENANCE_ROLE } from "./maintenance-role.js";
 import { applyMigrations, ensureAppUserRole, resolveAppUserPassword } from "./migrate-lib.js";
@@ -26,12 +26,10 @@ const migrationsDir = path.resolve(dirname, "../../db/migrations");
 // local superuser DSN rather than failing halfway through the first migration.
 const DEFAULT_LOCAL_SUPERUSER_URL = "postgres://postgres:postgres@localhost:5432/cogniplane";
 const config = loadConfig(process.env, undefined, { skipRuntimeChecks: true });
-const migrationConfig = {
-  ...config,
-  DATABASE_URL:
-    process.env.MIGRATION_DATABASE_URL ?? process.env.DATABASE_URL ?? DEFAULT_LOCAL_SUPERUSER_URL
-};
-const db = createDatabase(migrationConfig);
+const migrationDatabaseUrl =
+  process.env.MIGRATION_DATABASE_URL ?? process.env.DATABASE_URL ?? DEFAULT_LOCAL_SUPERUSER_URL;
+// Not a serving pool: no 30-second statement timeout (see createMigrationDatabase).
+const db = createMigrationDatabase(migrationDatabaseUrl);
 
 function extractPassword(databaseUrl: string): string | null {
   try {
@@ -55,7 +53,7 @@ async function run() {
   const appUserPassword = resolveAppUserPassword(process.env);
   await applyMigrations(db, migrationsDir, console.log, async (client) => {
     // Checkpointer DDL and role setup share the numbered migrations' lock.
-    await setupDeepAgentsCheckpointer(migrationConfig.DATABASE_URL);
+    await setupDeepAgentsCheckpointer(migrationDatabaseUrl);
     console.log(`Ensured Deep Agents checkpointer schema "${DEEP_AGENTS_CHECKPOINT_SCHEMA}" is up to date.`);
 
     await ensureMaintenanceRole(client, maintenancePassword);

@@ -149,7 +149,7 @@ function store(schedulerDb: pg.Pool = maintenancePool()): UserSettingsStore {
 async function claimTick(settings: UserSettingsStore, slots = 1): Promise<ScheduledJobRecord[]> {
   const claimed: ScheduledJobRecord[] = [];
   for (const job of await settings.listDueJobs(slots)) {
-    const won = await settings.claimJob(job.tenantId, job.jobId, nextHour());
+    const won = await settings.claimJob(job.tenantId, job.jobId, nextHour(), randomUUID());
     if (won) claimed.push(won);
   }
   return claimed;
@@ -216,7 +216,8 @@ function worker(options: { maxConcurrentJobs: number; schedulerDb?: pg.Pool; hol
     settings: {
       listDueJobs: settings.listDueJobs.bind(settings),
       claimJob: settings.claimJob.bind(settings),
-      createJobRun: settings.createJobRun.bind(settings),
+      parkJob: settings.parkJob.bind(settings),
+      attachJobRunSession: settings.attachJobRunSession.bind(settings),
       completeJobRun: settings.completeJobRun.bind(settings),
       recordJobRunOutcome: settings.recordJobRunOutcome.bind(settings),
       // The suite database holds pending runs of other test files.
@@ -354,8 +355,8 @@ describe.skipIf(!adminDatabaseUrl())("scheduler fairness across tenants and memb
 
       const nextRunAt = nextHour();
       const claims = await Promise.all([
-        replicaA.claimJob(quietTenant, quietJob, nextRunAt),
-        replicaB.claimJob(quietTenant, quietJob, nextRunAt)
+        replicaA.claimJob(quietTenant, quietJob, nextRunAt, randomUUID()),
+        replicaB.claimJob(quietTenant, quietJob, nextRunAt, randomUUID())
       ]);
       expect(claims.filter((claim) => claim !== null).map((claim) => claim?.jobId)).toEqual([quietJob]);
 

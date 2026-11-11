@@ -6,6 +6,7 @@ import { createDeepAgentsCheckpointer } from "../services/deep-agents/deep-agent
 import {
   createDatabase,
   createMaintenanceDatabase,
+  createMigrationDatabase,
   createPrivilegedDatabase,
   operationalPoolOptions,
   type PoolErrorLogger,
@@ -326,6 +327,43 @@ function recordingPoolLogger(): { logger: PoolErrorLogger; logged: Array<{ meta:
   const logged: Array<{ meta: object; msg: string }> = [];
   return { logger: { error: (meta, msg) => { logged.push({ meta, msg }); } }, logged };
 }
+
+// The migration command is not a serving pool. A 30-second statement cap would
+// stop a long schema validation or backfill, and the next run would fail in
+// the same way. applyMigrations sets the session limits of the migration
+// itself: no statement timeout, and a 10-second lock timeout.
+const MIGRATION_URL = "postgres://postgres:migrate-secret@db.test:5432/cogniplane";
+
+test("the migration pool has its own identity, one connection and no statement timeout", async () => {
+  const pool = createMigrationDatabase(MIGRATION_URL);
+  try {
+    expect(pool.options).toMatchObject({
+      connectionString: MIGRATION_URL,
+      application_name: "cogniplane-migrate",
+      max: 1,
+      connectionTimeoutMillis: 10_000,
+      idle_in_transaction_session_timeout: 60_000
+    });
+    expect(pool.options.statement_timeout).toBeUndefined();
+  } finally {
+    await pool.end();
+  }
+});
+
+test("the migration pool logs an idle connection error and does not throw", async () => {
+  const { logger, logged } = recordingPoolLogger();
+  const pool = createMigrationDatabase(MIGRATION_URL, logger);
+  try {
+    expect(() => emitIdleConnectionError(pool, MIGRATION_URL, "57P01")).not.toThrow();
+    expect(logged).toEqual([{
+      msg: "idle database connection failed",
+      meta: { pool: "cogniplane-migrate", code: "57P01", err: TERMINATED }
+    }]);
+    expect(JSON.stringify(logged)).not.toContain("migrate-secret");
+  } finally {
+    await pool.end();
+  }
+});
 
 test.each(SERVING_POOLS)("the $name pool logs an idle connection error and does not throw", async (serving) => {
   const { logger, logged } = recordingPoolLogger();

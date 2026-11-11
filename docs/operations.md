@@ -29,6 +29,39 @@ are not tested against a newer schema. If the new backends fail `/ready`, fix
 forward, or stop the backends, restore the backup from step 1 and redeploy the
 previous images.
 
+### Migration limits
+
+The migration job runs the migrations, the role setup and the grants on one
+connection, with `application_name` `cogniplane-migrate`. `applyMigrations`
+(`apps/backend/src/scripts/migrate-lib.ts`) sets two limits on that connection:
+
+- No statement timeout. A constraint validation or a backfill on a large table
+  can run for many minutes. The 30-second statement timeout of the backend
+  pools (`lib/db.ts`) does not apply. The runner also clears a
+  `statement_timeout` that the server, the database or the role sets. A
+  migration file can set its own limit with `SET LOCAL statement_timeout`.
+- A lock wait stops after 10 seconds (`lock_timeout`). This applies to the
+  migration lock (another migration job) and to each table lock that a
+  migration waits for. The migration then rolls back and the job fails.
+  Migrations that committed before it stay applied, and the next run starts
+  at the failed file. Run the job again when the sessions that held the lock
+  have ended.
+
+A long migration keeps its table locks until it commits. Backend queries that
+conflict with those locks wait, and fail after their 30-second statement
+timeout. Run a long migration when traffic is low.
+
+To stop a running migration, cancel it on the server. The migration rolls back:
+
+```sql
+SELECT pg_cancel_backend(pid) FROM pg_stat_activity
+WHERE application_name = 'cogniplane-migrate';
+```
+
+If you stop only the job process, PostgreSQL can continue the statement until
+it ends. The Deep Agents checkpoint setup (`setupDeepAgentsCheckpointer`) uses
+a second, short-lived connection with the server's default limits.
+
 ## Scale out
 
 Run several backends behind a load balancer, with Redis and shared file storage
@@ -48,8 +81,8 @@ request:
   `privilegedDb`: `POOL_MAX` each in `lib/db.ts`; checkpointer:
   `CHECKPOINTER_POOL_MAX` in
   `services/deep-agents/deep-agents-checkpointer.ts`). Size PostgreSQL
-  `max_connections` for their sum per replica plus the migration job and
-  operator tools.
+  `max_connections` for their sum per replica plus the migration job (two
+  connections) and operator tools.
 
 ## Rotate secrets
 
@@ -140,10 +173,18 @@ retention policy.
 `tenant:delete` (`services/tenant-deletion-service.ts`) first deletes the
 tenant's rows and writes a receipt (`tenant_deletion_receipts`) in one
 transaction, then removes storage objects and checkpoint threads, which are
-queued in `tenant_deletion_cleanup`. It flushes the whole Redis database of
-`REDIS_URL`, so it signs out every user of the environment. It kills no E2B
+queued in `tenant_deletion_cleanup`. It does not change Redis unless you add
+`--flush-redis` ([Redis](#redis-and-tenant-deletion)). It kills no E2B
 sandbox: a sandbox of the tenant runs until E2B expires it
 (`E2B_SANDBOX_TIMEOUT_MS` after its last turn start).
+
+User rows: the transaction finds each user that a row of the tenant names,
+also a former member with no membership left, and locks these `users` rows.
+After the tenant's rows are deleted, it deletes each of these users that no
+other row names (`row_counts.orphaned_users`). A user that a row of another
+tenant still names keeps the `users` row, for example a member removed from
+that tenant whose sessions or audit events stay there. User ids in JSON
+payloads (for example `audit_events.payload`) are not checked.
 
 ```bash
 MIGRATION_DATABASE_URL=... pnpm --filter @cogniplane/backend tenant:delete \
@@ -161,7 +202,54 @@ queue is empty: the tenant's rows, storage objects and checkpoint threads are
 deleted. Older versions in a versioned bucket stay until its lifecycle rule
 removes them. Any other status exits 1 and means some objects or threads are
 still queued: run the command again with the same `--request-id`. A new request
-id fails after the rows are gone, because the tenant no longer exists.
+id fails after the rows are gone, because the tenant no longer exists. A run
+for a completed request does nothing and prints the same receipt.
+
+### Redis and tenant deletion
+
+Without `--flush-redis`, the command does not connect to Redis. The command
+cannot remove only the deleted tenant's Redis keys: most keys do not name a
+tenant (for example `refresh_family:<id>`). The tenant's keys (refresh-token
+families, sign-in flows, rate-limit and quota counters) stay until they
+expire. They give no access: token refresh and each request check the
+membership in PostgreSQL (`checkAuthAdmission`, `lib/auth-admission.ts`), and
+the membership is deleted. The receipt's `redisDisposition` starts with
+`Redis not flushed`.
+
+`--flush-redis` adds `FLUSHDB` on the database number that `REDIS_URL` selects
+(`/2` in `redis://host:6379/2`; no number means `0`). It removes every key in
+that database, for all tenants:
+
+- Every user of every tenant is signed out.
+- All rate-limit and daily turn quota counters start again from zero.
+- Sign-in flows, step-up tokens and token-reuse detections that are not yet in
+  the audit log are lost ([what Redis holds](architecture/data.md#redis)).
+- Another service that uses the same database number loses its data.
+
+Other database numbers on the same server do not change. Use the flag only
+when the environment has its own Redis database and you accept these effects.
+Without `REDIS_URL`, the command refuses `--flush-redis` before it deletes
+anything.
+
+Only the run that deletes the rows can request a flush. The receipt tells what
+happened:
+
+| `redisDisposition` starts with | Meaning |
+|---|---|
+| `REDIS_URL was not configured` | No Redis; nothing to flush. |
+| `Redis not flushed: --flush-redis was not given` | Redis did not change. |
+| `Redis flush requested` | The flush is queued and did not run yet. |
+| `Redis database flushed` | The flush ran. |
+| `Redis flush failed` | The flush is still queued. |
+| `Redis not flushed: a flush is queued` | A run without `--flush-redis` found a queued flush and did not run it. |
+
+To finish a queued flush, run the command again with the same `--request-id`
+and `--flush-redis`. A run without the flag never flushes: it keeps the flush
+queued and exits 1. This is also true for a request from a version before
+`--flush-redis`. Such a version queued a flush whenever `REDIS_URL` was set,
+and wrote `Dedicated environment Redis database flushed` before the flush ran.
+A replay with `--flush-redis` for a request that has no queued flush does not
+flush; it prints a note to stderr.
 
 ## Monitor
 

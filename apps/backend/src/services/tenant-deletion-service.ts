@@ -7,9 +7,32 @@ import type { SkillBundleStorage } from "./skills/skill-bundle-storage.js";
 
 type CleanupKind = "artifact" | "skill_bundle" | "runtime_thread" | "redis_database";
 
+/**
+ * Texts for the receipt's `redisDisposition`. The command writes the first
+ * text when it deletes the rows. Cleanup replaces it when it runs a queued
+ * flush, so the receipt tells what happened, not what was requested. Receipts
+ * from older versions can hold "Dedicated environment Redis database flushed;
+ * ...", written before the flush ran.
+ */
+export const REDIS_DISPOSITION = {
+  notConfigured: "REDIS_URL was not configured; Redis was not contacted.",
+  notRequested:
+    "Redis not flushed: --flush-redis was not given. Sessions and counters of other tenants are unchanged. " +
+    "Keys of the deleted tenant stay in Redis until they expire.",
+  flushQueued: "Redis flush requested with --flush-redis; it has not run yet.",
+  flushed:
+    "Redis database flushed (--flush-redis): all keys in the database that REDIS_URL selects were removed, " +
+    "for all tenants. All users were signed out and all rate-limit and quota counters were reset.",
+  flushFailed: "Redis flush failed and stays queued. Run the command again with --flush-redis.",
+  flushNotAllowed:
+    "Redis not flushed: a flush is queued for this request, but this run did not have --flush-redis. " +
+    "Run the command again with --flush-redis to flush the whole Redis database."
+} as const;
+
 export type TenantDeletionInput = {
   requestId: string;
   tenantId: string;
+  /** Recorded when this request deletes the rows; a replay keeps the stored text. */
   redisDisposition: string;
   thirdPartyDisposition: string;
   backupDisposition: string;
@@ -39,10 +62,67 @@ type TenantDeletionDependencies = {
   artifactStorage: Pick<ArtifactStorage, "delete">;
   skillBundleStorage: Pick<SkillBundleStorage, "deleteBundle">;
   purgeRuntimeThread(threadId: string): Promise<void>;
+  /**
+   * Flushes the whole Redis database, for every tenant. Give it only when the
+   * operator asked for that (--flush-redis). A new deletion then queues a
+   * flush, and a replay runs a flush that an earlier run queued. Without it,
+   * the service never queues or runs a flush; a queued flush stays queued.
+   */
   flushRedis?: () => Promise<void>;
 };
 
 type CleanupRow = { kind: CleanupKind; locator: string };
+
+/**
+ * Columns that store a `users.user_id` without a foreign key to `users`. The
+ * deletion reads the foreign-key columns from the catalog. The integration
+ * test "names every column that can hold a user id" keeps this list complete.
+ */
+export const USER_ID_COLUMNS_WITHOUT_FOREIGN_KEY: readonly (readonly [table: string, column: string])[] = [
+  ["admin_mcp_app_csp_approvals", "approved_by"],
+  ["admin_mcp_connection_tests", "scope_user_id"],
+  ["admin_mcp_servers", "created_by"],
+  ["admin_skill_revisions", "created_by"],
+  ["admin_skill_revisions", "reviewed_by"],
+  ["admin_skills", "created_by"],
+  ["agent_memories", "approved_by_user_id"],
+  ["agent_memories", "user_id"],
+  ["artifact_download_tokens", "issued_by_user_id"],
+  ["auth_action_tokens", "created_by"],
+  ["auth_action_tokens", "user_id"],
+  ["email_outbox", "user_id"],
+  ["local_passwords", "user_id"],
+  ["member_mcp_credentials", "user_id"],
+  ["model_spending_reservations", "user_id"],
+  ["organization_skill_author_updates", "recipient_user_id"],
+  ["organization_skill_submission_attempts", "decided_by"],
+  ["organization_skill_submissions", "author_user_id"],
+  ["personal_capability_defaults", "user_id"],
+  ["personal_skill_revisions", "user_id"],
+  ["personal_skills", "user_id"],
+  ["pii_scan_jobs", "source_user_id"],
+  ["pii_scan_runs", "source_user_id"],
+  ["policy_decision", "user_id"],
+  ["policy_rule", "created_by"],
+  ["project_skill_revisions", "created_by"],
+  ["project_skills", "created_by"],
+  ["project_skills", "source_user_id"],
+  ["scheduled_job_runs", "user_id"],
+  ["session_runtime_gc", "user_id"],
+  ["tenant_custom_models", "created_by"],
+  ["user_jira_cleanups", "user_id"],
+  ["user_jira_identities", "user_id"],
+  ["user_passkeys", "user_id"],
+  ["user_recovery_codes", "user_id"],
+  ["user_totp_factors", "user_id"]
+];
+
+/** A column that can store a user id; both names are quoted SQL identifiers. */
+type UserReference = { table: string; column: string; tenantScoped: boolean };
+
+function quoteIdentifier(name: string): string {
+  return `"${name.replaceAll('"', '""')}"`;
+}
 
 function tenantHash(tenantId: string): string {
   return createHash("sha256").update(tenantId).digest("hex");
@@ -96,14 +176,86 @@ async function countTenantRows(client: PoolClient, tenantId: string): Promise<Re
   const counts: Record<string, number> = {};
   for (const { table_name: tableName } of tables.rows) {
     // The identifier comes from PostgreSQL's catalog, not operator input.
-    const quotedTable = `"${tableName.replaceAll('"', '""')}"`;
     const result = await client.query<{ count: string }>(
-      `SELECT COUNT(*)::text AS count FROM public.${quotedTable} WHERE tenant_id = $1`,
+      `SELECT COUNT(*)::text AS count FROM public.${quoteIdentifier(tableName)} WHERE tenant_id = $1`,
       [tenantId]
     );
     counts[tableName] = Number(result.rows[0]?.count ?? 0);
   }
   return counts;
+}
+
+// Every column that can store a user id: each foreign key to users from the
+// catalog, also from a table with no tenant_id, and the listed columns without
+// one. A foreign key to users that does not use user_id stops the deletion,
+// because the checks below cannot test it.
+async function loadUserReferences(client: PoolClient): Promise<UserReference[]> {
+  const foreignKeys = await client.query<{
+    constraint_name: string;
+    schema_name: string;
+    table_name: string;
+    column_name: string | null;
+    tenant_scoped: boolean;
+  }>(
+    `
+      SELECT con.conname AS constraint_name, n.nspname AS schema_name, c.relname AS table_name,
+             (SELECT a.attname
+                FROM unnest(con.conkey, con.confkey) AS k(attnum, ref_attnum)
+                JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = k.attnum
+                JOIN pg_attribute r ON r.attrelid = con.confrelid AND r.attnum = k.ref_attnum
+               WHERE r.attname = 'user_id') AS column_name,
+             EXISTS (
+               SELECT 1 FROM pg_attribute t
+               WHERE t.attrelid = c.oid AND t.attname = 'tenant_id' AND NOT t.attisdropped
+             ) AS tenant_scoped
+      FROM pg_constraint con
+      JOIN pg_class c ON c.oid = con.conrelid
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE con.contype = 'f' AND con.confrelid = 'public.users'::regclass
+      ORDER BY n.nspname, c.relname, con.conname
+    `
+  );
+  const references = new Map<string, UserReference>();
+  const add = (reference: UserReference) => references.set(`${reference.table}.${reference.column}`, reference);
+  for (const row of foreignKeys.rows) {
+    if (!row.column_name) {
+      throw new Error(`Foreign key ${row.constraint_name} references users without user_id; tenant deletion cannot check it.`);
+    }
+    // The identifiers come from PostgreSQL's catalog, not operator input.
+    add({
+      table: `${quoteIdentifier(row.schema_name)}.${quoteIdentifier(row.table_name)}`,
+      column: quoteIdentifier(row.column_name),
+      tenantScoped: row.tenant_scoped
+    });
+  }
+  for (const [table, column] of USER_ID_COLUMNS_WITHOUT_FOREIGN_KEY) {
+    add({ table: `public.${quoteIdentifier(table)}`, column: quoteIdentifier(column), tenantScoped: true });
+  }
+  return [...references.values()];
+}
+
+// The users that a row of the tenant names ($1): members, also former members
+// that have no membership or local identity left.
+function tenantUserIdsQuery(references: UserReference[]): string {
+  return references
+    .filter((reference) => reference.tenantScoped)
+    .map(({ table, column }) => `SELECT ${column} FROM ${table} WHERE tenant_id = $1`)
+    .join("\n UNION ");
+}
+
+// Deletes the users in $1 that no row names. Run it after the tenant delete:
+// its cascade removed the tenant's rows, so each row that still names a user
+// is in another tenant or a table without a tenant. A user delete then causes
+// no foreign-key action on any row.
+function deleteUnreferencedUsersQuery(references: UserReference[]): string {
+  const remaining = references
+    .map(({ table, column }) => `SELECT ${column} AS user_id FROM ${table} WHERE ${column} = ANY($1::text[])`)
+    .join("\n UNION ALL ");
+  return `
+    DELETE FROM users u
+    WHERE u.user_id = ANY($1::text[])
+      AND NOT EXISTS (SELECT 1 FROM (${remaining}) remaining WHERE remaining.user_id = u.user_id)
+  `;
 }
 
 async function enqueueCleanup(client: PoolClient, requestId: string, tenantId: string, includeRedis: boolean) {
@@ -183,12 +335,19 @@ export class TenantDeletionService {
       }
 
       const rowCounts = await countTenantRows(client, input.tenantId);
-      // Local accounts removed earlier have no membership left, but their
-      // user rows belong to this tenant too (local_identities).
+      const userReferences = await loadUserReferences(client);
+      // Member removal deletes only the membership, so a former member is
+      // found through the tenant's other rows. Lock the users rows before the
+      // delete checks them: a foreign-key write elsewhere holds FOR KEY SHARE
+      // on its users row, so this waits for it, and a later write waits for
+      // this transaction. Sorted, so two deletions lock in the same order.
       const userIds = await client.query<{ user_id: string }>(
-        `SELECT user_id FROM tenant_memberships WHERE tenant_id = $1
-         UNION
-         SELECT user_id FROM local_identities WHERE tenant_id = $1`,
+        `
+          SELECT user_id FROM users
+          WHERE user_id IN (${tenantUserIdsQuery(userReferences)})
+          ORDER BY user_id
+          FOR UPDATE
+        `,
         [input.tenantId]
       );
 
@@ -236,13 +395,7 @@ export class TenantDeletionService {
 
       await client.query(`DELETE FROM tenants WHERE tenant_id = $1`, [input.tenantId]);
       const orphanedUsers = await client.query(
-        `
-          DELETE FROM users u
-          WHERE u.user_id = ANY($1::text[])
-            AND NOT EXISTS (
-              SELECT 1 FROM tenant_memberships tm WHERE tm.user_id = u.user_id
-            )
-        `,
+        deleteUnreferencedUsersQuery(userReferences),
         [userIds.rows.map((row) => row.user_id)]
       );
       rowCounts.orphaned_users = orphanedUsers.rowCount ?? 0;
@@ -270,10 +423,14 @@ export class TenantDeletionService {
       [requestId]
     );
     const failures: string[] = [];
+    // Set when a queued Redis flush did not run or failed in this run.
+    let redisDisposition: string | null = null;
 
     for (const item of pending.rows) {
       try {
         const outcome = await this.cleanupItem(item);
+        // Queue removal and its receipt update share one statement. Redis
+        // itself is outside this transaction; a failed update leaves a retry.
         await this.deps.db.query(
           `
             WITH removed AS (
@@ -288,16 +445,23 @@ export class TenantDeletionService {
                   (SELECT COUNT(*) FROM removed WHERE kind IN ('artifact', 'skill_bundle') AND $4 = 'retained_shared'),
                 purged_runtime_thread_count = purged_runtime_thread_count +
                   (SELECT COUNT(*) FROM removed WHERE kind = 'runtime_thread'),
+                redis_disposition = CASE
+                  WHEN EXISTS (SELECT 1 FROM removed WHERE kind = 'redis_database') THEN $5
+                  ELSE redis_disposition
+                END,
                 last_error = NULL
             WHERE request_id = $1
           `,
-          [requestId, item.kind, item.locator, outcome]
+          [requestId, item.kind, item.locator, outcome, REDIS_DISPOSITION.flushed]
         );
       } catch (error) {
         // The queue already retains the locator needed for retry. Keep it out
         // of the durable receipt because object keys can contain tenant data.
         const message = `${item.kind}: ${errorMessage(error)}`;
         failures.push(message);
+        if (item.kind === "redis_database") {
+          redisDisposition = this.deps.flushRedis ? REDIS_DISPOSITION.flushFailed : REDIS_DISPOSITION.flushNotAllowed;
+        }
         await this.deps.db.query(
           `
             UPDATE tenant_deletion_cleanup
@@ -314,18 +478,22 @@ export class TenantDeletionService {
       [requestId]
     );
     const remainingCount = Number(remaining.rows[0]?.count ?? 0);
+    // A replay of a completed request keeps its completion time: the replay
+    // did no work, so the receipt must not change.
     await this.deps.db.query(
       `
         UPDATE tenant_deletion_receipts
         SET status = $2,
-            completed_at = CASE WHEN $2 = 'completed' THEN NOW() ELSE NULL END,
-            last_error = $3
+            completed_at = CASE WHEN $2 = 'completed' THEN COALESCE(completed_at, NOW()) ELSE NULL END,
+            last_error = $3,
+            redis_disposition = COALESCE($4::text, redis_disposition)
         WHERE request_id = $1
       `,
       [
         requestId,
         remainingCount === 0 ? "completed" : "cleanup_failed",
-        failures.length > 0 ? failures.join("\n") : null
+        failures.length > 0 ? failures.join("\n") : null,
+        redisDisposition
       ]
     );
   }
@@ -359,8 +527,12 @@ export class TenantDeletionService {
       await this.deps.purgeRuntimeThread(item.locator);
       return "purged";
     }
+    // Only an explicit --flush-redis allows a flush, also for a flush that an
+    // older version queued without asking.
     if (!this.deps.flushRedis) {
-      throw new Error("Redis cleanup was queued but no Redis client was configured.");
+      throw new Error(
+        "A Redis flush is queued for this request. Run the command again with --flush-redis to flush the whole Redis database."
+      );
     }
     await this.deps.flushRedis();
     return "purged";

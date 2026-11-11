@@ -1,9 +1,9 @@
 # Data and tenancy
 
 Scope: tenant isolation, database pools, tenant settings, user settings,
-retention and deletion, persistence, audit, usage, rate limits. Projects and
-artifacts are in [projects and files](projects-and-files.md). PII is in [PII
-protection](pii.md).
+retention and deletion, foreign-key indexes, persistence, audit, usage, rate
+limits. Projects and artifacts are in [projects and
+files](projects-and-files.md). PII is in [PII protection](pii.md).
 The SQL in `apps/backend/db/migrations/` is authoritative for the schema.
 
 ## Tenant isolation
@@ -44,6 +44,11 @@ The SQL in `apps/backend/db/migrations/` is authoritative for the schema.
    lacks either.
 5. If the table holds storage keys, add them to the cleanup list in
    `services/tenant-deletion-service.ts`.
+6. If a column stores a user id without a foreign key to `users`, add it to
+   `USER_ID_COLUMNS_WITHOUT_FOREIGN_KEY` in the same file. Tenant deletion
+   reads foreign keys to `users` from the catalog. A `user_id`, `*_user_id` or
+   `*_by` column that is in neither fails
+   `tenant-deletion.integration.test.ts`.
 
 ## Database pools
 
@@ -52,6 +57,9 @@ The SQL in `apps/backend/db/migrations/` is authoritative for the schema.
   authorize: sign-in lookups before the tenant is known, worker claims,
   recovery, download tokens, retention. Rules: [tenant data
   invariant](../security.md#tenant-data).
+- The migration command has its own pool (`createMigrationDatabase` in
+  `lib/db.ts`): one connection, no 30-second statement timeout ([migration
+  limits](../operations.md#migration-limits)).
 - Roles, grants and startup checks: [database roles](../database-roles.md).
 
 ## Tenant settings
@@ -143,6 +151,54 @@ Fields that agents change most often (the full list is `TenantSettingsSchema` in
 - Spending records stay when sessions or messages are deleted.
 - Tenant deletion is an operator command. See
   [operations](../operations.md#delete-a-tenant).
+- Session purge and tenant deletion need the [foreign-key
+  indexes](#foreign-key-indexes).
+
+## Foreign-key indexes
+
+PostgreSQL runs one action query for each parent row that a DELETE removes. The
+query deletes (CASCADE) or sets to NULL (SET NULL) the child rows whose
+foreign-key column equals the parent key. Without an index that starts with
+that column, each query reads the whole child table. An index that starts with
+`tenant_id` does not prevent this: PostgreSQL 17 reads the full index or the
+table, and PostgreSQL 18 reads the index once for each tenant (skip scan).
+
+- `apps/backend/db/migrations/089_foreign_key_action_indexes.sql` adds these
+  indexes. Session purge (`SessionStore.cleanupExpired`) and tenant deletion
+  fire their actions.
+
+  | Parent row deleted | Action | Indexed child columns |
+  |---|---|---|
+  | `messages` | SET NULL | `message_id` of `tool_events`, `tool_execution_contexts`, `resource_activations` |
+  | `runtime_sessions` | CASCADE | `runtime_id` of `approvals`, `tool_events`, `tool_execution_contexts` |
+  | `approvals` | SET NULL | `approval_id` of `tool_events`, `audit_events` |
+  | `artifacts` | CASCADE | `artifact_id` of `artifact_download_tokens` |
+  | `pii_scan_runs` | CASCADE | `scan_run_id` of `pii_scan_jobs` |
+
+- A nullable column has a partial index (`WHERE <column> IS NOT NULL`). The
+  action query compares with a strict operator, so the planner can use it.
+  `integration/foreign-key-indexes.integration.test.ts` checks the actions and
+  indexes.
+- A new foreign key with ON DELETE CASCADE or SET NULL needs an index that
+  starts with its columns, unless no code deletes the parent rows.
+
+Deployment of 089:
+
+- CREATE INDEX blocks INSERT, UPDATE and DELETE on its table until the migration
+  commits; reads continue. The migration is one transaction, so a table stays
+  blocked while the later indexes build. Turns, approvals and local sign-ins
+  write these tables, so they wait. The duration grows with `tool_events` and
+  `audit_events`, which have no size limit.
+- The file raises the statement timeout to 15 minutes for its own transaction.
+  The runner's 10-second lock timeout still applies: under write load the
+  migration can stop on a lock. It then changes nothing; run it again.
+- On a large database, build the indexes before the migration job, without the
+  write block. Run each CREATE INDEX statement of the file alone (not in a
+  transaction), as the migration role, with `CONCURRENTLY` after `INDEX`. The
+  migration keeps a valid index of the same name and definition. A failed
+  concurrent build leaves an invalid index: drop it with `DROP INDEX
+  CONCURRENTLY` and build it again. The migration stops on an invalid index or
+  one with another definition.
 
 ## Persistence
 
@@ -189,8 +245,9 @@ Fields that agents change most often (the full list is `TenantSettingsSchema` in
 
 With `REDIS_URL`, replicas share this short-lived state; without it, each
 process keeps it in memory. Redis holds no durable business data: losing or
-flushing it costs only the effects below. Give each environment its own Redis
-database ([tenant deletion flushes it](../operations.md#delete-a-tenant)).
+flushing it costs only the effects below, for all tenants. Give each
+environment its own Redis database: `tenant:delete --flush-redis` flushes it
+([tenant deletion](../operations.md#redis-and-tenant-deletion)).
 
 | State | Code | Loss or flush |
 |---|---|---|

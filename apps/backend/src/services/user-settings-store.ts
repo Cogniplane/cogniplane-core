@@ -71,9 +71,9 @@ export type ScheduledJobPausedReason = "security_change";
  * A job as the scheduler claimed it. `ownerSecurityVersion` is the security
  * version of the owner's local account from the session that last saved the
  * job; null for a WorkOS owner. It stays out of `ScheduledJobRecord`, so API
- * responses do not carry it.
+ * responses do not carry it. `runId` is the pending run that the claim wrote.
  */
-export type ClaimedScheduledJob = ScheduledJobRecord & { ownerSecurityVersion: number | null };
+export type ClaimedScheduledJob = ScheduledJobRecord & { ownerSecurityVersion: number | null; runId: string };
 
 /** What a create or edit stores about the session that saved the job. */
 export type ScheduledJobOwnerSession = {
@@ -139,12 +139,13 @@ function mapScheduledJob(row: Record<string, unknown>): ScheduledJobRecord {
   };
 }
 
-function mapClaimedScheduledJob(row: Record<string, unknown>): ClaimedScheduledJob {
+function mapClaimedScheduledJob(row: Record<string, unknown>, runId: string): ClaimedScheduledJob {
   return {
     ...mapScheduledJob(row),
     ownerSecurityVersion: row.owner_security_version === null || row.owner_security_version === undefined
       ? null
-      : Number(row.owner_security_version)
+      : Number(row.owner_security_version),
+    runId
   };
 }
 
@@ -557,11 +558,16 @@ export class UserSettingsStore {
   }
 
   /**
-   * Claim a due job for execution. Runs on the RLS-bypassing scheduler pool
-   * (the worker has no per-request tenant scope), so the `tenant_id` predicate
-   * is the *only* thing isolating one tenant's jobs from another — it must
-   * always be present and must come from the job row the worker already read,
-   * never from caller-supplied input.
+   * Claim a due job for execution and write its pending run (`runId`, no
+   * session yet) in the same transaction. A crash after the claim therefore
+   * leaves a run that `sweepStaleJobRuns` recovers, and a failed insert
+   * leaves the job due for the next tick. Under concurrent claims, the loser
+   * waits on the job row lock, then matches no row and writes no run.
+   *
+   * Runs as `app_user` in the tenant's scope: `maintenance_user` has no
+   * INSERT on `scheduled_job_runs`. RLS and the `tenant_id` predicate both
+   * bound the claim. The tenant comes from the job row that `listDueJobs`
+   * read, never from caller-supplied input.
    *
    * A job whose owner had a security change since the job was saved is not
    * claimed. The worker then pauses it with `pauseJobForSecurityChange`.
@@ -573,36 +579,70 @@ export class UserSettingsStore {
   async claimJob(
     tenantId: string,
     jobId: string,
-    nextRunAt: string | null
+    nextRunAt: string | null,
+    runId: string
   ): Promise<ClaimedScheduledJob | null> {
-    const result = await this.schedulerDb.query(
+    return withTenantScope(this.db, tenantId, async (client) => {
+      const claimed = await client.query(
+        `
+          UPDATE scheduled_jobs
+          SET
+            last_run_at = NOW(),
+            next_run_at = $3,
+            updated_at = NOW()
+          WHERE tenant_id = $1
+            AND job_id = $2
+            AND enabled = TRUE
+            AND next_run_at IS NOT NULL
+            AND next_run_at <= NOW()
+            -- Also checked here, not just in listDueJobs: that query is a
+            -- pre-filter run once per tick, while this UPDATE is the atomic gate.
+            -- A tick that listed a job just before its owner was removed would
+            -- otherwise still claim and execute it.
+            AND EXISTS (
+              SELECT 1 FROM tenant_memberships m
+              WHERE m.tenant_id = scheduled_jobs.tenant_id
+                AND m.user_id = scheduled_jobs.user_id
+            )
+            AND ${OWNER_SECURITY_CURRENT_SQL}
+          RETURNING *
+        `,
+        [tenantId, jobId, nextRunAt]
+      );
+      const row = claimed.rows[0];
+      if (!row) return null;
+
+      await client.query(
+        `
+          INSERT INTO scheduled_job_runs (tenant_id, run_id, job_id, user_id, session_id, status, started_at)
+          VALUES ($1, $2, $3, $4, NULL, 'pending', NOW())
+        `,
+        [row.tenant_id, runId, row.job_id, row.user_id]
+      );
+
+      return mapClaimedScheduledJob(row, runId);
+    });
+  }
+
+  /**
+   * Take a due job out of the due query without a run: next_run_at = NULL.
+   * The fallback for a job whose cron cannot be parsed when it cannot be
+   * disabled. Runs on the RLS-bypassing scheduler pool, so the `tenant_id`
+   * predicate is the sole isolation guarantee and must always be present.
+   */
+  async parkJob(tenantId: string, jobId: string): Promise<void> {
+    await this.schedulerDb.query(
       `
         UPDATE scheduled_jobs
-        SET
-          last_run_at = NOW(),
-          next_run_at = $3,
-          updated_at = NOW()
+        SET next_run_at = NULL, updated_at = NOW()
         WHERE tenant_id = $1
           AND job_id = $2
           AND enabled = TRUE
           AND next_run_at IS NOT NULL
           AND next_run_at <= NOW()
-          -- Also checked here, not just in listDueJobs: that query is a
-          -- pre-filter run once per tick, while this UPDATE is the atomic gate.
-          -- A tick that listed a job just before its owner was removed would
-          -- otherwise still claim and execute it.
-          AND EXISTS (
-            SELECT 1 FROM tenant_memberships m
-            WHERE m.tenant_id = scheduled_jobs.tenant_id
-              AND m.user_id = scheduled_jobs.user_id
-          )
-          AND ${OWNER_SECURITY_CURRENT_SQL}
-        RETURNING *
       `,
-      [tenantId, jobId, nextRunAt]
+      [tenantId, jobId]
     );
-
-    return result.rows[0] ? mapClaimedScheduledJob(result.rows[0]) : null;
   }
 
   /**
@@ -653,7 +693,7 @@ export class UserSettingsStore {
    * Record the outcome of a finished run against the job's poison counter.
    * On success the counter resets to 0; on failure it increments. Returns the
    * new `consecutive_failures` value so the scheduler can decide whether to
-   * auto-disable. Runs on the RLS-bypassing scheduler pool (same as claimJob)
+   * auto-disable. Runs on the RLS-bypassing scheduler pool
    * since the worker has no per-request tenant scope, so the `tenant_id`
    * predicate is the sole isolation guarantee and must always be present.
    */
@@ -695,27 +735,26 @@ export class UserSettingsStore {
     );
   }
 
-  async createJobRun(input: {
-    tenantId: string;
-    runId: string;
-    jobId: string;
-    userId: string;
-    sessionId: string | null;
-  }): Promise<ScheduledJobRunRecord> {
+  /**
+   * Link a claimed run to the session that the worker created for it.
+   * Returns false when the run row is gone (the job was deleted).
+   */
+  async attachJobRunSession(input: { tenantId: string; runId: string; sessionId: string }): Promise<boolean> {
     return withTenantScope(this.db, input.tenantId, async (client) => {
       const result = await client.query(
         `
-          INSERT INTO scheduled_job_runs (tenant_id, run_id, job_id, user_id, session_id, status, started_at)
-          VALUES ($1, $2, $3, $4, $5, 'pending', NOW())
-          RETURNING *
+          UPDATE scheduled_job_runs
+          SET session_id = $3
+          WHERE tenant_id = $1 AND run_id = $2
         `,
-        [input.tenantId, input.runId, input.jobId, input.userId, input.sessionId]
+        [input.tenantId, input.runId, input.sessionId]
       );
 
-      return mapScheduledJobRun(result.rows[0]);
+      return (result.rowCount ?? 0) > 0;
     });
   }
 
+  /** Record the outcome of a run. Returns null when the run row is gone. */
   async completeJobRun(input: {
     tenantId: string;
     runId: string;
@@ -725,7 +764,7 @@ export class UserSettingsStore {
     outputTokens: number;
     errorMessage: string | null;
     summary: string | null;
-  }): Promise<ScheduledJobRunRecord> {
+  }): Promise<ScheduledJobRunRecord | null> {
     return withTenantScope(this.db, input.tenantId, async (client) => {
       const result = await client.query(
         `
@@ -753,7 +792,7 @@ export class UserSettingsStore {
         ]
       );
 
-      return mapScheduledJobRun(result.rows[0]);
+      return result.rows[0] ? mapScheduledJobRun(result.rows[0]) : null;
     });
   }
 
