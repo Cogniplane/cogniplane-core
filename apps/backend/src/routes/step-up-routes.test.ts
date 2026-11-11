@@ -13,7 +13,7 @@ import { STEP_UP_ACTIONS, StepUpStore } from "../services/auth/step-up-store.js"
 import type { AuditEventInput } from "../services/audit-event-store.js";
 import { DataRouteControl } from "../services/data-route-control.js";
 import type { EvaluableRule } from "../services/policy/policy-engine.js";
-import type { PolicyRuleWriteOptions } from "../services/policy/policy-rule-store.js";
+import { PolicyRuleConflictError, type PolicyRuleWriteOptions } from "../services/policy/policy-rule-store.js";
 import { weakensPolicy } from "../services/policy/policy-weakening.js";
 import { WeakerChangeError } from "../services/weaker-change-error.js";
 import { getIntegrationDescriptor, registerIntegration } from "../services/integrations/integration-registry.js";
@@ -100,7 +100,7 @@ const PROJECT_SCOPE = { tenantId: "tenant-1", userId: "owner-1", projectId: PROJ
  */
 const BLOCK_RULE: PolicyRule = {
   ruleId: "pol_census_block", tenantId: "tenant-1", name: "Block exports", description: null, priority: 10, enabled: true,
-  effect: "block", conditions: { toolNames: ["export_customers"] }, reason: null, createdBy: "owner-1",
+  effect: "block", conditions: { toolNames: ["export_customers"] }, reason: null, createdBy: "owner-1", revision: 1,
   createdAt: "2026-10-28T00:00:00.000Z", updatedAt: "2026-10-28T00:00:00.000Z"
 };
 const ALLOW_RULE: PolicyRule = { ...BLOCK_RULE, ruleId: "pol_census_allow", name: "Allow the rest", priority: 20, effect: "allow", conditions: {} };
@@ -153,7 +153,7 @@ const CASES: Record<StepUpRoute, Case> = {
   // Changes that make the policy weaker: an allow rule before the block
   // rule, the block rule off or removed, the allow rule moved first.
   "POST /admin/policy/rules": { url: "/admin/policy/rules", payload: { name: "Allow all", effect: "allow", priority: 0 } },
-  "PATCH /admin/policy/rules/:ruleId": { url: `/admin/policy/rules/${BLOCK_RULE.ruleId}`, payload: { enabled: false } },
+  "PATCH /admin/policy/rules/:ruleId": { url: `/admin/policy/rules/${BLOCK_RULE.ruleId}`, payload: { enabled: false, expectedRevision: 1 } },
   "DELETE /admin/policy/rules/:ruleId": { url: `/admin/policy/rules/${BLOCK_RULE.ruleId}` },
   "PUT /admin/policy/rules/order": { url: "/admin/policy/rules/order", payload: { ruleIds: [ALLOW_RULE.ruleId, BLOCK_RULE.ruleId] } },
   // PII protection turned off, with the stored revision.
@@ -389,10 +389,14 @@ function policyRuleStore(calls: string[]) {
       const rule: PolicyRule = { ...ALLOW_RULE, ruleId: "pol_census_new", priority: 30, enabled: true, conditions: {}, ...input };
       return commit("create", [...rules, rule], [rule], rule, options);
     },
-    update: async (_tenantId: string, ruleId: string, patch: Partial<PolicyRule>, options: PolicyRuleWriteOptions<PolicyRule>) => {
+    update: async (_tenantId: string, ruleId: string, input: Partial<PolicyRule> & { expectedRevision: number },
+      options: PolicyRuleWriteOptions<PolicyRule>) => {
       const existing = find(ruleId);
       if (!existing) return null;
-      const rule = { ...existing, ...patch };
+      // As in the real store: an older revision is refused before the change is classified.
+      const { expectedRevision, ...patch } = input;
+      if (expectedRevision !== existing.revision) throw new PolicyRuleConflictError();
+      const rule = { ...existing, ...patch, revision: existing.revision + 1 };
       return commit("update", rules.map((candidate) => (candidate.ruleId === ruleId ? rule : candidate)), [existing, rule], rule, options);
     },
     delete: async (_tenantId: string, ruleId: string, options: PolicyRuleWriteOptions<PolicyRule>) => {
@@ -725,8 +729,8 @@ describe("step-up routes", () => {
   test.each([
     ["a new block rule", "POST", "/admin/policy/rules", { name: "Block deletes", effect: "block", priority: 0 }],
     ["a new allow rule after the block rule", "POST", "/admin/policy/rules", { name: "Allow reads", effect: "allow", priority: 15 }],
-    ["a renamed block rule", "PATCH", `/admin/policy/rules/${BLOCK_RULE.ruleId}`, { name: "Block customer exports" }],
-    ["a stricter effect", "PATCH", `/admin/policy/rules/${ALLOW_RULE.ruleId}`, { effect: "require_approval" }],
+    ["a renamed block rule", "PATCH", `/admin/policy/rules/${BLOCK_RULE.ruleId}`, { name: "Block customer exports", expectedRevision: 1 }],
+    ["a stricter effect", "PATCH", `/admin/policy/rules/${ALLOW_RULE.ruleId}`, { effect: "require_approval", expectedRevision: 1 }],
     ["the allow rule removed", "DELETE", `/admin/policy/rules/${ALLOW_RULE.ruleId}`, undefined],
     ["the same order", "PUT", "/admin/policy/rules/order", { ruleIds: [BLOCK_RULE.ruleId, ALLOW_RULE.ruleId] }]
   ] as const)("%s needs no step-up and sends no notice", async (_name, method, url, payload) => {
@@ -738,8 +742,33 @@ describe("step-up routes", () => {
     expect(calls.some((call) => call.startsWith("policyRules."))).toBe(true);
   });
 
+  // A save from an older revision of the rule answers 409 before the change
+  // is classified, so the user's proof stays usable for the next save.
+  test("PATCH /admin/policy/rules/:ruleId: a stale save answers 409 and does not spend the step-up token", async () => {
+    const route = "PATCH /admin/policy/rules/:ruleId";
+    const { app, consume, stepUp, notices } = await buildApp();
+    const { token } = await stepUp.create({
+      userId: IDENTITY.userId, tenantId: IDENTITY.tenantId, familyId: "family-1",
+      securityVersion: IDENTITY.securityVersion, action: STEP_UP_ROUTES[route]
+    }, ["pwd", "otp"]);
+    const url = `/admin/policy/rules/${BLOCK_RULE.ruleId}`;
+    // Another admin renames the rule (not weaker): it is now at revision 2.
+    expect((await app.inject({ method: "PATCH", url, headers: { origin: ORIGIN },
+      payload: { name: "Block customer exports", expectedRevision: 1 } })).statusCode).toBe(200);
+    // This save turns the rule off from revision 1.
+    const stale = await app.inject({ method: "PATCH", url, headers: { origin: ORIGIN, "x-step-up": token },
+      payload: { enabled: false, expectedRevision: 1 } });
+    expect(stale.statusCode).toBe(409);
+    expect(stale.json().error).toBe("policy_rule_conflict");
+    expect(consume).not.toHaveBeenCalled();
+    expect(notices).toEqual([]);
+    const fresh = await app.inject({ method: "PATCH", url, headers: { origin: ORIGIN, "x-step-up": token },
+      payload: { enabled: false, expectedRevision: 2 } });
+    expect(fresh.statusCode, fresh.body).toBeLessThan(300);
+  });
+
   test.each([
-    ["PATCH /admin/policy/rules/:ruleId", "PATCH", { enabled: false }],
+    ["PATCH /admin/policy/rules/:ruleId", "PATCH", { enabled: false, expectedRevision: 1 }],
     ["DELETE /admin/policy/rules/:ruleId", "DELETE", undefined]
   ] as const)("%s: a missing rule answers 404 and does not spend the step-up token", async (route, method, payload) => {
     const { app, consume, stepUp, notices } = await buildApp();

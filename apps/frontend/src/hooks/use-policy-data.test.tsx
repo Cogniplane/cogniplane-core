@@ -2,10 +2,11 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import type { PolicyRule, PolicyRuleInput } from "@cogniplane/shared-types";
+import type { PolicyRule, PolicyRuleInput, PolicyRulePatch } from "@cogniplane/shared-types";
 import type { ReactNode } from "react";
 
 import * as api from "../lib/admin-api";
+import { ApiError } from "../lib/api-client";
 import { queryKeys } from "../lib/query-keys";
 import { usePolicyData } from "./use-policy-data";
 
@@ -18,6 +19,7 @@ vi.mock("next/navigation", () => ({ usePathname: vi.fn(), useRouter: vi.fn(), us
 
 const rules = [{ ruleId: "a" }, { ruleId: "b" }, { ruleId: "c" }] as PolicyRule[];
 const input = { name: "Block secrets" } as PolicyRuleInput;
+const patch = { name: "Block secrets", expectedRevision: 3 } as PolicyRulePatch;
 
 const clients: QueryClient[] = [];
 beforeEach(() => {
@@ -41,16 +43,16 @@ async function renderLoaded() {
 
 const ids = (list: PolicyRule[]) => list.map((rule) => rule.ruleId);
 
-it("creates a rule without an id, updates one with an id, and reloads rules and lint", async () => {
+it("creates a rule without an id, updates one with an id and its revision, and reloads rules and lint", async () => {
   vi.mocked(api.createPolicyRule).mockResolvedValue(rules[0]!);
   vi.mocked(api.updatePolicyRule).mockResolvedValue(rules[1]!);
   const { result } = await renderLoaded();
 
-  await act(async () => { expect(await result.current.saveRule(null, input)).toBe(true); });
-  await act(async () => { expect(await result.current.saveRule("b", input)).toBe(true); });
+  await act(async () => { expect(await result.current.saveRule({ ruleId: null, input })).toBe("saved"); });
+  await act(async () => { expect(await result.current.saveRule({ ruleId: "b", patch })).toBe("saved"); });
 
   expect(api.createPolicyRule).toHaveBeenCalledWith(input);
-  expect(api.updatePolicyRule).toHaveBeenCalledWith("b", input);
+  expect(api.updatePolicyRule).toHaveBeenCalledWith("b", patch);
   await waitFor(() => {
     expect(api.listPolicyRules).toHaveBeenCalledTimes(3);
     expect(api.listPolicyLintWarnings).toHaveBeenCalledTimes(3);
@@ -61,7 +63,7 @@ it("returns false from a failed save and shows the server message", async () => 
   vi.mocked(api.createPolicyRule).mockRejectedValue(new Error("Rule name is taken."));
   const { result } = await renderLoaded();
 
-  await act(async () => { expect(await result.current.saveRule(null, input)).toBe(false); });
+  await act(async () => { expect(await result.current.saveRule({ ruleId: null, input })).toBe("failed"); });
 
   await waitFor(() => expect(result.current.error).toBe("Rule name is taken."));
 });
@@ -74,7 +76,7 @@ it("shows the latest action's failure with its own fallback, and recovers on ret
     .mockResolvedValueOnce(undefined as never);
   const { result } = await renderLoaded();
 
-  await act(async () => { await result.current.saveRule(null, input); });
+  await act(async () => { await result.current.saveRule({ ruleId: null, input }); });
   await waitFor(() => expect(result.current.error).toBe("Failed to save policy rule."));
 
   act(() => { void result.current.deleteRule("b"); });
@@ -93,10 +95,10 @@ it("guards all rule actions synchronously while a save is pending", async () => 
   let resolveSave!: (rule: PolicyRule) => void;
   vi.mocked(api.createPolicyRule).mockReturnValue(new Promise(resolve => { resolveSave = resolve; }));
   const { result } = await renderLoaded();
-  let saved!: Promise<boolean>;
+  let saved!: Promise<unknown>;
   act(() => {
-    saved = result.current.saveRule(null, input);
-    void result.current.saveRule(null, input);
+    saved = result.current.saveRule({ ruleId: null, input });
+    void result.current.saveRule({ ruleId: null, input });
     void result.current.deleteRule("b");
     void result.current.reorderRules(["b", "a", "c"]);
   });
@@ -104,6 +106,46 @@ it("guards all rule actions synchronously while a save is pending", async () => 
   expect(api.deletePolicyRule).not.toHaveBeenCalled();
   expect(api.reorderPolicyRules).not.toHaveBeenCalled();
   await act(async () => { resolveSave(rules[0]!); await saved; });
+});
+
+function refusal(status: number, code: string) {
+  return new ApiError({ status, code, method: "PATCH", path: "/admin/policy/rules/b", message: `Refused: ${code}` });
+}
+
+// A stale edit is not an error to show: the editor compares the draft with the
+// saved rule. The rules are read again before the answer, so the editor has
+// the saved rule (or its absence) when it shows the comparison.
+it.each([
+  [409, "policy_rule_conflict", "conflict"],
+  [404, "policy_rule_not_found", "missing"]
+] as const)("answers %s %s as %s after it reads the rules again, with no action error", async (status, code, answer) => {
+  vi.mocked(api.updatePolicyRule).mockRejectedValue(refusal(status, code));
+  const { result } = await renderLoaded();
+  const newer = [{ ruleId: "a" }, { ruleId: "b", revision: 4 }, { ruleId: "c" }] as PolicyRule[];
+  vi.mocked(api.listPolicyRules).mockResolvedValue(newer);
+
+  let outcome: unknown;
+  let readsBeforeAnswer = 0;
+  await act(async () => {
+    outcome = await result.current.saveRule({ ruleId: "b", patch });
+    readsBeforeAnswer = vi.mocked(api.listPolicyRules).mock.calls.length;
+  });
+
+  expect(outcome).toBe(answer);
+  expect(readsBeforeAnswer).toBe(2);
+  expect(result.current.rules).toEqual(newer);
+  expect(result.current.error).toBeNull();
+});
+
+it("shows any other refusal of an edit as a failure, and never reads a create's 409 as a stale edit", async () => {
+  vi.mocked(api.updatePolicyRule).mockRejectedValue(refusal(409, "conflict"));
+  vi.mocked(api.createPolicyRule).mockRejectedValue(refusal(409, "policy_rule_conflict"));
+  const { result } = await renderLoaded();
+
+  await act(async () => { expect(await result.current.saveRule({ ruleId: "b", patch })).toBe("failed"); });
+  expect(result.current.error).toBe("Refused: conflict");
+  await act(async () => { expect(await result.current.saveRule({ ruleId: null, input })).toBe("failed"); });
+  expect(result.current.error).toBe("Refused: policy_rule_conflict");
 });
 
 it("shows the load fallback when the rules fail to load without an Error", async () => {

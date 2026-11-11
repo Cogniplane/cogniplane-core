@@ -103,6 +103,11 @@ export const POLICY_CONDITION_KEYS = [
 ] as const;
 export type PolicyConditionKey = (typeof POLICY_CONDITION_KEYS)[number];
 
+// A rule's revision. It starts at 1; each edit adds 1, and a reorder adds 1 to
+// each rule that it moves. A rule edit sends the revision that the admin
+// loaded (`expectedRevision`), so a save from an older copy is refused (409).
+export const PolicyRuleRevisionSchema = z.number().int().min(1);
+
 export const PolicyRuleSchema = z
   .object({
     ruleId: z.string(),
@@ -115,6 +120,7 @@ export const PolicyRuleSchema = z
     conditions: PolicyConditionsSchema,
     reason: z.string().nullable(),
     createdBy: z.string().nullable(),
+    revision: PolicyRuleRevisionSchema,
     createdAt: IsoDateSchema,
     updatedAt: IsoDateSchema
   })
@@ -154,14 +160,19 @@ export type PolicyRuleInput = z.infer<typeof PolicyRuleInputSchema>;
 // Patch body — every field optional so a partial update (e.g. just `enabled`)
 // is valid. Omitted fields preserve the stored value.
 //
+// `expectedRevision` is required: the revision of the rule that the change is
+// based on. The server refuses the patch (409 `policy_rule_conflict`) when
+// the rule has another revision, so a save from a stale form, or a toggle of
+// one field, cannot replace a newer edit. It is not a rule field.
+//
 // `.strict()` (not `.passthrough()`) so an unknown/typo'd key is rejected with
 // 400 rather than passing the non-empty check and producing a silent no-op
 // UPDATE + a false "rule updated" audit event. After strict-stripping, the
 // refine guarantees the body carried at least one real field.
 export const PolicyRulePatchSchema = z
-  .object(policyRuleFields)
+  .object({ ...policyRuleFields, expectedRevision: PolicyRuleRevisionSchema })
   .strict()
-  .refine((patch) => Object.keys(patch).length > 0, {
+  .refine((patch) => Object.keys(patch).some((key) => key !== "expectedRevision"), {
     message: "Patch must include at least one field to update."
   });
 export type PolicyRulePatch = z.infer<typeof PolicyRulePatchSchema>;

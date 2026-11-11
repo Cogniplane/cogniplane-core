@@ -9,7 +9,7 @@
 import { randomUUID } from "node:crypto";
 import cookie from "@fastify/cookie";
 import Fastify, { type FastifyRequest } from "fastify";
-import { afterEach, beforeEach, describe, expect, test } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import { decrypt, encrypt } from "../lib/crypto-utils.js";
 import { withTenantScope } from "../lib/db.js";
@@ -200,7 +200,8 @@ describe.skipIf(!adminDatabaseUrl())("data route owner notices", () => {
     await app.ready();
     try {
       // Not weaker: a rename, and a new block rule.
-      expect((await app.inject({ method: "PATCH", url: `/admin/policy/rules/${block.ruleId}`, payload: { name: "Block customer exports" } })).statusCode).toBe(200);
+      expect((await app.inject({ method: "PATCH", url: `/admin/policy/rules/${block.ruleId}`,
+        payload: { name: "Block customer exports", expectedRevision: block.revision } })).statusCode).toBe(200);
       expect((await app.inject({ method: "POST", url: "/admin/policy/rules", payload: { name: "Block deletes", effect: "block", conditions: { toolNames: ["delete_customers"] } } })).statusCode).toBe(200);
       expect(await noticesOf(t.tenantId)).toEqual([]);
       // Weaker: the export block rule removed.
@@ -221,6 +222,101 @@ describe.skipIf(!adminDatabaseUrl())("data route owner notices", () => {
     expect(audit.rows.map((row) => [row.event_type, row.payload.weaker]).sort()).toEqual([
       ["admin.policy_rule.created", false], ["admin.policy_rule.deleted", true], ["admin.policy_rule.updated", false]
     ]);
+  });
+
+  // Admin A edits a rule from an old form while admin B has made it stricter.
+  // The save names the revision that A loaded. The route answers 409 before
+  // it classifies the change: no step-up prompt, no change, no audit event, no
+  // owner notice and no cache drop. A save from the current revision works.
+  test("a Policy Center save from an older revision answers 409 and writes nothing", async () => {
+    const t = await workosTenant();
+    const rules = new PolicyRuleStore(appPool());
+    const decisions = new PolicyDecisionStore(appPool());
+    const policyService = new PolicyService({ rules, decisions, auditEvents: new AuditEventStore(appPool()) });
+    const invalidate = vi.spyOn(policyService, "invalidate");
+    const loaded = await rules.create(t.tenantId,
+      { name: "Allow exports", effect: "allow", enabled: false, conditions: { toolNames: ["export_customers"] } }, t.admin.userId, ALLOW_WEAKER);
+    let session: NonNullable<FastifyRequest["auth"]["session"]> = { authSource: "workos", familyId: "family-1" };
+    const app = Fastify();
+    app.decorate("db", appPool());
+    app.addHook("preHandler", async (request) => {
+      request.auth = { userId: t.admin.userId, tenantId: t.tenantId, role: "admin", isAdmin: true, session };
+    });
+    await registerAdminPolicyRoutes(app, { policyRules: rules, policyDecisions: decisions, policyService, dataRoutes: control() });
+    await app.ready();
+    const patch = (payload: Record<string, unknown>) =>
+      app.inject({ method: "PATCH", url: `/admin/policy/rules/${loaded.ruleId}`, payload });
+    // A's old form: the old status and effect, with a new name.
+    const staleForm = { expectedRevision: loaded.revision, name: "Allow customer exports", enabled: false, effect: "allow",
+      conditions: { toolNames: ["export_customers"] }, reason: null };
+    try {
+      // B turns the rule on as a block rule.
+      const stricter = await patch({ expectedRevision: loaded.revision, enabled: true, effect: "block" });
+      expect(stricter.statusCode, stricter.body).toBe(200);
+      expect(stricter.json().rule).toMatchObject({ enabled: true, effect: "block", revision: 2 });
+      invalidate.mockClear();
+
+      // A local session would need step-up for a weaker change. The stale save is refused first.
+      session = { authSource: "local", familyId: "family-1" };
+      const fromLocal = await patch(staleForm);
+      expect(fromLocal.statusCode, fromLocal.body).toBe(409);
+      expect(fromLocal.json()).toEqual({ error: "policy_rule_conflict", message: expect.any(String) });
+      // A WorkOS session gets no step-up: the revision is the only check.
+      session = { authSource: "workos", familyId: "family-1" };
+      expect((await patch(staleForm)).statusCode).toBe(409);
+      expect(invalidate).not.toHaveBeenCalled();
+      // No revision: the body is refused.
+      const { expectedRevision: _omitted, ...withoutRevision } = staleForm;
+      expect((await patch(withoutRevision)).statusCode).toBe(400);
+
+      // From the current revision, the same rename commits and gives the next revision.
+      const fresh = await patch({ expectedRevision: 2, name: "Block customer exports" });
+      expect(fresh.statusCode, fresh.body).toBe(200);
+      expect(fresh.json().rule).toMatchObject({ name: "Block customer exports", enabled: true, effect: "block", revision: 3 });
+      expect(invalidate).toHaveBeenCalledTimes(1);
+    } finally {
+      await app.close();
+    }
+
+    expect(await rules.get(t.tenantId, loaded.ruleId)).toMatchObject({ name: "Block customer exports", enabled: true, effect: "block", revision: 3 });
+    // B's change was not weaker: no notice. The refused saves wrote none.
+    expect(await noticesOf(t.tenantId)).toEqual([]);
+    const audit = await superuserPool().query<{ payload: Record<string, unknown> }>(
+      `SELECT payload FROM audit_events WHERE tenant_id = $1 AND event_type = 'admin.policy_rule.updated' ORDER BY created_at`, [t.tenantId]);
+    expect(audit.rows.map((row) => row.payload)).toEqual([
+      { ruleId: loaded.ruleId, effect: "block", enabled: true, revision: 2, weaker: false },
+      { ruleId: loaded.ruleId, effect: "block", enabled: true, revision: 3, weaker: false }
+    ]);
+  });
+
+  test("a Policy Center save cannot reach a rule of another tenant", async () => {
+    const t = await workosTenant();
+    const other = await workosTenant();
+    const rules = new PolicyRuleStore(appPool());
+    const decisions = new PolicyDecisionStore(appPool());
+    const theirs = await rules.create(other.tenantId, { name: "Block exports", effect: "block" }, other.admin.userId, ALLOW_WEAKER);
+    const app = Fastify();
+    app.decorate("db", appPool());
+    app.addHook("preHandler", async (request) => {
+      request.auth = { userId: t.admin.userId, tenantId: t.tenantId, role: "admin", isAdmin: true,
+        session: { authSource: "workos", familyId: "family-1" } };
+    });
+    await registerAdminPolicyRoutes(app, {
+      policyRules: rules, policyDecisions: decisions,
+      policyService: new PolicyService({ rules, decisions, auditEvents: new AuditEventStore(appPool()) }),
+      dataRoutes: control()
+    });
+    await app.ready();
+    try {
+      const res = await app.inject({ method: "PATCH", url: `/admin/policy/rules/${theirs.ruleId}`,
+        payload: { expectedRevision: theirs.revision, enabled: false } });
+      expect(res.statusCode).toBe(404);
+      expect(res.json()).toEqual({ error: "policy_rule_not_found" });
+    } finally {
+      await app.close();
+    }
+    expect(await rules.get(other.tenantId, theirs.ruleId)).toEqual(theirs);
+    expect(await noticesOf(other.tenantId)).toEqual([]);
   });
 
   test("a PII save emails the owners with the weaker field names only when it makes the protection weaker", async () => {

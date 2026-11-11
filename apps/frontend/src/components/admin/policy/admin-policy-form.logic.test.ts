@@ -8,13 +8,17 @@ import {
   draftConditions,
   draftFromRule,
   draftToInput,
+  draftToPatch,
   EFFECT_LABELS,
   emptyDraft,
   isDraftValid,
+  keepDraftChanges,
   parseCsv,
   reorderedRuleIds,
+  ruleConflictRows,
   toggleInList,
-  type DecisionFilterDraft
+  type DecisionFilterDraft,
+  type PolicyRuleDraft
 } from "./admin-policy-form.logic";
 
 function rule(overrides: Partial<PolicyRule> = {}): PolicyRule {
@@ -29,6 +33,7 @@ function rule(overrides: Partial<PolicyRule> = {}): PolicyRule {
     conditions: { toolNames: ["github_write_file"], categories: ["github"], severities: ["file_change"] },
     reason: "External writes need review.",
     createdBy: "admin",
+    revision: 1,
     createdAt: "2026-05-31T00:00:00.000Z",
     updatedAt: "2026-05-31T00:00:00.000Z",
     ...overrides
@@ -208,4 +213,65 @@ describe("reorderedRuleIds", () => {
     reorderedRuleIds(rules, "a", "c");
     expect(rules.map((r) => r.ruleId)).toEqual(["a", "b", "c"]);
   });
+});
+
+describe("draftToPatch", () => {
+  test("sends every form field and the revision of the rule that the draft started from", () => {
+    const base = rule({ revision: 4 });
+    const draft = { ...draftFromRule(base), name: "  Block all GH writes " };
+    expect(draftToPatch(draft, base)).toEqual({ ...draftToInput(draft), name: "Block all GH writes", expectedRevision: 4 });
+  });
+});
+
+// Admin A opened `base`. Admin B saved `saved`. A's form is `draft`.
+describe("rule conflict review", () => {
+  const base = rule({ name: "Allow exports", effect: "allow", enabled: false, conditions: { toolNames: ["export_customers"] }, reason: null });
+  const saved = rule({ name: "Allow exports", effect: "block", enabled: true, conditions: { toolNames: ["export_customers"] }, reason: null, revision: 2 });
+
+  test("lists each field where the saved rule and the draft differ, and who changed it", () => {
+    const draft = { ...draftFromRule(base), name: "Allow customer exports", effect: "require_approval" as const };
+    expect(ruleConflictRows(base, saved, draft)).toEqual([
+      { field: "name", label: "Name", saved: "Allow exports", draft: "Allow customer exports", changedBy: "you" },
+      { field: "effect", label: "Effect", saved: "Block", draft: "Require actor confirmation", changedBy: "both" },
+      { field: "enabled", label: "Enabled", saved: "On", draft: "Off", changedBy: "someone else" }
+    ]);
+  });
+
+  test("compares stored values, not how the form spells them", () => {
+    const sameBase = rule({ conditions: { categories: ["github"], severities: ["read_only", "file_change"] } });
+    const draft: PolicyRuleDraft = {
+      ...draftFromRule(sameBase), name: ` ${sameBase.name} `, categoriesText: "github, ", severities: ["file_change", "read_only"]
+    };
+    expect(ruleConflictRows(sameBase, { ...sameBase, revision: 2 }, draft)).toEqual([]);
+  });
+
+  test("keep my changes: the fields that the admin changed stay, every other field takes the saved value", () => {
+    const draft = { ...draftFromRule(base), name: "Allow customer exports", reason: "Exports go to the CRM." };
+    const kept = keepDraftChanges(base, saved, draft);
+    expect(kept).toEqual({
+      ...draftFromRule(saved),
+      name: "Allow customer exports",
+      reason: "Exports go to the CRM."
+    });
+    // The newer save's stricter values are not reverted.
+    expect(draftToPatch(kept, saved)).toMatchObject({ effect: "block", enabled: true, expectedRevision: 2 });
+  });
+
+  test("keep my changes keeps the admin's value of a field that both changed, as typed", () => {
+    const draft = { ...draftFromRule(base), effect: "require_approval" as const, toolNamesText: "export_customers,  export_orders" };
+    const kept = keepDraftChanges(base, { ...saved, conditions: { toolNames: ["export_all"] } }, draft);
+    expect(kept.effect).toBe("require_approval");
+    expect(kept.toolNamesText).toBe("export_customers,  export_orders");
+    expect(kept.enabled).toBe(true);
+  });
+});
+
+
+test("conflict merging distinguishes literal labels from absent conditions and explanation", () => {
+  const base = rule({ conditions: {}, reason: null });
+  const saved = rule({ conditions: {}, reason: null, revision: 2, effect: "require_approval" });
+  const draft = { ...draftFromRule(base), toolNamesText: "Any", reason: "None" };
+  expect(ruleConflictRows(base, saved, draft).map(row => row.field)).toContain("toolNames");
+  expect(ruleConflictRows(base, saved, draft).map(row => row.field)).toContain("reason");
+  expect(keepDraftChanges(base, saved, draft)).toMatchObject({ toolNamesText: "Any", reason: "None" });
 });

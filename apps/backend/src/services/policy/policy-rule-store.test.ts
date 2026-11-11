@@ -2,7 +2,7 @@ import { describe, test, expect, vi } from "vitest";
 
 import type { Pool } from "../../lib/db.js";
 
-import { PolicyRuleStore, PolicyReorderMismatchError, type PolicyRuleWriteOptions } from "./policy-rule-store.js";
+import { PolicyRuleConflictError, PolicyRuleStore, PolicyReorderMismatchError, type PolicyRuleWriteOptions } from "./policy-rule-store.js";
 import { WeakerChangeError } from "../weaker-change-error.js";
 import type { AuditEventInput } from "../audit-event-store.js";
 
@@ -95,6 +95,7 @@ class InMemoryRuleDatabase {
         conditions_json: JSON.parse(String(params[7])),
         reason: params[8],
         created_by: params[9],
+        revision: 1,
         created_at: now,
         updated_at: now
       };
@@ -102,10 +103,11 @@ class InMemoryRuleDatabase {
       return { rows: [row], rowCount: 1 };
     }
 
-    if (sql.includes("UPDATE policy_rule SET priority = $3")) {
-      // reorder single-row update
+    if (sql.includes("SET revision = CASE WHEN priority = $3")) {
+      // reorder single-row update: a moved rule gets the next revision
       const row = ofTenant().find((r) => r.rule_id === params[1]);
       if (row) {
+        if (row.priority !== Number(params[2])) row.revision = Number(row.revision) + 1;
         row.priority = Number(params[2]);
         row.updated_at = this.nextTimestamp();
       }
@@ -113,8 +115,10 @@ class InMemoryRuleDatabase {
     }
 
     if (sql.includes("UPDATE policy_rule SET")) {
-      const row = ofTenant().find((r) => r.rule_id === params[1]);
+      // update: only from the expected revision ($10), and it adds 1
+      const row = ofTenant().find((r) => r.rule_id === params[1] && r.revision === params[9]);
       if (!row) return { rows: [], rowCount: 0 };
+      row.revision = Number(row.revision) + 1;
       row.name = params[2];
       row.description = params[3];
       row.priority = Number(params[4]);
@@ -167,9 +171,10 @@ test("update preserves unspecified fields and changes provided ones", async () =
     ALLOW_WEAKER
   );
 
-  const updated = await store.update("t1", created.ruleId, { name: "renamed" }, ALLOW_WEAKER);
+  const updated = await store.update("t1", created.ruleId, { expectedRevision: 1, name: "renamed" }, ALLOW_WEAKER);
   expect(updated).not.toBeNull();
   expect(updated!.name).toBe("renamed");
+  expect(updated!.revision).toBe(2);
   expect(updated!.effect).toBe("block");
   expect(updated!.description).toBe("d");
   expect(updated!.reason).toBe("r");
@@ -179,13 +184,28 @@ test("update preserves unspecified fields and changes provided ones", async () =
 test("update can null out a description explicitly", async () => {
   const { store } = makeStore();
   const created = await store.create("t1", { name: "n", effect: "allow", description: "keep" }, null, ALLOW_WEAKER);
-  const updated = await store.update("t1", created.ruleId, { description: null }, ALLOW_WEAKER);
+  const updated = await store.update("t1", created.ruleId, { expectedRevision: 1, description: null }, ALLOW_WEAKER);
   expect(updated!.description).toBe(null);
 });
 
 test("update returns null for a missing rule", async () => {
   const { store } = makeStore();
-  expect(await store.update("t1", "pol_nope", { name: "x" }, ALLOW_WEAKER)).toBe(null);
+  expect(await store.update("t1", "pol_nope", { expectedRevision: 1, name: "x" }, ALLOW_WEAKER)).toBe(null);
+});
+
+// The check runs before the write and before the weaker-change check.
+test("update from an older revision throws PolicyRuleConflictError and rolls back with no write and no audit event", async () => {
+  const { db, store } = makeStore();
+  const created = await store.create("t1", { name: "block", effect: "block" }, null, ALLOW_WEAKER);
+  await store.update("t1", created.ruleId, { expectedRevision: 1, name: "block exports" }, ALLOW_WEAKER);
+  db.statements.length = 0;
+  const audit = vi.fn(() => AUDIT);
+
+  await expect(store.update("t1", created.ruleId, { expectedRevision: 1, enabled: false }, { allowWeaker: false, audit }))
+    .rejects.toBeInstanceOf(PolicyRuleConflictError);
+  expect(db.statements).toEqual(["BEGIN", "lock:t1", "SELECT", "ROLLBACK"]);
+  expect(audit).not.toHaveBeenCalled();
+  expect(await store.get("t1", created.ruleId)).toMatchObject({ name: "block exports", enabled: true, revision: 2 });
 });
 
 test("delete returns the removed rule, or null when there is none", async () => {
@@ -204,6 +224,8 @@ test("reorder rewrites priorities to index*10 in the supplied order", async () =
   const reordered = await store.reorder("t1", [c.ruleId, a.ruleId, b.ruleId], ALLOW_WEAKER);
   expect(reordered.map((r) => r.name)).toEqual(["c", "a", "b"]);
   expect(reordered.map((r) => r.priority)).toEqual([0, 10, 20]);
+  // Each rule moved, so each has the next revision.
+  expect(reordered.map((r) => r.revision)).toEqual([2, 2, 2]);
 });
 
 test("reorder rejects duplicate ids", async () => {
@@ -270,7 +292,7 @@ test("update reads and writes the rule in one transaction under the tenant's rul
   const rule = await store.create("t1", { name: "r", effect: "block", conditions: {} }, null, ALLOW_WEAKER);
   db.statements.length = 0;
 
-  await store.update("t1", rule.ruleId, { enabled: false }, ALLOW_WEAKER);
+  await store.update("t1", rule.ruleId, { expectedRevision: 1, enabled: false }, ALLOW_WEAKER);
 
   // A read in one transaction and a write in another let a concurrent partial
   // update or reorder be lost between them.
@@ -294,8 +316,8 @@ describe("a change that makes the policy weaker", () => {
     options: PolicyRuleWriteOptions<never>) => Promise<unknown>]> = [
     ["create: an allow rule before the block rule",
       (store, _ids, options) => store.create("t1", { name: "allow all", effect: "allow", priority: 0 }, null, options as never)],
-    ["update: the block rule turned off", (store, ids, options) => store.update("t1", ids.block, { enabled: false }, options as never)],
-    ["update: block becomes approval", (store, ids, options) => store.update("t1", ids.block, { effect: "require_approval" }, options as never)],
+    ["update: the block rule turned off", (store, ids, options) => store.update("t1", ids.block, { expectedRevision: 1, enabled: false }, options as never)],
+    ["update: block becomes approval", (store, ids, options) => store.update("t1", ids.block, { expectedRevision: 1, effect: "require_approval" }, options as never)],
     ["delete: the block rule", (store, ids, options) => store.delete("t1", ids.block, options as never)],
     ["reorder: the allow rule first", (store, ids, options) => store.reorder("t1", [ids.allow, ids.block], options as never)]
   ];
@@ -321,7 +343,7 @@ describe("a change that makes the policy weaker", () => {
   test("a change that is not weaker commits without allowWeaker and says so to the audit event", async () => {
     const { db, store, block } = await seeded();
     const audit = vi.fn((_saved: unknown, weaker: boolean) => ({ ...AUDIT, payload: { weaker } }));
-    await store.update("t1", block.ruleId, { name: "block customer exports" }, { allowWeaker: false, audit });
+    await store.update("t1", block.ruleId, { expectedRevision: 1, name: "block customer exports" }, { allowWeaker: false, audit });
     await store.create("t1", { name: "block deletes", effect: "block", priority: 0 }, null, { allowWeaker: false, audit });
     expect(db.audits).toEqual([{ type: AUDIT.type, payload: { weaker: false } }, { type: AUDIT.type, payload: { weaker: false } }]);
   });
