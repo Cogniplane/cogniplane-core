@@ -221,7 +221,8 @@ export async function buildApp() {
 
   // After the commit of a security change (a new security version of a local
   // account, or a member removal): stop the account's runtimes in this
-  // process. The tool-context check refuses their tool calls on every replica.
+  // process, and kill the sandboxes that the change took from the account's
+  // chats. The tool-context check refuses their tool calls on every replica.
   const afterSecurityChange = stopActiveWork({ runtimes: deps.runtimeAdapter, logger: app.log });
 
   // Local login: password sign-in, one-time links, step-up, manager actions.

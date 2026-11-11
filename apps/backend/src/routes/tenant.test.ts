@@ -236,6 +236,8 @@ test("tenant role updates reject demoting an owner", async () => {
       // A WorkOS member: no step-up, and no local identity to lock.
       if (text.includes("SELECT user_auth_source FROM tenant_memberships")) return { rows: [{ user_auth_source: "workos" }] };
       if (text.includes("FROM local_identities")) return { rows: [], rowCount: 0 };
+      // The member's chats, locked before the membership (session-execution-store.ts).
+      if (text.includes("FROM sessions s") && text.includes("FOR UPDATE OF s")) return { rows: [] };
       // The caller's own version, as the local session carries it.
       if (text.includes("FOR SHARE") && text.includes("security_version")) return { rows: [{ security_version: 1 }] };
       if (text.includes("AS actor_role")) return { rows: [{ actor_role: "admin" }] };
@@ -298,6 +300,8 @@ test("tenant role updates still allow changing a non-owner member", async () => 
       if (text.includes("pg_advisory_xact_lock")) return { rows: [] };
       if (text.includes("SELECT user_auth_source FROM tenant_memberships")) return { rows: [{ user_auth_source: "workos" }] };
       if (text.includes("FROM local_identities")) return { rows: [], rowCount: 0 };
+      // The member's chats, locked before the membership (session-execution-store.ts).
+      if (text.includes("FROM sessions s") && text.includes("FOR UPDATE OF s")) return { rows: [] };
       // The caller's own version, as the local session carries it.
       if (text.includes("FOR SHARE") && text.includes("security_version")) return { rows: [{ security_version: 1 }] };
       if (text.includes("AS actor_role")) return { rows: [{ actor_role: "owner" }] };
@@ -402,6 +406,19 @@ function makeMembersDb(targetRole: string | null, targetAuthSource: "workos" | "
       }
       if (text.includes("SELECT user_auth_source FROM tenant_memberships")) {
         return { rows: targetRole === null ? [] : [{ user_auth_source: targetAuthSource }] };
+      }
+      // The member's chats, then their leases and sandboxes (session-execution-store.ts).
+      if (text.includes("FROM sessions s") && text.includes("FOR UPDATE OF s")) {
+        tracked.statements.push("lock_chats");
+        return { rows: [] };
+      }
+      if (text.includes("UPDATE session_executions")) {
+        tracked.statements.push("stop_leases");
+        return { rows: [] };
+      }
+      if (text.includes("UPDATE sessions s SET sandbox_id=NULL")) {
+        tracked.statements.push("take_sandboxes");
+        return { rows: [] };
       }
       if (text.includes("FROM local_identities") && text.includes("FOR UPDATE")) {
         tracked.statements.push("lock_identity");
@@ -578,7 +595,8 @@ test("DELETE member: happy path returns 200 and fires DELETE scoped to tenant + 
   expect(tracked.deleteValues).toContain("tenant-1");
   expect(tracked.deleteValues).toContain("member-user");
   // The audit event is written in the membership transaction, after the delete.
-  expect(tracked.statements.at(-1)).toBe("audit");
+  // The transaction then takes the member's sandboxes.
+  expect(tracked.statements.slice(-4)).toEqual(["audit", "lock_chats", "stop_leases", "take_sandboxes"]);
   expect(tracked.audits).toEqual([
     { type: "tenant.member.removed", payload: { targetUserId: "member-user", previousRole: "member" } }
   ]);
@@ -626,9 +644,11 @@ test.each(["workos", "local"] as const)("DELETE member: a %s member's local acco
       ? ["mark_local_removed", "delete_local_credentials", "delete_local_credentials", "delete_second_factors", "delete_second_factors", "delete_second_factors"]
       : []
   );
-  // Identity, then membership, then jobs: the order disable uses too.
-  const order = ["lock_tenant", "lock_identity", "lock_membership", "disable_jobs", "delete_membership"];
-  expect(tracked.statements.filter((step) => order.includes(step))).toEqual(order);
+  // Identity, then the member's chats, then membership, then jobs: the order
+  // disable uses too, with the chats where turn admission takes them. The
+  // sandbox release at the end locks the chats again (they are already held).
+  const order = ["lock_tenant", "lock_identity", "lock_chats", "lock_membership", "disable_jobs", "delete_membership"];
+  expect(tracked.statements.filter((step) => order.includes(step))).toEqual([...order, "lock_chats"]);
   if (authSource === "local") {
     expect(tracked.statements.indexOf("mark_local_removed")).toBeLessThan(tracked.statements.indexOf("delete_membership"));
   }
@@ -711,8 +731,8 @@ test("PUT member role: promoting a local member locks the identity first and can
 
   expect(response.statusCode).toBe(200);
   // A reset link an admin got for this member must not survive the promotion.
-  expect(tracked.statements.filter((step) => ["lock_tenant", "lock_identity", "lock_membership", "cancel_links"].includes(step)))
-    .toEqual(["lock_tenant", "lock_identity", "lock_membership", "cancel_links"]);
+  expect(tracked.statements.filter((step) => ["lock_tenant", "lock_identity", "lock_chats", "lock_membership", "cancel_links"].includes(step)))
+    .toEqual(["lock_tenant", "lock_identity", "lock_chats", "lock_membership", "cancel_links"]);
 });
 
 // A role decides what an account can do. With a stolen owner token, an
@@ -809,7 +829,7 @@ test("DELETE member: after the commit, stops the removed member's active work (a
 
   expect(response.statusCode).toBe(200);
   expect(tracked.deleteCalled).toBe(true);
-  expect(securityChanges.calls).toEqual([{ tenantId: "tenant-1", userIds: ["member-user"] }]);
+  expect(securityChanges.calls).toEqual([{ tenantId: "tenant-1", userIds: ["member-user"], releasedSandboxes: [] }]);
 });
 
 test("DELETE member: a refused removal stops nothing", async () => {
@@ -848,7 +868,11 @@ test("DELETE member: disables the removed member's scheduled jobs in the same tr
   expect(tracked.disableJobsValues).toContain("member-user");
   // Both statements ran on the same client, before the commit — the disable is
   // not a best-effort follow-up that a crash could skip.
-  expect(tracked.statements).toEqual(["lock_tenant", "lock_identity", "lock_membership", "disable_jobs", "delete_membership", "audit"]);
+  // The member's sandboxes are taken last, in the same transaction.
+  expect(tracked.statements).toEqual([
+    "lock_tenant", "lock_identity", "lock_chats", "lock_membership", "disable_jobs", "delete_membership", "audit",
+    "lock_chats", "stop_leases", "take_sandboxes"
+  ]);
 });
 
 test("DELETE member: an owner rejection disables no jobs", async () => {

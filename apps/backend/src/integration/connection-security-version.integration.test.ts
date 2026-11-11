@@ -20,7 +20,8 @@ import { McpConnectionSchema, SessionCapabilitiesSchema } from "@cogniplane/shar
 
 import { PasswordHasher } from "../lib/password-hash.js";
 import { memberMcpStatuses } from "../routes/member-mcp-status.js";
-import { NO_RUNTIMES_IN_THIS_PROCESS, OwnerSecurityVersionChangedError } from "../services/auth/security-change.js";
+import { OwnerSecurityVersionChangedError } from "../services/auth/security-change.js";
+import { IGNORE_SECURITY_CHANGE } from "../test-helpers/security-change.js";
 import { bootstrapLocalTenant } from "../scripts/local-auth-commands-lib.js";
 import { LocalAccountService, type RequestMeta } from "../services/auth/local-account-service.js";
 import { GithubConnectionStore } from "../services/integrations/github/github-connection-store.js";
@@ -46,7 +47,7 @@ type Owner = { tenantId: string; userId: string; securityVersion: number };
 // No runtimes run in these tests: the stop after the commit has nothing to stop.
 function accounts() {
   return new LocalAccountService({
-    afterSecurityChange: NO_RUNTIMES_IN_THIS_PROCESS, db: appPool(), lookupDb: maintenancePool(),
+    afterSecurityChange: IGNORE_SECURITY_CHANGE, db: appPool(), lookupDb: maintenancePool(),
     hasher: new PasswordHasher(4), frontendOrigin: ORIGIN
   });
 }

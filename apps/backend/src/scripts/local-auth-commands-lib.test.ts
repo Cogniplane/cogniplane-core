@@ -1,6 +1,6 @@
 import { describe, expect, test } from "vitest";
 
-import { parseBootstrapArguments, parseRecoverOwnerArguments } from "./local-auth-commands-lib.js";
+import { operatorSandboxes, parseBootstrapArguments, parseRecoverOwnerArguments } from "./local-auth-commands-lib.js";
 
 describe("operator command arguments", () => {
   test("bootstrap reads the tenant name, owner email, and optional owner name", () => {
@@ -23,5 +23,14 @@ describe("operator command arguments", () => {
   test("recover-owner needs both the tenant and the email", () => {
     expect(parseRecoverOwnerArguments(["--tenant-id", "t1", "--email", "o@t.co"])).toEqual({ tenantId: "t1", email: "o@t.co" });
     expect(() => parseRecoverOwnerArguments(["--tenant-id", "t1"])).toThrow(/Usage: auth:recover-owner/);
+  });
+});
+
+describe("operator sandbox kills", () => {
+  const limits = { E2B_NETWORK_REQUEST_TIMEOUT_MS: 5_000, E2B_NETWORK_CONFIRM_TIMEOUT_MS: 20_000 };
+
+  test("kill nothing without E2B_API_KEY, and use the E2B kill with it", () => {
+    expect(operatorSandboxes({ ...limits, E2B_API_KEY: undefined })).toBeNull();
+    expect(operatorSandboxes({ ...limits, E2B_API_KEY: "e2b-test-key" })).toEqual({ destroySandbox: expect.any(Function) });
   });
 });

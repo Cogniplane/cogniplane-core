@@ -1,10 +1,15 @@
 import { randomBytes } from "node:crypto";
 
+import type { FastifyBaseLogger } from "fastify";
+
+import type { AppConfig } from "../config.js";
 import { type Pool, withTransaction } from "../lib/db.js";
 import { PasswordHasher } from "../lib/password-hash.js";
 import { uuidv7 } from "../lib/uuid.js";
+import type { RuntimeAdapter } from "../runtime-contracts.js";
 import { type IssuedLink, LocalAccountService } from "../services/auth/local-account-service.js";
-import { NO_RUNTIMES_IN_THIS_PROCESS } from "../services/auth/security-change.js";
+import { operatorSecurityChange } from "../services/auth/security-change.js";
+import { E2bSandboxDisposal } from "../services/runtime/e2b-sandbox-disposal.js";
 
 // Operator commands for local login (docs/architecture/local-accounts.md).
 // They run on MIGRATION_DATABASE_URL, like tenant:delete, and print a one-time
@@ -55,14 +60,49 @@ function slugFor(name: string): string {
   return `${base || "tenant"}-${randomBytes(3).toString("hex")}`;
 }
 
-export function operatorAccountService(db: Pool, frontendOrigin: string): LocalAccountService {
+/** The log of the operator commands: one JSON line on stderr for each event, so stdout keeps only the result. */
+function stderrLog(level: "info" | "warn" | "error") {
+  return (fields: Record<string, unknown>, msg?: string) => {
+    const { err, ...rest } = fields;
+    console.error(JSON.stringify({
+      level, msg, ...rest, ...(err === undefined ? {} : { err: err instanceof Error ? err.message : String(err) })
+    }));
+  };
+}
+
+const OPERATOR_LOGGER = {
+  info: stderrLog("info"), warn: stderrLog("warn"), error: stderrLog("error")
+} as unknown as Pick<FastifyBaseLogger, "info" | "warn" | "error">;
+
+/**
+ * The kill of the sandboxes that a security change took, with the limits that the
+ * servers use (DeepAgentsRuntimeAdapter). Null when E2B is not configured.
+ */
+export function operatorSandboxes(
+  config: Pick<AppConfig, "E2B_API_KEY" | "E2B_NETWORK_REQUEST_TIMEOUT_MS" | "E2B_NETWORK_CONFIRM_TIMEOUT_MS">
+): Pick<RuntimeAdapter, "destroySandbox"> | null {
+  if (!config.E2B_API_KEY) return null;
+  const disposal = new E2bSandboxDisposal({
+    apiKey: config.E2B_API_KEY,
+    requestTimeoutMs: config.E2B_NETWORK_REQUEST_TIMEOUT_MS,
+    deadlineMs: config.E2B_NETWORK_CONFIRM_TIMEOUT_MS,
+    logger: OPERATOR_LOGGER
+  });
+  return { destroySandbox: (released) => disposal.destroy(released) };
+}
+
+export function operatorAccountService(
+  db: Pool, frontendOrigin: string, sandboxes: Pick<RuntimeAdapter, "destroySandbox"> | null = null
+): LocalAccountService {
   // The commands never hash a password; one slot is enough. No mail queue:
   // the commands always print the link for the operator, also with email on.
   // The command cannot stop runtimes of the servers. After a recovery, the
   // gateway refuses the tool calls of the owner's older turns on every
-  // server (services/auth/security-change.ts).
+  // server, and the command kills the sandboxes that the recovery took from
+  // the owner's chats (services/auth/security-change.ts).
   return new LocalAccountService({
-    db, lookupDb: db, hasher: new PasswordHasher(1), frontendOrigin, afterSecurityChange: NO_RUNTIMES_IN_THIS_PROCESS
+    db, lookupDb: db, hasher: new PasswordHasher(1), frontendOrigin,
+    afterSecurityChange: operatorSecurityChange({ sandboxes, logger: OPERATOR_LOGGER })
   });
 }
 

@@ -36,6 +36,7 @@ import { ManagedToolFactoryRegistry } from "../managed-tools/factory.js";
 import { registerBuiltinManagedTools } from "../managed-tools/register-builtin-managed-tools.js";
 import type { PolicyApprovalProof } from "../policy/policy-approval-proof.js";
 import { ActiveTurnsRegistry } from "../active-turns-registry.js";
+import { stopActiveWork } from "../auth/security-change.js";
 
 const testConfig = createTestConfig({ ANTHROPIC_API_KEY: "sk-ant-test-key" });
 
@@ -1234,6 +1235,67 @@ describe("DeepAgentsRuntimeAdapter", () => {
           type: AGUIEventType.RUN_ERROR,
           message: "This turn stopped because its execution permission is no longer valid."
         }));
+      } finally { await adapter.close(); }
+    });
+
+    it("a turn whose lease a security change stopped reports the security change, not the ended lease", async () => {
+      const runtime = twoStepRuntime();
+      let current = true;
+      const executions = {
+        isCurrent: vi.fn(async () => current), bindRuntime: vi.fn(async () => {}),
+        stoppedBySecurityChange: vi.fn(async () => true)
+      };
+      const states: ToolContextLiveness[] = ["live", "security_change"];
+      const stores = {
+        extend: vi.fn(async () => null),
+        liveness: vi.fn(async (): Promise<ToolContextLiveness> => {
+          // The security change stops the lease and ends the context after admission.
+          current = false;
+          return states.shift()!;
+        })
+      };
+      const adapter = makeAdapter({ factory: runtime.factory, executions, toolContexts: stores });
+      const execution = { ...sessionInput, executionId: "execution-1", ownerId: "replica-1", projectId: null,
+        expiresAt: new Date(Date.now() + 30_000).toISOString() };
+      try {
+        const session = await adapter.createSession({ ...sessionInput, execution });
+        const events = await collect(adapter.runMessageAGUI(session, { ...runMessageInput(), toolContextId: "ctx-1" }));
+
+        expect(executions.stoppedBySecurityChange).toHaveBeenCalledWith(execution);
+        expect(text(events)).not.toContain("second step");
+        expect(events.at(-1)).toEqual(expect.objectContaining({
+          type: AGUIEventType.RUN_FINISHED,
+          result: { interrupted: true, reason: "security_change" }
+        }));
+      } finally { await adapter.close(); }
+    });
+
+    it.each([
+      ["a security change", true, { type: AGUIEventType.RUN_FINISHED, result: { interrupted: true, reason: "security_change" } }],
+      ["another end of access", false,
+        { type: AGUIEventType.RUN_ERROR, message: "This turn stopped because its execution permission is no longer valid." }]
+    ])("the lease check before a native tool, after %s stopped the lease, stops the turn with its reason", async (_case, bySecurityChange, last) => {
+      let current = true;
+      const runtime = makeRuntimeFactory(async function* () {
+        // The lease stops while the turn runs.
+        current = false;
+        await runtime.factoryCalls.at(-1)!.requireExecution!();
+        yield { event: "on_chat_model_stream", metadata: {}, data: { chunk: { content: "after the lease check" } } };
+      });
+      const executions = {
+        isCurrent: vi.fn(async () => current), bindRuntime: vi.fn(async () => {}),
+        stoppedBySecurityChange: vi.fn(async () => bySecurityChange)
+      };
+      const adapter = makeAdapter({ factory: runtime.factory, executions });
+      const execution = { ...sessionInput, executionId: "execution-1", ownerId: "replica-1", projectId: null,
+        expiresAt: new Date(Date.now() + 30_000).toISOString() };
+      try {
+        const session = await adapter.createSession({ ...sessionInput, execution });
+        const events = await collect(adapter.runMessageAGUI(session, runMessageInput()));
+        expect(text(events)).not.toContain("after the lease check");
+        expect(events.at(-1)).toEqual(expect.objectContaining(last));
+        // The runtime stays warm; only the turn ended.
+        expect(adapter.hasSession(sessionInput.sessionId)).toBe(true);
       } finally { await adapter.close(); }
     });
 
@@ -3270,8 +3332,8 @@ it("keeps a standalone runtime and checkpointer across execution generations", a
   } finally { await adapter.close(); }
 });
 
-// Archive, delete and purge take the saved sandbox from the session row and kill it
-// through destroySandbox. A teardown after which the session goes on (idle,
+// Archive, delete, purge and a security change take the saved sandbox from the session
+// row and kill it through destroySandbox. A teardown of the runtime alone (idle,
 // invalidation, shutdown) never kills a saved sandbox: the next turn, on this replica
 // or on another one, reconnects to it.
 describe("sandbox of a disposed session", () => {
@@ -3298,37 +3360,82 @@ describe("sandbox of a disposed session", () => {
     } finally { await adapter.close(); }
   });
 
-  it("never kills a saved sandbox when it tears down a runtime of a session that goes on", async () => {
+  /** An adapter whose normal-chat runtime saves its sandbox in `record`, as the session row does. */
+  function adapterWithSavedSandbox(destroy: Pick<import("../runtime/e2b-sandbox-disposal.js").E2bSandboxDisposal, "destroy">["destroy"]) {
     const runtime = makeRuntimeFactory(() => scriptedChatStream());
-    const destroy = vi.fn(async () => "killed" as const);
-    let saved: { sandboxId: string; networkPolicyHash: string | null } | null = null;
+    const record: { saved: { sandboxId: string; networkPolicyHash: string | null } | null } = { saved: null };
     const adapter = makeAdapter({
       factory: runtime.factory, config: configWithE2b, sandboxDisposal: { destroy },
       dynamicConfig: makeDynamicConfig({ allowCommandExecution: true }),
       executions: {
         isCurrent: async () => true,
         bindRuntime: async () => {},
-        sandboxBinding: async () => saved,
-        bindSandboxId: async (_execution, _previousId, sandboxId, networkPolicyHash) => { saved = { sandboxId, networkPolicyHash }; },
-        releaseSandboxId: async () => { saved = null; }
+        sandboxBinding: async () => record.saved,
+        bindSandboxId: async (_execution, _previousId, sandboxId, networkPolicyHash) => { record.saved = { sandboxId, networkPolicyHash }; },
+        releaseSandboxId: async () => { record.saved = null; }
       }
     });
     const execution = { ...sessionInput, executionId: "first", ownerId: "replica-a",
       projectId: null, expiresAt: new Date(Date.now() + 30_000).toISOString() };
+    return { runtime, adapter, record, execution };
+  }
+
+  it("never kills a saved sandbox when it tears down a runtime of a session that goes on", async () => {
+    const destroy = vi.fn(async () => "killed" as const);
+    const { runtime, adapter, record, execution } = adapterWithSavedSandbox(destroy);
     try {
       await adapter.createSession({ ...sessionInput, execution });
       await runtime.factoryCalls[0]!.sandboxBinding!.save(null, "sandbox-one", "policy-a");
+      // Idle teardown and a turn timeout recycle end here.
       await adapter.abortSession(sessionInput);
       await adapter.createSession({ ...sessionInput, execution });
       await adapter.invalidateTenantRuntimes(sessionInput.tenantId);
       await adapter.createSession({ ...sessionInput, execution });
-      await adapter.invalidateRuntimesForUser(sessionInput.tenantId, sessionInput.userId, { reason: "security_change" });
+      await adapter.invalidateRuntimesForIntegration(sessionInput.tenantId, sessionInput.userId, "github");
       await adapter.createSession({ ...sessionInput, execution });
     } finally { await adapter.close(); }
     expect(runtime.factoryCalls).toHaveLength(4);
     expect(runtime.dispose).toHaveBeenCalledTimes(4);
     expect(destroy).not.toHaveBeenCalled();
-    expect(saved).toEqual({ sandboxId: "sandbox-one", networkPolicyHash: "policy-a" });
+    expect(record.saved).toEqual({ sandboxId: "sandbox-one", networkPolicyHash: "policy-a" });
+  });
+
+  // The security change kills a sandbox only by the id that its transaction took from the
+  // session row (security-change.ts). The runtime invalidation knows no such id.
+  it("a security invalidation of the runtimes kills no sandbox by itself", async () => {
+    const destroy = vi.fn(async () => "killed" as const);
+    const { adapter, runtime, record, execution } = adapterWithSavedSandbox(destroy);
+    try {
+      await adapter.createSession({ ...sessionInput, execution });
+      await runtime.factoryCalls[0]!.sandboxBinding!.save(null, "sandbox-one", "policy-a");
+      await adapter.invalidateRuntimesForUser(sessionInput.tenantId, sessionInput.userId, { reason: "security_change" });
+    } finally { await adapter.close(); }
+    expect(runtime.dispose).toHaveBeenCalledTimes(1);
+    expect(destroy).not.toHaveBeenCalled();
+    expect(record.saved).toEqual({ sandboxId: "sandbox-one", networkPolicyHash: "policy-a" });
+  });
+
+  it("a security change stops the account's runtime in this process, then kills the sandbox that its transaction took", async () => {
+    const order: string[] = [];
+    const destroy = vi.fn(async (input: { sandboxId: string }) => {
+      order.push(`kill ${input.sandboxId}`);
+      return "killed" as const;
+    });
+    const { adapter, runtime, execution } = adapterWithSavedSandbox(destroy);
+    const logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    try {
+      await adapter.createSession({ ...sessionInput, execution });
+      // abortSession aborts the runtime, then disposes it.
+      runtime.dispose.mockImplementation(async () => { order.push("dispose runtime"); });
+      await stopActiveWork({ runtimes: adapter, logger })({
+        tenantId: sessionInput.tenantId, userIds: [sessionInput.userId],
+        releasedSandboxes: [{ tenantId: sessionInput.tenantId, userId: sessionInput.userId, sessionId: sessionInput.sessionId, sandboxId: "sandbox-one" }]
+      });
+      await vi.waitFor(() => expect(destroy).toHaveBeenCalledTimes(1));
+      expect(order).toEqual(["dispose runtime", "kill sandbox-one"]);
+      expect(destroy).toHaveBeenCalledWith({ tenantId: sessionInput.tenantId, sessionId: sessionInput.sessionId, sandboxId: "sandbox-one" });
+      expect(adapter.hasSession(sessionInput.sessionId)).toBe(false);
+    } finally { await adapter.close(); }
   });
 });
 

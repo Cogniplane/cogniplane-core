@@ -92,7 +92,11 @@ export interface RuntimeAdapter {
       onBeforeTurn?: (signal: AbortSignal) => Promise<void>;
     }
   ): AsyncIterable<BaseEvent>;
-  abortSession(input: { tenantId: string; sessionId: string; userId: string; executionId?: string }): Promise<void>;
+  abortSession(input: {
+    tenantId: string; sessionId: string; userId: string; executionId?: string;
+    /** Why the backend stops the session; its running turn reports it. */
+    reason?: TurnStopReason;
+  }): Promise<void>;
   /**
    * Stop the in-flight turn for `sessionId` while keeping the session warm.
    * Returns `"interrupted"` when an active turn was signalled, `"no_active_turn"`
@@ -139,11 +143,13 @@ export interface RuntimeAdapter {
     userId: string;
   }): Promise<void>;
   /**
-   * Kill the sandbox that archive, delete or purge took from a session. The session
-   * store read the id under the session row lock and cleared it in the transaction
-   * that changed the status, so no runtime can adopt the sandbox now. Idle teardown,
-   * invalidation and shutdown never call this: the next turn reconnects to a saved
-   * sandbox. It does not throw for a provider failure; the outcome says what happened.
+   * Kill the sandbox that archive, delete, purge or a security change of the owner's
+   * account took from a session. The store read the id under the session row lock and
+   * cleared it in the transaction that changed the status or the security version,
+   * and that transaction stopped the session lease, so no runtime can adopt the
+   * sandbox now (services/auth/security-change.ts). Idle teardown, invalidation and
+   * shutdown never call this: the next turn reconnects to a saved sandbox. It does not
+   * throw for a provider failure; the outcome says what happened.
    */
   destroySandbox(input: ReleasedSandbox): Promise<SandboxDisposalOutcome>;
   /**

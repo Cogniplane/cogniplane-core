@@ -26,13 +26,47 @@ the variables named here.
   check. It sends no connect, and makes up to four tries inside
   `E2B_NETWORK_CONFIRM_TIMEOUT_MS`. A restored chat starts a new sandbox at its
   next shell or file call, with no `Workspace reset` notice.
-- Idle teardown, runtime invalidation and shutdown do not kill a saved sandbox:
-  the next turn, on any replica, reconnects to it.
-- Known limits of the disposal kill: a kill that fails after its tries, or a
-  process that stops between the commit and the kill, leaves the sandbox with its
-  files and its network until E2B expires it (`E2B_SANDBOX_TIMEOUT_MS` after the
-  last turn start). The error log names the sandbox; nothing tries the kill again,
-  because the session row no longer names it. Tenant deletion kills no sandbox.
+- A security change of an account
+  ([revocation](local-accounts.md#security-version-and-revocation)) kills the
+  saved sandboxes of the account's chats. A process that an older turn started
+  in the sandbox does not stop with the turn, so the turn stop alone is not
+  enough. The transaction of the change locks the account's chats, stops the
+  lease of each normal chat of the account (`stop_reason` `security_change`),
+  takes each saved `sessions.sandbox_id` and clears it
+  (`releaseAccountSandboxes` in `services/session-execution-store.ts`). After
+  the commit, the process that made the change stops the account's runtimes in
+  that process, then kills each taken sandbox with the same kill as archive.
+  After the commit, an older turn on any replica cannot load, save or release a
+  sandbox record, and it ends at its next lease check or heartbeat with the
+  reason `security_change`. A turn that starts after the commit starts a new, empty
+  sandbox, and the change does not kill it. The chat keeps its messages; the
+  files of the old sandbox are lost, with no `Workspace reset` notice.
+- The member removal and role routes lock the member's chats before the
+  membership row, in the order that turn admission locks them. The other order
+  can deadlock with a turn admission of that member.
+- A project chat saves no sandbox, so the sandbox step of a security change takes
+  none from it and leaves its lease. A chat that moved into a project keeps the id of the
+  sandbox that it had as a normal chat. No project turn loads that id, so a
+  security change of the chat's owner kills that sandbox.
+- Idle teardown, runtime invalidation and shutdown do not kill a saved sandbox.
+  This is on purpose: the next turn, on any replica, reconnects to it with its
+  files.
+- Known limits of the disposal kill (archive, delete, purge, security change):
+  - A kill that fails after its tries, or a process that stops between the
+    commit and the kill, leaves the sandbox with its files, its processes and its
+    network until E2B expires it (`E2B_SANDBOX_TIMEOUT_MS` after the last turn
+    start). The error log names the sandbox. Nothing tries the kill again,
+    because the session row no longer names it, and no turn reconnects to it.
+  - `auth:recover-owner` kills the sandboxes only when `E2B_API_KEY` is set in
+    its environment. Otherwise its log names each sandbox that runs on.
+  - The sandbox of a project chat is in the memory of the replica that runs the
+    turn. After a security change, that replica kills it when the turn stops and
+    the runtime is torn down: at once on the replica that made the change, and
+    at idle teardown (`RUNTIME_IDLE_TIMEOUT_MS`) on the other replicas.
+  - A turn that a request under the older security version admits while the
+    change transaction runs can keep its lease. The tool context check refuses
+    that turn at its first model call, before it can make a sandbox.
+  - Tenant deletion kills no sandbox.
 - Limits: `DEEP_AGENTS_EXECUTE_TIMEOUT_MS` per command, an output cap
   (`MAX_EXECUTE_OUTPUT_CHARS` in `deep-agents-e2b-backend.ts`), and
   `E2B_SANDBOX_TIMEOUT_MS`, a lifetime deadline that each turn start extends

@@ -47,7 +47,9 @@ changes](architecture/sensitive-changes.md)
 ### Revocation
 
 A security change of a local account must stop its tokens, running turns, tool
-contexts, scheduled jobs and personal connections. [local
+contexts, scheduled jobs and personal connections. Its transaction takes the
+sandboxes that the account's chats saved, and the server kills them after the
+commit (limits: [sandbox](architecture/sandbox.md#e2b-sandbox)). [local
 accounts](architecture/local-accounts.md#security-version-and-revocation)
 
 ### Sandbox

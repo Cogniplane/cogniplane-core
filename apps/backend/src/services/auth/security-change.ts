@@ -4,13 +4,14 @@ import type { PoolClient } from "pg";
 import type { AppConfig } from "../../config.js";
 import { type Pool, withTenantScope } from "../../lib/db.js";
 import type { RuntimeAdapter } from "../../runtime-contracts.js";
+import { lockAccountChats, type ReleasedAccountSandbox, releaseAccountSandboxes } from "../session-execution-store.js";
 
 // A security change of a local account increments
 // local_identities.security_version: password change or reset, manager reset,
 // disable, enable, sign out everywhere, removal, operator recovery, a factor
 // change, a stricter MFA rule. The new version ends the account's sessions
 // (lib/auth-admission.ts). Work that already started under the old version
-// must stop too, so two layers apply:
+// must stop too, so three layers apply:
 //
 // 1. After the commit, `stopActiveWork` stops the account's runtimes in this
 //    process: interactive turns and scheduled turns. It cannot reach other
@@ -24,6 +25,18 @@ import type { RuntimeAdapter } from "../../runtime-contracts.js";
 //    at each model start (summaries included), before each native tool and
 //    at each approval round, so the turn itself stops at its next step on
 //    every replica.
+// 3. The sandboxes of the account's chats. Processes that an older turn
+//    started in a sandbox go on when the turn stops, and the next turn would
+//    reconnect to that sandbox. So the transaction of the change stops the
+//    lease of each normal chat of the account, and takes the sandbox ids that
+//    the account's chats saved (releaseAccountSandboxes in
+//    session-execution-store.ts). A turn whose lease stopped ends at its next
+//    lease check or heartbeat, on any replica, with the reason
+//    `security_change`. After the commit, the handler kills the taken
+//    sandboxes by id: `stopActiveWork` on a server, `operatorSecurityChange`
+//    in an operator command. A kill that fails, or a process that stops before it, leaves
+//    the sandbox running until the provider expires it; no turn reconnects to
+//    it. The next turn of the chat starts a new, empty sandbox.
 //
 // Only the helpers that take a `SecurityChange` write security_version, and
 // each records the account it changed. A `SecurityChange` comes only from
@@ -35,8 +48,11 @@ import type { RuntimeAdapter } from "../../runtime-contracts.js";
 // changes for them: their contexts are not compared, and only a member
 // removal stops their runtimes.
 
-/** The accounts of one tenant whose active work must stop. */
-export type ChangedAccounts = { tenantId: string; userIds: string[] };
+/**
+ * The accounts of one tenant whose active work must stop, and the sandboxes that the
+ * transaction took from their chats (layer 3 above), which the handler kills.
+ */
+export type ChangedAccounts = { tenantId: string; userIds: string[]; releasedSandboxes: ReleasedAccountSandbox[] };
 
 /**
  * Runs after the commit of a security change. It should not reject: the
@@ -46,8 +62,21 @@ export type ChangedAccounts = { tenantId: string; userIds: string[] };
  */
 export type AfterSecurityChange = (changed: ChangedAccounts) => Promise<void>;
 
-/** For the operator commands, which run in their own process with no runtimes: layer 2 applies. */
-export const NO_RUNTIMES_IN_THIS_PROCESS: AfterSecurityChange = async () => {};
+/**
+ * For the operator commands, which run in their own process with no runtimes:
+ * layer 2 stops the turns. The sandboxes that the change took are killed when
+ * E2B is configured (`sandboxes`), and the command waits for the kills. With no
+ * E2B configuration the log names each sandbox that runs until the provider expires it.
+ */
+export function operatorSecurityChange(deps: {
+  sandboxes: Pick<RuntimeAdapter, "destroySandbox"> | null;
+  logger: SecurityChangeLogger;
+}): AfterSecurityChange {
+  const runtimes = deps.sandboxes ?? { destroySandbox: async () => "skipped" as const };
+  return async ({ releasedSandboxes }) => {
+    await Promise.all(releasedSandboxes.map((released) => killReleasedSandbox(runtimes, deps.logger, released)));
+  };
+}
 
 class SecurityChangeScope {
   readonly #userIds = new Set<string>();
@@ -63,6 +92,16 @@ class SecurityChangeScope {
     this.#userIds.add(userId);
   }
 
+  /**
+   * The change takes the sandboxes of the account's chats under their row locks
+   * before the commit (layer 3 above). A transaction that also locks a membership
+   * row of the account calls this before it locks that row, so that its locks
+   * come in the order that turn admission takes them (lockAccountChats).
+   */
+  async lockChatsBeforeMembership(userId: string): Promise<void> {
+    await lockAccountChats(this.client, this.tenantId, [userId]);
+  }
+
   get userIds(): string[] {
     return [...this.#userIds];
   }
@@ -75,11 +114,13 @@ class SecurityChangeScope {
 export type { SecurityChangeScope as SecurityChange };
 
 /**
- * Runs `fn` in one transaction in the tenant's scope (withTenantScope).
- * After the commit, calls `afterCommit` with the accounts that `fn` changed.
- * Not on a rollback: then nothing changed. A rejection of `afterCommit` is
- * logged and does not reject: the change is committed, so the caller gets its
- * result, and the gateway check (layer 2) still refuses the older turns.
+ * Runs `fn` in one transaction in the tenant's scope (withTenantScope). When
+ * `fn` changed accounts, the same transaction then takes the sandboxes of their
+ * chats (layer 3 above). After the commit, calls `afterCommit` with the accounts
+ * and the sandboxes. Not on a rollback: then nothing changed. A rejection of
+ * `afterCommit` is logged and does not reject: the change is committed, so the
+ * caller gets its result, and the gateway check (layer 2) still refuses the
+ * older turns.
  */
 export async function withSecurityChange<T>(
   db: Pool,
@@ -87,16 +128,21 @@ export async function withSecurityChange<T>(
   afterCommit: AfterSecurityChange,
   fn: (client: PoolClient, change: SecurityChangeScope) => Promise<T>
 ): Promise<T> {
-  const scopes: SecurityChangeScope[] = [];
-  const result = await withTenantScope(db, tenantId, (client) => {
+  const changes: ChangedAccounts[] = [];
+  const result = await withTenantScope(db, tenantId, async (client) => {
     const scope = new SecurityChangeScope(client, tenantId);
-    scopes.push(scope);
-    return fn(client, scope);
+    const value = await fn(client, scope);
+    const userIds = scope.userIds;
+    if (userIds.length > 0) {
+      changes.push({ tenantId, userIds, releasedSandboxes: await releaseAccountSandboxes(client, tenantId, userIds) });
+    }
+    return value;
   });
-  const userIds = scopes[0]?.userIds ?? [];
-  if (userIds.length > 0) {
+  const changed = changes[0];
+  if (changed) {
+    const { userIds } = changed;
     try {
-      await afterCommit({ tenantId, userIds });
+      await afterCommit(changed);
     } catch (error) {
       // No request logger here (services and operator commands call this).
       // Same structured line as lib/redis.ts.
@@ -112,21 +158,54 @@ export async function withSecurityChange<T>(
   return result;
 }
 
+type SecurityChangeLogger = Pick<FastifyBaseLogger, "error" | "info" | "warn">;
+
+const SANDBOX_NOT_KILLED =
+  "security change: the sandbox of a chat of the account was not killed; it runs until the provider expires it";
+
 /**
- * The after-commit handler of the server: layer 1 above. Stops the runtimes
- * of each account in this process, which ends their interactive and
- * scheduled turns (an interrupted scheduled turn records a failed run).
+ * Kills one sandbox that the change took, by id (RuntimeAdapter.destroySandbox),
+ * and logs the outcome with the account. It never rejects.
+ */
+async function killReleasedSandbox(
+  runtimes: Pick<RuntimeAdapter, "destroySandbox">,
+  logger: SecurityChangeLogger,
+  released: ReleasedAccountSandbox
+): Promise<void> {
+  const { tenantId, userId, sessionId, sandboxId } = released;
+  const fields = { tenantId, userId, sessionId, sandboxId };
+  try {
+    const outcome = await runtimes.destroySandbox({ tenantId, sessionId, sandboxId });
+    if (outcome === "killed" || outcome === "not_found") {
+      logger.info({ ...fields, outcome }, "security change: the sandbox of a chat of the account is gone");
+    } else if (outcome === "skipped") {
+      logger.warn({ ...fields, outcome }, SANDBOX_NOT_KILLED);
+    } else {
+      logger.error({ ...fields, outcome }, SANDBOX_NOT_KILLED);
+    }
+  } catch (error) {
+    logger.error({ err: error, ...fields }, SANDBOX_NOT_KILLED);
+  }
+}
+
+/**
+ * The after-commit handler of the server: layers 1 and 3 above. Stops the
+ * runtimes of each account in this process, which ends their interactive and
+ * scheduled turns (an interrupted scheduled turn records a failed run). Then
+ * kills each sandbox that the transaction took.
  *
  * It does not wait for the result, so the request that made the change does
  * not wait for the disposal of the runtimes (the MCP client close, and one
- * E2B kill request for a sandbox without a saved binding). The turns stop
- * before it returns: invalidateRuntimesForUser aborts each turn before its
- * first await, and only the disposal continues. The result is logged: a
+ * E2B kill request for a sandbox without a saved binding), nor for the kills.
+ * The turns stop before it returns: invalidateRuntimesForUser aborts each turn
+ * before its first await, and only the disposal continues. So a turn of this
+ * process has stopped before the kill of its sandbox is sent, and does not
+ * replace the sandbox when the kill ends a command. The results are logged: a
  * failure as an error, and it never rejects.
  */
 export function stopActiveWork(deps: {
-  runtimes: Pick<RuntimeAdapter, "invalidateRuntimesForUser">;
-  logger: Pick<FastifyBaseLogger, "error" | "info">;
+  runtimes: Pick<RuntimeAdapter, "invalidateRuntimesForUser" | "destroySandbox">;
+  logger: SecurityChangeLogger;
 }): AfterSecurityChange {
   const stopAccount = async (tenantId: string, userId: string) => {
     try {
@@ -144,8 +223,9 @@ export function stopActiveWork(deps: {
       );
     }
   };
-  return async ({ tenantId, userIds }) => {
+  return async ({ tenantId, userIds, releasedSandboxes }) => {
     for (const userId of userIds) void stopAccount(tenantId, userId);
+    for (const released of releasedSandboxes) void killReleasedSandbox(deps.runtimes, deps.logger, released);
   };
 }
 
