@@ -273,6 +273,12 @@ export const envSchema = z.object({
   TURN_QUOTA_PER_USER_PER_DAY: z.coerce.number().int().min(0).default(200),
   TURN_QUOTA_PER_TENANT_PER_DAY: z.coerce.number().int().min(0).default(1000),
   PROJECT_FILE_RETENTION_ENABLED: booleanFromEnvSchema.default(true),
+  // Each scheduled run creates a session with its messages. The scheduler
+  // worker deletes such a session this many days after its last activity, and
+  // keeps the run's row and summary. At least 1 day: a shorter window could
+  // delete a new session before its run writes the run row.
+  SCHEDULED_SESSION_RETENTION_ENABLED: booleanFromEnvSchema.default(true),
+  SCHEDULED_SESSION_RETENTION_DAYS: z.coerce.number().int().min(1).default(30),
   SCHEDULER_ENABLED: booleanFromEnvSchema.default(true),
   SCHEDULER_POLL_INTERVAL_MS: z.coerce.number().int().positive().default(30_000),
   SCHEDULER_MAX_CONCURRENT_JOBS: z.coerce.number().int().positive().default(2),

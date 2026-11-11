@@ -128,13 +128,33 @@ Fields that agents change most often (the full list is `TenantSettingsSchema` in
 
 - Retention of `audit_events` and `tool_events`: [audit
   retention](../operations.md#audit-retention).
-- Session trash and project file retention run in the scheduler worker
-  ([background workers](runtime.md#background-workers)).
+- Session trash, scheduled session and project file retention run in the
+  scheduler worker ([background workers](runtime.md#background-workers)).
 - Deleted sessions go to trash for `SESSION_TRASH_RETENTION_DAYS`
   (`SESSION_TRASH_RETENTION_ENABLED`). The delete kills the session sandbox
   ([sandbox](sandbox.md#e2b-sandbox)). Purge removes messages, storage objects
   and the checkpoint thread, and kills a sandbox that the row still names (a row
   that an earlier version moved to trash).
+- Each scheduled run creates a session with `purpose = 'scheduled'`. When
+  `SCHEDULED_SESSION_RETENTION_ENABLED` is on, the worker deletes such a
+  session `SCHEDULED_SESSION_RETENTION_DAYS` after its last activity. The purge
+  is the same as for trash (`SessionStore.cleanupExpiredScheduled`).
+  - Last activity is the latest of: the creation or rename of the session, a
+    write to one of its messages, and the end of one of its runs. A follow-up
+    turn of the owner starts the window again. A session without a run row
+    (its job was deleted, or the row was never written) has no run term.
+  - Retention keeps, at any age, a session with a run that did not end, an
+    execution lease that is not stopped, or a pending approval. It does not
+    touch a scheduled session in trash (trash retention applies) or in the
+    archive.
+  - The run rows stay with their status, token counts and summary. Their
+    `session_id` becomes NULL, and so does the `session_id` of the session's
+    audit events. The session's tool events are deleted.
+  - `GET /admin/token-usage` reads `messages`, so a deleted session's turns
+    leave that report. To read usage further back, set a longer
+    `SCHEDULED_SESSION_RETENTION_DAYS`. The spending ledger keeps its records.
+  - A pass deletes at most 100 sessions, oldest first. A large backlog, for
+    example at the first start after an upgrade, takes many passes.
 - `PROJECT_FILE_RETENTION_ENABLED` (scheduler,
   `ProjectFileStore.cleanupExpired`) deletes promoted files and files in the
   trash for more than 30 days, with their versions. It does not prune the

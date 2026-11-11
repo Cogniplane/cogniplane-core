@@ -152,8 +152,10 @@ Restore into a stopped environment:
 
 ## Audit retention
 
-No worker deletes `audit_events`. `tool_events` rows go only when their session
-is purged from trash (foreign-key cascade) or the tenant is deleted. A
+No worker deletes `audit_events`. `tool_events` rows go only when trash or
+scheduled session retention deletes their session (foreign-key cascade, [data
+retention](architecture/data.md#retention-and-deletion)), or when the tenant is
+deleted. A
 restrictive RLS policy forbids deletes of `audit_events` for `app_user`, and
 `maintenance_user` has only INSERT on it (`MAINTENANCE_GRANTS`). Run retention
 as the migration role, in batches, on a schedule:

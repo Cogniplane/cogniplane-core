@@ -190,6 +190,10 @@ delete). Limits: `SCHEDULED_JOB_CREATE_LIMIT_*` and
 - An interrupted scheduled turn keeps its partial text with message status
   `interrupted`; the job run records `failed`. The run summary is a redacted
   prefix of the response (`scheduler-worker.ts`).
+- Each run creates a session with `purpose = 'scheduled'`. After the run, the
+  worker purges the runtime and checkpoint thread of that session, and keeps
+  the session and its messages. Retention deletes them later
+  (`SCHEDULED_SESSION_RETENTION_DAYS`, [retention](data.md#retention-and-deletion)).
 
 ## Background workers
 
@@ -202,7 +206,7 @@ teardown.
 
 | Worker | Code | Runs |
 |---|---|---|
-| Scheduler: jobs, PII scan jobs, session trash and project file retention | `services/scheduler-worker.ts`, `build-scheduler-worker.ts` | Every `SCHEDULER_POLL_INTERVAL_MS` |
+| Scheduler: jobs, PII scan jobs, session trash, scheduled session and project file retention | `services/scheduler-worker.ts`, `build-scheduler-worker.ts` | Every `SCHEDULER_POLL_INTERVAL_MS` |
 | Mail outbox | `services/mail/mail-outbox-worker.ts` | Every `MAIL_POLL_INTERVAL_MS` (`MAIL_CLEANUP_INTERVAL_MS` with email off; code constants) |
 | Expired session execution leases | `app-bootstrap.ts` | At start, then every `SESSION_EXECUTION_HEARTBEAT_MS` |
 | Stale approvals | `services/runtime/stale-approval-sweeper.ts` | At start, then every `APPROVAL_REQUEST_TTL_MS` |

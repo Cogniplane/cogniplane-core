@@ -185,6 +185,8 @@ from build arguments). Frontend variables are in `apps/frontend/.env.example`
 | `TURN_QUOTA_PER_USER_PER_DAY` | number, integer, minimum 0 | `200` | [data](architecture/data.md) |
 | `TURN_QUOTA_PER_TENANT_PER_DAY` | number, integer, minimum 0 | `1000` | [data](architecture/data.md) |
 | `PROJECT_FILE_RETENTION_ENABLED` | boolean | `true` | [data](architecture/data.md) |
+| `SCHEDULED_SESSION_RETENTION_ENABLED` | boolean | `true` | [data](architecture/data.md) |
+| `SCHEDULED_SESSION_RETENTION_DAYS` | number, integer, minimum 1 | `30` | [data](architecture/data.md), [runtime](architecture/runtime.md) |
 | `SCHEDULER_ENABLED` | boolean | `true` | [runtime](architecture/runtime.md), [self-hosting](self-hosting.md) |
 | `SCHEDULER_POLL_INTERVAL_MS` | number, integer, > 0 | `30000` | [runtime](architecture/runtime.md), [self-hosting](self-hosting.md) |
 | `SCHEDULER_MAX_CONCURRENT_JOBS` | number, integer, > 0 | `2` | [runtime](architecture/runtime.md), [self-hosting](self-hosting.md) |

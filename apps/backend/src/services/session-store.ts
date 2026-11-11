@@ -97,6 +97,13 @@ export type SessionTrashCleanupOptions = {
   destroySandbox?: (input: { tenantId: string; sessionId: string; sandboxId: string }) => Promise<void>;
 };
 
+export type ScheduledSessionCleanupOptions = SessionTrashCleanupOptions & {
+  /** Days after the last activity of a scheduled session. At least 1: see scheduledSessionExpiredSql. */
+  retentionDays: number;
+};
+
+export type SessionCleanupResult = { deletedSessions: number; deletedObjects: number; purgedRuntimes: number };
+
 /**
  * Archive and delete take the saved sandbox of the session (`sessions.sandbox_id`).
  * The caller kills `releasedSandboxId` after the commit; null means there is nothing to kill.
@@ -115,6 +122,46 @@ type SessionRuntimeGcRow = {
   user_id: string;
 };
 
+type SessionPurgeCandidate = SessionRuntimeGcRow;
+
+type CommittedSessionPurge = {
+  deletedSessions: number;
+  releasedSandboxes: Array<{ tenantId: string; sessionId: string; sandboxId: string }>;
+  storageGc: SessionStorageGcRow[];
+  runtimeGc: SessionRuntimeGcRow[];
+};
+
+/**
+ * An active scheduled chat whose last activity is older than `days` days, and
+ * in which nothing runs.
+ *
+ * Last activity is the latest of: the session row (`created_at`, and
+ * `updated_at`, which a rename changes), a write to one of its messages, and
+ * the end of one of its runs. A follow-up turn of the owner writes messages,
+ * so it starts the window again. A session with no run row (its job was
+ * deleted, or the run row was never written) has no run term.
+ *
+ * Live work keeps the session at any age: a run that did not end, an
+ * execution lease that is not stopped (also after its expiry, until the lease
+ * sweeper stops it), or a pending approval. Trash and archive keep it too:
+ * Trash retention owns a deleted session, and the owner chose to keep an
+ * archived one.
+ */
+function scheduledSessionExpiredSql(session: string, days: string): string {
+  const cutoff = `NOW() - (${days} * INTERVAL '1 day')`;
+  return `${session}.purpose = 'scheduled' AND ${session}.status = 'active' AND ${session}.project_id IS NULL
+    AND ${session}.created_at <= ${cutoff} AND ${session}.updated_at <= ${cutoff}
+    AND NOT EXISTS (SELECT 1 FROM scheduled_job_runs r
+      WHERE r.tenant_id = ${session}.tenant_id AND r.session_id = ${session}.session_id
+        AND (r.status NOT IN ('completed', 'failed') OR COALESCE(r.completed_at, r.started_at) > ${cutoff}))
+    AND NOT EXISTS (SELECT 1 FROM messages m
+      WHERE m.tenant_id = ${session}.tenant_id AND m.session_id = ${session}.session_id
+        AND m.updated_at > ${cutoff})
+    AND NOT EXISTS (SELECT 1 FROM session_executions e
+      WHERE e.tenant_id = ${session}.tenant_id AND e.session_id = ${session}.session_id AND e.status = 'active')
+    AND NOT EXISTS (SELECT 1 FROM approvals a
+      WHERE a.tenant_id = ${session}.tenant_id AND a.session_id = ${session}.session_id AND a.status = 'pending')`;
+}
 
 function sessionDefaults(row: Record<string, unknown>) {
   const source = row.project_id ? "project" : row.purpose === "normal" ? "personal" : "organization";
@@ -639,14 +686,10 @@ export class SessionStore {
   async cleanupExpired(
     storage: Pick<ArtifactStorage, "delete">,
     options: SessionTrashCleanupOptions = {},
-  ): Promise<{ deletedSessions: number; deletedObjects: number; purgedRuntimes: number }> {
+  ): Promise<SessionCleanupResult> {
     const limit = options.batchSize ?? 100;
     const committed = await withTransaction(this.maintenanceDb, async (db) => {
-      const candidates = await db.query<{
-        tenant_id: string;
-        session_id: string;
-        user_id: string;
-      }>(
+      const candidates = await db.query<SessionPurgeCandidate>(
         `SELECT tenant_id, session_id, user_id
          FROM sessions
          WHERE status='deleted' AND deleted_at <= NOW() - ($2 * INTERVAL '1 day')
@@ -655,91 +698,168 @@ export class SessionStore {
          FOR UPDATE SKIP LOCKED`,
         [limit, this.retentionDays],
       );
-      let deletedSessions = 0;
-      // Delete takes the sandbox, but a row that an earlier version trashed can still name one.
-      const releasedSandboxes: Array<{ tenantId: string; sessionId: string; sandboxId: string }> = [];
-      for (const candidate of candidates.rows) {
-        const artifacts = await db.query<{ storage_key: string }>(
-          `SELECT DISTINCT storage_key FROM artifacts
-           WHERE tenant_id=$1 AND session_id=$2 AND storage_key IS NOT NULL`,
-          [candidate.tenant_id, candidate.session_id],
-        );
-        for (const artifact of artifacts.rows) {
-          await db.query(
-            `INSERT INTO session_storage_gc (tenant_id, session_id, storage_key)
-             VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
-            [candidate.tenant_id, candidate.session_id, artifact.storage_key],
-          );
-        }
-        await db.query(
-          `INSERT INTO session_runtime_gc (tenant_id, session_id, user_id)
-           VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
-          [candidate.tenant_id, candidate.session_id, candidate.user_id],
-        );
-
-        // These legacy foreign keys do not follow the session cascade rules.
-        // Remove their rows explicitly before deleting the session.
-        await db.query(
-          `DELETE FROM messages WHERE tenant_id=$1 AND session_id=$2`,
-          [candidate.tenant_id, candidate.session_id],
-        );
-        await db.query(
-          `DELETE FROM runtime_sessions WHERE tenant_id=$1 AND session_id=$2`,
-          [candidate.tenant_id, candidate.session_id],
-        );
-        await db.query(
-          `DELETE FROM session_executions WHERE tenant_id=$1 AND session_id=$2`,
-          [candidate.tenant_id, candidate.session_id],
-        );
-        const deleted = await db.query<{ sandbox_id: string | null }>(
-          `DELETE FROM sessions
-           WHERE tenant_id=$1 AND session_id=$2 AND status='deleted'
-             AND deleted_at <= NOW() - ($3 * INTERVAL '1 day')
-           RETURNING sandbox_id`,
-          [candidate.tenant_id, candidate.session_id, this.retentionDays],
-        );
-        deletedSessions += deleted.rowCount ?? 0;
-        const sandboxId = deleted.rows[0]?.sandbox_id;
-        if (sandboxId) releasedSandboxes.push({ tenantId: candidate.tenant_id, sessionId: candidate.session_id, sandboxId });
-      }
-
-      const storageGc = await db.query<SessionStorageGcRow>(
-        `WITH candidates AS (
-           SELECT tenant_id, session_id, storage_key
-           FROM session_storage_gc
-           WHERE next_attempt_at <= NOW()
-           ORDER BY next_attempt_at, created_at, tenant_id, session_id, storage_key
-           LIMIT $1
-           FOR UPDATE SKIP LOCKED
-         )
-         UPDATE session_storage_gc AS gc
-         SET attempts=gc.attempts+1, next_attempt_at=NOW() + INTERVAL '1 hour'
-         FROM candidates
-         WHERE gc.tenant_id=candidates.tenant_id
-           AND gc.session_id=candidates.session_id
-           AND gc.storage_key=candidates.storage_key
-         RETURNING gc.tenant_id, gc.session_id, gc.storage_key`,
-        [limit],
-      );
-      const runtimeGc = await db.query<SessionRuntimeGcRow>(
-        `WITH candidates AS (
-           SELECT tenant_id, session_id, user_id
-           FROM session_runtime_gc
-           WHERE next_attempt_at <= NOW()
-           ORDER BY next_attempt_at, created_at, tenant_id, session_id
-           LIMIT $1
-           FOR UPDATE SKIP LOCKED
-         )
-         UPDATE session_runtime_gc AS gc
-         SET attempts=gc.attempts+1, next_attempt_at=NOW() + INTERVAL '1 hour'
-         FROM candidates
-         WHERE gc.tenant_id=candidates.tenant_id AND gc.session_id=candidates.session_id
-         RETURNING gc.tenant_id, gc.session_id, gc.user_id`,
-        [limit],
-      );
-      return { deletedSessions, releasedSandboxes, storageGc: storageGc.rows, runtimeGc: runtimeGc.rows };
+      const purged = await this.purgeLockedSessions(db, candidates.rows,
+        "status='deleted' AND deleted_at <= NOW() - ($3 * INTERVAL '1 day')", [this.retentionDays]);
+      return { ...purged, ...(await this.claimSessionGc(db, limit)) };
     });
+    return this.finishSessionPurge(storage, committed, options);
+  }
 
+  /**
+   * Deletes the scheduled chats that `scheduledSessionExpiredSql` selects, in
+   * every tenant, the same way as a Trash purge. The run rows stay: their
+   * foreign key sets `session_id` to NULL, and the run status and summary stay.
+   */
+  async cleanupExpiredScheduled(
+    storage: Pick<ArtifactStorage, "delete">,
+    options: ScheduledSessionCleanupOptions,
+  ): Promise<SessionCleanupResult> {
+    const { retentionDays } = options;
+    // A shorter window could delete a new session before its run writes the run row.
+    if (!Number.isInteger(retentionDays) || retentionDays < 1) {
+      throw new Error("Scheduled session retention must be at least 1 day.");
+    }
+    const limit = options.batchSize ?? 100;
+    const committed = await withTransaction(this.maintenanceDb, async (db) => {
+      const locked = await db.query<SessionPurgeCandidate>(
+        `SELECT s.tenant_id, s.session_id, s.user_id
+         FROM sessions s
+         WHERE ${scheduledSessionExpiredSql("s", "$2")}
+         ORDER BY s.created_at, s.session_id
+         LIMIT $1
+         FOR UPDATE OF s SKIP LOCKED`,
+        [limit, retentionDays],
+      );
+      // Turn admission locks the session row before it writes the lease
+      // (SessionExecutionStore.acquire). A lease that committed after the
+      // snapshot of the statement above is not in its result. This statement
+      // starts after the locks, so it sees that lease, and no new one can
+      // commit until this transaction ends.
+      const candidates = locked.rows.length === 0 ? [] : (await db.query<SessionPurgeCandidate>(
+        `SELECT s.tenant_id, s.session_id, s.user_id
+         FROM sessions s
+         JOIN unnest($1::text[], $2::text[]) AS locked(tenant_id, session_id)
+           ON s.tenant_id = locked.tenant_id AND s.session_id = locked.session_id
+         WHERE ${scheduledSessionExpiredSql("s", "$3")}
+         ORDER BY s.created_at, s.session_id`,
+        [locked.rows.map((row) => row.tenant_id), locked.rows.map((row) => row.session_id), retentionDays],
+      )).rows;
+      const purged = await this.purgeLockedSessions(db, candidates, "purpose='scheduled' AND status='active'", []);
+      return { ...purged, ...(await this.claimSessionGc(db, limit)) };
+    });
+    return this.finishSessionPurge(storage, committed, options);
+  }
+
+  /**
+   * Deletes sessions that the caller locked, children first, and queues their
+   * storage objects and checkpoint threads for the GC passes. `deleteGuard`
+   * repeats the caller's row condition on the session DELETE; its parameters
+   * start at $3.
+   */
+  private async purgeLockedSessions(
+    db: PoolClient,
+    candidates: SessionPurgeCandidate[],
+    deleteGuard: string,
+    guardParams: unknown[],
+  ): Promise<Pick<CommittedSessionPurge, "deletedSessions" | "releasedSandboxes">> {
+    let deletedSessions = 0;
+    // A Trash delete takes the sandbox, but a row that an earlier version trashed can
+    // still name one. A scheduled chat names one after a follow-up turn of its owner.
+    const releasedSandboxes: CommittedSessionPurge["releasedSandboxes"] = [];
+    for (const candidate of candidates) {
+      const artifacts = await db.query<{ storage_key: string }>(
+        `SELECT DISTINCT storage_key FROM artifacts
+         WHERE tenant_id=$1 AND session_id=$2 AND storage_key IS NOT NULL`,
+        [candidate.tenant_id, candidate.session_id],
+      );
+      for (const artifact of artifacts.rows) {
+        await db.query(
+          `INSERT INTO session_storage_gc (tenant_id, session_id, storage_key)
+           VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
+          [candidate.tenant_id, candidate.session_id, artifact.storage_key],
+        );
+      }
+      await db.query(
+        `INSERT INTO session_runtime_gc (tenant_id, session_id, user_id)
+         VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
+        [candidate.tenant_id, candidate.session_id, candidate.user_id],
+      );
+
+      // These legacy foreign keys do not follow the session cascade rules.
+      // Remove their rows explicitly before deleting the session.
+      await db.query(
+        `DELETE FROM messages WHERE tenant_id=$1 AND session_id=$2`,
+        [candidate.tenant_id, candidate.session_id],
+      );
+      await db.query(
+        `DELETE FROM runtime_sessions WHERE tenant_id=$1 AND session_id=$2`,
+        [candidate.tenant_id, candidate.session_id],
+      );
+      await db.query(
+        `DELETE FROM session_executions WHERE tenant_id=$1 AND session_id=$2`,
+        [candidate.tenant_id, candidate.session_id],
+      );
+      const deleted = await db.query<{ sandbox_id: string | null }>(
+        `DELETE FROM sessions
+         WHERE tenant_id=$1 AND session_id=$2 AND ${deleteGuard}
+         RETURNING sandbox_id`,
+        [candidate.tenant_id, candidate.session_id, ...guardParams],
+      );
+      deletedSessions += deleted.rowCount ?? 0;
+      const sandboxId = deleted.rows[0]?.sandbox_id;
+      if (sandboxId) releasedSandboxes.push({ tenantId: candidate.tenant_id, sessionId: candidate.session_id, sandboxId });
+    }
+    return { deletedSessions, releasedSandboxes };
+  }
+
+  /** Leases due GC rows for this pass, so a concurrent pass skips them. */
+  private async claimSessionGc(
+    db: PoolClient,
+    limit: number,
+  ): Promise<Pick<CommittedSessionPurge, "storageGc" | "runtimeGc">> {
+    const storageGc = await db.query<SessionStorageGcRow>(
+      `WITH candidates AS (
+         SELECT tenant_id, session_id, storage_key
+         FROM session_storage_gc
+         WHERE next_attempt_at <= NOW()
+         ORDER BY next_attempt_at, created_at, tenant_id, session_id, storage_key
+         LIMIT $1
+         FOR UPDATE SKIP LOCKED
+       )
+       UPDATE session_storage_gc AS gc
+       SET attempts=gc.attempts+1, next_attempt_at=NOW() + INTERVAL '1 hour'
+       FROM candidates
+       WHERE gc.tenant_id=candidates.tenant_id
+         AND gc.session_id=candidates.session_id
+         AND gc.storage_key=candidates.storage_key
+       RETURNING gc.tenant_id, gc.session_id, gc.storage_key`,
+      [limit],
+    );
+    const runtimeGc = await db.query<SessionRuntimeGcRow>(
+      `WITH candidates AS (
+         SELECT tenant_id, session_id, user_id
+         FROM session_runtime_gc
+         WHERE next_attempt_at <= NOW()
+         ORDER BY next_attempt_at, created_at, tenant_id, session_id
+         LIMIT $1
+         FOR UPDATE SKIP LOCKED
+       )
+       UPDATE session_runtime_gc AS gc
+       SET attempts=gc.attempts+1, next_attempt_at=NOW() + INTERVAL '1 hour'
+       FROM candidates
+       WHERE gc.tenant_id=candidates.tenant_id AND gc.session_id=candidates.session_id
+       RETURNING gc.tenant_id, gc.session_id, gc.user_id`,
+      [limit],
+    );
+    return { storageGc: storageGc.rows, runtimeGc: runtimeGc.rows };
+  }
+
+  /** After the commit: deletes the leased objects and threads, then kills the released sandboxes. */
+  private async finishSessionPurge(
+    storage: Pick<ArtifactStorage, "delete">,
+    committed: CommittedSessionPurge,
+    options: SessionTrashCleanupOptions,
+  ): Promise<SessionCleanupResult> {
     let deletedObjects = 0;
     for (const pending of committed.storageGc) {
       const refs = await this.maintenanceDb.query(
