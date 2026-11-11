@@ -6,11 +6,18 @@ import {
   actOnPersonalSkill, createPersonalSkill, deletePersonalSkill, getPersonalSkillHistory,
   getPersonalSkills, updatePersonalSkill
 } from "@/lib/personal-skills-api";
+import { listMySkillSubmissions } from "@/lib/organization-skill-submissions-api";
 import { PersonalSkills } from "./personal-skills";
 
 vi.mock("@/lib/personal-skills-api", () => ({
   actOnPersonalSkill: vi.fn(), createPersonalSkill: vi.fn(), deletePersonalSkill: vi.fn(),
   getPersonalSkillHistory: vi.fn(), getPersonalSkills: vi.fn(), updatePersonalSkill: vi.fn()
+}));
+const navigation = vi.hoisted(() => ({ replace: vi.fn() }));
+vi.mock("next/navigation", () => ({ useRouter: () => navigation }));
+vi.mock("@/lib/organization-skill-submissions-api", () => ({
+  getMySkillSubmission: vi.fn(), listMySkillSubmissions: vi.fn(), resubmitSkillSubmission: vi.fn(),
+  submitPersonalSkill: vi.fn(), withdrawSkillSubmission: vi.fn()
 }));
 const scope = { tenantId: "tenant-a", userId: "person-a" };
 const content = { name: "meeting-notes", description: "Prepare meeting notes", instructions: "Summarize decisions." };
@@ -27,6 +34,7 @@ beforeEach(() => {
   vi.mocked(actOnPersonalSkill).mockResolvedValue({ scope, skill: released });
   vi.mocked(deletePersonalSkill).mockResolvedValue({ scope, deleted: true });
   vi.mocked(getPersonalSkillHistory).mockResolvedValue({ scope, revisions: [revision] });
+  vi.mocked(listMySkillSubmissions).mockResolvedValue({ scope, submissions: [] });
 });
 afterEach(cleanup);
 
@@ -461,6 +469,135 @@ it("uses one list recovery after leaving a skill whose conflict reread failed", 
   await waitFor(() => expect(screen.queryByRole("alert")).toBeNull());
   expect(getPersonalSkills).toHaveBeenCalledTimes(3);
   expect(updatePersonalSkill).toHaveBeenCalledTimes(1);
+});
+
+const disabledButton = (name: string) => (screen.getByRole("button", { name }) as HTMLButtonElement).disabled;
+// Edits released revision 1, gets a save conflict, and fails the reread that follows.
+async function failRecoveryWhileEditing(text = "My draft.") {
+  vi.mocked(getPersonalSkills).mockResolvedValueOnce({ scope, skills: [released] })
+    .mockRejectedValueOnce(new Error("Read unavailable"));
+  vi.mocked(updatePersonalSkill).mockRejectedValueOnce(conflictError);
+  render(<PersonalSkills expectedScope={scope} />);
+  fireEvent.click(await screen.findByRole("button", { name: "Edit" }));
+  fireEvent.change(screen.getByRole("textbox", { name: "Instructions" }), { target: { value: text } });
+  fireEvent.click(screen.getByRole("button", { name: "Save draft" }));
+  await screen.findByRole("button", { name: "Reload latest version" });
+}
+async function discardAndLeave() {
+  fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+  fireEvent.click(screen.getByRole("button", { name: "Discard changes" }));
+  fireEvent.click(screen.getByRole("button", { name: "Back to skills" }));
+  await screen.findByRole("heading", { name: "Private skills" });
+}
+
+it("keeps the write block after leaving and reopening a skill whose conflict reread failed", async () => {
+  await failRecoveryWhileEditing();
+  await discardAndLeave();
+  expect(disabledButton("Edit")).toBe(true);
+  expect(disabledButton("Create skill")).toBe(true);
+  expect(screen.getByRole("alert").textContent).toContain("Reload skills before you create or change a skill.");
+  fireEvent.click(screen.getByRole("button", { name: "Details" }));
+  expect(screen.getByRole("group", { name: "Reload current skill" })).toBeTruthy();
+  expect(disabledButton("Edit")).toBe(true);
+  expect(disabledButton("Turn off")).toBe(true);
+  expect(disabledButton("Delete")).toBe(true);
+  fireEvent.click(screen.getByRole("button", { name: "Turn off" }));
+  expect(actOnPersonalSkill).not.toHaveBeenCalled();
+  expect(getPersonalSkills).toHaveBeenCalledTimes(2);
+});
+
+it("keeps the write block after a round trip through Share with organization", async () => {
+  await failRecoveryWhileEditing();
+  fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+  fireEvent.click(screen.getByRole("button", { name: "Discard changes" }));
+  fireEvent.click(screen.getByRole("button", { name: "Share with organization" }));
+  expect((await screen.findByLabelText("Private skill") as HTMLSelectElement).value).toBe("skill-1");
+  // The prefilled submission counts as unsent work, so leaving asks first.
+  const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+  fireEvent.click(screen.getByRole("button", { name: "Back to private skills" }));
+  expect(confirm).toHaveBeenCalledOnce();
+  confirm.mockRestore();
+  expect(await screen.findByRole("heading", { name: "Private skills" })).toBe(document.activeElement);
+  expect(disabledButton("Edit")).toBe(true);
+  expect(disabledButton("Create skill")).toBe(true);
+  expect(updatePersonalSkill).toHaveBeenCalledTimes(1);
+});
+
+it("keeps the write block through a failed list reload and lifts it after a successful one", async () => {
+  const newer = { ...released, version: 3 };
+  await failRecoveryWhileEditing();
+  await discardAndLeave();
+  vi.mocked(getPersonalSkills).mockRejectedValueOnce(new Error("Still unavailable"));
+  fireEvent.click(screen.getByRole("button", { name: "Reload skills" }));
+  expect(await screen.findByText("Still unavailable")).toBeTruthy();
+  expect(disabledButton("Edit")).toBe(true);
+  vi.mocked(getPersonalSkills).mockResolvedValueOnce({ scope, skills: [newer] });
+  fireEvent.click(screen.getByRole("button", { name: "Reload skills" }));
+  await waitFor(() => expect(screen.queryByRole("alert")).toBeNull());
+  expect(disabledButton("Create skill")).toBe(false);
+  fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+  expect((screen.getByRole("textbox", { name: "Instructions" }) as HTMLTextAreaElement).value).toBe(content.instructions);
+  fireEvent.change(screen.getByRole("textbox", { name: "Instructions" }), { target: { value: "Fresh edit." } });
+  fireEvent.click(screen.getByRole("button", { name: "Save draft" }));
+  await waitFor(() => expect(updatePersonalSkill).toHaveBeenLastCalledWith("skill-1", { scope, version: 3, source: { kind: "inline", ...content, instructions: "Fresh edit." } }));
+});
+
+it("returns to the saved skill, not the discarded draft, after a later successful reread", async () => {
+  const newer = { ...released, version: 3, latest: { ...revision, revision: 2, content: { ...content, instructions: "Other text." } } };
+  await failRecoveryWhileEditing();
+  fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+  fireEvent.click(screen.getByRole("button", { name: "Discard changes" }));
+  vi.mocked(getPersonalSkills).mockResolvedValueOnce({ scope, skills: [newer] });
+  fireEvent.click(screen.getByRole("button", { name: "Reload latest version" }));
+  expect((await screen.findByRole("alert")).textContent).toContain("This skill changed elsewhere");
+  expect(screen.queryByRole("group", { name: "Latest saved version" })).toBeNull();
+  expect(screen.queryByRole("textbox")).toBeNull();
+  expect(screen.getByText("Other text.")).toBeTruthy();
+  expect(disabledButton("Turn off")).toBe(false);
+});
+
+it("shows a skill deleted elsewhere as a list notice after its draft was discarded", async () => {
+  await failRecoveryWhileEditing();
+  fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+  fireEvent.click(screen.getByRole("button", { name: "Discard changes" }));
+  vi.mocked(getPersonalSkills).mockResolvedValueOnce({ scope, skills: [] });
+  fireEvent.click(screen.getByRole("button", { name: "Reload latest version" }));
+  expect((await screen.findByRole("alert")).textContent).toContain("It is no longer in your list.");
+  expect(screen.getByRole("heading", { name: "Private skills" })).toBe(document.activeElement);
+  expect(screen.queryByRole("textbox")).toBeNull();
+  expect(disabledButton("Create skill")).toBe(false);
+});
+
+it("keeps edited text through two failed rereads, then offers the choice", async () => {
+  const newer = { ...released, version: 3, latest: { ...revision, revision: 2, content: { ...content, instructions: "Other text." } } };
+  await failRecoveryWhileEditing("Keep this.");
+  vi.mocked(getPersonalSkills).mockRejectedValueOnce(new Error("Still unavailable"));
+  fireEvent.click(screen.getByRole("button", { name: "Reload latest version" }));
+  expect(await screen.findByText("Still unavailable")).toBeTruthy();
+  expect(screen.getByRole("group", { name: "Reload current skill" })).toBeTruthy();
+  expect(disabledButton("Save draft")).toBe(true);
+  vi.mocked(getPersonalSkills).mockResolvedValueOnce({ scope, skills: [newer] });
+  fireEvent.click(screen.getByRole("button", { name: "Reload latest version" }));
+  expect((await screen.findByRole("group", { name: "Latest saved version" })).textContent).toContain("Other text.");
+  expect((screen.getByRole("textbox", { name: "Instructions" }) as HTMLTextAreaElement).value).toBe("Keep this.");
+  expect(disabledButton("Save draft")).toBe(true);
+});
+
+it("turns an edited skill deleted elsewhere into a new draft after a retried reread", async () => {
+  const onDirtyChange = vi.fn();
+  vi.mocked(getPersonalSkills).mockResolvedValueOnce({ scope, skills: [released] })
+    .mockRejectedValueOnce(new Error("Read unavailable")).mockResolvedValueOnce({ scope, skills: [] });
+  vi.mocked(updatePersonalSkill).mockRejectedValueOnce(conflictError);
+  render(<PersonalSkills expectedScope={scope} onDirtyChange={onDirtyChange} />);
+  fireEvent.click(await screen.findByRole("button", { name: "Edit" }));
+  fireEvent.change(screen.getByRole("textbox", { name: "Instructions" }), { target: { value: "Keep this." } });
+  fireEvent.click(screen.getByRole("button", { name: "Save draft" }));
+  fireEvent.click(await screen.findByRole("button", { name: "Reload latest version" }));
+  expect(await screen.findByRole("heading", { name: "Create a draft" })).toBe(document.activeElement);
+  expect(screen.getByRole("alert").textContent).toContain("Your text is still here.");
+  expect((screen.getByRole("textbox", { name: "Instructions" }) as HTMLTextAreaElement).value).toBe("Keep this.");
+  expect(disabledButton("Save draft")).toBe(false);
+  expect(onDirtyChange).toHaveBeenLastCalledWith(true);
 });
 
 

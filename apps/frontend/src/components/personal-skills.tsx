@@ -21,7 +21,9 @@ import {
 type Mode = "list" | "create" | "edit" | "review" | "details" | "submissions";
 type Operation = "save" | "release" | "disable" | "delete" | "history" | "latest";
 type Block = Exclude<Operation, "latest">;
-type Recovery = { id: string; editing: boolean; reason: string };
+// A write failed because the skill changed or is gone, and no list read has confirmed it since.
+// All writes stay blocked until a full list read succeeds. Navigation does not clear it.
+type Recovery = { id: string; reason: string };
 // A failed write or read shows at the control that started it.
 type ActionError = { operation: Operation; tone: "danger" | "attention"; title: string; detail: string };
 // A result for the whole view: a confirmed write, or a skill deleted elsewhere.
@@ -209,6 +211,7 @@ export function PersonalSkills({ expectedScope, requestedSubmissionId = null, on
       setHistory(null);
       setHistoryOpen(false);
       if (!keepEditor) {
+        setRecovery(null);
         setNotice(null);
         if (trigger === document.activeElement && trigger?.getAttribute("data-skill-action") === "reload") pendingViewFocus.current = true;
       }
@@ -241,18 +244,20 @@ export function PersonalSkills({ expectedScope, requestedSubmissionId = null, on
     setHistoryOpen(false);
   };
   const beginCreate = () => {
+    if (recovery) return;
     pendingViewFocus.current = true;
     const next: Editor = { kind: "inline", content: { ...emptyContent } };
     leaveView();
     setEditor(next); setBaseline(JSON.stringify(next)); setSelectedId(null);
-    setMode("create"); setRecovery(null); setConflictSkillId(null);
+    setMode("create"); setConflictSkillId(null);
   };
   const beginEdit = (skill: PersonalSkill) => {
+    if (recovery) return;
     pendingViewFocus.current = true;
     const next: Editor = { kind: "inline", content: { ...skill.latest.content } };
     leaveView();
     setEditor(next); setBaseline(JSON.stringify(next)); setSelectedId(skill.id);
-    setMode("edit"); setConflictSkillId(null); setRecovery(null);
+    setMode("edit"); setConflictSkillId(null);
   };
   const openSkill = (skill: PersonalSkill, next: "details" | "review") => {
     pendingViewFocus.current = true;
@@ -262,40 +267,38 @@ export function PersonalSkills({ expectedScope, requestedSubmissionId = null, on
   const backToList = () => {
     pendingViewFocus.current = true;
     leaveView();
-    setRecovery(null);
     setMode("list"); setSelectedId(null);
   };
   const leaveEditor = () => {
     pendingViewFocus.current = true;
     leaveView();
     setMode(selectedId ? "details" : "list"); setConflictSkillId(null);
-    setRecovery((current) => current ? { ...current, editing: false } : null);
   };
   const cancelEdit = () => { if (dirty) setDiscard("cancel"); else leaveEditor(); };
   const recoverLatest = async (target: Recovery) => {
     const reloaded = await reload(true);
     if (!reloaded) return;
     setRecovery(null);
-    if (!reloaded.some((item) => item.id === target.id)) {
+    // Navigation is blocked while the read runs, so the view is the one that started it.
+    const editing = mode === "edit" && selectedId === target.id;
+    const viewing = (mode === "details" || mode === "review") && selectedId === target.id;
+    const stillHere = document.activeElement === document.body ||
+      document.activeElement?.hasAttribute("data-skill-action") ||
+      recoveryRef.current?.contains(document.activeElement);
+    if (!reloaded.some((item) => item.id === target.id) && (editing || viewing)) {
       pendingViewFocus.current = true;
       setSelectedId(null); setConfirmDelete(false);
-      setMode(target.editing ? "create" : "list");
-      setNotice({ tone: "attention", title: "This skill was deleted elsewhere", detail: target.editing
+      setMode(editing ? "create" : "list");
+      setNotice({ tone: "attention", title: "This skill was deleted elsewhere", detail: editing
         ? "Your text is still here. Save it as a new draft if you want to keep it."
         : "It is no longer in your list." });
+    } else if (editing) {
+      pendingConflictFocus.current = Boolean(stillHere);
+      setConflictSkillId(target.id);
+      setActionError(null);
     } else {
-      const stillHere = document.activeElement === document.body ||
-        document.activeElement?.hasAttribute("data-skill-action") ||
-        recoveryRef.current?.contains(document.activeElement);
-      const detail = `${target.reason} Review the current version before you try again.`;
-      if (target.editing) {
-        pendingConflictFocus.current = Boolean(stillHere);
-        setConflictSkillId(target.id);
-        setActionError(null);
-      } else {
-        if (stillHere) pendingViewFocus.current = true;
-        setNotice({ tone: "attention", title: "This skill changed elsewhere", detail });
-      }
+      if (stillHere) pendingViewFocus.current = true;
+      if (viewing) setNotice({ tone: "attention", title: "This skill changed elsewhere", detail: `${target.reason} Review the current version before you try again.` });
     }
   };
   const failure = (operation: Operation) => ({
@@ -317,7 +320,7 @@ export function PersonalSkills({ expectedScope, requestedSubmissionId = null, on
       if (cause instanceof ApiError && ((cause.status === 409 && cause.code === "personal_skill_conflict") || cause.status === 404)) {
         setReviewedRevision(null);
         if (selectedId) {
-          const target = { id: selectedId, editing: mode === "edit", reason: message(cause) };
+          const target = { id: selectedId, reason: message(cause) };
           pendingRecoveryFocus.current = document.activeElement === document.body || document.activeElement?.getAttribute("data-skill-action") === operation;
           setRecovery(target);
           await recoverLatest(target);
@@ -417,7 +420,7 @@ export function PersonalSkills({ expectedScope, requestedSubmissionId = null, on
   const recoveryBlock = recovery ? <SkillNotice ref={recoveryRef} tabIndex={-1} role="group" aria-label="Reload current skill" tone="danger" title="The current version could not be confirmed">
     {listReadError ? <p className={prose}>{listReadError}</p> : null}
     <p className={prose}>{recovery.reason}</p>
-    <p className={prose}>{recovery.editing ? "Your unsaved text is still here. " : ""}Reload the latest version before saving, releasing, turning off, or deleting this skill.</p>
+    <p className={prose}>{mode === "edit" || mode === "create" ? "Your unsaved text is still here. " : ""}Reload the latest version before saving, releasing, turning off, or deleting this skill.</p>
     <Button data-skill-action="latest" size="sm" variant="outline" aria-disabled={pending === "latest"} disabled={disabled && pending !== "latest"} onClick={() => void run("latest", () => recoverLatest(recovery))}><Pending active={pending === "latest"} idle="Reload latest version" busy="Reloading latest version…" /></Button>
   </SkillNotice> : null;
   const saveNote = mode === "create" || !selected?.active ? "Saving a draft does not make it available in chats. You review it before release."
@@ -437,7 +440,7 @@ export function PersonalSkills({ expectedScope, requestedSubmissionId = null, on
         <h2 ref={listHeadingRef} tabIndex={-1} id="private-skills-title" className={`text-base font-semibold text-on-surface ${headingFocus}`}>Private skills</h2>
         <p className="text-sm text-on-surface-variant">Write or import instructions for your own standalone chats. Only you can use these skills. Projects and scheduled jobs do not use them.</p>
       </div>
-      {mode === "list" ? <div className="flex flex-wrap gap-2"><Button size="sm" variant="outline" disabled={disabled} onClick={() => { leaveView(); setSubmissionSourceId(null); setMode("submissions"); }}>My submissions</Button><Button size="sm" className={quietDisabled} disabled={disabled} onClick={beginCreate}>Create skill</Button></div> : null}
+      {mode === "list" ? <div className="flex flex-wrap gap-2"><Button size="sm" variant="outline" disabled={disabled} onClick={() => { leaveView(); setSubmissionSourceId(null); setMode("submissions"); }}>My submissions</Button><Button size="sm" className={quietDisabled} disabled={disabled || Boolean(recovery)} onClick={beginCreate}>Create skill</Button></div> : null}
     </div>
     {scopeMismatch ? <SkillNotice role="alert" tone="danger" title={sessionExpired ? "Your session expired" : "Your account or organization changed"}>
       <p>{sessionExpired ? "Reload this page to sign in again." : "Reload this page before editing private skills."}</p>
@@ -446,9 +449,10 @@ export function PersonalSkills({ expectedScope, requestedSubmissionId = null, on
     </SkillNotice> : null}
     {mode === "list" && !scopeMismatch ? <>
       {viewNotice}
-      {recoveryBlock}
+      {listReadError ? null : recoveryBlock}
       {listReadError ? <SkillNotice role="alert" tone="danger" title={skills.length > 0 ? "Could not load the full skills list" : "Could not load private skills"}>
         <p className={prose}>{listReadError}</p>
+        {recovery ? <p className={prose}>Reload skills before you create or change a skill.</p> : null}
         <Button data-skill-action="reload" size="sm" variant="outline" aria-disabled={loading} disabled={busy || readingFile || scopeMismatch} onClick={() => { if (!loading) void reload(); }}><Pending active={loading} idle="Reload skills" busy="Reloading skills…" /></Button>
         {skills.length > 0 ? <p role={loading ? "status" : undefined} className={prose}>{loading ? "Reloading skills. The list below shows the last confirmed items." : "Only skills confirmed in this session are shown below."}</p> : null}
       </SkillNotice> : null}
@@ -464,7 +468,7 @@ export function PersonalSkills({ expectedScope, requestedSubmissionId = null, on
             {/* Two lines in the list. Details show the full purpose. */}
             <p className={`line-clamp-2 whitespace-pre-wrap text-sm text-on-surface-variant ${prose}`}>{skill.latest.content.description}</p>
           </div>
-          <div className="flex shrink-0 gap-2"><Button size="sm" variant="outline" disabled={disabled} onClick={() => openSkill(skill, "details")}>Details</Button><Button size="sm" className={quietDisabled} disabled={disabled} onClick={() => editable ? beginEdit(skill) : openSkill(skill, "review")}>{editable ? "Edit" : "Review"}</Button></div>
+          <div className="flex shrink-0 gap-2"><Button size="sm" variant="outline" disabled={disabled} onClick={() => openSkill(skill, "details")}>Details</Button><Button size="sm" className={quietDisabled} disabled={disabled || Boolean(editable && recovery)} onClick={() => editable ? beginEdit(skill) : openSkill(skill, "review")}>{editable ? "Edit" : "Review"}</Button></div>
         </li>;
       })}</ul> : null}
     </> : null}
