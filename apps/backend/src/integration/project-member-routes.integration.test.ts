@@ -32,9 +32,10 @@ describe.skipIf(!adminDatabaseUrl())("project member HTTP authorization", () => 
       expect(invite.json()).toEqual({ role: "editor", effectiveRole: "editor" });
       h.authenticate(h.editorId);
       expect((await h.app.inject({ method: "GET", url: `${url}/members` })).statusCode).toBe(403);
-      expect((await h.app.inject({ method: "PUT", url: `${url}/sharing`, payload: { visibility: "organization", organizationRole: "editor", confirmAudience: true } })).statusCode).toBe(403);
+      const saved = { visibility: "private", organizationRole: "viewer" };
+      expect((await h.app.inject({ method: "PUT", url: `${url}/sharing`, payload: { visibility: "organization", organizationRole: "editor", confirmAudience: true, expected: saved } })).statusCode).toBe(403);
       h.authenticate(h.ownerId);
-      const sharing = { visibility: "organization", organizationRole: "viewer" };
+      const sharing = { visibility: "organization", organizationRole: "viewer", expected: saved };
       expect((await h.app.inject({ method: "PUT", url: `${url}/sharing`, payload: sharing })).statusCode).toBe(409);
       expect((await h.app.inject({ method: "PUT", url: `${url}/sharing`, payload: { ...sharing, confirmAudience: true } })).statusCode).toBe(204);
       h.authenticate(h.editorId);
@@ -43,6 +44,29 @@ describe.skipIf(!adminDatabaseUrl())("project member HTTP authorization", () => 
       const otherTenant = await seedTenant();
       h.authenticate(h.ownerId, otherTenant);
       expect((await h.app.inject({ method: "GET", url: `${url}/members` })).statusCode).toBe(404);
+    } finally { await h.app.close(); }
+  });
+
+  test("returns a classified 409 when the saved access in the request is stale, and 400 when it is missing", async () => {
+    const h = await setup();
+    const url = `/projects/${h.projectId}/sharing`;
+    const put = (payload: Record<string, unknown>) => h.app.inject({ method: "PUT", url, payload });
+    const shared = { visibility: "organization", organizationRole: "viewer" };
+    try {
+      expect((await put({ ...shared, confirmAudience: true, expected: { visibility: "private", organizationRole: "viewer" } })).statusCode).toBe(204);
+      expect((await put({ visibility: "private", organizationRole: "viewer", expected: shared })).statusCode).toBe(204);
+      // The owner's page still shows "organization, viewer".
+      const stale = await put({ visibility: "organization", organizationRole: "editor", confirmAudience: true, expected: shared });
+      expect(stale.statusCode).toBe(409);
+      expect(stale.json()).toMatchObject({ error: "project_sharing_conflict" });
+      const unnamed = await put({ visibility: "organization", organizationRole: "editor", confirmAudience: true });
+      expect(unnamed.statusCode).toBe(400);
+      expect((await h.app.inject({ method: "GET", url: `/projects/${h.projectId}/members` })).json())
+        .toMatchObject({ visibility: "private", organizationRole: "viewer" });
+      h.authenticate(h.editorId);
+      expect((await put({ visibility: "private", organizationRole: "viewer", expected: shared })).statusCode).toBe(404);
+      h.authenticate(h.ownerId, await seedTenant());
+      expect((await put({ visibility: "private", organizationRole: "viewer", expected: { visibility: "private", organizationRole: "viewer" } })).statusCode).toBe(404);
     } finally { await h.app.close(); }
   });
 

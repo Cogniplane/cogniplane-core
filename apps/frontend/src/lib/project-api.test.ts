@@ -130,11 +130,17 @@ it("loads and updates project sharing through the project endpoints", async () =
   await updateProjectSharing("p1", {
     visibility: "organization",
     organizationRole: "editor",
+    expected: { visibility: "private", organizationRole: "viewer" },
     confirmAudience: true
   });
   expect(request).toHaveBeenLastCalledWith("/projects/p1/sharing", {
     method: "PUT",
-    body: JSON.stringify({ visibility: "organization", organizationRole: "editor", confirmAudience: true })
+    body: JSON.stringify({
+      visibility: "organization",
+      organizationRole: "editor",
+      expected: { visibility: "private", organizationRole: "viewer" },
+      confirmAudience: true
+    })
   });
 });
 

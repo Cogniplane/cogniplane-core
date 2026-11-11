@@ -22,6 +22,9 @@ type Project = {
 };
 
 const actor = { tenantId: "tenant-a", projectId: "project-1", userId: "owner-1" };
+const privateViewer = { visibility: "private", organizationRole: "viewer" } as const;
+const sharedViewer = { visibility: "organization", organizationRole: "viewer" } as const;
+const sharedEditor = { visibility: "organization", organizationRole: "editor" } as const;
 
 class ProjectWorld {
   readonly pool = new FakePool();
@@ -131,7 +134,7 @@ describe("ProjectMemberStore input validation", () => {
   test("rejects an invalid sharing setting or role before it opens a transaction", async () => {
     const world = new ProjectWorld();
 
-    await expect(world.store().setSharing(actor, { visibility: "public" as "private", organizationRole: "viewer" }))
+    await expect(world.store().setSharing(actor, { visibility: "public" as "private", organizationRole: "viewer", expected: privateViewer }))
       .rejects.toMatchObject({ code: "invalid_project_sharing", status: 400 });
     await expect(world.store().setMember(actor, "member-1", "admin" as "owner"))
       .rejects.toMatchObject({ code: "invalid_project_role", status: 400 });
@@ -144,7 +147,7 @@ describe("ProjectMemberStore lock order", () => {
   // order only: the actor's organization membership is held FOR SHARE before
   // the project row lock. The blocking effect itself needs Postgres.
   test.each([
-    ["setSharing", (store: ProjectMemberStore) => store.setSharing(actor, { visibility: "private", organizationRole: "viewer" })],
+    ["setSharing", (store: ProjectMemberStore) => store.setSharing(actor, { ...privateViewer, expected: privateViewer })],
     ["setMember", (store: ProjectMemberStore) => store.setMember(actor, "member-1", "viewer")]
   ])("%s locks the actor's organization membership before the project", async (_label, change) => {
     const world = new ProjectWorld();
@@ -165,10 +168,10 @@ describe("ProjectMemberStore.setSharing", () => {
     const world = new ProjectWorld();
 
     const error = await refusedWithoutWrite(world,
-      world.store().setSharing(actor, { visibility: "organization", organizationRole: "viewer" }));
+      world.store().setSharing(actor, { ...sharedViewer, expected: privateViewer }));
     expect(error).toMatchObject({ code: "project_audience_confirmation_required", status: 409 });
 
-    await world.store().setSharing(actor, { visibility: "organization", organizationRole: "viewer", confirmAudience: true });
+    await world.store().setSharing(actor, { ...sharedViewer, confirmAudience: true, expected: privateViewer });
     expect(world.project).toMatchObject({ visibility: "organization", organizationRole: "viewer" });
     expect(world.audits).toEqual([{
       userId: "owner-1",
@@ -188,34 +191,63 @@ describe("ProjectMemberStore.setSharing", () => {
     const world = new ProjectWorld();
     world.project.visibility = "organization";
 
-    await refusedWithoutWrite(world, world.store().setSharing(actor, { visibility: "organization", organizationRole: "editor" }));
+    await refusedWithoutWrite(world, world.store().setSharing(actor, { ...sharedEditor, expected: sharedViewer }));
   });
 
   test("makes a project private again without confirmation", async () => {
     const world = new ProjectWorld();
     world.project.visibility = "organization";
 
-    await world.store().setSharing(actor, { visibility: "private", organizationRole: "viewer" });
+    await world.store().setSharing(actor, { ...privateViewer, expected: sharedViewer });
     expect(world.project.visibility).toBe("private");
   });
 
+  // Issue #42: the owner confirms a change from the access they loaded. When
+  // another owner changed it since, the confirmation describes the wrong change.
+  test.each([
+    ["the project became private", privateViewer, { ...sharedEditor, confirmAudience: true }],
+    ["the organization role changed", sharedEditor, { ...sharedEditor, confirmAudience: true }],
+    ["the organization role changed before a members-only save", sharedEditor, privateViewer]
+  ] as const)("refuses a change made from stale access when %s", async (_label, saved, change) => {
+    const world = new ProjectWorld();
+    Object.assign(world.project, saved);
+
+    const error = await refusedWithoutWrite(world, world.store().setSharing(actor, { ...change, expected: sharedViewer }));
+    expect(error).toMatchObject({ code: "project_sharing_conflict", status: 409 });
+    expect(world.project).toMatchObject(saved);
+  });
+
+  test("refuses a change that does not name the saved access it was made from", async () => {
+    const world = new ProjectWorld();
+    world.project.visibility = "private";
+    const unnamed = { ...sharedEditor, confirmAudience: true } as unknown as Parameters<ProjectMemberStore["setSharing"]>[1];
+
+    await expect(world.store().setSharing(actor, unnamed)).rejects.toMatchObject({ code: "invalid_project_sharing", status: 400 });
+    expect(world.pool.queries).toEqual([]);
+    expect(world.project).toMatchObject(privateViewer);
+  });
+
+  // The role check runs before the saved-access check, so a conflict never
+  // tells a person who is not an owner what the saved access is.
   test.each([
     ["an editor", "editor-1", { code: "project_role_required", status: 403 }],
     ["a former organization member", "gone-1", { code: "project_not_found", status: 404 }]
-  ])("refuses %s", async (_label, userId, expected) => {
-    const world = new ProjectWorld();
-    world.project.explicit.set("gone-1", "owner");
+  ])("refuses %s, also with stale access", async (_label, userId, expected) => {
+    for (const named of [privateViewer, sharedEditor]) {
+      const world = new ProjectWorld();
+      world.project.explicit.set("gone-1", "owner");
 
-    const error = await refusedWithoutWrite(world, world.store().setSharing({ ...actor, userId },
-      { visibility: "private", organizationRole: "viewer" }));
-    expect(error).toMatchObject(expected);
+      const error = await refusedWithoutWrite(world, world.store().setSharing({ ...actor, userId },
+        { ...privateViewer, expected: named }));
+      expect(error).toMatchObject(expected);
+    }
   });
 
   test("refuses a sharing change on an archived project", async () => {
     const world = new ProjectWorld();
     world.project.archived = true;
 
-    const error = await refusedWithoutWrite(world, world.store().setSharing(actor, { visibility: "private", organizationRole: "viewer" }));
+    const error = await refusedWithoutWrite(world, world.store().setSharing(actor, { ...privateViewer, expected: privateViewer }));
     expect(error).toMatchObject({ code: "project_archived", status: 409 });
   });
 });

@@ -62,6 +62,11 @@ export class ProjectMemberStore {
     return withTenantScope(this.pool, actor.tenantId, async (db) => {
       await this.lockActorMembership(db, actor);
       const access = await requireProjectAccess(db, actor, "owner", { lock: true, active: true });
+      // Compare under the row lock. The owner confirmed a change from the
+      // expected access. From other saved access, the same request is a different change.
+      if (access.visibility !== value.expected.visibility || access.organizationRole !== value.expected.organizationRole)
+        throw new ProjectAccessError("project_sharing_conflict",
+          "Project access changed after you loaded it. Review the current access and save again.", 409);
       if (value.visibility === "organization" &&
           (access.visibility !== "organization" || access.organizationRole !== value.organizationRole) && !value.confirmAudience)
         throw new ProjectAccessError("project_audience_confirmation_required",

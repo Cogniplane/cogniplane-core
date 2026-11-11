@@ -53,11 +53,19 @@ export const ProjectDetailSchema = z.object({
 export type ProjectDetail = z.infer<typeof ProjectDetailSchema>;
 
 export const ProjectRoleSchema = z.enum(["owner", "editor", "viewer"]);
-export const ProjectSharingUpdateSchema = z.object({
+const ProjectSharingStateSchema = z.object({
   visibility: z.enum(["private", "organization"]),
-  organizationRole: z.enum(["viewer", "editor"]),
+  organizationRole: z.enum(["viewer", "editor"])
+}).strict();
+export type ProjectSharingState = z.infer<typeof ProjectSharingStateSchema>;
+/** `expected` is the saved access that the owner saw when they made and
+ *  confirmed the change. The backend refuses the change when the project
+ *  has a different saved access (409 `project_sharing_conflict`). */
+export const ProjectSharingUpdateSchema = ProjectSharingStateSchema.extend({
+  expected: ProjectSharingStateSchema,
   confirmAudience: z.boolean().default(false)
 }).strict();
+export type ProjectSharingUpdate = z.input<typeof ProjectSharingUpdateSchema>;
 export const ProjectMemberUpdateSchema = z.object({
   role: ProjectRoleSchema.nullable(),
   confirmRetainedRole: z.enum(["viewer", "editor"]).optional()
