@@ -54,7 +54,7 @@ it("warns that the project will have no owner before the only owner leaves, and 
 
   fireEvent.click(within(open).getByRole("button", { name: "Leave project" }));
 
-  await waitFor(() => expect(updateProjectMember).toHaveBeenCalledWith("p1", "ana", { role: null, confirmRetainedRole: undefined }));
+  await waitFor(() => expect(updateProjectMember).toHaveBeenCalledWith("p1", "ana", { role: null, confirmRetainedRole: undefined, confirmNoOwner: true }));
   expect(updateProjectMember).toHaveBeenCalledTimes(1);
   await waitFor(() => expect(toast.success).toHaveBeenCalledWith("Ana was removed from the project."));
   expect(screen.queryByRole("alertdialog")).toBeNull();
@@ -74,7 +74,7 @@ it("warns before the only owner is demoted, and sends the new role after the con
 
   fireEvent.click(within(open).getByRole("button", { name: "Change role" }));
 
-  await waitFor(() => expect(updateProjectMember).toHaveBeenCalledWith("p1", "ana", { role: "viewer", confirmRetainedRole: undefined }));
+  await waitFor(() => expect(updateProjectMember).toHaveBeenCalledWith("p1", "ana", { role: "viewer", confirmRetainedRole: undefined, confirmNoOwner: true }));
 });
 
 it("changes nothing when the only owner cancels", async () => {
@@ -140,6 +140,74 @@ it("keeps the dialog open with the reason, and offers Try again, when the change
   expect(toast.success).not.toHaveBeenCalled();
   fireEvent.click(within(open).getByRole("button", { name: "Try again" }));
   await waitFor(() => expect(updateProjectMember).toHaveBeenCalledTimes(2));
+});
+
+// Issue #42: Cy left after this page loaded. The page still shows two owners,
+// so it does not warn. The backend counts the owners and refuses the change.
+const noOwnerRefusal = () => new ApiError({
+  status: 409, code: "project_no_owner_confirmation_required", method: "PUT", path: "/projects/p1/members/ana",
+  message: "This change leaves the project with no owner. Confirm the change to continue."
+});
+
+it("shows the warning from the backend refusal and sends the confirmation only after an explicit choice", async () => {
+  vi.mocked(updateProjectMember)
+    .mockRejectedValueOnce(noOwnerRefusal())
+    .mockResolvedValueOnce({ role: "viewer", effectiveRole: "viewer" });
+  const invalidate = vi.spyOn(client, "invalidateQueries");
+  renderMembers({ access: { members: [ANA, CY, BO] } });
+  fireEvent.change(screen.getByLabelText("Role of Ana"), { target: { value: "viewer" } });
+  const open = await dialog();
+  expect(within(open).queryByRole("alert")).toBeNull();
+
+  fireEvent.click(within(open).getByRole("button", { name: "Change role" }));
+
+  await waitFor(() => expect(within(open).getByRole("alert").textContent).toContain(NO_OWNER));
+  expect(updateProjectMember).toHaveBeenCalledWith("p1", "ana", { role: "viewer", confirmRetainedRole: undefined, confirmNoOwner: undefined });
+  expect(within(open).getByRole("alert").textContent).toContain("The member list changed after this page loaded.");
+  expect(open.textContent).not.toContain("You will no longer be able to manage this project.");
+  expect(within(open).queryByRole("button", { name: "Try again" })).toBeNull();
+  expect(invalidate).toHaveBeenCalledWith({ queryKey: ["projects", "p1", "access"] });
+  expect(updateProjectMember).toHaveBeenCalledTimes(1);
+  expect(toast.success).not.toHaveBeenCalled();
+
+  fireEvent.click(within(open).getByRole("button", { name: "Change role" }));
+
+  await waitFor(() => expect(updateProjectMember).toHaveBeenLastCalledWith("p1", "ana", { role: "viewer", confirmRetainedRole: undefined, confirmNoOwner: true }));
+  await waitFor(() => expect(toast.success).toHaveBeenCalledWith("Ana is now viewer."));
+  expect(screen.queryByRole("alertdialog")).toBeNull();
+});
+
+it("sends both confirmations after the refusal when organization sharing keeps access", async () => {
+  vi.mocked(updateProjectMember).mockRejectedValueOnce(noOwnerRefusal());
+  renderMembers({ access: { visibility: "organization", organizationRole: "editor", members: [ANA, CY, BO] } });
+  fireEvent.click(screen.getByRole("button", { name: "Leave project" }));
+  const open = await dialog();
+  fireEvent.click(within(open).getByRole("button", { name: "Leave project" }));
+  await waitFor(() => expect(within(open).getByRole("alert").textContent).toContain(NO_OWNER));
+
+  fireEvent.click(within(open).getByRole("button", { name: "Leave project" }));
+
+  await waitFor(() => expect(updateProjectMember).toHaveBeenLastCalledWith("p1", "ana", { role: null, confirmRetainedRole: "editor", confirmNoOwner: true }));
+});
+
+it("sends nothing after the refusal when the person cancels, and asks again for the next change", async () => {
+  vi.mocked(updateProjectMember).mockRejectedValueOnce(noOwnerRefusal());
+  renderMembers({ access: { members: [ANA, CY, BO] } });
+  fireEvent.click(screen.getByRole("button", { name: "Leave project" }));
+  const first = await dialog();
+  fireEvent.click(within(first).getByRole("button", { name: "Leave project" }));
+  await waitFor(() => expect(within(first).getByRole("alert").textContent).toContain(NO_OWNER));
+
+  fireEvent.click(within(first).getByRole("button", { name: "Cancel" }));
+  await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
+  expect(updateProjectMember).toHaveBeenCalledTimes(1);
+
+  fireEvent.click(screen.getByRole("button", { name: "Leave project" }));
+  const again = await dialog();
+  expect(within(again).queryByRole("alert")).toBeNull();
+  fireEvent.click(within(again).getByRole("button", { name: "Leave project" }));
+  await waitFor(() => expect(updateProjectMember).toHaveBeenCalledTimes(2));
+  expect(updateProjectMember).toHaveBeenLastCalledWith("p1", "ana", { role: null, confirmRetainedRole: undefined, confirmNoOwner: undefined });
 });
 
 it("loads the project data again after a saved change", async () => {

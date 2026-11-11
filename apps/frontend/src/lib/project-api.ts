@@ -138,12 +138,15 @@ export async function updateProjectSharing(id: string, input: ProjectSharingUpda
 }
 
 /** Sets the explicit role of a member, or removes it with a null role. A member
- *  can remove their own role. The backend lets the last owner leave or lose
- *  the role, so the caller warns first. `confirmRetainedRole`
- *  confirms the access that organization sharing still gives afterwards. */
+ *  can remove their own role. `confirmRetainedRole` confirms the access that
+ *  organization sharing still gives afterwards. The last owner can leave or
+ *  lose the role only with `confirmNoOwner: true`, after the caller warns.
+ *  Without it, the backend counts the current owners and returns 409
+ *  `project_no_owner_confirmation_required` when none stays. */
 export async function updateProjectMember(id: string, userId: string, input: {
   role: "owner" | "editor" | "viewer" | null;
   confirmRetainedRole?: "viewer" | "editor";
+  confirmNoOwner?: boolean;
 }) {
   return parseResponse(
     ProjectMemberUpdateResponseSchema,

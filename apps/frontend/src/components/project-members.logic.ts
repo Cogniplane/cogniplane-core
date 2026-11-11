@@ -13,7 +13,8 @@ const ROLE_PHRASE: Record<ProjectRole, string> = {
 };
 
 /** The warning before the last owner leaves or loses the role. The backend
- *  allows it, and an organization admin can assign an owner. */
+ *  allows it after this warning (`confirmNoOwner`), and an organization admin
+ *  can assign an owner later. */
 export const NO_OWNER_WARNING =
   "The project will have no owner. An organization admin can assign one later. " +
   "Until then, nobody can change owner-only settings, such as access and sharing. " +
@@ -23,8 +24,9 @@ export function memberName(member: Pick<ProjectMember, "displayName" | "email" |
   return member.displayName?.trim() || member.email?.trim() || member.userId;
 }
 
-/** True when the change takes the role of the only owner. The backend counts
- *  an owner the same way: an explicit owner who is still in the organization. */
+/** True when the change takes the role of the only owner in `members`. The
+ *  backend counts an owner the same way: an explicit owner who is still in the
+ *  organization. The list can be stale, so the backend counts again. */
 export function leavesNoOwner(members: readonly ProjectMember[], change: MemberChange): boolean {
   if (change.member.role !== "owner" || change.role === "owner") return false;
   return members.filter((member) => member.role === "owner").length === 1;
@@ -35,21 +37,26 @@ export type MemberChangeNotice = {
   details: string[];
   /** Set when the project has no owner after the change. */
   noOwnerWarning: string | null;
+  /** Sent as `confirmNoOwner`: true when the dialog shows the warning. */
+  confirmNoOwner: true | undefined;
   /** The access that organization sharing still gives. The backend asks for it. */
   confirmRetainedRole: "viewer" | "editor" | undefined;
   confirmLabel: string;
 };
 
 /** The text of the confirmation for one change of a member. `self` is true
- *  when the member is the person who looks at the page. */
+ *  when the member is the person who looks at the page. `backendNoOwner` is
+ *  true after the backend refused the change because no other owner stays
+ *  (409 `project_no_owner_confirmation_required`). */
 export function describeMemberChange(
   access: Pick<ProjectAccess, "visibility" | "organizationRole" | "members">,
   change: MemberChange,
-  self: boolean
+  self: boolean,
+  { backendNoOwner = false }: { backendNoOwner?: boolean } = {}
 ): MemberChangeNotice {
   const { member, role } = change;
   const name = memberName(member);
-  const noOwner = leavesNoOwner(access.members, change);
+  const noOwner = backendNoOwner || leavesNoOwner(access.members, change);
   // The same rule as the backend: sharing keeps access after a removal, or after
   // a change to viewer when the organization role is editor.
   const retained = access.visibility === "organization" && (role === null || (role === "viewer" && access.organizationRole === "editor"));
@@ -70,6 +77,7 @@ export function describeMemberChange(
       : self ? `Change your role to ${role}?` : `Change ${name} to ${role}?`,
     details,
     noOwnerWarning: noOwner ? NO_OWNER_WARNING : null,
+    confirmNoOwner: noOwner ? true : undefined,
     confirmRetainedRole: retained ? access.organizationRole : undefined,
     confirmLabel: role === null ? (self ? "Leave project" : "Remove member") : "Change role"
   };

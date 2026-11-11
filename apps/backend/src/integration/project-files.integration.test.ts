@@ -503,7 +503,7 @@ describe.skipIf(!adminDatabaseUrl())("versioned project files", () => {
           );
         if (change === "revoked" || change === "downgraded") {
           const memberships = new ProjectMemberStore(appPool());
-          await memberships.setMember(h.actor, h.actor.userId, change === "revoked" ? null : "viewer");
+          await memberships.setMember(h.actor, h.actor.userId, change === "revoked" ? null : "viewer", { confirmNoOwner: true });
         }
         releaseCopy();
         const outcome = await result;

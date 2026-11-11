@@ -24,6 +24,17 @@ selections. Routes: `routes/projects.ts`, `project-files.ts`,
   shows the saved access, and the owner must change the draft again to get a new
   confirmation (`components/project-sharing.tsx`). Audit event:
   `project_sharing_changed`.
+- Members: an owner sets an explicit role with `PUT
+  /projects/:projectId/members/:userId` (`{ role }`; `null` removes it). A
+  member can remove their own role. When organization sharing still gives
+  access after the change, the body needs `confirmRetainedRole` with that role
+  (409 `project_organization_access_retained`). When no owner stays after the
+  change, the body needs `confirmNoOwner: true` (409
+  `project_no_owner_confirmation_required`). The store counts the owners under
+  the project lock, so a member list that is older than the departure of
+  another owner cannot skip the warning. After this 409 the dialog shows the
+  warning, and the person confirms or cancels
+  (`components/project-members.tsx`). Audit event: `project_member_changed`.
 - Ownerless project (no owner who is still a tenant member): a tenant owner or
   admin lists them in Admin > Project owners (`GET /admin/projects/ownerless`)
   and makes a current member the owner (`POST

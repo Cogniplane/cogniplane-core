@@ -17,6 +17,20 @@ export class ProjectMemberStore {
     if (!member.rowCount) throw new ProjectAccessError("project_not_found", "This project is unavailable.", 404);
   }
 
+  // The owners that count: explicit owners who are still in the organization.
+  // The caller holds the project row lock, which protects explicit roles. The
+  // key share lock keeps each owner's organization membership until commit, so
+  // a concurrent organization removal commits before this count or waits for it.
+  private async ownerIds(db: PoolClient, actor: ProjectActor): Promise<string[]> {
+    const owners = await db.query(
+      `SELECT pm.user_id FROM project_memberships pm JOIN tenant_memberships tm
+       ON tm.tenant_id=pm.tenant_id AND tm.user_id=pm.user_id
+       WHERE pm.tenant_id=$1 AND pm.project_id=$2 AND pm.role='owner' FOR KEY SHARE OF tm`,
+      [actor.tenantId, actor.projectId],
+    );
+    return owners.rows.map(row => String(row.user_id));
+  }
+
   async listOwnerless(tenantId: string, userId: string) {
     return withTenantScope(this.pool, tenantId, async (db) => {
       const admin = await db.query(`SELECT user_id FROM tenant_memberships
@@ -84,7 +98,7 @@ export class ProjectMemberStore {
   }
 
   async setMember(actor: ProjectActor, userId: string, role: z.infer<typeof roleSchema> | null,
-    options: { confirmRetainedRole?: "viewer" | "editor" } = {}) {
+    options: { confirmRetainedRole?: "viewer" | "editor"; confirmNoOwner?: boolean } = {}) {
     if (role !== null && !roleSchema.safeParse(role).success)
       throw new ProjectAccessError("invalid_project_role", "Choose a valid project role.", 400);
     return withTenantScope(this.pool, actor.tenantId, async (db) => {
@@ -115,6 +129,13 @@ export class ProjectMemberStore {
       const rank: Record<string, number> = { viewer: 1, editor: 2, owner: 3 };
       if (access.archivedAt && role !== null && rank[role]! > (rank[oldRole ?? ""] ?? 0))
         throw new ProjectAccessError("project_archived", "Restore the project before granting access.", 409);
+      // A project can have no owner, but only after the person confirms it.
+      // Count the owners under the lock: the member list that the caller saw
+      // can be older than the departure of another owner.
+      if (oldRole === "owner" && role !== "owner" && member.rows[0] && !options.confirmNoOwner &&
+          !(await this.ownerIds(db, actor)).some(ownerId => ownerId !== userId))
+        throw new ProjectAccessError("project_no_owner_confirmation_required",
+          "This change leaves the project with no owner. Confirm the change to continue.", 409);
       if (role === null) {
         await db.query(`DELETE FROM project_memberships WHERE tenant_id=$1 AND project_id=$2 AND user_id=$3`,
           [actor.tenantId, actor.projectId, userId]);
@@ -147,13 +168,8 @@ export class ProjectMemberStore {
       const project = await db.query(`SELECT project_id FROM projects WHERE tenant_id=$1 AND project_id=$2 FOR UPDATE`,
         [actor.tenantId, actor.projectId]);
       if (!project.rows[0]) throw new ProjectAccessError("project_not_found", "This project is unavailable.", 404);
-      const owners = await db.query(
-        `SELECT pm.user_id FROM project_memberships pm JOIN tenant_memberships tm
-         ON tm.tenant_id=pm.tenant_id AND tm.user_id=pm.user_id
-         WHERE pm.tenant_id=$1 AND pm.project_id=$2 AND pm.role='owner'`,
-        [actor.tenantId, actor.projectId],
-      );
-      if (owners.rows.length) throw new ProjectAccessError("project_has_owner", "This project already has an owner.", 409);
+      if ((await this.ownerIds(db, actor)).length)
+        throw new ProjectAccessError("project_has_owner", "This project already has an owner.", 409);
       const target = await db.query(`SELECT user_id FROM tenant_memberships WHERE tenant_id=$1 AND user_id=$2 FOR SHARE`,
         [actor.tenantId, userId]);
       if (!target.rows[0]) throw new ProjectAccessError("organization_member_not_found", "Choose a current organization member.", 404);

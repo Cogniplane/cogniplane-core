@@ -127,7 +127,7 @@ describe.skipIf(!adminDatabaseUrl())("shared session reads", () => {
     h.authenticate(admin, h.tenantId, true);
     expect((await h.app.inject(`/sessions/${h.sessionId}/messages`)).statusCode).toBe(404);
     expect((await h.app.inject(`/downloads/${token}`)).statusCode).toBe(404);
-    await h.members.setMember(h.actor, h.userId, null);
+    await h.members.setMember(h.actor, h.userId, null, { confirmNoOwner: true });
     h.authenticate(h.userId);
     expect((await h.app.inject(`/sessions/${h.sessionId}/messages`)).statusCode).toBe(404);
     expect((await h.artifacts.listForUser(h.tenantId, h.userId, {})).items).toEqual([]);
@@ -169,7 +169,7 @@ describe.skipIf(!adminDatabaseUrl())("shared session reads", () => {
   test("keeps remaining members readable without an owner and consumes a token only once", async () => {
     const h = await setup();
     const token = await h.mint();
-    await h.members.setMember(h.actor, h.userId, null);
+    await h.members.setMember(h.actor, h.userId, null, { confirmNoOwner: true });
     expect((await h.app.inject(`/projects/${h.actor.projectId}`)).statusCode).toBe(200);
     expect((await h.app.inject(`/sessions/${h.sessionId}/messages`)).statusCode).toBe(200);
     const consume = () => h.artifacts.consumeDownloadToken({ token });

@@ -14,6 +14,7 @@ import {
   AlertDialogTitle
 } from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
+import { ApiError } from "@/lib/api-client";
 import { updateProjectMember } from "@/lib/project-api";
 import { PROJECT_SELECT } from "@/lib/project-ui";
 import {
@@ -27,8 +28,10 @@ import {
 
 /** The members of a project. An owner can change a role, remove a member, or
  *  leave. Every change asks first. When the change takes the role of the only
- *  owner, the question says that the project will have no owner. The backend
- *  allows that, and an organization admin can assign an owner. */
+ *  owner, the question says that the project will have no owner, and the save
+ *  confirms it. An organization admin can assign an owner later. The list on
+ *  this page can be stale, so the backend counts the owners again. When it
+ *  refuses the change, the dialog shows the warning and asks again. */
 export function ProjectMembers({ projectId, access, canManage, currentUserId, organizationNote }: {
   projectId: string;
   access: ProjectAccess;
@@ -41,12 +44,19 @@ export function ProjectMembers({ projectId, access, canManage, currentUserId, or
   const client = useQueryClient();
   const [change, setChange] = useState<MemberChange | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // The backend refused the open change because no other owner stays.
+  const [backendNoOwner, setBackendNoOwner] = useState(false);
 
   const update = useMutation({
-    mutationFn: (value: { change: MemberChange; confirmRetainedRole: "viewer" | "editor" | undefined }) =>
+    mutationFn: (value: {
+      change: MemberChange;
+      confirmRetainedRole: "viewer" | "editor" | undefined;
+      confirmNoOwner: true | undefined;
+    }) =>
       updateProjectMember(projectId, value.change.member.userId, {
         role: value.change.role,
-        confirmRetainedRole: value.confirmRetainedRole
+        confirmRetainedRole: value.confirmRetainedRole,
+        confirmNoOwner: value.confirmNoOwner
       }),
     onSuccess: async (result, value) => {
       setChange(null);
@@ -63,7 +73,14 @@ export function ProjectMembers({ projectId, access, canManage, currentUserId, or
       await client.invalidateQueries({ queryKey: ["projects"] });
     },
     onError: async (cause) => {
-      setError(cause instanceof Error ? cause.message : "The change was not saved. Try again.");
+      // The list on this page showed another owner. Show the warning, and send
+      // the confirmation only when the person chooses to continue.
+      if (cause instanceof ApiError && cause.code === "project_no_owner_confirmation_required") {
+        setBackendNoOwner(true);
+        setError(null);
+      } else {
+        setError(cause instanceof Error ? cause.message : "The change was not saved. Try again.");
+      }
       // The members or the sharing can have changed. The dialog reads the new state.
       await client.invalidateQueries({ queryKey: ["projects", projectId, "access"] });
     }
@@ -71,10 +88,13 @@ export function ProjectMembers({ projectId, access, canManage, currentUserId, or
 
   const open = (next: MemberChange) => {
     setError(null);
+    setBackendNoOwner(false);
     update.reset();
     setChange(next);
   };
-  const notice = change ? describeMemberChange(access, change, change.member.userId === currentUserId) : null;
+  const notice = change
+    ? describeMemberChange(access, change, change.member.userId === currentUserId, { backendNoOwner })
+    : null;
 
   return (
     <div className="border-t border-outline-variant pt-4">
@@ -140,9 +160,10 @@ export function ProjectMembers({ projectId, access, canManage, currentUserId, or
             {notice?.details.map((line) => <li key={line} className="wrap-anywhere">{line}</li>)}
           </ul>
           {notice?.noOwnerWarning ? (
-            <p role="alert" className="rounded-md border border-danger/40 bg-danger-surface px-3 py-2 text-sm font-medium text-danger">
-              {notice.noOwnerWarning}
-            </p>
+            <div role="alert" className="space-y-1 rounded-md border border-danger/40 bg-danger-surface px-3 py-2 text-sm font-medium text-danger">
+              {backendNoOwner ? <p>The member list changed after this page loaded. No other owner stays.</p> : null}
+              <p>{notice.noOwnerWarning}</p>
+            </div>
           ) : null}
           {error ? <p role="alert" className="text-sm text-danger">{error}</p> : null}
           <AlertDialogFooter>
@@ -152,7 +173,11 @@ export function ProjectMembers({ projectId, access, canManage, currentUserId, or
               variant={notice?.noOwnerWarning ? "destructive" : "default"}
               disabled={update.isPending}
               aria-busy={update.isPending}
-              onClick={() => { if (change && notice) update.mutate({ change, confirmRetainedRole: notice.confirmRetainedRole }); }}
+              onClick={() => {
+                if (change && notice) {
+                  update.mutate({ change, confirmRetainedRole: notice.confirmRetainedRole, confirmNoOwner: notice.confirmNoOwner });
+                }
+              }}
             >
               {update.isPending ? "Saving…" : error ? "Try again" : notice?.confirmLabel}
             </Button>
