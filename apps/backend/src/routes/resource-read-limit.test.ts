@@ -6,7 +6,6 @@ import { registerProjectFileRoutes } from "./project-files.js";
 import { registerSessionRoutes } from "./sessions.js";
 import { buildManagedToolRegistries } from "../services/managed-tools/build-managed-tools.js";
 import { INTERACTIVE_UI_RESOURCE_URI } from "../services/managed-tools/interactive-ui.js";
-import { ProjectFileStore } from "../services/project-file-store.js";
 import { RequestLimits } from "../services/request-limits.js";
 import { FakePool } from "../test-helpers/fake-pool.js";
 import { InMemoryAuditEventStore } from "../test-helpers/in-memory-audit-events.js";
@@ -40,9 +39,9 @@ async function appWithOneLimiter() {
       return "PDF TEXT";
     }
   };
-  vi.spyOn(ProjectFileStore.prototype, "content").mockResolvedValue({
-    name: "plan.pdf", mimeType: "application/pdf", storageKey: "stored-key"
-  } as never);
+  const projectFiles = {
+    content: vi.fn(async () => ({ name: "plan.pdf", mimeType: "application/pdf", storageKey: "stored-key" }))
+  };
   const widgetInput = { title: "Spending", description: "Travel is the largest category.", html: "<p>Travel</p>" };
   const savedCall = {
     serverId: "managed-session-context", toolName: "render_interactive_ui", input: "{}",
@@ -73,7 +72,7 @@ async function appWithOneLimiter() {
     processor,
     limits
   } as never);
-  await registerProjectFileRoutes(app, { artifactStorage: {}, artifactProcessor: processor, limits } as never);
+  await registerProjectFileRoutes(app, { artifactStorage: {}, artifactProcessor: processor, limits, projectFiles } as never);
   await registerSessionRoutes(app, {
     limits,
     sessions: { getReadable: async () => ({ status: "active", projectId: null }) },

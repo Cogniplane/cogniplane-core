@@ -44,7 +44,7 @@ variables named here.
 |---|---|---|
 | Graph state | Postgres checkpointer, `thread_id` = session id | In-memory checkpoints for the life of the runtime; each turn rebuilds history from saved user and assistant messages |
 | Runtime | Kept between turns until idle teardown or invalidation | New runtime for each turn, under the identity of the member who sends it |
-| Sandbox binding | Sandbox id saved; any replica reconnects while it exists; archive, delete and purge kill it ([sandbox](sandbox.md#e2b-sandbox)) | Not saved; disposing the runtime kills its sandbox |
+| Sandbox binding | Sandbox id saved; any replica reconnects while it exists; archive, delete, purge and a security change of the owner's account kill it ([sandbox](sandbox.md#e2b-sandbox)) | Not saved; disposing the runtime kills its sandbox |
 | Workspace files | Kept across turns while the sandbox exists | Kept for one turn only |
 | Personal skills and defaults | Yes | No |
 

@@ -6,6 +6,7 @@ import { Pool } from "./lib/db.js";
 import type { ToolExecutionContext } from "./services/auth/tool-execution-context-store.js";
 import { getIntegrationDescriptor } from "./services/integrations/integration-registry.js";
 import type { ManagedToolFactoryDeps } from "./services/managed-tools/factory.js";
+import { ProjectFileStore } from "./services/project-file-store.js";
 import { createSilentLogger } from "./test-helpers/silent-logger.js";
 import { createTestConfig } from "./test-helpers/test-config.js";
 
@@ -14,6 +15,7 @@ import { createTestConfig } from "./test-helpers/test-config.js";
 const pools: Pool[] = [];
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   await Promise.all(pools.splice(0).map((pool) => pool.end()));
 });
 
@@ -68,6 +70,19 @@ const BUILTIN_FACTORY_ORDER = [
 const BUILTIN_CATALOG_ORDER = [
   "session", "skill-corpus", "write-artifact", "project", "memory", "interactive-ui", "github", "notion", "jira"
 ];
+
+test("the app's project file store gets the app's PII service and PDF text extractor", () => {
+  const attach = vi.spyOn(ProjectFileStore.prototype, "setPiiProtection");
+
+  const deps = build();
+
+  // The project file routes and the project tools use `deps.projectFiles`.
+  // Without this service, the store refuses every agent draft.
+  expect(attach).toHaveBeenCalledOnce();
+  expect(attach.mock.contexts[0]).toBe(deps.projectFiles);
+  expect(attach.mock.calls[0]?.[0]).toBe(deps.piiProtection);
+  expect(attach.mock.calls[0]?.[1]).toBeTypeOf("function");
+});
 
 test("built-in connectors put their OAuth callback paths in the app registry that the auth allowlist reads", () => {
   const deps = build();

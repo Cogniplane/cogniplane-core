@@ -101,7 +101,7 @@ describe.skipIf(!adminDatabaseUrl())("a turn whose tool context ended, on a repl
           const sessionIds = await other.runtimeAdapter.invalidateRuntimesForUser(...args);
           stopped.push(sessionIds);
           return sessionIds;
-        } },
+        }, destroySandbox: (input) => other.runtimeAdapter.destroySandbox(input) },
         logger: createSilentLogger()
       })).revokeSessions(owner.tenantId, owner.userId, owner.userId, META);
     };
@@ -110,9 +110,11 @@ describe.skipIf(!adminDatabaseUrl())("a turn whose tool context ended, on a repl
 
     expect(response.statusCode, response.body).toBe(200);
     expect(stopped).toEqual([[]]);
-    // The check at the model start passed; the check before the tool did not.
+    // The check at the model start passed. The security change also stopped
+    // the lease of this normal chat, so the lease check before the tool stops
+    // the turn, before its tool context is read again, with the same reason.
     expect(model.calls).toBe(1);
-    expect(liveness).toHaveBeenCalledTimes(2);
+    expect(liveness).toHaveBeenCalledTimes(1);
     const stream = events(response.body);
     expect(stream.some((event) => event.type === "TOOL_CALL_START")).toBe(false);
     expect(stream.map((event) => event.delta ?? "").join("")).not.toContain("Second step.");

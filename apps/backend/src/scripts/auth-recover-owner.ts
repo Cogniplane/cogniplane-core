@@ -1,9 +1,11 @@
 import { loadConfig } from "../config.js";
 import { createPrivilegedDatabase } from "../lib/db.js";
-import { operatorAccountService, parseRecoverOwnerArguments } from "./local-auth-commands-lib.js";
+import { operatorAccountService, operatorSandboxes, parseRecoverOwnerArguments } from "./local-auth-commands-lib.js";
 
 // Gives a local owner who lost the password a new setup link. Every session
-// and older link of that account ends; the action is audited.
+// and older link of that account ends; the action is audited. The sandboxes of
+// the owner's chats are killed when E2B_API_KEY is set; the log on stderr
+// names each one.
 // pnpm --filter @cogniplane/backend auth:recover-owner --tenant-id <id> --email <owner email>
 
 async function run(): Promise<void> {
@@ -14,7 +16,8 @@ async function run(): Promise<void> {
 
   const db = createPrivilegedDatabase(databaseUrl);
   try {
-    const result = await operatorAccountService(db, config.API_ORIGIN).recoverOwner(args.tenantId, args.email);
+    const result = await operatorAccountService(db, config.API_ORIGIN, operatorSandboxes(config))
+      .recoverOwner(args.tenantId, args.email);
     console.log(JSON.stringify({ ownerUserId: result.userId, setupLink: result.link.url, expiresAt: result.link.expiresAt }, null, 2));
   } finally {
     await db.end();

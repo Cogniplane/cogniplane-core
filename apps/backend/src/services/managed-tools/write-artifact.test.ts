@@ -285,29 +285,29 @@ test("write_artifact (filePath path): reads bytes from runtime", async () => {
   expect(storageCalls.length === 1).toBeTruthy();
 });
 
-test("write_artifact: filename without extension yields no extension on storage key", async () => {
-  const { deps, storageCalls } = makeDeps();
+test("write_artifact: stores the object under the tenant, user and session of the tool context", async () => {
+  const { deps, storageCalls, artifactCalls } = makeDeps();
   await tool(deps).handler({
-    context: ctx(),
-    arguments: { name: "noext", content: "data" }
+    context: ctx({ tenantId: "tenant-a", userId: "user-1", sessionId: "session-1" }),
+    // A tool argument cannot choose the tenant segment.
+    arguments: { name: "report.csv", content: "a,b", tenantId: "tenant-b" }
   });
-  // The load-bearing contract is extension handling, not the internal key
-  // layout: a name with no dot yields NO trailing extension. Assert that, not
-  // the u/s/uuid prefix (a private storage.put() detail).
-  const key = storageCalls[0].storageKey;
-  expect(key.includes(".")).toBe(false);
+  const key = storageCalls[0]?.storageKey ?? "";
+  expect(key).toMatch(/^tenant-a\/user-1\/session-1\/[0-9a-f-]{36}\.csv$/);
+  expect(artifactCalls[0]).toMatchObject({ tenantId: "tenant-a", storageKey: key });
 });
 
-test("write_artifact: extension is sanitized of unsafe chars", async () => {
+// Uploads use the same extension rule (artifact-storage-key.test.ts), also for
+// a dot file and for a dot in a folder name only.
+test.each([
+  ["noext", ""],
+  ["weird.tar.g$", ".g"],
+  [".env", ""],
+  ["reports.v2/summary", ""]
+])("write_artifact: stores %j with the upload extension %j", async (name, extension) => {
   const { deps, storageCalls } = makeDeps();
-  await tool(deps).handler({
-    context: ctx(),
-    // Tricky filename with a leading dot in the "extension"
-    arguments: { name: "weird.tar.g$", content: "x" }
-  });
-  // The load-bearing contract is extension sanitization: the unsafe `$` is
-  // stripped, leaving `.g`. Assert the sanitized suffix, not the u/s/uuid prefix.
-  const key = storageCalls[0].storageKey;
-  expect(key.endsWith(".g")).toBe(true);
-  expect(key).not.toContain("$");
+  await tool(deps).handler({ context: ctx(), arguments: { name, content: "x" } });
+  const key = storageCalls[0]?.storageKey ?? "";
+  // The last segment is `<uuidv7><extension>`; a UUID has 36 characters.
+  expect(key.slice(key.lastIndexOf("/") + 1).slice(36)).toBe(extension);
 });

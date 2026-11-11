@@ -1,12 +1,12 @@
 import { createHash } from "node:crypto";
 import { Readable } from "node:stream";
-import { uuidv7 } from "../../lib/uuid.js";
 
 import type { ArtifactStorage } from "../artifacts/artifact-storage.js";
 import type { ArtifactStore } from "../artifacts/artifact-store.js";
 import type { AuditEventStore } from "../audit-event-store.js";
 import { ToolCallError } from "../../lib/tool-call-error.js";
 import { validateArtifactFilename } from "../artifacts/artifact-filename.js";
+import { buildArtifactStorageKey } from "../artifacts/artifact-storage-key.js";
 import { strictObjectSchema, withManagedToolErrorSchema, type ManagedToolDefinition } from "./types.js";
 
 type WriteArtifactDeps = {
@@ -143,10 +143,12 @@ export function createWriteArtifactTool(deps: WriteArtifactDeps): ManagedToolDef
 
         const mimeType = args.mimeType ? String(args.mimeType) : inferMimeType(name);
         const checksumSha256 = createHash("sha256").update(contentBuffer).digest("hex");
-        const safeExt = name.lastIndexOf(".") >= 0
-          ? name.slice(name.lastIndexOf(".")).slice(0, 32).replace(/[^a-zA-Z0-9._-]/g, "")
-          : "";
-        const storageKey = `${context.userId}/${context.sessionId}/${uuidv7()}${safeExt}`;
+        const storageKey = buildArtifactStorageKey({
+          tenantId: context.tenantId,
+          userId: context.userId,
+          sessionId: context.sessionId,
+          artifactName: name
+        });
 
         const stored = await deps.storage.put({ storageKey, stream: Readable.from([contentBuffer]) });
 

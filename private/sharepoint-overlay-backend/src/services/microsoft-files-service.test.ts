@@ -289,6 +289,8 @@ test("MicrosoftFilesService.importFileToSession stores the file as an artifact",
   expect(artifact.artifactId).toBe("artifact-1");
   expect(storedBodies[0]?.toString("utf8")).toBe("artifact body");
   expect(createdArtifacts[0]?.mimeType).toBe("text/plain");
+  // The import goes through UploadAdmission, so it gets the tenant key layout.
+  expect(createdArtifacts[0]?.storageKey).toMatch(/^tenant-1\/user-1\/session-1\/[0-9a-f-]{36}\.txt$/);
   expect(auditEvents).toHaveLength(1);
   expect(auditEvents[0]).toMatchObject({
     tenantId: "tenant-1",

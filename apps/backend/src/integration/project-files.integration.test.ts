@@ -13,6 +13,11 @@ import { ProjectFileStore } from "../services/project-file-store.js";
 import { LocalArtifactStorage } from "../services/artifacts/artifact-storage.js";
 import { ArtifactProcessor } from "../services/artifacts/artifact-processor.js";
 import { registerProjectFileRoutes } from "../routes/project-files.js";
+import { piiPolicyReader } from "../services/pii/build-pii-services.js";
+import { PiiProtectionService } from "../services/pii/pii-protection-service.js";
+import { RuleBasedPiiDetector } from "../services/pii/rule-based-pii-detector.js";
+import { TenantOrgSettingsStore } from "../services/tenant-org-settings-store.js";
+import { PII_SAVE_ALLOWED } from "../test-helpers/data-routes.js";
 import { createTestConfig } from "../test-helpers/test-config.js";
 import { Pool, withTenantScope } from "../lib/db.js";
 import {
@@ -23,7 +28,9 @@ import {
   superuserPool,
 } from "./support/database.js";
 import { seedTenant, seedUser, seedMembership } from "./support/fixtures.js";
-import type { ProjectFile } from "@cogniplane/shared-types";
+import { DEFAULT_PII_PROTECTION, type ProjectFile } from "@cogniplane/shared-types";
+
+const SETTINGS_SECRET = "project-files-integration-secret";
 
 async function setup() {
   const tenantId = await seedTenant(),
@@ -38,6 +45,14 @@ async function setup() {
   const storage = new LocalArtifactStorage(root);
   const app = Fastify();
   const files = new ProjectFileStore(appPool(), app.log, maintenancePool());
+  // As in app-dependencies.ts: the PII service reads the stored tenant policy
+  // with the privileged pool. The default policy is off.
+  const settings = new TenantOrgSettingsStore(appPool(), SETTINGS_SECRET);
+  files.setPiiProtection(new PiiProtectionService({
+    policyReader: piiPolicyReader(new TenantOrgSettingsStore(maintenancePool(), SETTINGS_SECRET)),
+    ruleDetector: new RuleBasedPiiDetector(),
+    timeoutMs: 5000,
+  }));
   const config = createTestConfig();
   app.decorate("db", appPool());
   app.decorate("config", config);
@@ -55,6 +70,7 @@ async function setup() {
     artifactStorage: storage,
     artifactProcessor: processor,
     limits: { consumeRateLimit: async () => null } as never,
+    projectFiles: files,
   });
   onTestFinished(async () => {
     await app.close();
@@ -110,6 +126,7 @@ async function setup() {
     sessions,
     artifacts,
     files,
+    settings,
     storage,
     processor,
     app,
@@ -120,6 +137,50 @@ async function setup() {
       auth = next;
     },
   };
+}
+
+type ProjectRef = { tenantId: string; projectId: string };
+
+/** Moves Trash entries past the 30-day window without waiting for it. */
+async function expireTrash(project: ProjectRef, fileIds: string[]) {
+  await superuserPool().query(
+    "UPDATE project_files SET trashed_at=NOW()-INTERVAL '31 days' WHERE tenant_id=$1 AND project_id=$2 AND file_id=ANY($3)",
+    [project.tenantId, project.projectId, fileIds],
+  );
+}
+
+/** Reads the file links and object keys that the API does not return. */
+async function storedFiles(project: ProjectRef) {
+  const files = await superuserPool().query<{
+    file_id: string;
+    kind: string;
+    target_file_id: string | null;
+    base_version_id: string | null;
+    trashed_at: Date | null;
+  }>(
+    "SELECT file_id, kind, target_file_id, base_version_id, trashed_at FROM project_files WHERE tenant_id=$1 AND project_id=$2",
+    [project.tenantId, project.projectId],
+  );
+  const versions = await superuserPool().query<{ file_id: string; storage_key: string }>(
+    "SELECT file_id, storage_key FROM project_file_versions WHERE tenant_id=$1 AND project_id=$2",
+    [project.tenantId, project.projectId],
+  );
+  return {
+    rows: new Map(files.rows.map((row) => [row.file_id, row])),
+    keys: (fileId: string) =>
+      versions.rows.filter((row) => row.file_id === fileId).map((row) => row.storage_key),
+  };
+}
+
+async function retentionAudits(project: ProjectRef) {
+  const { rows } = await superuserPool().query<{
+    payload: { fileIds: string[]; detachedFileIds?: string[] };
+  }>(
+    `SELECT payload FROM audit_events
+     WHERE tenant_id=$1 AND event_type='project_file_retention_deleted' AND payload->>'projectId'=$2`,
+    [project.tenantId, project.projectId],
+  );
+  return rows.map((row) => row.payload);
 }
 
 describe.skipIf(!adminDatabaseUrl())("versioned project files", () => {
@@ -813,6 +874,200 @@ describe.skipIf(!adminDatabaseUrl())("versioned project files", () => {
     expect((await superuserPool().query("SELECT 1 FROM project_files WHERE file_id=$1", [saved.fileId])).rowCount).toBe(0);
 
   });
+  test("retention removes an expired update target but keeps its unexpired drafts as new-file drafts", async () => {
+    const h = await setup();
+    const target = await h.add({ text: "Original" });
+    await h.projects.setAgentFileMode(h.actor.tenantId, h.actor.userId, h.actor.projectId, "read-write");
+    const agentWrite = (text: string) =>
+      h.files.createAgentDraftFromContent({
+        actor: h.actor,
+        name: target.name,
+        folderId: target.folderId,
+        targetFileId: target.fileId,
+        baseVersionId: target.version.versionId,
+        mimeType: "text/plain",
+        content: new TextEncoder().encode(text),
+        storage: h.storage,
+        maxBytes: 10_000,
+        createdByType: "agent",
+      });
+    const live = await agentWrite("Live one");
+    const liveLatest = await agentWrite("Live two");
+    const freshTrash = await h.add({ kind: "draft", target, text: "Fresh trash" });
+    await h.files.trash(h.actor, freshTrash.fileId);
+    const expiredDraft = await h.add({ kind: "draft", target, text: "Expired draft" });
+    await h.files.trash(h.actor, expiredDraft.fileId);
+    // Promotion gives the target a version that shares the promoted row's object.
+    const promotedDraft = await h.add({ kind: "draft", target, text: "Promoted" });
+    await h.files.promote(h.actor, promotedDraft.fileId);
+    await h.files.trash(h.actor, target.fileId);
+    await expireTrash(h.actor, [target.fileId, expiredDraft.fileId]);
+
+    const before = await storedFiles(h.actor);
+    const liveHistory = await h.files.history(h.actor, live.fileId);
+    expect(liveHistory).toHaveLength(2);
+    const removedKeys = [target.fileId, expiredDraft.fileId, promotedDraft.fileId].flatMap(before.keys);
+    const keptKeys = [live.fileId, freshTrash.fileId].flatMap(before.keys);
+    const deleteObject = vi.spyOn(h.storage, "delete");
+
+    // Large batch: rows that other tests left behind must not crowd these out.
+    await h.files.cleanupExpired(h.storage, 10_000);
+
+    const after = await storedFiles(h.actor);
+    expect([...after.rows.keys()].sort()).toEqual([live.fileId, freshTrash.fileId].sort());
+    expect(after.rows.get(live.fileId)).toMatchObject({
+      kind: "draft",
+      target_file_id: null,
+      base_version_id: null,
+      trashed_at: null,
+    });
+    // A dependent in Trash keeps its own 30-day window.
+    expect(after.rows.get(freshTrash.fileId)).toMatchObject({
+      kind: "draft",
+      target_file_id: null,
+      base_version_id: null,
+      trashed_at: before.rows.get(freshTrash.fileId)!.trashed_at,
+    });
+    expect(await h.files.history(h.actor, live.fileId)).toEqual(liveHistory);
+    const deletedKeys = deleteObject.mock.calls.map(([key]) => key);
+    expect(deletedKeys).toEqual(expect.arrayContaining(removedKeys));
+    for (const key of keptKeys) expect(deletedKeys).not.toContain(key);
+    const audits = await retentionAudits(h.actor);
+    expect(audits).toHaveLength(1);
+    expect([...audits[0]!.fileIds].sort())
+      .toEqual([target.fileId, expiredDraft.fileId, promotedDraft.fileId].sort());
+    expect([...(audits[0]!.detachedFileIds ?? [])].sort()).toEqual([live.fileId, freshTrash.fileId].sort());
+
+    for (const version of liveHistory) {
+      const download = await h.app.inject(
+        `${h.url}/files/${live.fileId}/versions/${version.versionId}/content`,
+      );
+      expect(download.statusCode).toBe(200);
+      expect(download.body).toBe(version.versionNumber === 2 ? "Live two" : "Live one");
+    }
+    // The target's name is free again, so the draft can take it as a new file.
+    await h.files.saveDraftAsNew(h.actor, live.fileId, target.name, target.folderId);
+    expect(await h.files.promote(h.actor, live.fileId)).toMatchObject({
+      fileId: live.fileId,
+      kind: "published",
+      name: target.name,
+      targetFileId: null,
+      version: { versionId: liveLatest.version.versionId },
+    });
+    await h.files.restoreTrash(h.actor, freshTrash.fileId, "Fresh.txt", null);
+    expect((await h.files.list(h.actor)).files.find((entry) => entry.fileId === freshTrash.fileId))
+      .toMatchObject({ kind: "draft", targetFileId: null, baseVersionId: null, trashedAt: null });
+  });
+  test("retention detaches drafts only in the expired target's project and keeps shared objects", async () => {
+    const h = await setup();
+    const target = await h.add({ text: "Original" });
+    const draft = await h.add({ kind: "draft", target, text: "Proposal" });
+    await h.files.trash(h.actor, target.fileId);
+    await expireTrash(h.actor, [target.fileId]);
+    const [targetKey] = (await storedFiles(h.actor)).keys(target.fileId);
+
+    // Another project in this tenant and a project in another tenant hold rows
+    // with the same file ids, a live target and an update draft for it. They
+    // also reference the expiring target's object.
+    const otherTenant = await seedTenant();
+    const otherUser = await seedUser();
+    await seedMembership(otherTenant, otherUser);
+    const others: ProjectRef[] = [
+      { tenantId: h.actor.tenantId, projectId: (await h.projects.create(h.actor.tenantId, h.actor.userId, "Other")).projectId },
+      { tenantId: otherTenant, projectId: (await h.projects.create(otherTenant, otherUser, "Other tenant")).projectId },
+    ];
+    for (const other of others) {
+      const client = await superuserPool().connect();
+      try {
+        await client.query("BEGIN");
+        for (const [fileId, kind, targetFileId, baseVersionId] of [
+          [target.fileId, "published", null, null],
+          [draft.fileId, "draft", target.fileId, target.version.versionId],
+        ] as const) {
+          const versionId = fileId === target.fileId ? target.version.versionId : draft.version.versionId;
+          await client.query(
+            `INSERT INTO project_files (tenant_id,project_id,file_id,name,kind,current_version_id,target_file_id,base_version_id,created_by)
+             VALUES ($1,$2,$3,'Brief.txt',$4,$5,$6,$7,$8)`,
+            [other.tenantId, other.projectId, fileId, kind, versionId, targetFileId, baseVersionId, h.actor.userId],
+          );
+          await client.query(
+            `INSERT INTO project_file_versions (tenant_id,project_id,file_id,version_id,version_number,storage_backend,storage_key,mime_type,file_size_bytes,checksum_sha256,created_by)
+             VALUES ($1,$2,$3,$4,1,'local',$5,'text/plain',8,'checksum',$6)`,
+            [other.tenantId, other.projectId, fileId, versionId, targetKey, h.actor.userId],
+          );
+        }
+        await client.query("COMMIT");
+      } finally {
+        client.release();
+      }
+    }
+    const deleteObject = vi.spyOn(h.storage, "delete");
+
+    await h.files.cleanupExpired(h.storage, 10_000);
+
+    expect((await storedFiles(h.actor)).rows.get(draft.fileId)).toMatchObject({
+      target_file_id: null,
+      base_version_id: null,
+    });
+    for (const other of others) {
+      const stored = await storedFiles(other);
+      expect(stored.rows.get(target.fileId)).toMatchObject({ kind: "published", trashed_at: null });
+      expect(stored.rows.get(draft.fileId)).toMatchObject({
+        kind: "draft",
+        target_file_id: target.fileId,
+        base_version_id: target.version.versionId,
+      });
+      expect(await retentionAudits(other)).toEqual([]);
+    }
+    expect(deleteObject).not.toHaveBeenCalledWith(targetKey);
+    const gc = await superuserPool().query(
+      "SELECT 1 FROM project_file_storage_gc WHERE storage_key=$1",
+      [targetKey],
+    );
+    expect(gc.rowCount).toBe(0);
+  });
+  test("retention waits for a concurrent change to a dependent draft and keeps it", async () => {
+    const h = await setup();
+    const target = await h.add();
+    const draft = await h.add({ kind: "draft", target, text: "Proposal" });
+    await h.files.trash(h.actor, target.fileId);
+    await expireTrash(h.actor, [target.fileId]);
+
+    // A user moves the draft to Trash in a transaction that is still open.
+    const user = await appPool().connect();
+    let cleanup: ReturnType<ProjectFileStore["cleanupExpired"]> | undefined;
+    try {
+      await user.query("BEGIN");
+      await user.query("SELECT set_config('app.current_tenant_id', $1, true)", [h.actor.tenantId]);
+      await user.query(
+        "UPDATE project_files SET trashed_at=NOW(), updated_at=NOW() WHERE tenant_id=$1 AND project_id=$2 AND file_id=$3",
+        [h.actor.tenantId, h.actor.projectId, draft.fileId],
+      );
+      cleanup = h.files.cleanupExpired(h.storage, 10_000);
+      await vi.waitFor(async () => {
+        const waiting = await superuserPool().query(
+          "SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock'",
+        );
+        expect(waiting.rowCount).toBeGreaterThan(0);
+      }, { timeout: 5_000 });
+      await user.query("COMMIT");
+    } catch (error) {
+      await user.query("ROLLBACK");
+      throw error;
+    } finally {
+      user.release();
+    }
+    await cleanup;
+
+    const stored = await storedFiles(h.actor);
+    expect([...stored.rows.keys()]).toEqual([draft.fileId]);
+    expect(stored.rows.get(draft.fileId)).toMatchObject({
+      target_file_id: null,
+      base_version_id: null,
+      trashed_at: expect.any(Date),
+    });
+    await h.files.restoreTrash(h.actor, draft.fileId, draft.name, null);
+  });
   test("missing destinations require an explicit replacement when restoring a trashed draft", async () => {
     const h = await setup();
     const folder = await h.files.createFolder(h.actor, "Work", null);
@@ -1162,6 +1417,96 @@ describe.skipIf(!adminDatabaseUrl())("versioned project files", () => {
       `${h.url}/files/${promoted.fileId}/versions/${promoted.version.versionId}/content`,
     );
     expect(download.body).toBe("Fourth");
+  });
+
+  test("agent drafts follow the tenant's upload PII policy through the store that the routes use", async () => {
+    const h = await setup();
+    await h.projects.setAgentFileMode(h.actor.tenantId, h.actor.userId, h.actor.projectId, "read-write");
+    const put = vi.spyOn(h.storage, "put");
+    const write = (name: string, text: string) =>
+      h.files.createAgentDraftFromContent({
+        actor: h.actor,
+        name,
+        folderId: null,
+        targetFileId: null,
+        baseVersionId: null,
+        mimeType: "text/plain",
+        content: new TextEncoder().encode(text),
+        storage: h.storage,
+        maxBytes: 10_000,
+        createdByType: "agent",
+      });
+
+    // The default policy is off: the service allows the draft.
+    expect(await write("Off.txt", "Contact jane.doe@example.com")).toMatchObject({ kind: "draft" });
+
+    // Block mode without the uploads scope still allows it.
+    await h.settings.setPiiProtection(h.actor.tenantId, {
+      ...DEFAULT_PII_PROTECTION,
+      enabled: true,
+      mode: "block",
+      scopes: { ...DEFAULT_PII_PROTECTION.scopes, uploads: false },
+    }, PII_SAVE_ALLOWED);
+    expect(await write("Out of scope.txt", "Contact jane.doe@example.com")).toMatchObject({ kind: "draft" });
+
+    await h.settings.setPiiProtection(h.actor.tenantId, {
+      ...DEFAULT_PII_PROTECTION,
+      enabled: true,
+      mode: "block",
+      scopes: { ...DEFAULT_PII_PROTECTION.scopes, uploads: true },
+    }, PII_SAVE_ALLOWED);
+    put.mockClear();
+    await expect(write("Blocked.txt", "Contact jane.doe@example.com"))
+      .rejects.toMatchObject({ code: "pii_block", status: 422 });
+    expect(put).not.toHaveBeenCalled();
+    expect(await write("Clean.txt", "Quarterly totals")).toMatchObject({ kind: "draft" });
+
+    // The library route reads through the same store.
+    const list = vi.spyOn(h.files, "list");
+    const library = await h.app.inject(h.url);
+    expect(library.statusCode).toBe(200);
+    expect(list).toHaveBeenCalledOnce();
+    expect(library.json().files.map((file: ProjectFile) => file.name).sort())
+      .toEqual(["Clean.txt", "Off.txt", "Out of scope.txt"]);
+  });
+
+  test("a store without the PII service refuses an agent draft before storage or a database write", async () => {
+    const h = await setup();
+    await h.projects.setAgentFileMode(h.actor.tenantId, h.actor.userId, h.actor.projectId, "read-write");
+    const put = vi.spyOn(h.storage, "put");
+    // Built as the routes built their own store before: no setPiiProtection call.
+    const unwired = new ProjectFileStore(appPool(), h.app.log);
+
+    await expect(unwired.createAgentDraftFromContent({
+      actor: h.actor,
+      name: "Agent.txt",
+      folderId: null,
+      targetFileId: null,
+      baseVersionId: null,
+      mimeType: "text/plain",
+      content: new TextEncoder().encode("Contact jane.doe@example.com"),
+      storage: h.storage,
+      maxBytes: 10_000,
+      createdByType: "agent",
+    })).rejects.toMatchObject({
+      code: "pii_protection_unavailable",
+      status: 503,
+      message: "Project drafts are unavailable. Contact your administrator.",
+    });
+
+    expect(put).not.toHaveBeenCalled();
+    const [files, events] = await Promise.all([
+      superuserPool().query(
+        "SELECT file_id FROM project_files WHERE tenant_id = $1 AND project_id = $2",
+        [h.actor.tenantId, h.actor.projectId],
+      ),
+      superuserPool().query(
+        "SELECT event_type FROM audit_events WHERE tenant_id = $1 AND event_type LIKE 'project_draft_%'",
+        [h.actor.tenantId],
+      ),
+    ]);
+    expect(files.rows).toEqual([]);
+    expect(events.rows).toEqual([]);
   });
 
   test("agent drafts enforce the MIME allow-list and PII blocking gate", async () => {

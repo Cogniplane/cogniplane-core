@@ -1,8 +1,10 @@
-// Kills the sandbox of a session that will not go on. Archive, delete and purge take
-// the sandbox id from the session row in the transaction that changes the status and
-// clears the record (services/session-store.ts). After that transaction no runtime can
-// adopt the sandbox: the record is empty, and the status change stopped the execution
-// lease. So this kill needs no lease check, and any replica can send it.
+// Kills a sandbox that a session gave up. Archive, delete and purge take the sandbox id
+// from the session row in the transaction that changes the status and clears the record
+// (services/session-store.ts). A security change of the owner's account does the same in
+// the transaction that changes the security version (releaseAccountSandboxes in
+// services/session-execution-store.ts). After that transaction no runtime can adopt the
+// sandbox: the record is empty, and the transaction stopped the execution lease. So this
+// kill needs no lease check, and any replica can send it.
 //
 // It kills by id and sends no connect: a connect sends a new lifetime for the sandbox.
 // It makes up to four tries inside one deadline, as the kill of a replaced sandbox does
@@ -23,7 +25,7 @@ import { loadE2bSandboxClass, type E2bSandboxClassLike } from "./e2b-sandbox.js"
  */
 export type SandboxDisposalOutcome = "killed" | "not_found" | "failed" | "skipped";
 
-/** A sandbox that a lifecycle change took from a session. The tenant and the session are for the log. */
+/** A sandbox that a lifecycle or security change took from a session. The tenant and the session are for the log. */
 export type ReleasedSandbox = { tenantId: string; sessionId: string; sandboxId: string };
 
 export type E2bSandboxDisposalOptions = {
@@ -60,7 +62,7 @@ export class E2bSandboxDisposal {
       try {
         const outcome = await this.killOnce(sandboxId, Math.min(this.options.requestTimeoutMs, left))
           ? "killed" : "not_found";
-        this.options.logger.info({ sessionId, sandboxId, outcome }, "The sandbox of a disposed session is gone");
+        this.options.logger.info({ sessionId, sandboxId, outcome }, "The released sandbox of a session is gone");
         return outcome;
       } catch (error) {
         lastError = error;
@@ -68,7 +70,7 @@ export class E2bSandboxDisposal {
     }
     this.options.logger.error(
       { err: lastError, sessionId, sandboxId, tries },
-      "Failed to kill the sandbox of a disposed session after retries; it runs until the provider expires it"
+      "Failed to kill the released sandbox of a session after retries; it runs until the provider expires it"
     );
     return "failed";
   }

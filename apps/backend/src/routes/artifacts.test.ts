@@ -62,7 +62,7 @@ function toRecord(row: FakeTokenRow) {
 function buildApp(opts: {
   initialRows: FakeTokenRow[];
   auth: { userId: string; tenantId: string; role: "owner" | "admin" | "member" };
-  openReadStream?: () => Promise<{ stream: unknown; fileSizeBytes: number }>;
+  openReadStream?: (storageKey: string) => Promise<{ stream: unknown; fileSizeBytes: number }>;
 }) {
   const rows = new Map(opts.initialRows.map((row) => [row.token, row]));
   const audit = new InMemoryAuditEventStore();
@@ -135,6 +135,34 @@ test("GET /downloads/:token streams once, then returns 404 on replay (single-use
   expect(second.statusCode).toBe(404);
   expect(second.json().error).toBe("download_not_found");
 
+  await app.close();
+});
+
+// New objects have a tenant segment first. Rows written before it keep their
+// key, so readers use the stored key as it is and never rebuild it.
+const STORED_KEY_LAYOUTS = [
+  ["the layout before the tenant segment", "user-1/session-1/0196f7ca-8d4b-7a70-9f3f-aaaaaaaaaaaa.bin"],
+  ["the tenant layout", "tenant-A/user-1/session-1/0196f7ca-8d4b-7a70-9f3f-bbbbbbbbbbbb.bin"]
+] as const;
+
+test.each(STORED_KEY_LAYOUTS)("GET /downloads/:token reads a stored key in %s unchanged", async (_label, storageKey) => {
+  const opened: string[] = [];
+  const { app, stores } = buildApp({
+    initialRows: [makeRow({ storageKey })],
+    auth: { userId: "user-1", tenantId: "tenant-A", role: "member" },
+    openReadStream: async (key) => {
+      opened.push(key);
+      const { Readable } = await import("node:stream");
+      return { stream: Readable.from([Buffer.from("PAYLOAD")]), fileSizeBytes: 7 };
+    }
+  });
+  await registerArtifactRoutes(app, stores as never);
+  await app.ready();
+
+  const response = await app.inject({ method: "GET", url: "/downloads/tok-1" });
+
+  expect(response.statusCode).toBe(200);
+  expect(opened).toEqual([storageKey]);
   await app.close();
 });
 
@@ -466,7 +494,7 @@ describe("GET /downloads/:token Content-Disposition", () => {
 describe("POST /artifacts/:artifactId/download-token", () => {
   const artifactId = "0196f7ca-8d4b-7a70-9f3f-111111111111";
 
-  async function issue(artifact: { status: string; detail: Record<string, unknown> }) {
+  async function issue(artifact: { status: string; detail: Record<string, unknown>; storageKey?: string }) {
     const issued: unknown[] = [];
     const stores = {
       sessions: { async requireUploadAccess() { return null; }, async getReadable() { return null; } },
@@ -533,6 +561,13 @@ describe("POST /artifacts/:artifactId/download-token", () => {
 
     expect(response.statusCode).toBe(409);
     expect(issued).toEqual([]);
+  });
+
+  test.each(STORED_KEY_LAYOUTS)("copies a stored key in %s to the token unchanged", async (_label, storageKey) => {
+    const { response, issued } = await issue({ status: "ready", detail: {}, storageKey });
+
+    expect(response.statusCode).toBe(200);
+    expect(issued).toEqual([expect.objectContaining({ tenantId: "tenant-A", storageKey })]);
   });
 });
 

@@ -11,6 +11,7 @@ function makeAdmission(opts: { createUploadThrows?: Error; auditThrows?: Error }
     put: [] as string[],
     delete: [] as string[],
     createUpload: [] as string[],
+    rowKeys: [] as string[],
     audits: [] as AuditInput[],
     enqueue: 0,
     update: 0,
@@ -32,8 +33,12 @@ function makeAdmission(opts: { createUploadThrows?: Error; auditThrows?: Error }
     artifacts: {
       // The store writes the event in the transaction of the row: when the
       // event fails, the row does not commit and createUpload rejects.
-      async createUpload(input: { artifactName: string }, audit: (artifact: ReturnType<typeof record>) => AuditInput) {
+      async createUpload(
+        input: { artifactName: string; storageKey: string },
+        audit: (artifact: ReturnType<typeof record>) => AuditInput
+      ) {
         calls.createUpload.push(input.artifactName);
+        calls.rowKeys.push(input.storageKey);
         calls.order.push("createUpload");
         if (opts.createUploadThrows) throw opts.createUploadThrows;
         const created = record(input.artifactName);
@@ -122,6 +127,18 @@ describe("UploadAdmission.admit file name validation", () => {
     expect(error).not.toBeInstanceOf(InvalidArtifactFilenameError);
     // The stored object is still cleaned up.
     expect(calls.delete).toEqual(calls.put);
+  });
+});
+
+describe("UploadAdmission.admit storage key", () => {
+  test("stores the object under the ticket's tenant, user and session, and records that key", async () => {
+    const { calls, admit } = makeAdmission();
+
+    await admit("notes.txt");
+
+    expect(calls.put).toHaveLength(1);
+    expect(calls.put[0]).toMatch(/^t\/u\/s\/[0-9a-f-]{36}\.txt$/);
+    expect(calls.rowKeys).toEqual(calls.put);
   });
 });
 

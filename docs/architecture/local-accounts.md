@@ -57,6 +57,11 @@ other people in Admin > People (`routes/tenant-local-members.ts`).
 - Scheduled jobs and personal connections keep the version of the sign-in
   session that saved them; a change pauses or suspends them (see
   [tools](tools.md#personal-connections-after-a-security-change)).
+- The transaction of the change also stops the lease of each normal chat of
+  the account and takes the sandboxes that the account's chats saved. After the
+  commit, the process that made the change kills them by id. A member removal
+  does the same for a WorkOS member. Details and limits:
+  [sandbox](sandbox.md#e2b-sandbox).
 - WorkOS accounts have no security version in this database, so objects that a
   revoked WorkOS session created stay active.
 
@@ -119,7 +124,9 @@ other people in Admin > People (`routes/tenant-local-members.ts`).
   link.
 - `pnpm --filter @cogniplane/backend auth:recover-owner --tenant-id <id> --email
   <email>` ends the owner's sign-in sessions, removes the password and factors, writes
-  an audit event and prints a new setup link.
+  an audit event and prints a new setup link. When its environment configures E2B,
+  it also kills the sandboxes of the owner's chats; its log on stderr names each
+  one ([sandbox](sandbox.md#e2b-sandbox)).
 - Both read `MIGRATION_DATABASE_URL` from the shell environment (set it on the
   command line; `.env` does not supply it). In the backend image (work directory
   `/app`), run `node apps/backend/dist/scripts/auth-bootstrap.js` and `node

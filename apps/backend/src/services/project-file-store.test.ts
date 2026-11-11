@@ -611,6 +611,27 @@ test("createAgentDraftFromContent reports an unscannable draft as a 422 the agen
   expect(storage.put).not.toHaveBeenCalled();
 });
 
+test("createAgentDraftFromContent without a PII service refuses the draft before storage or a database write", async () => {
+  const pool = grantAccess(new FakePool());
+  pool.onQuery("SELECT agent_file_mode FROM projects", () => ({
+    rows: [{ agent_file_mode: "read-write" }],
+    rowCount: 1,
+  }));
+  const storage = { put: vi.fn(), delete: vi.fn() };
+
+  // No setPiiProtection call: a store that was not wired must not skip the scan.
+  await expect(
+    storeWith(pool).createAgentDraftFromContent(draftInput({ storage: storage as never })),
+  ).rejects.toMatchObject({
+    code: "pii_protection_unavailable",
+    status: 503,
+    message: "Project drafts are unavailable. Contact your administrator.",
+  });
+  expect(storage.put).not.toHaveBeenCalled();
+  expect(storage.delete).not.toHaveBeenCalled();
+  expect(pool.queries.filter(({ text }) => /^\s*(INSERT|UPDATE|DELETE)\b/i.test(text))).toEqual([]);
+});
+
 test("createAgentDraftFromContent refuses to write when the project is read-only for agents", async () => {
   const pool = grantAccess(new FakePool());
   const storage = { put: vi.fn(), delete: vi.fn() };

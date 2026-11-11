@@ -232,6 +232,8 @@ export class ProjectFileStore {
   /**
    * Remove expired Trash and superseded promotion rows, then retry storage
    * deletion for objects that no longer have a project or artifact reference.
+   * A draft whose update target is removed stays when it is not expired itself:
+   * it loses its target and base version and becomes a new-file draft.
    * Database cleanup commits before object deletion so a transient bucket
    * failure leaves a durable GC row for the next worker tick.
    */
@@ -239,6 +241,20 @@ export class ProjectFileStore {
     storage: Pick<ArtifactStorage, "delete">,
     batchSize = 100,
   ): Promise<{ deletedFiles: number; deletedObjects: number }> {
+    type FileKey = { tenantId: string; projectId: string; fileId: string };
+    const fileKey = (row: Row): [string, FileKey] => {
+      const entry = {
+        tenantId: String(row.tenant_id),
+        projectId: String(row.project_id),
+        fileId: String(row.file_id),
+      };
+      return [`${entry.tenantId}:${entry.projectId}:${entry.fileId}`, entry];
+    };
+    const fileValues = (entries: FileKey[]) => ({
+      placeholders: entries.map((_, index) =>
+        `($${index * 3 + 1}, $${index * 3 + 2}, $${index * 3 + 3})`).join(","),
+      params: entries.flatMap((entry) => [entry.tenantId, entry.projectId, entry.fileId]),
+    });
     const result = await withTransaction(this.maintenanceDb, async (db) => {
       const roots = await db.query(
         `SELECT tenant_id, project_id, file_id FROM project_files
@@ -248,42 +264,36 @@ export class ProjectFileStore {
          FOR UPDATE SKIP LOCKED`,
         [batchSize],
       );
-      const doomed = new Map<string, { tenantId: string; projectId: string; fileId: string }>();
-      for (const row of roots.rows) {
-        const entry = {
-          tenantId: String(row.tenant_id),
-          projectId: String(row.project_id),
-          fileId: String(row.file_id),
-        };
-        doomed.set(`${entry.tenantId}:${entry.projectId}:${entry.fileId}`, entry);
-      }
+      const doomed = new Map<string, FileKey>(roots.rows.map(fileKey));
+      const detached = new Map<string, FileKey>();
       if (doomed.size) {
-        const rootIds = [...doomed.values()];
-        const placeholders = rootIds.map((_, index) =>
-          `($${index * 3 + 1}, $${index * 3 + 2}, $${index * 3 + 3})`).join(",");
-        const params = rootIds.flatMap((entry) => [entry.tenantId, entry.projectId, entry.fileId]);
+        const { placeholders, params } = fileValues([...doomed.values()]);
+        // A row whose target is removed must lose its link to the target's
+        // versions. Delete it only when it is expired itself. A live draft, or
+        // a draft in Trash for less than 30 days, stays as a new-file draft.
+        // FOR UPDATE waits for a concurrent writer and returns the committed
+        // row, so `expired` is not computed from a stale version.
         const dependent = await db.query(
-          `SELECT f.tenant_id, f.project_id, f.file_id
+          `SELECT f.tenant_id, f.project_id, f.file_id,
+             f.kind = 'promoted' OR (f.trashed_at IS NOT NULL AND f.trashed_at < NOW() - INTERVAL '30 days') AS expired
            FROM project_files f
            JOIN (VALUES ${placeholders}) AS roots(tenant_id, project_id, file_id)
              ON roots.tenant_id=f.tenant_id AND roots.project_id=f.project_id AND roots.file_id=f.target_file_id
-           FOR UPDATE`,
+           FOR UPDATE OF f`,
           params,
         );
         for (const row of dependent.rows) {
-          const entry = {
-            tenantId: String(row.tenant_id),
-            projectId: String(row.project_id),
-            fileId: String(row.file_id),
-          };
-          doomed.set(`${entry.tenantId}:${entry.projectId}:${entry.fileId}`, entry);
+          const [key, entry] = fileKey(row);
+          if (row.expired === true) doomed.set(key, entry);
+          else detached.set(key, entry);
         }
       }
       const doomedFiles = [...doomed.values()];
+      const detachedFiles = [...detached.values()];
       if (doomedFiles.length) {
-        const placeholders = doomedFiles.map((_, index) =>
-          `($${index * 3 + 1}, $${index * 3 + 2}, $${index * 3 + 3})`).join(",");
-        const params = doomedFiles.flatMap((entry) => [entry.tenantId, entry.projectId, entry.fileId]);
+        const { placeholders, params } = fileValues(doomedFiles);
+        // Versions of detached drafts are outside the removed set, so the
+        // first NOT EXISTS keeps every object that they share.
         await db.query(
         `INSERT INTO project_file_storage_gc (tenant_id, project_id, storage_key)
          SELECT DISTINCT v.tenant_id, v.project_id, v.storage_key
@@ -306,11 +316,14 @@ export class ProjectFileStore {
          ON CONFLICT DO NOTHING`,
           params,
         );
+        // base_version_id points into the versions deleted next. Clear it with
+        // target_file_id in one statement; the CHECK requires both or neither.
+        const linked = fileValues([...doomedFiles, ...detachedFiles]);
         await db.query(
         `UPDATE project_files f SET target_file_id=NULL, base_version_id=NULL
-         FROM (VALUES ${placeholders}) AS doomed(tenant_id, project_id, file_id)
-         WHERE f.tenant_id=doomed.tenant_id AND f.project_id=doomed.project_id AND f.file_id=doomed.file_id`,
-          params,
+         FROM (VALUES ${linked.placeholders}) AS linked(tenant_id, project_id, file_id)
+         WHERE f.tenant_id=linked.tenant_id AND f.project_id=linked.project_id AND f.file_id=linked.file_id`,
+          linked.params,
         );
         await db.query(
         `DELETE FROM project_file_versions v
@@ -324,24 +337,37 @@ export class ProjectFileStore {
          WHERE f.tenant_id=doomed.tenant_id AND f.project_id=doomed.project_id AND f.file_id=doomed.file_id`,
           params,
         );
-        const auditByProject = new Map<string, { tenantId: string; projectId: string; fileIds: string[] }>();
-        for (const entry of doomedFiles) {
+        const auditByProject = new Map<string, {
+          tenantId: string;
+          projectId: string;
+          fileIds: string[];
+          detachedFileIds: string[];
+        }>();
+        const auditGroup = (entry: FileKey) => {
           const key = `${entry.tenantId}:${entry.projectId}`;
-          const group = auditByProject.get(key) ?? {
+          const found = auditByProject.get(key) ?? {
             tenantId: entry.tenantId,
             projectId: entry.projectId,
             fileIds: [],
+            detachedFileIds: [],
           };
-          group.fileIds.push(entry.fileId);
-          auditByProject.set(key, group);
-        }
+          auditByProject.set(key, found);
+          return found;
+        };
+        for (const entry of doomedFiles) auditGroup(entry).fileIds.push(entry.fileId);
+        for (const entry of detachedFiles) auditGroup(entry).detachedFileIds.push(entry.fileId);
         for (const group of auditByProject.values()) {
           await AuditEventStore.createInTransaction(db, {
             tenantId: group.tenantId,
             sessionId: null,
             userId: null,
             type: "project_file_retention_deleted",
-            payload: { projectId: group.projectId, fileIds: group.fileIds, reason: "retention" },
+            payload: {
+              projectId: group.projectId,
+              fileIds: group.fileIds,
+              detachedFileIds: group.detachedFileIds,
+              reason: "retention",
+            },
           });
         }
       }
@@ -922,36 +948,44 @@ export class ProjectFileStore {
       if (mode === "create-only" && input.targetFileId)
         throw new ProjectFileError("project_agent_create_only", "Create-only mode cannot update an existing project file.");
     });
-    if (this.piiProtection) {
-      const piiProtection = this.piiProtection;
-      const decision = await piiProtection.evaluateArtifact({
-        tenantId: actor.tenantId,
-        artifact: {
-          artifactId: `project-draft:${uuidv7()}`,
-          contentType: mimeType,
-          entityTypes: [],
-          // Project drafts get no OCR: their image coverage is not stored yet.
-          readContent: async (signal) =>
-            (await toScannableText(mimeType, Buffer.from(input.content), { extractPdfText: this.extractPdfText }, signal)).text
-        },
-        // Project drafts are new bytes entering the shared library, so they
-        // follow the tenant's existing upload PII scope and blocking policy.
-        subject: { kind: "upload" }
-      }).catch((error: unknown) => {
-        // A file the scan cannot read is a client error the agent can act on,
-        // for example by writing a text version instead.
-        if (error instanceof PiiProtectionServiceError && PERMANENT_PII_ERROR_CODES.has(error.code)) {
-          throw new ProjectFileError(error.code, error.message, 422);
-        }
-        throw error;
-      });
-      if (decision.action === "block") {
-        throw new ProjectFileError(
-          "pii_block",
-          "The project draft was blocked by organization policy.",
-          422,
-        );
+    // The PII service decides, also when the tenant policy is off. A store
+    // without the service refuses the draft: a wiring fault must not skip the
+    // scan.
+    const piiProtection = this.piiProtection;
+    if (!piiProtection) {
+      throw new ProjectFileError(
+        "pii_protection_unavailable",
+        "Project drafts are unavailable. Contact your administrator.",
+        503,
+      );
+    }
+    const decision = await piiProtection.evaluateArtifact({
+      tenantId: actor.tenantId,
+      artifact: {
+        artifactId: `project-draft:${uuidv7()}`,
+        contentType: mimeType,
+        entityTypes: [],
+        // Project drafts get no OCR: their image coverage is not stored yet.
+        readContent: async (signal) =>
+          (await toScannableText(mimeType, Buffer.from(input.content), { extractPdfText: this.extractPdfText }, signal)).text
+      },
+      // Project drafts are new bytes entering the shared library, so they
+      // follow the tenant's existing upload PII scope and blocking policy.
+      subject: { kind: "upload" }
+    }).catch((error: unknown) => {
+      // A file the scan cannot read is a client error the agent can act on,
+      // for example by writing a text version instead.
+      if (error instanceof PiiProtectionServiceError && PERMANENT_PII_ERROR_CODES.has(error.code)) {
+        throw new ProjectFileError(error.code, error.message, 422);
       }
+      throw error;
+    });
+    if (decision.action === "block") {
+      throw new ProjectFileError(
+        "pii_block",
+        "The project draft was blocked by organization policy.",
+        422,
+      );
     }
     const stored = await input.storage.put({
       storageKey: `project-files/${actor.projectId}/${uuidv7()}`,
