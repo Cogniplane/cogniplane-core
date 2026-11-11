@@ -133,12 +133,16 @@ export function createOperationalPool(
   identity: PoolIdentity,
   logger: PoolErrorLogger = defaultPoolErrorLogger
 ): Pool {
-  const pool = new Pool(operationalPoolOptions(identity));
+  return logIdleConnectionErrors(new Pool(operationalPoolOptions(identity)), identity.applicationName, logger);
+}
+
+/** The `error` listener of `createOperationalPool`, for any pool. */
+function logIdleConnectionErrors(pool: Pool, applicationName: string, logger: PoolErrorLogger): Pool {
   pool.on("error", (error) => {
     const code = (error as { code?: unknown }).code;
     logger.error(
       {
-        pool: identity.applicationName,
+        pool: applicationName,
         ...(typeof code === "string" ? { code } : {}),
         err: error.message
       },
@@ -146,6 +150,37 @@ export function createOperationalPool(
     );
   });
   return pool;
+}
+
+/**
+ * The pool of the migration command (`scripts/migrate.ts`). It is not a
+ * serving pool, so it does not get `POOL_STATEMENT_TIMEOUT_MS`: a constraint
+ * validation or a backfill on a large table can run for minutes, and a cap
+ * would roll the migration back on every run. `applyMigrations` sets the
+ * limits of the migration session itself: no statement timeout and a
+ * 10-second lock timeout. A pool option cannot do this, because pg does not
+ * send a `statement_timeout` of 0, so a default of the server, database or
+ * role would stay.
+ *
+ * - `max: 1`: `applyMigrations` runs every statement on one pinned client. A
+ *   second connection would not have the session limits or the advisory lock.
+ * - The connection and idle-in-transaction limits stay.
+ * - `application_name` lets an operator find the migration in
+ *   `pg_stat_activity` and cancel it.
+ */
+export function createMigrationDatabase(
+  connectionString: string,
+  logger: PoolErrorLogger = defaultPoolErrorLogger
+): Pool {
+  const applicationName = "cogniplane-migrate";
+  const pool = new Pool({
+    connectionString,
+    max: 1,
+    connectionTimeoutMillis: POOL_CONNECTION_TIMEOUT_MS,
+    idle_in_transaction_session_timeout: POOL_IDLE_IN_TRANSACTION_TIMEOUT_MS,
+    application_name: applicationName
+  });
+  return logIdleConnectionErrors(pool, applicationName, logger);
 }
 
 /** The pool every route shares. */

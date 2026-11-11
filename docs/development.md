@@ -75,6 +75,8 @@ The `pre-push` hook (`.husky/pre-push`) runs gitleaks on the pushed commits
 - Commits: Conventional Commits (`type(scope): subject`).
 - Migrations: never edit an applied file; add the next numbered file in
   `apps/backend/db/migrations/`. The runner checks each applied file's hash.
+  A migration has no statement timeout, but it fails when it waits more than
+  10 seconds for a lock ([migration limits](operations.md#migration-limits)).
 - Deferred SQL (`apps/backend/db/deferred/`): changes that must not run
   automatically, for example dropping a column after every backend stopped using
   it. Each file says when to run it; run it with `psql` and the migration
