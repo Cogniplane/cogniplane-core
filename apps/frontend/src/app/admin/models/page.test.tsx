@@ -31,9 +31,9 @@ vi.mock("../../../lib/admin-api", () => ({
 }));
 // Test page mutation wiring with real queries; existing card tests cover the forms.
 vi.mock("../../../components/admin/admin-model-availability-card", () => ({
-  AdminModelAvailabilityCard: ({ onSave, onAddModel, onRemoveModel, addError, saveError, providerKeys, writesBlocked, recoveredVersion }: ModelCardProps) => <>
+  AdminModelAvailabilityCard: ({ onSave, onAddModel, onRemoveModel, addError, saveError, providerKeys, writesBlocked, settings }: ModelCardProps) => <>
     {saveError ? <p>{saveError}</p> : null}
-    <p>Writes: {writesBlocked ? "paused" : "ready"}. Recovered version: {recoveredVersion ?? "none"}</p>
+    <p>Writes: {writesBlocked ? "paused" : "ready"}. Settings version: {settings?.version ?? "none"}</p>
     <p>Target provider: {providerKeys.targetProvider ?? "none"}</p>
     <button onClick={() => void providerKeys.onSaveProviderKey("openai", "test-key")}>Save key</button>
     <button onClick={() => void providerKeys.onSaveProviderKey("openai", "")}>Remove key</button>
@@ -200,8 +200,10 @@ it("rejects retained data after a failed 409 reread and waits for an explicit re
   fireEvent.click(screen.getByRole("button", { name: "Save availability" }));
   expect(api.updateTenantModelAvailability).toHaveBeenCalledTimes(1);
   vi.mocked(api.getTenantSettings).mockResolvedValue(makeTenantSettings({ version: 6 }));
+  expect(screen.getByText(/Settings version: 5/)).toBeTruthy();
   fireEvent.click(screen.getByRole("button", { name: "Retry model settings" }));
-  await screen.findByText(/Recovered version: 6/);
+  // The card gets the recovered settings and rebases its draft on them.
+  await screen.findByText(/Writes: ready. Settings version: 6/);
   expect(api.updateTenantModelAvailability).toHaveBeenCalledTimes(1);
 });
 

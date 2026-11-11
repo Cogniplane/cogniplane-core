@@ -24,49 +24,35 @@ import {
   SelectValue
 } from "@/components/ui/select";
 import { useConfirmLeave } from "../../hooks/use-confirm-leave";
-import { CHIP, HINT, PILL_GRAY } from "../../lib/ui-tokens";
+import { CHIP, HINT, PILL_AMBER, PILL_GRAY } from "../../lib/ui-tokens";
+import {
+  buildModelDraft,
+  changedModelSettings,
+  conflictingModelSettings,
+  describeModelChanges,
+  followNewer,
+  keepEditsOn,
+  rebaseModelDraft,
+  removeModelFromEditor,
+  startModelEditor,
+  toModelAvailabilityInput,
+  type ModelAvailabilityInput,
+  type ModelDraft,
+  type ModelEditor
+} from "./model-availability-draft";
 import { ProviderKeyRows } from "./provider-key-rows";
 import { DisclosureRow } from "./overview-row";
 import { SaveBar } from "./save-bar";
 import { useFeedbackFocus } from "./use-feedback-focus";
 
-export type ModelAvailabilityInput = {
-  expectedVersion: number;
-  enabledProviders: ModelProvider[];
-  enabledModelIds: string[] | null;
-  defaultModelId: string | null;
-  modelDefaultEfforts: Record<string, EffortLevel>;
-  showEffortSelector: boolean;
-};
+export type { ModelAvailabilityInput } from "./model-availability-draft";
 
 /**
  * The result of a save. `conflict` means that other settings were saved first,
- * and holds the settings that the page loaded again.
+ * and holds the settings that the page loaded again. `true` means saved, with
+ * no settings to return.
  */
 export type ModelAvailabilitySaveResult = boolean | { conflict: TenantSettings } | { saved: TenantSettings };
-
-type Draft = {
-  expectedVersion: number;
-  enabledProviders: ModelProvider[];
-  // "all" keeps enabledModelIds null server-side; "custom" persists the list.
-  modelSelectionMode: "all" | "custom";
-  enabledModelIds: string[];
-  defaultModelId: string | null;
-  modelDefaultEfforts: Record<string, EffortLevel>;
-  showEffortSelector: boolean;
-};
-
-function buildDraft(settings: TenantSettings): Draft {
-  return {
-    expectedVersion: settings.version,
-    enabledProviders: settings.enabledProviders,
-    modelSelectionMode: settings.enabledModelIds === null ? "all" : "custom",
-    enabledModelIds: settings.enabledModelIds ?? [],
-    defaultModelId: settings.defaultModelId,
-    modelDefaultEfforts: { ...settings.modelDefaultEfforts },
-    showEffortSelector: settings.showEffortSelector
-  };
-}
 
 function EffortSelect(props: {
   model: Model;
@@ -359,19 +345,26 @@ export function AdminModelAvailabilityCard(props: {
   providerKeys: Omit<ComponentProps<typeof ProviderKeyRows>, "providerStatuses" | "status" | "actions">;
   saveError: string | null;
   writesBlocked?: boolean;
-  recoveredVersion?: number | null;
   readError?: string | null;
   retryingRead?: boolean;
   onRetryRead?: () => Promise<void>;
 }) {
   const { catalog, settings } = props;
-  const [draft, setDraft] = useState<Draft | null>(null);
-  const [isDirty, setIsDirty] = useState(false);
+  // One state, so that a newer version, the draft rebased on it and the list
+  // of what it changed always move together. Unsaved edits are the difference
+  // between the draft and its baseline.
+  const [editor, setEditor] = useState<ModelEditor | null>(null);
+  // Settings that a refused save or a model removal returned. The page also
+  // puts them in `settings`.
+  const [received, setReceived] = useState<TenantSettings | null>(null);
+  // The version that refused the last save.
+  const [refusedVersion, setRefusedVersion] = useState<number | null>(null);
   const [showSuccess, setShowSuccess] = useState(false);
   const [customModelOpen, setCustomModelOpen] = useState(false);
   const statusRef = useRef<HTMLDivElement>(null);
   const operationStatusRef = useRef<HTMLDivElement>(null);
   const removalStatusRef = useRef<HTMLParagraphElement>(null);
+  const changesRef = useRef<HTMLElement>(null);
   const saveRef = useRef<HTMLButtonElement>(null);
   const revision = useRef(0);
   const savingRef = useRef(false);
@@ -383,27 +376,28 @@ export function AdminModelAvailabilityCard(props: {
   const [operationMessage, setOperationMessage] = useState<string | null>(null);
   // The page keeps the last mutation error. Show it only for this draft's last save.
   const [saveFailed, setSaveFailed] = useState(false);
-  // The newer version that the draft moved to after a save conflict.
-  const [rebasedVersion, setRebasedVersion] = useState<number | null>(null);
   const focusResult = useFeedbackFocus();
+  const latest = received && (!settings || received.version > settings.version) ? received : settings;
+  const isDirty = editor !== null && changedModelSettings(editor.baseline.values, editor.draft).length > 0;
+  const busy = savingLocal || props.saving;
   useConfirmLeave(isDirty);
 
-  // Seed/resync the draft from the server state unless the admin has local
-  // edits in flight.
+  // Start the editor, and follow newer settings that the page loads in the
+  // background (followNewer). A save or a removal applies its own result, so
+  // not while one runs.
   useEffect(() => {
-    if (settings && !isDirty) {
+    if (!latest || !catalog) return;
+    if (!editor) {
       // eslint-disable-next-line react-hooks/set-state-in-effect
-      setDraft(buildDraft(settings));
+      setEditor(startModelEditor(latest));
+      return;
     }
-  }, [settings, isDirty]);
-
-  useEffect(() => {
-    if (props.recoveredVersion == null) return;
-    // An explicit read recovered after a failed conflict refresh.
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    setDraft(current => current ? { ...current, expectedVersion: props.recoveredVersion! } : current);
-    setRebasedVersion(props.recoveredVersion);
-  }, [props.recoveredVersion]);
+    if (busy || removing) return;
+    const next = followNewer(editor, latest, catalog.models);
+    if (next === editor) return;
+    setEditor(next);
+    setSaveFailed(false);
+  }, [latest, catalog, editor, busy, removing]);
 
   const modelsByProvider = useMemo(() => {
     const groups = new Map<ModelProvider, Model[]>();
@@ -415,21 +409,54 @@ export function AdminModelAvailabilityCard(props: {
     return groups;
   }, [catalog]);
 
-  if (!catalog || !settings || !draft) {
+  if (!catalog || !latest || !editor) {
     return null;
   }
+  const { baseline, draft, mergedFrom } = editor;
 
-  const busy = savingLocal || props.saving;
   const blocked = Boolean(props.writesBlocked || busy || props.adding || removing);
+  // Newer saved settings that the draft has not taken yet. Save waits: for one
+  // render after a background load, until the effect above rebases the draft,
+  // or until the administrator keeps or discards edits that conflict.
+  const newer = latest.version > baseline.version && !busy && !removing ? latest : null;
+  const newerValues = newer ? buildModelDraft(newer) : null;
+  const conflicts = newerValues && isDirty ? conflictingModelSettings(baseline.values, draft, newerValues, catalog.models) : [];
+  const conflictVersion = newer && conflicts.length > 0 ? newer.version : null;
+  const review = conflictVersion !== null && newerValues
+    ? { from: baseline.values, to: newerValues }
+    : mergedFrom && isDirty ? { from: mergedFrom, to: baseline.values } : null;
+  const savedChanges = review ? describeModelChanges(review.from, review.to, catalog.models) : [];
+  // The draft's default model choice that the newer version makes unavailable.
+  const lostDefault = newerValues && draft.defaultModelId && conflicts.includes("defaultModelId") &&
+    rebaseModelDraft(baseline.values, draft, newerValues, catalog.models).defaultModelId !== draft.defaultModelId
+    ? catalog.models.find((model) => model.id === draft.defaultModelId)?.displayName ?? draft.defaultModelId
+    : null;
 
-  function updateDraft(recipe: (current: Draft) => Draft): void {
+  function updateDraft(recipe: (current: ModelDraft) => ModelDraft): void {
     revision.current += 1;
-    setIsDirty(true);
     setShowSuccess(false);
     setOperationMessage(null);
     setSaveFailed(false);
-    setDraft((current) => (current ? recipe(current) : current));
+    setEditor((current) => (current ? { ...current, draft: recipe(current.draft) } : current));
   }
+
+  const keepMyEdits = () => {
+    if (!newer) return;
+    setEditor((current) => (current ? keepEditsOn(current, newer, catalog.models) : current));
+    setSaveFailed(false);
+    statusRef.current?.focus();
+  };
+
+  const discardDraft = () => {
+    if (blocked) return;
+    revision.current += 1;
+    setEditor(latest.version > baseline.version ? startModelEditor(latest) : { baseline, draft: baseline.values, mergedFrom: null });
+    setRefusedVersion(null);
+    setShowSuccess(false);
+    setOperationMessage(null);
+    setSaveFailed(false);
+    statusRef.current?.focus();
+  };
 
   const toggleProvider = (provider: ModelProvider, enabled: boolean) =>
     updateDraft((current) => ({
@@ -461,22 +488,13 @@ export function AdminModelAvailabilityCard(props: {
       const modelId = model.id;
       const updated = await props.onRemoveModel(modelId);
       if (!updated) { setRemoveError(`Could not remove ${model.displayName}. Your availability draft is kept. Try again.`); return; }
-      // The backend removed the model from tenant_settings. The resync effect
-      // ignores server state while the draft is dirty, so strip the id here.
-      // Otherwise the next Save sends an unknown id and gets a 400. Use
-      // setDraft, not updateDraft, so a clean draft stays clean. Expect the new
-      // settings version on the next Save.
-      setDraft((current) => {
-        if (!current) return current;
-        const { [modelId]: _removed, ...remainingEfforts } = current.modelDefaultEfforts;
-        return {
-          ...current,
-          expectedVersion: updated.version,
-          defaultModelId: current.defaultModelId === modelId ? null : current.defaultModelId,
-          enabledModelIds: current.enabledModelIds.filter((id) => id !== modelId),
-          modelDefaultEfforts: remainingEfforts
-        };
-      });
+      // The backend deleted the model and pruned it from the saved settings.
+      // Prune the baseline and the draft in the same way, so the deletion is
+      // neither an unsaved edit nor a change saved elsewhere, and the next Save
+      // cannot send the unknown id (400). The returned settings can also hold
+      // other saves: they take the same rebase or decision as any newer version.
+      setEditor((current) => (current ? followNewer(removeModelFromEditor(current, modelId), updated, catalog.models) : current));
+      setReceived(updated);
       removed = true;
       setRemoveDecision(null);
       setOperationMessage(`${model.displayName} removed. Your other availability edits are kept.`);
@@ -518,43 +536,44 @@ export function AdminModelAvailabilityCard(props: {
   const customCount = catalog.models.filter((model) => model.source === "custom").length;
 
   const handleSave = async () => {
-    if (savingRef.current || blocked) return;
+    if (savingRef.current || blocked || newer !== null || !isDirty) return;
     savingRef.current = true;
     setSavingLocal(true);
     const sentRevision = revision.current;
+    const sent = draft;
+    const sentBaseline = baseline;
     const ownsFocus = trackOperationFocus(saveRef.current, statusRef.current);
     try {
-      const saved = await props.onSave({
-        expectedVersion: draft.expectedVersion,
-        enabledProviders: draft.enabledProviders,
-        enabledModelIds: draft.modelSelectionMode === "all" ? null : draft.enabledModelIds,
-        defaultModelId: draft.defaultModelId,
-        modelDefaultEfforts: draft.modelDefaultEfforts,
-        showEffortSelector: draft.showEffortSelector
-      });
+      const saved = await props.onSave(toModelAvailabilityInput(sentBaseline.values, sent, sentBaseline.version));
       if (typeof saved === "object" && "conflict" in saved) {
-        // This page saves only the fields in the draft. So keep them all and move
-        // the draft to the newer version. The administrator saves again.
-        setDraft((current) => (current ? { ...current, expectedVersion: saved.conflict.version } : current));
-        setRebasedVersion(saved.conflict.version);
+        // Nothing was saved. The newer settings take the same rebase or
+        // decision as any newer version, then the administrator saves again.
+        setEditor((current) => (current ? followNewer(current, saved.conflict, catalog.models) : current));
+        setReceived(saved.conflict);
+        setRefusedVersion(saved.conflict.version);
         setSaveFailed(false);
         return;
       }
       setSaveFailed(!saved);
       if (saved) {
         const changedDuringSave = revision.current !== sentRevision;
-        if (typeof saved === "object" && "saved" in saved) {
-          setDraft(current => current ? { ...current, expectedVersion: saved.saved.version } : current);
-        }
-        setIsDirty(changedDuringSave);
+        const savedValues = typeof saved === "object" ? buildModelDraft(saved.saved) : sent;
+        if (typeof saved === "object") setReceived(saved.saved);
+        setEditor((current) => current && {
+          baseline: { version: typeof saved === "object" ? saved.saved.version : sentBaseline.version, values: savedValues },
+          // Keep only the edits made while the save was in flight.
+          draft: rebaseModelDraft(sent, current.draft, savedValues, catalog.models),
+          mergedFrom: null
+        });
+        setRefusedVersion(null);
         setShowSuccess(!changedDuringSave);
         setOperationMessage(changedDuringSave ? "Submitted availability saved. Your later edits are still unsaved." : null);
-        setRebasedVersion(null);
       }
     } finally {
       savingRef.current = false;
       setSavingLocal(false);
-      if (ownsFocus()) focusResult(() => statusRef.current);
+      // A refusal that needs a decision moves focus to the saved changes and their choices.
+      if (ownsFocus()) focusResult(() => changesRef.current?.dataset.conflict === "true" ? changesRef.current : statusRef.current);
     }
   };
 
@@ -704,8 +723,8 @@ export function AdminModelAvailabilityCard(props: {
           {removeDecision ? <div className="flex min-w-0 flex-col gap-3 border-t border-outline-variant pt-4" aria-label={`Remove ${removeDecision.displayName}`}>
             <h4 className="font-medium break-words [overflow-wrap:anywhere]">Remove {removeDecision.displayName}?</h4>
             <p className="text-sm text-on-surface-variant">This removes the custom model immediately, including its saved default and effort references. Other unsaved availability edits stay in your draft.</p>
-            {settings.defaultModelId === removeDecision.id ? <p className="text-sm text-warning">This is the saved default. New chats will use the next available default.</p> : null}
-            {settings.enabledModelIds?.length === 1 && settings.enabledModelIds[0] === removeDecision.id ? <p className="text-sm text-warning">This is the last saved selected model. Removing it restores all remaining models in the saved availability settings. Your current draft still needs its own save.</p> : null}
+            {latest.defaultModelId === removeDecision.id ? <p className="text-sm text-warning">This is the saved default. New chats will use the next available default.</p> : null}
+            {latest.enabledModelIds?.length === 1 && latest.enabledModelIds[0] === removeDecision.id ? <p className="text-sm text-warning">This is the last saved selected model. Removing it restores all remaining models in the saved availability settings. Your current draft still needs its own save.</p> : null}
             <p ref={removalStatusRef} role="status" tabIndex={-1} className="rounded-sm text-sm text-on-surface-variant outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50">{removing ? `Removing ${removeDecision.displayName}...` : removeError ? "Model removal was not confirmed. Review the error below." : "Confirm model removal to save this change."}</p>
             <div className="flex flex-wrap gap-2"><Button type="button" variant="destructive" disabled={blocked} onClick={event => void handleRemoveModel(removeDecision, event.currentTarget)}>{removing ? "Removing model..." : "Confirm model removal"}</Button><Button type="button" variant="outline" disabled={removing} onClick={() => { setRemoveDecision(null); setRemoveError(null); }}>Keep model</Button></div>
             {removeError ? <p role="alert" className="text-sm text-danger">{removeError}</p> : null}
@@ -762,25 +781,60 @@ export function AdminModelAvailabilityCard(props: {
       </div>
     </section>
 
+      {savedChanges.length > 0 ? (
+        <section
+          ref={changesRef}
+          tabIndex={-1}
+          aria-labelledby="model-saved-changes-heading"
+          data-conflict={conflictVersion !== null ? "true" : undefined}
+          className={`mt-6 rounded-lg p-3 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring ${conflictVersion !== null ? "border border-warning/40 bg-warning-surface" : "bg-surface-container-low"}`}
+        >
+          <h3 id="model-saved-changes-heading" className="font-semibold text-on-surface">Settings saved after your draft began</h3>
+          <p className="mt-1 text-on-surface-variant">
+            {conflictVersion !== null
+              ? "Your draft also changes the marked settings. If you keep your edits, your values replace these values. In the provider and model lists, only the items that you turned on or off change."
+              : "Your draft now includes these changes, and your own edits are kept."}
+          </p>
+          <ul className="mt-2 flex flex-col gap-1.5">
+            {savedChanges.map((change) => (
+              <li key={change.setting} className="flex flex-wrap items-center gap-x-2 gap-y-1 [overflow-wrap:anywhere]">
+                <span><span className="font-medium text-on-surface">{change.label}:</span> {change.detail}</span>
+                {conflicts.includes(change.setting) ? <span className={PILL_AMBER}>Also in your draft</span> : null}
+              </li>
+            ))}
+          </ul>
+          {lostDefault ? <p className="mt-2 text-warning [overflow-wrap:anywhere]">{lostDefault} is not available in v{conflictVersion}. If you keep your edits, the default model of v{conflictVersion} stays.</p> : null}
+          {conflictVersion !== null ? (
+            <div className="mt-3 flex flex-wrap gap-2">
+              <Button type="button" size="sm" onClick={keepMyEdits}>Keep my edits on v{conflictVersion}</Button>
+              <Button type="button" size="sm" variant="outline" onClick={discardDraft}>Discard my edits</Button>
+            </div>
+          ) : null}
+        </section>
+      ) : null}
       <div ref={operationStatusRef} role={operationMessage ? "status" : undefined} tabIndex={-1} className="mt-3 rounded-sm text-sm text-on-surface-variant focus-visible:ring-2 focus-visible:ring-ring">{operationMessage}</div>
       <SaveBar
         dirty={isDirty || busy}
         keepFeedbackVisible={showSuccess}
-        busy={blocked}
+        busy={blocked || newer !== null}
         submitRef={saveRef}
         status={props.readError ? <><span className="text-danger">{props.readError}</span>{props.onRetryRead ? <Button type="button" variant="outline" aria-disabled={props.retryingRead || undefined} onClick={async event => {
           if (props.retryingRead) return;
           const ownsFocus = trackOperationFocus(event.currentTarget, statusRef.current);
           try { await props.onRetryRead?.(); }
           finally { if (ownsFocus()) focusResult(() => statusRef.current); }
-        }}>{props.retryingRead ? "Loading model settings..." : "Retry model data"}</Button> : null}</> : busy ? <span>Saving submitted availability. Later edits stay in your draft.</span> : isDirty ? (rebasedVersion !== null
-          ? <span className="text-warning">Settings changed to v{rebasedVersion} before your save. Your model changes are kept. Save again to apply them.</span>
-          : <span className={HINT}>Unsaved changes</span>) : showSuccess ? <span className="text-success">Model availability saved.</span> : null}
+        }}>{props.retryingRead ? "Loading model settings..." : "Retry model data"}</Button> : null}</> : busy ? <span>Saving submitted availability. Later edits stay in your draft.</span> : isDirty ? (conflictVersion !== null
+          ? <span className="text-warning">Settings changed to v{conflictVersion}, and your draft changes the same settings. Keep or discard your edits before you save.</span>
+          : savedChanges.length > 0
+            ? <span className="text-warning">Settings changed to v{baseline.version} after your draft began. Check the saved changes, then save your edits.</span>
+            : refusedVersion !== null
+              ? <span className="text-warning">Settings changed to v{refusedVersion} before your save. Your model changes are kept. Save again to apply them.</span>
+              : <span className={HINT}>Unsaved changes</span>) : showSuccess ? <span className="text-success">Model availability saved.</span> : null}
         error={saveFailed ? props.saveError : null}
         submitLabel="Save model availability"
         busyLabel={busy ? "Saving availability..." : "Save model availability"}
         onSubmit={() => void handleSave()}
-        onCancel={() => { if (blocked) return; revision.current += 1; setDraft(buildDraft(settings)); setIsDirty(false); setShowSuccess(false); setOperationMessage(null); setSaveFailed(false); setRebasedVersion(null); statusRef.current?.focus(); }}
+        onCancel={discardDraft}
         statusRef={statusRef}
       />
     </div>

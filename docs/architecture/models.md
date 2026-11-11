@@ -26,6 +26,14 @@ spending](model-spending.md).
   backend prunes unavailable model ids; an allowlist that pruning empties
   becomes null. Frontend caches refresh through the `queryKeys.models.all`
   prefix (`apps/frontend/src/lib/query-keys.ts`).
+- Admin > Models edits these settings as one draft
+  (`apps/frontend/src/components/admin/model-availability-draft.ts`). A save
+  sends `expectedVersion` and only the settings that the draft changed. When a
+  newer version arrives (a refused save, a reload, a custom model removal), the
+  draft moves to it: unchanged settings take the newer values, the provider
+  and model lists merge item by item, and each model's default effort merges
+  separately. When both versions changed the same setting, Save waits until
+  the admin keeps or discards the draft's edits.
 - Turn checks (`services/runtime/runtime-model-resolver.ts`): a requested model
   must exist and be enabled (400), and its provider must have a key (400
   `provider_api_key_required`).
