@@ -352,6 +352,7 @@ function makeAdapter(input: {
   config?: typeof testConfig;
   toolContexts?: Pick<ToolExecutionContextStore, "extend" | "liveness">;
   log?: ReturnType<typeof createSilentLogger>;
+  sandboxDisposal?: Pick<import("../runtime/e2b-sandbox-disposal.js").E2bSandboxDisposal, "destroy">;
 }) {
   const tenantKeyFn = input.getTenantApiKey;
   const credentials: ProviderCredentials | undefined =
@@ -381,7 +382,8 @@ function makeAdapter(input: {
       sessions: input.sessions ?? fakeSessionAccess,
       tenantMembers: (input.tenantMembers ?? fakeTenantMemberStore) as never,
       activeTurns: input.activeTurns,
-      toolContexts: input.toolContexts
+      toolContexts: input.toolContexts,
+      sandboxDisposal: input.sandboxDisposal
     },
     credentials,
     input.factory
@@ -3420,6 +3422,68 @@ it("keeps a standalone runtime and checkpointer across execution generations", a
     expect(await binding.load()).toBeNull();
     expect(sandboxExecutions).toEqual(["second", "second", "second", "second"]);
   } finally { await adapter.close(); }
+});
+
+// Archive, delete and purge take the saved sandbox from the session row and kill it
+// through destroySandbox. A teardown after which the session goes on (idle,
+// invalidation, shutdown) never kills a saved sandbox: the next turn, on this replica
+// or on another one, reconnects to it.
+describe("sandbox of a disposed session", () => {
+  const configWithE2b = createTestConfig({ ANTHROPIC_API_KEY: "sk-ant-test-key", E2B_API_KEY: "e2b-test-key" });
+  const released = { tenantId: "test-tenant", sessionId: "sess-1", sandboxId: "sandbox-one" };
+
+  it("kills a released sandbox by id and returns what the provider did", async () => {
+    const destroy = vi.fn(async () => "not_found" as const);
+    const adapter = makeAdapter({ factory: makeRuntimeFactory(() => scriptedChatStream()).factory, config: configWithE2b,
+      sandboxDisposal: { destroy } });
+    try {
+      await expect(adapter.destroySandbox(released)).resolves.toBe("not_found");
+      expect(destroy).toHaveBeenCalledExactlyOnceWith(released);
+    } finally { await adapter.close(); }
+  });
+
+  it("kills nothing, and says so in the log, when E2B is not configured", async () => {
+    const log = createSilentLogger();
+    const warn = vi.spyOn(log, "warn");
+    const adapter = makeAdapter({ factory: makeRuntimeFactory(() => scriptedChatStream()).factory, log });
+    try {
+      await expect(adapter.destroySandbox(released)).resolves.toBe("skipped");
+      expect(warn).toHaveBeenCalledWith({ sessionId: "sess-1", sandboxId: "sandbox-one" }, expect.stringContaining("not configured"));
+    } finally { await adapter.close(); }
+  });
+
+  it("never kills a saved sandbox when it tears down a runtime of a session that goes on", async () => {
+    const runtime = makeRuntimeFactory(() => scriptedChatStream());
+    const destroy = vi.fn(async () => "killed" as const);
+    let saved: { sandboxId: string; networkPolicyHash: string | null } | null = null;
+    const adapter = makeAdapter({
+      factory: runtime.factory, config: configWithE2b, sandboxDisposal: { destroy },
+      dynamicConfig: makeDynamicConfig({ allowCommandExecution: true }),
+      executions: {
+        isCurrent: async () => true,
+        bindRuntime: async () => {},
+        sandboxBinding: async () => saved,
+        bindSandboxId: async (_execution, _previousId, sandboxId, networkPolicyHash) => { saved = { sandboxId, networkPolicyHash }; },
+        releaseSandboxId: async () => { saved = null; }
+      }
+    });
+    const execution = { ...sessionInput, executionId: "first", ownerId: "replica-a",
+      projectId: null, expiresAt: new Date(Date.now() + 30_000).toISOString() };
+    try {
+      await adapter.createSession({ ...sessionInput, execution });
+      await runtime.factoryCalls[0]!.sandboxBinding!.save(null, "sandbox-one", "policy-a");
+      await adapter.abortSession(sessionInput);
+      await adapter.createSession({ ...sessionInput, execution });
+      await adapter.invalidateTenantRuntimes(sessionInput.tenantId);
+      await adapter.createSession({ ...sessionInput, execution });
+      await adapter.invalidateRuntimesForUser(sessionInput.tenantId, sessionInput.userId, { reason: "security_change" });
+      await adapter.createSession({ ...sessionInput, execution });
+    } finally { await adapter.close(); }
+    expect(runtime.factoryCalls).toHaveLength(4);
+    expect(runtime.dispose).toHaveBeenCalledTimes(4);
+    expect(destroy).not.toHaveBeenCalled();
+    expect(saved).toEqual({ sandboxId: "sandbox-one", networkPolicyHash: "policy-a" });
+  });
 });
 
 it("does not install execution checks for personal runtimes", async () => {

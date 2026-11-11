@@ -126,8 +126,8 @@ describe.skipIf(!adminDatabaseUrl())("session history format", () => {
     // Lifecycle changes and a move into a project keep the stored format:
     // the old transcript and checkpoint move with the session.
     expect((await sessions.rename(tenant, legacy, user, "Renamed"))?.transcriptFormat).toBe("legacy");
-    expect((await sessions.setArchived(tenant, legacy, user, true))?.transcriptFormat).toBe("legacy");
-    expect((await sessions.setArchived(tenant, legacy, user, false))?.transcriptFormat).toBe("legacy");
+    expect((await sessions.setArchived(tenant, legacy, user, true))?.session.transcriptFormat).toBe("legacy");
+    expect((await sessions.setArchived(tenant, legacy, user, false))?.session.transcriptFormat).toBe("legacy");
     expect(await projects.setSession(tenant, user, project.projectId, legacy)).toBe(true);
     expect(await storedFormat(legacy)).toBeNull();
     expect((await sessions.getReadable(tenant, legacy, user))?.transcriptFormat).toBe("legacy");

@@ -31,7 +31,7 @@ describe.skipIf(!adminDatabaseUrl())("session Trash retention", () => {
     await superuserPool().query("UPDATE artifacts SET storage_key=$1 WHERE artifact_id=$2", [storageKey, otherArtifactId]);
 
     const store = new SessionStore(appPool(), maintenancePool());
-    expect(await store.remove(tenant, sessionId, user)).toBe(true);
+    expect(await store.remove(tenant, sessionId, user)).toEqual({ releasedSandboxId: null });
     expect((await store.listPage(tenant, user, { status: "deleted" })).sessions).toHaveLength(1);
     expect((await store.listPage(otherTenant, otherUser, { status: "deleted" })).sessions).toEqual([]);
     await superuserPool().query(
@@ -82,8 +82,8 @@ describe.skipIf(!adminDatabaseUrl())("session Trash retention", () => {
     const sessionId = await seedSession(tenant, user);
     const store = new SessionStore(appPool(), maintenancePool());
 
-    expect((await store.setArchived(tenant, sessionId, user, true))?.status).toBe("archived");
-    expect(await store.remove(tenant, sessionId, user)).toBe(true);
+    expect((await store.setArchived(tenant, sessionId, user, true))?.session.status).toBe("archived");
+    expect(await store.remove(tenant, sessionId, user)).toEqual({ releasedSandboxId: null });
     expect((await store.restoreDeleted(tenant, sessionId, user))?.status).toBe("archived");
   });
 });

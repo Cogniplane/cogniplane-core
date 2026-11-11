@@ -621,7 +621,7 @@ test("a download token for a personal artifact keeps working after its chat is d
   expect(tokenResponse.statusCode).toBe(200);
   const tokenUrl = tokenResponse.json().download.url as string;
 
-  expect(await sessions.remove("test-tenant", sessionId, "platform-user")).toBe(true);
+  expect(await sessions.remove("test-tenant", sessionId, "platform-user")).toEqual({ releasedSandboxId: null });
 
   const downloadResponse = await app.inject({
     method: "GET",

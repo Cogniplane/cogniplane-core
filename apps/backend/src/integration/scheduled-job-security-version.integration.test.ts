@@ -157,7 +157,8 @@ function scopedWorker(tenantId: string, options: {
       })();
     },
     abortSession: async () => {},
-    purgeSessionData: async () => {}
+    purgeSessionData: async () => {},
+    destroySandbox: async () => "killed"
   };
   const deps: SchedulerWorkerDeps = {
     settings: {

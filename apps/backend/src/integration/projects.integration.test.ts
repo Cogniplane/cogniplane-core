@@ -144,7 +144,7 @@ describe.skipIf(!adminDatabaseUrl())("private project workspaces", () => {
     ]);
     // The reference session backs project files and must not be removable or
     // archivable through the ordinary session routes.
-    expect(await h.sessions.remove(h.tenantId, h.project.referenceSessionId, h.userId)).toBe(false);
+    expect(await h.sessions.remove(h.tenantId, h.project.referenceSessionId, h.userId)).toBeNull();
     expect(
       await h.sessions.setArchived(h.tenantId, h.project.referenceSessionId, h.userId, true)
     ).toBeNull();

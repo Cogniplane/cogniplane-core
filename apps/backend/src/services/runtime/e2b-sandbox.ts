@@ -1,5 +1,6 @@
 // Thin structural interface over the E2B SDK's Sandbox. Every consumer that talks to
-// an E2B sandbox uses it (today: the Deep Agents execution backend).
+// an E2B sandbox uses it (today: the Deep Agents execution backend, and the kill of the
+// sandbox of a disposed session in e2b-sandbox-disposal.ts).
 
 /** Session workspaces are rooted here inside every sandbox template. */
 export const E2B_WORKSPACE_BASE = "/home/user/workspace";
@@ -127,11 +128,16 @@ export function toE2bCreateOptions(input: {
   };
 }
 
-/** The static side of the E2B SDK's Sandbox class that the backend uses. */
+/** The static side of the E2B SDK's Sandbox class that the backend and the disposal use. */
 export type E2bSandboxClassLike = {
   create: (templateId: string, options: E2bCreateOptions) => Promise<E2bSandboxLike>;
   connect: (sandboxId: string, options: { apiKey: string; timeoutMs: number }) => Promise<E2bSandboxLike>;
   getInfo: (sandboxId: string, options: { apiKey: string } & E2bRequestLimits) => Promise<E2bSandboxInfoLike>;
+  /**
+   * Kills a sandbox by id (`DELETE /sandboxes/{id}`) with no connect. It returns false when
+   * the provider does not have the sandbox (HTTP 404), and throws for any other failure (e2b@2.63).
+   */
+  kill: (sandboxId: string, options: { apiKey: string } & E2bRequestLimits) => Promise<boolean>;
 };
 
 export async function loadE2bSandboxClass(): Promise<E2bSandboxClassLike> {

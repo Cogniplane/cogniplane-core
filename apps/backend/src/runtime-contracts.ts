@@ -4,6 +4,7 @@ import type { BaseEvent } from "@ag-ui/client";
 import type { EffortLevel, PolicyTurnContext, ProjectApprovalMode, TurnStopReason } from "@cogniplane/shared-types";
 import type { ResolvedRuntimePolicy } from "./services/admin-config-records.js";
 import type { SessionExecution } from "./services/session-execution-store.js";
+import type { ReleasedSandbox, SandboxDisposalOutcome } from "./services/runtime/e2b-sandbox-disposal.js";
 
 export type RuntimeSessionRef = {
   sessionId: string;
@@ -137,6 +138,14 @@ export interface RuntimeAdapter {
     sessionId: string;
     userId: string;
   }): Promise<void>;
+  /**
+   * Kill the sandbox that archive, delete or purge took from a session. The session
+   * store read the id under the session row lock and cleared it in the transaction
+   * that changed the status, so no runtime can adopt the sandbox now. Idle teardown,
+   * invalidation and shutdown never call this: the next turn reconnects to a saved
+   * sandbox. It does not throw for a provider failure; the outcome says what happened.
+   */
+  destroySandbox(input: ReleasedSandbox): Promise<SandboxDisposalOutcome>;
   /**
    * Tear down every active runtime for `tenantId` after tenant settings that
    * are snapshotted into runtime config change (also covers admin integration

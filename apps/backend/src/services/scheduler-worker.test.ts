@@ -248,7 +248,8 @@ function createFakeDeps(options?: {
     },
     purgeSessionData: async (input) => {
       purgeSessionDataCalls.push(input);
-    }
+    },
+    destroySandbox: async () => "killed"
   };
 
   const deps: SchedulerWorkerDeps = {
@@ -721,7 +722,8 @@ describe("SchedulerWorker", () => {
           })();
         },
         abortSession: async () => {},
-        purgeSessionData: async () => {}
+        purgeSessionData: async () => {},
+        destroySandbox: async () => "killed"
       });
 
     const callsA: string[] = [];
@@ -2208,5 +2210,30 @@ describe("SchedulerWorker retention cleanup", () => {
     await worker.tick();
 
     await vi.waitFor(() => expect(fake.purgeSessionDataCalls).toEqual([target]));
+  });
+
+  // Purge takes the sandbox that a trashed row still names and kills it through the
+  // runtime adapter. A kill that throws is logged: the row is gone, and nothing tries again.
+  test("lets the session Trash cleanup kill a released sandbox through the runtime adapter", async () => {
+    const released = { tenantId: "tenant-a", sessionId: "session-1", sandboxId: "sandbox-one" };
+    type Options = { destroySandbox: (input: typeof released) => Promise<void> };
+    const cleanupExpired = vi.fn(async (_storage: unknown, options: Options) => {
+      await options.destroySandbox(released);
+      await options.destroySandbox(released);
+      return cases[0]!.removed;
+    });
+    const { worker, fake, logger } = setup(cases[0]!, cleanupExpired);
+    const failure = new Error("unexpected");
+    const destroySandbox = vi.fn(async (_input: typeof released) => "killed" as const)
+      .mockRejectedValueOnce(failure);
+    fake.deps.runtimeAdapter.destroySandbox = destroySandbox;
+
+    await worker.tick();
+
+    await vi.waitFor(() => expect(logger.info).toHaveBeenCalledWith(cases[0]!.removed, cases[0]!.logged));
+    expect(destroySandbox.mock.calls).toEqual([[released], [released]]);
+    expect(logger.error).toHaveBeenCalledWith(
+      { error: failure, sessionId: "session-1", sandboxId: "sandbox-one" },
+      "Failed to kill the sandbox of a purged session; it runs until the provider expires it");
   });
 });

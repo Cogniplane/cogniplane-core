@@ -9,11 +9,13 @@ async function setup(status: SessionRecord["status"] = "active") {
   const session: SessionRecord = { sessionId, projectId: null, userId: "user", sessionName: "Research", status,
     createdAt: "2026-09-13T12:00:00Z", updatedAt: "2026-09-13T12:00:00Z", transcriptFormat: "current" };
   const activeTurns = new ActiveTurnsRegistry();
-  const setArchived = vi.fn(async (_tenant: string, _id: string, _user: string, archived: boolean): Promise<SessionRecord | null> => ({ ...session, status: archived ? "archived" : "active" }));
+  const setArchived = vi.fn(async (_tenant: string, _id: string, _user: string, archived: boolean): Promise<{ session: SessionRecord; releasedSandboxId: string | null } | null> =>
+    ({ session: { ...session, status: archived ? "archived" : "active" }, releasedSandboxId: null }));
   const restoreDeleted = vi.fn(async () => null);
   const getReadable = vi.fn(async () => session as SessionRecord | null);
   const auditEvents = { create: vi.fn(async () => {}) };
-  const adapter = { hasActiveTurn: vi.fn(() => false), abortSession: vi.fn(), purgeSessionData: vi.fn() };
+  const adapter = { hasActiveTurn: vi.fn(() => false), abortSession: vi.fn(), purgeSessionData: vi.fn(),
+    destroySandbox: vi.fn(async (_input: { tenantId: string; sessionId: string; sandboxId: string }) => "killed" as const) };
   const app = await sessionRoutesApp({ sessions: { getReadable, setArchived, restoreDeleted }, activeTurns, runtimeAdapter: adapter, auditEvents });
   return { app, setArchived, getReadable, restoreDeleted, activeTurns, adapter, auditEvents };
 }
@@ -32,6 +34,7 @@ it.each(["archive", "restore"])("%s changes metadata without aborting or purging
   });
   expect(h.adapter.abortSession).not.toHaveBeenCalled();
   expect(h.adapter.purgeSessionData).not.toHaveBeenCalled();
+  expect(h.adapter.destroySandbox).not.toHaveBeenCalled();
 });
 
 it.each(["registry", "adapter"])("rejects an active turn reported by the %s", async (source) => {
@@ -89,14 +92,17 @@ it.each(["archive", "restore"])("keeps a project %s retry idempotent", async (ac
     transcriptFormat: "current"
   });
   h.setArchived.mockResolvedValue({
-    sessionId,
-    userId: "user",
-    sessionName: "Research",
-    status: action === "archive" ? "archived" : "active",
-    projectId: "project",
-    createdAt: "2026-09-13T12:00:00Z",
-    updatedAt: "2026-09-13T12:00:00Z",
-    transcriptFormat: "current"
+    session: {
+      sessionId,
+      userId: "user",
+      sessionName: "Research",
+      status: action === "archive" ? "archived" : "active",
+      projectId: "project",
+      createdAt: "2026-09-13T12:00:00Z",
+      updatedAt: "2026-09-13T12:00:00Z",
+      transcriptFormat: "current"
+    },
+    releasedSandboxId: null
   });
   const response = await h.app.inject({ method: "POST", url: `/sessions/${sessionId}/${action}` });
   expect(response.statusCode).toBe(200);
@@ -110,5 +116,43 @@ it("keeps a completed transition successful and releases the reservation when au
   const response = await h.app.inject({ method: "POST", url: `/sessions/${sessionId}/archive` });
   expect(response.statusCode).toBe(200);
   expect(response.json().session.status).toBe("archived");
+  expect(h.activeTurns.isBusy(sessionId)).toBe(false);
+});
+
+// The store took the saved sandbox in the transaction that archived the session. The
+// route kills it while it still holds the turn reservation, and keeps the warm
+// runtime: no turn runs (the route refused a running one), and the next turn after a
+// restore finds no saved sandbox, so the runtime starts a new one.
+it("kills the sandbox that the archive took from the session, and keeps the warm runtime", async () => {
+  const h = await setup();
+  h.setArchived.mockResolvedValueOnce({
+    session: { sessionId, projectId: null, userId: "user", sessionName: "Research", status: "archived",
+      createdAt: "2026-09-13T12:00:00Z", updatedAt: "2026-09-13T12:00:00Z", transcriptFormat: "current" },
+    releasedSandboxId: "sandbox-one"
+  });
+  h.adapter.destroySandbox.mockImplementationOnce(async () => {
+    expect(h.activeTurns.isBusy(sessionId)).toBe(true);
+    return "killed";
+  });
+  const response = await h.app.inject({ method: "POST", url: `/sessions/${sessionId}/archive` });
+  expect(response.statusCode).toBe(200);
+  expect(response.json().session).not.toHaveProperty("releasedSandboxId");
+  expect(h.adapter.destroySandbox).toHaveBeenCalledExactlyOnceWith({ tenantId: "tenant", sessionId, sandboxId: "sandbox-one" });
+  expect(h.adapter.abortSession).not.toHaveBeenCalled();
+  expect(h.activeTurns.isBusy(sessionId)).toBe(false);
+});
+
+it("keeps a committed archive successful when the kill throws", async () => {
+  const h = await setup();
+  h.setArchived.mockImplementationOnce(async () => ({
+    session: { sessionId, projectId: null, userId: "user", sessionName: "Research", status: "archived",
+      createdAt: "2026-09-13T12:00:00Z", updatedAt: "2026-09-13T12:00:00Z", transcriptFormat: "current" },
+    releasedSandboxId: "sandbox-one"
+  }));
+  h.adapter.destroySandbox.mockRejectedValueOnce(new Error("provider down"));
+  const response = await h.app.inject({ method: "POST", url: `/sessions/${sessionId}/archive` });
+  expect(response.statusCode).toBe(200);
+  expect(response.json().session.status).toBe("archived");
+  expect(h.auditEvents.create).toHaveBeenCalledOnce();
   expect(h.activeTurns.isBusy(sessionId)).toBe(false);
 });

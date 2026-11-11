@@ -118,7 +118,7 @@ export type SchedulerWorkerDeps = {
 
 export type SchedulerRuntimeAdapter = Pick<
   RuntimeAdapter,
-  "id" | "createSession" | "runMessageAGUI" | "abortSession" | "purgeSessionData"
+  "id" | "createSession" | "runMessageAGUI" | "abortSession" | "purgeSessionData" | "destroySandbox"
 >;
 
 export type SchedulerWorkerOptions = {
@@ -336,6 +336,15 @@ export class SchedulerWorker {
     try {
       const result = await this.deps.sessionTrash.cleanupExpired(this.deps.sessionStorage, {
         purgeRuntime: (input) => this.deps.runtimeAdapter.purgeSessionData(input),
+        // The adapter logs a failed kill. This catches only an unexpected throw: the row is gone, so nothing tries again.
+        destroySandbox: async (input) => {
+          try {
+            await this.deps.runtimeAdapter.destroySandbox(input);
+          } catch (error) {
+            this.deps.logger.error({ error, sessionId: input.sessionId, sandboxId: input.sandboxId },
+              "Failed to kill the sandbox of a purged session; it runs until the provider expires it");
+          }
+        },
       });
       if (result.deletedSessions || result.deletedObjects || result.purgedRuntimes) {
         this.deps.logger.info(result, "Expired session Trash cleaned up");
