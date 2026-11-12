@@ -293,7 +293,11 @@ function reduceActive(state: ActiveState, event: Exclude<PersonalSkillsEvent, { 
     case "keepMyText": {
       const skill = selectedSkill(state);
       if (state.view.kind !== "edit" || !skill) return state;
-      return { ...state, view: { ...state.view, version: skill.version, actionError: null }, focus: focus("heading") };
+      // Keep local text, but compare later edits with the accepted server version.
+      return {
+        ...state, view: { ...state.view, version: skill.version, baseline: editView(skill).baseline, actionError: null },
+        focus: focus("heading")
+      };
     }
     case "useLatest": {
       const skill = selectedSkill(state);

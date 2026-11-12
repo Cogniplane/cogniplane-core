@@ -952,7 +952,9 @@ it("drops a file read that finishes after the editor unmounts", async () => {
   const onDirtyChange = vi.fn();
   const errors = vi.spyOn(console, "error");
   const { unmount } = render(<PersonalSkills expectedScope={scope} onDirtyChange={onDirtyChange} />);
-  fireEvent.click(await screen.findByRole("button", { name: "Create skill" }));
+  const create = screen.getByRole("button", { name: "Create skill" });
+  await waitFor(() => expect(create).toHaveProperty("disabled", false));
+  fireEvent.click(create);
   fireEvent.click(screen.getByRole("button", { name: "Import SKILL.md" }));
   fireEvent.change(screen.getByLabelText("Upload SKILL.md"), { target: { files: [{ name: "SKILL.md", size: 100, text: read }] } });
   expect(await screen.findByRole("status")).toHaveProperty("textContent", "Reading SKILL.md…");
@@ -995,4 +997,28 @@ it("replaces the draft and clears dirty state when the latest version is taken a
   fireEvent.change(screen.getByRole("textbox", { name: "Instructions" }), { target: { value: "Server text, edited" } });
   fireEvent.click(screen.getByRole("button", { name: "Save draft" }));
   await waitFor(() => expect(updatePersonalSkill).toHaveBeenLastCalledWith("skill-1", { scope, version: 3, source: { kind: "inline", ...content, instructions: "Server text, edited" } }));
+});
+
+it("keeps restored original text unsaved after accepting a newer save version", async () => {
+  const newer = { ...released, version: 3, latest: { ...revision, revision: 2, content: { ...content, instructions: "Server text" } } };
+  const saved = { ...newer, version: 4, latest: { ...revision, revision: 3 } };
+  vi.mocked(getPersonalSkills).mockResolvedValueOnce({ scope, skills: [released] }).mockResolvedValueOnce({ scope, skills: [newer] });
+  vi.mocked(updatePersonalSkill).mockRejectedValueOnce(conflictError).mockResolvedValueOnce({ scope, skill: saved });
+  const onDirtyChange = vi.fn();
+  render(<PersonalSkills expectedScope={scope} onDirtyChange={onDirtyChange} />);
+  fireEvent.click(await screen.findByRole("button", { name: "Edit" }));
+  fireEvent.change(screen.getByRole("textbox", { name: "Instructions" }), { target: { value: "Local draft" } });
+  fireEvent.click(screen.getByRole("button", { name: "Save draft" }));
+  const choice = await screen.findByRole("group", { name: "Latest saved version" });
+  fireEvent.click(within(choice).getByRole("button", { name: "Keep my text" }));
+  fireEvent.change(screen.getByRole("textbox", { name: "Instructions" }), { target: { value: content.instructions } });
+  expect(screen.getByRole("button", { name: "Save draft" })).toHaveProperty("disabled", false);
+  await waitFor(() => expect(onDirtyChange).toHaveBeenLastCalledWith(true));
+  fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+  const discard = screen.getByRole("alertdialog", { name: "Discard unsaved skill changes?" });
+  fireEvent.click(within(discard).getByRole("button", { name: "Keep editing" }));
+  expect(screen.getByRole("textbox", { name: "Instructions" })).toHaveProperty("value", content.instructions);
+  fireEvent.click(screen.getByRole("button", { name: "Save draft" }));
+  await waitFor(() => expect(updatePersonalSkill).toHaveBeenLastCalledWith("skill-1", { scope, version: 3, source: { kind: "inline", ...content } }));
+  expect(await screen.findByText("Instructions in draft revision 3")).toBeTruthy();
 });

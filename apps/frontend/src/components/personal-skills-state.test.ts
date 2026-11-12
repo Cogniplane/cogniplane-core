@@ -62,6 +62,16 @@ describe("recovery after a write conflict", () => {
     expect(hasConflict(state)).toBe(false);
   });
 
+  it("compares kept text with the accepted server version instead of the original version", () => {
+    const kept = active(run(failedRecovery(), loaded([newer]), { type: "keepMyText" }));
+    const restored = active(reduce(kept, typed(content.instructions)));
+    expect(restored.view).toMatchObject({ kind: "edit", version: 3 });
+    expect(isDirty(restored.view)).toBe(true);
+    expect(active(reduce(restored, { type: "cancelEditor" })).view).toMatchObject({ discard: "cancel" });
+    const matching = active(reduce(kept, typed(newer.latest.content.instructions)));
+    expect(isDirty(matching.view)).toBe(false);
+  });
+
   it("keeps the block through every navigation and refuses a stale edit or a new draft", () => {
     let state = active(reduce(failedRecovery(), { type: "cancelEditor" }));
     expect(state.view).toMatchObject({ kind: "edit", discard: "cancel" });
