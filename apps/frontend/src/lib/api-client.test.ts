@@ -7,6 +7,7 @@ import {
   changeSession,
   getAccessToken,
   getSessionEpoch,
+  installedSessionEpoch,
   refreshAccessToken,
   replaceSession,
   request,
@@ -18,6 +19,7 @@ import {
   setStepUpPrompt,
   setTokenRefresher,
   StepUpCancelledError,
+  subscribeAccessToken,
   createApiHeaders,
   buildErrorMessage
 } from "./api-client";
@@ -709,5 +711,532 @@ describe("refresh deadlines", () => {
       await vi.advanceTimersByTimeAsync(0);
       expect(getAccessToken()).toBe("new-session");
     } finally { vi.useRealTimers(); }
+  });
+});
+
+// Sequences that pin the order of the session coordinator
+// (session-coordinator.ts) through the exports of this module.
+describe("the shared refresh", () => {
+  beforeEach(() => {
+    setAccessToken(null);
+  });
+
+  it("starts one network refresh in the first call and gives every caller the same promise", async () => {
+    const refresher = vi.fn(async () => "renewed");
+    setTokenRefresher(refresher);
+
+    const first = refreshAccessToken();
+    // The gate is open: the refresher starts before the first call returns.
+    expect(refresher).toHaveBeenCalledOnce();
+    expect(refreshAccessToken()).toBe(first);
+    expect(await first).toBe("renewed");
+    expect(refresher).toHaveBeenCalledOnce();
+  });
+
+  it("gives the callers that wait at the gate the same promise and one network refresh", async () => {
+    const refresher = vi.fn(async () => "renewed");
+    setTokenRefresher(refresher);
+    const answer = deferred<void>();
+
+    const change = changeSession(() => answer.promise);
+    const first = refreshAccessToken();
+    expect(refreshAccessToken()).toBe(first);
+    answer.resolve();
+    await change;
+    expect(await first).toBe("renewed");
+    expect(refresher).toHaveBeenCalledOnce();
+  });
+
+  it("starts a new refresh for a call in the continuation of a settled refresh", async () => {
+    const refresher = vi.fn(async () => "renewed");
+    setTokenRefresher(refresher);
+
+    const first = refreshAccessToken();
+    const second = await first.then(() => {
+      const next = refreshAccessToken();
+      expect(next).not.toBe(first);
+      expect(refresher).toHaveBeenCalledTimes(2);
+      return next;
+    });
+    expect(await second).toBe("renewed");
+  });
+
+  it("holds a refresh while the gate holder refreshes after a 401, then gives it the installed token", async () => {
+    setAccessToken("expired");
+    const refresher = vi.fn(async () => "renewed");
+    setTokenRefresher(refresher);
+    const { calls, fetch } = stubFetch([
+      () => jsonResponse(401, { error: "invalid_token" }),
+      () => jsonResponse(200, { accessToken: "new-session" })
+    ]);
+    // @ts-expect-error — stub
+    global.fetch = fetch;
+
+    const change = changeSession(
+      (gated) => gated<{ accessToken: string }>("/me/security/password", { method: "POST", body: "{}" }),
+      (answer) => answer.accessToken
+    );
+    const held = refreshAccessToken().then((token) => ({ token, inMemory: getAccessToken() }));
+
+    expect(await change).toEqual({ accessToken: "new-session" });
+    expect(await held).toEqual({ token: "new-session", inMemory: "new-session" });
+    expect(refresher).toHaveBeenCalledOnce();
+    expect(calls).toHaveLength(2);
+  });
+
+  it("gives a held refresh the token that the gate holder's refresh wrote when the holder installs nothing", async () => {
+    setAccessToken("expired");
+    const refresher = vi.fn(async () => "renewed");
+    setTokenRefresher(refresher);
+    const { fetch } = stubFetch([
+      () => jsonResponse(401, { error: "invalid_token" }),
+      () => jsonResponse(200, { ok: true })
+    ]);
+    // @ts-expect-error — stub
+    global.fetch = fetch;
+    const epoch = getSessionEpoch();
+
+    const change = changeSession((gated) => gated("/me/security/totp", { method: "POST", body: "{}" }));
+    const held = refreshAccessToken();
+
+    await change;
+    expect(await held).toBe("renewed");
+    expect(refresher).toHaveBeenCalledOnce();
+    expect(getSessionEpoch()).toBe(epoch);
+  });
+
+  it.each([
+    ["the same token", "current"],
+    ["null", null]
+  ])("gives a held refresh the token in memory after a write of %s in the same epoch", async (_name, written) => {
+    setAccessToken("current");
+    const refresher = vi.fn(async () => "renewed");
+    setTokenRefresher(refresher);
+    const answer = deferred<void>();
+    const epoch = getSessionEpoch();
+
+    const change = changeSession(() => answer.promise);
+    const held = refreshAccessToken();
+    setAccessToken(written);
+    answer.resolve();
+    await change;
+
+    expect(await held).toBe(written);
+    expect(refresher).not.toHaveBeenCalled();
+    expect(getSessionEpoch()).toBe(epoch);
+  });
+
+  it("starts a session change after a failed refresh, and the refresh callers get the failure", async () => {
+    let fail!: (error: Error) => void;
+    const refresher = vi.fn((_signal: AbortSignal) => new Promise<string | null>((_resolve, reject) => { fail = reject; }));
+    setTokenRefresher(refresher);
+    const send = vi.fn(async () => "sent");
+
+    const refreshed = refreshAccessToken();
+    const change = changeSession(send);
+    await settle();
+    expect(send).not.toHaveBeenCalled();
+
+    fail(new Error("refresh failed"));
+    await expect(refreshed).rejects.toThrow("refresh failed");
+    await expect(change).resolves.toBe("sent");
+    // The failed refresh made one attempt and left nothing behind.
+    expect(refresher).toHaveBeenCalledOnce();
+    refresher.mockImplementationOnce(async () => "renewed");
+    expect(await refreshAccessToken()).toBe("renewed");
+    expect(refresher).toHaveBeenCalledTimes(2);
+  });
+
+  it("makes one attempt when the refresher answers null and clears its timer", async () => {
+    vi.useFakeTimers();
+    try {
+      const refresher = vi.fn(async () => null);
+      setTokenRefresher(refresher);
+
+      expect(await refreshAccessToken()).toBeNull();
+      expect(refresher).toHaveBeenCalledOnce();
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("the session-change queue", () => {
+  beforeEach(() => {
+    setAccessToken(null);
+  });
+
+  it("runs three changes in order through a failure and sends a held refresh only after the last", async () => {
+    const refresher = vi.fn(async () => "renewed");
+    setTokenRefresher(refresher);
+    const sent: Array<[string, number]> = [];
+    const first = deferred<void>();
+
+    const changes = [
+      changeSession(async () => { sent.push(["first", refresher.mock.calls.length]); await first.promise; }),
+      changeSession(async () => { sent.push(["second", refresher.mock.calls.length]); throw new Error("refused"); }),
+      changeSession(async () => { sent.push(["third", refresher.mock.calls.length]); })
+    ];
+    const held = refreshAccessToken();
+    await settle();
+    expect(sent).toEqual([["first", 0]]);
+
+    first.resolve();
+    const results = await Promise.allSettled(changes);
+    expect(results.map((result) => result.status)).toEqual(["fulfilled", "rejected", "fulfilled"]);
+    expect(sent).toEqual([["first", 0], ["second", 0], ["third", 0]]);
+    expect(await held).toBe("renewed");
+    expect(refresher).toHaveBeenCalledOnce();
+  });
+
+  it("keeps a held refresh waiting when the installer of the holder admits a new change first", async () => {
+    const refresher = vi.fn(async () => "renewed");
+    setTokenRefresher(refresher);
+    const next = deferred<void>();
+    let admitted: Promise<void> | undefined;
+
+    const change = changeSession(async () => "answer", () => {
+      // This microtask runs before the held refresh wakes at the open gate.
+      queueMicrotask(() => { admitted = changeSession(() => next.promise); });
+      return undefined;
+    });
+    const held = refreshAccessToken();
+    await change;
+    await settle();
+    expect(admitted).toBeDefined();
+    expect(refresher).not.toHaveBeenCalled();
+
+    next.resolve();
+    await admitted;
+    expect(await held).toBe("renewed");
+    expect(refresher).toHaveBeenCalledOnce();
+  });
+
+  it("releases the gate after a send that throws at once and after an installer that throws", async () => {
+    setAccessToken("current");
+    const refresher = vi.fn(async () => "renewed");
+    setTokenRefresher(refresher);
+    const epoch = getSessionEpoch();
+
+    await expect(changeSession(() => { throw new Error("send failed"); })).rejects.toThrow("send failed");
+    await expect(changeSession(async () => "answer", () => { throw new Error("install failed"); })).rejects.toThrow("install failed");
+    expect(getAccessToken()).toBe("current");
+    expect(getSessionEpoch()).toBe(epoch);
+
+    // The send guard and the gate are free again.
+    await expect(changeSession(async () => "next")).resolves.toBe("next");
+    expect(await refreshAccessToken()).toBe("renewed");
+    expect(refresher).toHaveBeenCalledOnce();
+  });
+
+  it("does not install the token of an installer that started a newer session", async () => {
+    const result = await changeSession(async () => "answer", () => {
+      replaceSession("newer");
+      return "mine";
+    });
+
+    expect(result).toBe("answer");
+    expect(getAccessToken()).toBe("newer");
+    expect(getSessionEpoch()).toBe(1);
+    expect(installedSessionEpoch("mine")).toBeNull();
+  });
+
+  it("starts the time limit of a change when its send starts, after the change ahead of it", async () => {
+    vi.useFakeTimers();
+    try {
+      const ahead = changeSession(() => new Promise<void>((done) => { setTimeout(done, 20_000); }));
+      let timedOut: unknown;
+      const behind = changeSession(() => new Promise<never>(() => {})).catch((error: unknown) => { timedOut = error; });
+
+      await vi.advanceTimersByTimeAsync(SESSION_CHANGE_TIME_LIMIT_MS);
+      await ahead;
+      expect(timedOut).toBeUndefined();
+
+      await vi.advanceTimersByTimeAsync(20_000);
+      await behind;
+      expect(timedOut).toBeInstanceOf(SessionChangeTimeoutError);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not install the late answer of a change that timed out", async () => {
+    vi.useFakeTimers();
+    try {
+      setAccessToken("current");
+      const answer = deferred<{ accessToken: string }>();
+      const install = vi.fn((result: { accessToken: string }) => result.accessToken);
+
+      const change = changeSession(() => answer.promise, install).catch((error: unknown) => error);
+      await vi.advanceTimersByTimeAsync(SESSION_CHANGE_TIME_LIMIT_MS);
+      expect(await change).toBeInstanceOf(SessionChangeTimeoutError);
+
+      answer.resolve({ accessToken: "late" });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(install).not.toHaveBeenCalled();
+      expect(getAccessToken()).toBe("current");
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("sign-out in the session-change queue", () => {
+  beforeEach(() => {
+    setAccessToken("current");
+  });
+
+  it("cancels the running and queued callbacks, keeps the normal change ahead of it, and keeps a later callback", async () => {
+    const sent: string[] = [];
+    let callbackSignal: AbortSignal | undefined;
+    const normalAnswer = deferred<void>();
+
+    const callback = changeSession(async (_request, signal) => {
+      sent.push("callback");
+      callbackSignal = signal;
+      await new Promise<never>(() => {});
+    }, undefined, { interruptible: true });
+    const normal = changeSession(async () => { sent.push("normal"); await normalAnswer.promise; });
+    const queued = changeSession(async () => { sent.push("queued callback"); }, undefined, { interruptible: true });
+    await settle();
+    expect(sent).toEqual(["callback"]);
+
+    const signOut = changeSession(async () => { sent.push("sign-out"); }, () => null, { stopRefresh: true });
+    const later = changeSession(async () => { sent.push("later callback"); }, undefined, { interruptible: true });
+    await expect(callback).rejects.toThrow("Sign-out cancelled the callback");
+    expect(callbackSignal?.aborted).toBe(true);
+    await settle();
+    expect(sent).toEqual(["callback", "normal"]);
+
+    normalAnswer.resolve();
+    await expect(normal).resolves.toBeUndefined();
+    await expect(queued).rejects.toThrow("Sign-out cancelled the callback");
+    await signOut;
+    await later;
+    expect(sent).toEqual(["callback", "normal", "sign-out", "later callback"]);
+    expect(getAccessToken()).toBeNull();
+  });
+
+  it("stops at its turn a refresh that the change ahead of it started and left running", async () => {
+    vi.useFakeTimers();
+    try {
+      setAccessToken("expired");
+      const refreshSignals: AbortSignal[] = [];
+      setTokenRefresher((signal) => {
+        refreshSignals.push(signal);
+        return new Promise<never>(() => {});
+      });
+      // The 401 of the holder comes late in its time limit.
+      global.fetch = vi.fn(() => new Promise<Response>((resolve) => {
+        setTimeout(() => resolve(jsonResponse(401, { error: "invalid_token" })), SESSION_CHANGE_TIME_LIMIT_MS - 1_000);
+      }));
+
+      const holder = changeSession((gated) => gated("/me/security/password", { method: "POST", body: "{}" })).catch((error: unknown) => error);
+      const signOutSend = vi.fn(async () => undefined);
+      const signOut = changeSession(signOutSend, () => null, { stopRefresh: true });
+
+      await vi.advanceTimersByTimeAsync(SESSION_CHANGE_TIME_LIMIT_MS - 1_000);
+      // The holder refreshes after its 401. The sign-out came before this refresh.
+      expect(refreshSignals).toHaveLength(1);
+      expect(refreshSignals[0].aborted).toBe(false);
+      expect(signOutSend).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(await holder).toBeInstanceOf(SessionChangeTimeoutError);
+      // At its turn, the sign-out stops the refresh and does not wait for it.
+      expect(refreshSignals[0].aborted).toBe(true);
+      await signOut;
+      expect(signOutSend).toHaveBeenCalledOnce();
+      expect(refreshSignals).toHaveLength(1);
+      expect(getAccessToken()).toBeNull();
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("token listeners and the installed session", () => {
+  it("calls a listener once for each token write until it unsubscribes", async () => {
+    const seen: Array<string | null> = [];
+    const unsubscribe = subscribeAccessToken(() => { seen.push(getAccessToken()); });
+    try {
+      setAccessToken("a");
+      replaceSession("b");
+      setTokenRefresher(async () => "renewed");
+      await refreshAccessToken();
+      await changeSession(async () => "installed", (token) => token);
+      expect(seen).toEqual(["a", "b", "renewed", "installed"]);
+
+      unsubscribe();
+      setAccessToken("c");
+      expect(seen).toHaveLength(4);
+    } finally {
+      unsubscribe();
+    }
+  });
+
+  it("remembers the epoch of the token that the last session change installed", async () => {
+    await changeSession(async () => "first", (token) => token);
+    const epoch = getSessionEpoch();
+    expect(installedSessionEpoch("first")).toBe(epoch);
+
+    // A refresh renews the token in the same epoch and keeps the record.
+    setTokenRefresher(async () => "renewed");
+    await refreshAccessToken();
+    expect(installedSessionEpoch("first")).toBe(epoch);
+    expect(installedSessionEpoch("renewed")).toBeNull();
+
+    // A change that installs nothing and a direct new session keep the record.
+    await changeSession(async () => "kept", () => undefined);
+    replaceSession("direct");
+    expect(installedSessionEpoch("first")).toBe(epoch);
+    expect(installedSessionEpoch("direct")).toBeNull();
+
+    // A change that ends the session forgets it.
+    await changeSession(async () => "ended", () => null);
+    expect(installedSessionEpoch("first")).toBeNull();
+  });
+});
+
+// The test reset starts a new generation in place. Work from before the reset
+// can settle and clean up its own resources, but it does not change the state
+// of the new generation.
+describe("the test reset and work from before it", () => {
+  it("keeps listeners, calls none of them, and aborts no signal", async () => {
+    vi.useFakeTimers();
+    const listener = vi.fn();
+    const unsubscribe = subscribeAccessToken(listener);
+    try {
+      setAccessToken("current");
+      let changeSignal: AbortSignal | undefined;
+      void changeSession((_request, signal) => {
+        changeSignal = signal;
+        return new Promise<never>(() => {});
+      }).catch(() => undefined);
+      await vi.advanceTimersByTimeAsync(0);
+      listener.mockClear();
+
+      __resetSessionGateForTests();
+      expect(listener).not.toHaveBeenCalled();
+      expect(changeSignal?.aborted).toBe(false);
+
+      setAccessToken("next");
+      expect(listener).toHaveBeenCalledOnce();
+    } finally {
+      unsubscribe();
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not let a change from before the reset open the gate of a newer change", async () => {
+    const old = deferred<void>();
+    const oldChange = changeSession(() => old.promise);
+    await settle();
+    __resetSessionGateForTests();
+    const refresher = vi.fn(async () => "renewed");
+    setTokenRefresher(refresher);
+    const current = deferred<void>();
+
+    const change = changeSession(() => current.promise);
+    const held = refreshAccessToken();
+    old.resolve();
+    await oldChange;
+    await settle();
+    expect(refresher).not.toHaveBeenCalled();
+
+    current.resolve();
+    await change;
+    expect(await held).toBe("renewed");
+    expect(refresher).toHaveBeenCalledOnce();
+  });
+
+  it("does not send a change that waited in the queue before the reset", async () => {
+    const old = deferred<void>();
+    const oldChange = changeSession(() => old.promise);
+    const queuedSend = vi.fn(async () => "sent");
+    const queued = changeSession(queuedSend);
+    await settle();
+    __resetSessionGateForTests();
+
+    old.resolve();
+    await oldChange;
+    await expect(queued).rejects.toThrow("The session coordinator was reset.");
+    expect(queuedSend).not.toHaveBeenCalled();
+  });
+
+  it("does not send a change that waited across the reset for a refresh on the wire", async () => {
+    const answer = deferred<string | null>();
+    setTokenRefresher(() => answer.promise);
+    const refreshed = refreshAccessToken();
+    const send = vi.fn(async () => "sent");
+    const change = changeSession(send);
+    await settle();
+    __resetSessionGateForTests();
+
+    answer.resolve("old-token");
+    await expect(change).rejects.toThrow("The session coordinator was reset.");
+    expect(send).not.toHaveBeenCalled();
+    expect(await refreshed).toBeNull();
+    expect(getAccessToken()).toBeNull();
+  });
+
+  it("does not install the answer of a change from before the reset", async () => {
+    const answer = deferred<string>();
+    const change = changeSession(() => answer.promise, (token) => token);
+    await settle();
+    __resetSessionGateForTests();
+
+    answer.resolve("old-session");
+    expect(await change).toBe("old-session");
+    expect(getAccessToken()).toBeNull();
+    expect(getSessionEpoch()).toBe(0);
+    expect(installedSessionEpoch("old-session")).toBeNull();
+  });
+
+  it("does not let a refresh from before the reset write its token or end the newer refresh", async () => {
+    const old = deferred<string | null>();
+    let oldSignal: AbortSignal | undefined;
+    setTokenRefresher((signal) => {
+      oldSignal = signal;
+      return old.promise;
+    });
+    const oldRefresh = refreshAccessToken();
+    __resetSessionGateForTests();
+    expect(oldSignal?.aborted).toBe(false);
+    const current = deferred<string | null>();
+    const refresher = vi.fn((_signal: AbortSignal) => current.promise);
+    setTokenRefresher(refresher);
+
+    const refreshed = refreshAccessToken();
+    old.resolve("old-token");
+    expect(await oldRefresh).toBeNull();
+    expect(getAccessToken()).toBeNull();
+    // The newer refresh is still the shared one.
+    expect(refreshAccessToken()).toBe(refreshed);
+    expect(refresher).toHaveBeenCalledOnce();
+
+    current.resolve("renewed");
+    expect(await refreshed).toBe("renewed");
+    expect(getAccessToken()).toBe("renewed");
+  });
+
+  it("ends a refresh that waited at the gate before the reset without a network refresh", async () => {
+    const oldSend = vi.fn(async () => undefined);
+    // The reset comes before this change reaches its turn, so it does not send.
+    const oldChange = changeSession(oldSend);
+    const held = refreshAccessToken();
+    __resetSessionGateForTests();
+    const refresher = vi.fn(async () => "renewed");
+    setTokenRefresher(refresher);
+
+    expect(await held).toBeNull();
+    expect(refresher).not.toHaveBeenCalled();
+    await expect(oldChange).rejects.toThrow("The session coordinator was reset.");
+    expect(oldSend).not.toHaveBeenCalled();
   });
 });

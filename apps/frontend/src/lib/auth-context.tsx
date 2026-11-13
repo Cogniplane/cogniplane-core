@@ -201,10 +201,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     userEpochRef.current = getSessionEpoch();
     setUserState(next);
   }, []);
-  // The API client holds the token and is its one writer (api-client.ts,
-  // "The session token, in order"). The writers below start or end a session
-  // there, and each async answer applies only in the session epoch of its
-  // start. Thus a late answer for an older session cannot replace a newer one.
+  // The API client holds the token and is its one writer. Its session
+  // coordinator orders the writes (session-coordinator.ts, "The session token,
+  // in order"). The writers below start or end a session there, and each async
+  // answer applies only in the session epoch of its start. Thus a late answer
+  // for an older session cannot replace a newer one.
   const accessToken = useSyncExternalStore(subscribeAccessToken, getAccessToken, () => null);
   const [isLoading, setIsLoading] = useState(true);
 

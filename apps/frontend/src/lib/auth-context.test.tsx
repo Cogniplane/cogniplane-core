@@ -438,9 +438,9 @@ describe("AuthProvider.adoptSession", () => {
   });
 });
 
-// The writers go through the API client in order (api-client.ts, "The session
-// token, in order"): an answer that started before a newer session must not
-// replace it.
+// The writers go through the API client in order (session-coordinator.ts,
+// "The session token, in order"): an answer that started before a newer
+// session must not replace it.
 describe("AuthProvider — a late answer for an older session", () => {
   function pending() {
     let resolve!: (response: Response) => void;

@@ -53,7 +53,9 @@ Sign-in types:
 - The frontend keeps the access token in memory only (`lib/api-client.ts`),
   never in `localStorage` or `sessionStorage`. A reload uses the refresh cookie.
   A session-change gate keeps a refresh from sending a cookie that a sign-in or
-  sign-out replaces.
+  sign-out replaces. `lib/session-coordinator.ts` owns the token, the refresh
+  and the gate, and documents their order; other code imports them from
+  `lib/api-client.ts`.
 - `cogniplane_session_hint` (`SameSite=Lax`) is a UI hint for redirects, not a
   credential.
 

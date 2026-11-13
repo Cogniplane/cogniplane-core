@@ -6,12 +6,13 @@ import {
   type StepUpAction
 } from "@cogniplane/shared-types";
 
+import { SessionCoordinator, type TokenRefresher } from "./session-coordinator";
 import { parseResponse } from "./validate-response";
 // This module must never run server-side: it holds module-level auth state
-// (accessTokenRef, tokenRefresher) that is pushed in by AuthProvider. In an
-// SSR context that state would be shared across all requests in the same Node
-// process. The "use client" directive prevents Next.js from importing this
-// module in the server bundle.
+// (the session coordinator, with the token and the refresher that AuthProvider
+// pushes in). In an SSR context that state would be shared across all
+// requests in the same Node process. The "use client" directive prevents
+// Next.js from importing this module in the server bundle.
 
 export const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:3001";
 const DEV_USER_ID = process.env.NEXT_PUBLIC_DEV_USER_ID;
@@ -78,104 +79,23 @@ export function setStepUpPrompt(prompt: StepUpPrompt | null) {
 
 // ---- The session token, in order ----
 //
-// Different writers change the session token. A refresh renews it. A sign-in
-// or an account change (a new password, a first second factor) starts a new
-// session. A sign-out ends it. Without an order, the last answer wins: a late
-// answer for an older session can replace a newer session, and a late
-// /auth/refresh answer can set or delete the refresh cookie of a newer one.
-// Two rules give the order:
-//
-// 1. The session-change gate. A call whose answer sets or deletes the refresh
-//    cookie runs in changeSession and holds the gate while it runs. A refresh
-//    waits until no session change runs before it sends the cookie, and a
-//    session change waits for a refresh that is on the wire. Thus no refresh
-//    sends a cookie that a running session change replaces. A refresh that
-//    waited uses the token that the session change installed, and sends
-//    nothing.
-// 2. The session epoch. It changes when a new session starts in memory or the
-//    session ends, not when a refresh renews the token. A writer reads it
-//    before its call. If it is different after the call, the answer is for an
-//    older session, and the writer must not apply it.
-//
-// Both waits have a time limit. A session change waits for a refresh on the
-// wire at most REFRESH_ATTEMPTS × REFRESH_TIME_LIMIT_MS, and a sign-out does
-// not wait: it stops the refresh. A stopped or timed-out refresh is aborted,
-// so an answer that did not arrive cannot set its cookie later.
+// session-coordinator.ts owns the session token, the refresh and the
+// session-change gate, and explains their order. This module makes its one
+// instance and gives the exports below. Import them from here.
 
-let accessTokenRef: string | null = null;
-let sessionEpoch = 0;
-/** Counts every token write, also a refresh. */
-let tokenWrites = 0;
-const tokenListeners = new Set<() => void>();
+const session = new SessionCoordinator();
 
-/**
- * Sends /auth/refresh once. It must give `signal` to its fetch and change
- * nothing after the signal aborts.
- */
-export type TokenRefresher = (signal: AbortSignal) => Promise<string | null>;
-
-let tokenRefresher: TokenRefresher | null = null;
-/** The shared refresh. It can wait at the gate before it sends. */
-let refreshPromise: Promise<string | null> | null = null;
-/** The /auth/refresh request on the wire. */
-let refreshOnWire: Promise<string | null> | null = null;
-/** Stops the refresh on the wire (changeSession with `stopRefresh`). */
-let refreshStop: AbortController | null = null;
-
-/**
- * The time limit of one /auth/refresh attempt. When it passes, the attempt is
- * aborted and the refresh sends the cookie once more. The server can have
- * rotated the cookie while the answer did not arrive. For 60 seconds after a
- * rotation, the server answers the same cookie with the same result
- * (refresh-token-store.ts in the backend); after that, the old cookie is
- * reuse, which ends the session. The second attempt is sent inside that
- * window, and both attempts end within REFRESH_ATTEMPTS × this limit.
- */
-export const REFRESH_TIME_LIMIT_MS = 15_000;
-/** The first attempt, and one more after a time-out. */
-export const REFRESH_ATTEMPTS = 2;
-const TIMED_OUT = Symbol("refresh timed out");
-
-/** Session changes that wait or run. */
-let sessionChanges = 0;
-/** Settles when no session change waits or runs. */
-let gateOpened: Promise<void> = Promise.resolve();
-let openGate: () => void = () => {};
-/** Settles when the last session change in the queue ends. */
-let lastSessionChange: Promise<void> = Promise.resolve();
-/** True while the synchronous part of a session change's send runs. */
-let sendStarting = false;
-/** Callback exchanges can be cancelled by sign-out. */
-const interruptibleSessionChanges = new Set<AbortController>();
-/** The token that the last session change installed, and its epoch. */
-let lastInstall: { token: string; epoch: number } | null = null;
-
-/**
- * The time limit of a session-changing call. When it passes, the call is
- * aborted and the gate opens. If its answer had not arrived, its Set-Cookie
- * does not apply, so a late answer cannot replace a newer cookie. If the
- * headers had arrived (the body or the parse was late), the browser already
- * has the new cookie, and the next refresh uses it.
- */
-export const SESSION_CHANGE_TIME_LIMIT_MS = 30_000;
-
-/** A session-changing call that did not answer in its time limit. */
-export class SessionChangeTimeoutError extends Error {
-  constructor() {
-    super("The session change did not answer in time.");
-    this.name = "SessionChangeTimeoutError";
-  }
-}
-
-function writeToken(token: string | null) {
-  accessTokenRef = token;
-  tokenWrites += 1;
-  for (const listener of tokenListeners) listener();
-}
+export {
+  REFRESH_ATTEMPTS,
+  REFRESH_TIME_LIMIT_MS,
+  SESSION_CHANGE_TIME_LIMIT_MS,
+  SessionChangeTimeoutError,
+  type TokenRefresher
+} from "./session-coordinator";
 
 /** Writes the token of the session in memory, as a refresh does. */
 export function setAccessToken(token: string | null) {
-  writeToken(token);
+  session.writeToken(token);
 }
 
 /**
@@ -183,17 +103,15 @@ export function setAccessToken(token: string | null) {
  * the answers of calls that started before are late. Returns the new epoch.
  */
 export function replaceSession(token: string | null): number {
-  sessionEpoch += 1;
-  writeToken(token);
-  return sessionEpoch;
+  return session.replaceSession(token);
 }
 
 export function getAccessToken(): string | null {
-  return accessTokenRef;
+  return session.getToken();
 }
 
 export function getSessionEpoch(): number {
-  return sessionEpoch;
+  return session.getEpoch();
 }
 
 /**
@@ -201,122 +119,33 @@ export function getSessionEpoch(): number {
  * gate opened, or null when no session change installed it.
  */
 export function installedSessionEpoch(token: string): number | null {
-  return lastInstall?.token === token ? lastInstall.epoch : null;
+  return session.installedEpoch(token);
 }
 
-/** Only for tests: opens the gate and forgets the token, the epoch and the refresh. */
+/**
+ * Only for tests: opens the gate and forgets the token, the epoch and the
+ * refresh. Token listeners stay. Work from before the reset changes nothing
+ * after it.
+ */
 export function __resetSessionGateForTests(): void {
-  openGate();
-  accessTokenRef = null;
-  sessionEpoch = 0;
-  tokenWrites = 0;
-  tokenRefresher = null;
-  refreshPromise = null;
-  refreshOnWire = null;
-  refreshStop = null;
-  sessionChanges = 0;
-  gateOpened = Promise.resolve();
-  openGate = () => {};
-  lastSessionChange = Promise.resolve();
-  sendStarting = false;
-  lastInstall = null;
-  interruptibleSessionChanges.clear();
+  session.resetForTests();
 }
 
 /** For useSyncExternalStore: the listener runs after each token write. */
 export function subscribeAccessToken(listener: () => void): () => void {
-  tokenListeners.add(listener);
-  return () => {
-    tokenListeners.delete(listener);
-  };
+  return session.subscribe(listener);
 }
 
 export function setTokenRefresher(refresher: TokenRefresher) {
-  tokenRefresher = refresher;
+  session.setRefresher(refresher);
 }
 
 /**
- * Sends /auth/refresh now, once for all callers. Only refreshAccessToken and
- * a holder of the gate call it.
+ * The shared refresh. It waits until no session change runs, and all callers
+ * get the same promise until it settles.
  */
-function sendRefresh(): Promise<string | null> {
-  if (refreshOnWire) return refreshOnWire;
-  const epoch = sessionEpoch;
-  const stop = new AbortController();
-  refreshStop = stop;
-  refreshOnWire = (async () => {
-    const refresher = tokenRefresher;
-    if (!refresher) return null;
-    let token: string | null = null;
-    for (let attempt = 1; attempt <= REFRESH_ATTEMPTS; attempt += 1) {
-      const answer = await attemptInTimeLimit(refresher, stop.signal);
-      if (answer !== TIMED_OUT) {
-        token = answer;
-        break;
-      }
-    }
-    // A sign-out stopped this refresh: its answer applies to nothing.
-    if (stop.signal.aborted) return null;
-    // A new session started, or the session ended, while this refresh ran.
-    // Its answer is for the older session: keep the newer one.
-    if (sessionEpoch !== epoch) return accessTokenRef;
-    if (token) writeToken(token);
-    return token;
-  })().finally(() => {
-    refreshOnWire = null;
-    refreshStop = null;
-  });
-  return refreshOnWire;
-}
-
-/**
- * One refresh attempt in REFRESH_TIME_LIMIT_MS. Gives TIMED_OUT when the
- * limit passes, and null when `stop` aborts. Either way, the attempt's signal
- * aborts, and a later result of the refresher is ignored.
- */
-async function attemptInTimeLimit(refresher: TokenRefresher, stop: AbortSignal): Promise<string | null | typeof TIMED_OUT> {
-  if (stop.aborted) return null;
-  const attempt = new AbortController();
-  let end!: (result: null | typeof TIMED_OUT) => void;
-  const ended = new Promise<null | typeof TIMED_OUT>((resolve) => {
-    end = resolve;
-  });
-  const onStop = () => {
-    attempt.abort(stop.reason);
-    end(null);
-  };
-  stop.addEventListener("abort", onStop, { once: true });
-  const timer = setTimeout(() => {
-    attempt.abort(new DOMException("The refresh did not answer in time.", "TimeoutError"));
-    end(TIMED_OUT);
-  }, REFRESH_TIME_LIMIT_MS);
-  try {
-    const running = refresher(attempt.signal);
-    // An answer after the limit is dropped; its failure is not unhandled.
-    running.catch(() => undefined);
-    return await Promise.race([running, ended]);
-  } finally {
-    clearTimeout(timer);
-    stop.removeEventListener("abort", onStop);
-  }
-}
-
 export function refreshAccessToken(): Promise<string | null> {
-  if (!refreshPromise) {
-    refreshPromise = refreshAfterSessionChanges().finally(() => {
-      refreshPromise = null;
-    });
-  }
-  return refreshPromise;
-}
-
-async function refreshAfterSessionChanges(): Promise<string | null> {
-  const writes = tokenWrites;
-  while (sessionChanges > 0) await gateOpened;
-  // A session change installed a token while this refresh waited (or ended
-  // the session). Its cookie is new, so a refresh is not necessary.
-  if (tokenWrites !== writes) return accessTokenRef;
-  return sendRefresh();
+  return session.requestRefresh();
 }
 
 /** `request` for the calls in changeSession: it holds the gate. */
@@ -332,8 +161,10 @@ export type SessionChangeRequest = <T>(path: string, init?: RequestInit) => Prom
  * and no other session change runs. A plain fetch in `send` must use the
  * `signal` that it receives.
  *
- * `send` has SESSION_CHANGE_TIME_LIMIT_MS. When the limit passes, the signal
- * aborts, the call fails with SessionChangeTimeoutError, and the gate opens.
+ * `send` has SESSION_CHANGE_TIME_LIMIT_MS. The limit starts when `send`
+ * starts, after the wait for the changes ahead and for a refresh on the wire.
+ * When the limit passes, the signal aborts, the call fails with
+ * SessionChangeTimeoutError, and the gate opens.
  *
  * Do not call changeSession inside `send`: the inner call would wait for the
  * gate that the outer call holds. A call in the synchronous part of `send`
@@ -355,92 +186,22 @@ export type SessionChangeRequest = <T>(path: string, init?: RequestInit) => Prom
  * arrived, the browser has its cookie, and the sign-out sends that one and
  * ends it. Thus the browser keeps no cookie that the sign-out did not end.
  */
-export async function changeSession<T>(
+export function changeSession<T>(
   send: (request: SessionChangeRequest, signal: AbortSignal) => Promise<T>,
   install?: (result: T) => string | null | undefined,
   options: { stopRefresh?: boolean; interruptible?: boolean } = {}
 ): Promise<T> {
-  if (sendStarting) {
-    throw new Error("changeSession was called inside a session change. Use the request that changeSession gives to send.");
-  }
-  if (sessionChanges === 0) {
-    gateOpened = new Promise<void>((resolve) => {
-      openGate = resolve;
-    });
-  }
-  if (options.stopRefresh) {
-    refreshStop?.abort();
-    for (const interrupt of interruptibleSessionChanges) interrupt.abort(new Error("Sign-out cancelled the callback"));
-  }
-  const interrupt = options.interruptible ? new AbortController() : null;
-  if (interrupt) interruptibleSessionChanges.add(interrupt);
-  sessionChanges += 1;
-  const before = lastSessionChange;
-  let ended!: () => void;
-  lastSessionChange = new Promise<void>((resolve) => {
-    ended = resolve;
-  });
-  try {
-    await before;
-    // A refresh on the wire ends first: its answer can set or delete the
-    // refresh cookie. A sign-out stops it.
-    if (refreshOnWire) {
-      if (options.stopRefresh) refreshStop?.abort();
-      await refreshOnWire.catch(() => null);
-    }
-    const epoch = sessionEpoch;
-    const result = await sendInTimeLimit(send, interrupt?.signal);
-    const token = sessionEpoch === epoch ? install?.(result) : undefined;
-    if (token !== undefined && sessionEpoch === epoch) {
-      const installed = replaceSession(token);
-      lastInstall = token === null ? null : { token, epoch: installed };
-    }
-    return result;
-  } finally {
-    if (interrupt) interruptibleSessionChanges.delete(interrupt);
-    sessionChanges -= 1;
-    if (sessionChanges === 0) openGate();
-    ended();
-  }
+  return session.changeSession((signal, refreshNow) => send(gatedRequest(signal, refreshNow), signal), install, options);
 }
 
-async function sendInTimeLimit<T>(send: (request: SessionChangeRequest, signal: AbortSignal) => Promise<T>, stop?: AbortSignal): Promise<T> {
-  if (stop?.aborted) throw stop.reason;
-  const limit = new AbortController();
-  const request: SessionChangeRequest = (path, init) =>
-    requestWithRefresh(path, { ...init, signal: eitherSignal(init?.signal, limit.signal) }, sendRefresh);
-  let sending: Promise<T>;
-  sendStarting = true;
-  try {
-    sending = send(request, limit.signal);
-  } catch (error) {
-    sending = Promise.reject(error);
-  } finally {
-    sendStarting = false;
-  }
-  // An answer after the limit is dropped; its failure is not unhandled.
-  sending.catch(() => undefined);
-
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const expired = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => {
-      const error = new SessionChangeTimeoutError();
-      limit.abort(error);
-      reject(error);
-    }, SESSION_CHANGE_TIME_LIMIT_MS);
-  });
-  let onStop: (() => void) | undefined;
-  const stopped = new Promise<never>((_, reject) => {
-    onStop = () => { limit.abort(stop?.reason); reject(stop?.reason); };
-    if (stop?.aborted) onStop();
-    else stop?.addEventListener("abort", onStop, { once: true });
-  });
-  try {
-    return await Promise.race([sending, expired, stopped]);
-  } finally {
-    if (onStop) stop?.removeEventListener("abort", onStop);
-    clearTimeout(timer);
-  }
+/**
+ * The `request` of a session change: its fetch aborts at the time limit or
+ * when the caller's signal aborts. A 401 refreshes without the gate, the
+ * request goes once more when the refresh gives a token, and no step-up
+ * prompt opens.
+ */
+function gatedRequest(limit: AbortSignal, refreshNow: () => Promise<string | null>): SessionChangeRequest {
+  return (path, init) => requestWithRefresh(path, { ...init, signal: eitherSignal(init?.signal, limit) }, refreshNow);
 }
 
 /** A signal that aborts when the caller's signal or the time limit aborts. */
@@ -470,8 +231,9 @@ export function createApiHeaders(init?: HeadersInit, body?: BodyInit | null): He
     headers.set("X-Tenant-Id", DEV_TENANT_ID);
     // Required by the backend when dev-headers runs on a non-loopback bind.
     if (DEV_AUTH_KEY) headers.set("X-Dev-Auth-Key", DEV_AUTH_KEY);
-  } else if (accessTokenRef) {
-    headers.set("Authorization", `Bearer ${accessTokenRef}`);
+  } else {
+    const token = session.getToken();
+    if (token) headers.set("Authorization", `Bearer ${token}`);
   }
 
   if (body != null && !(body instanceof FormData)) {

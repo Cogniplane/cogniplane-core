@@ -25,8 +25,9 @@ this Next.js version differs from older ones.
   change refreshes every related query.
 - `lib/api-client.ts` holds the access token
   ([auth](auth.md#tokens-and-cookies)), refreshes it, orders session changes,
-  and resends a request once after step-up. Per-domain clients are
-  `lib/*-api.ts`.
+  and resends a request once after step-up. Its token, refresh and session
+  changes run in the session coordinator (`lib/session-coordinator.ts`); import
+  them from `lib/api-client.ts`. Per-domain clients are `lib/*-api.ts`.
 - Parse every response with its shared schema through `parseResponse`
   (`lib/validate-response.ts`); do not cast JSON to a type.
 - `AuthGuard` (`lib/auth-guard.tsx`) and `middleware.ts` only control rendering
