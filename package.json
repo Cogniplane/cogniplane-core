@@ -34,7 +34,7 @@
     "@types/node": "26.6.6",
     "@types/spdx-expression-parse": "4.0.0",
     "@typescript/native": "npm:typescript@7.0.2",
-    "@vitejs/plugin-react": "^6.2.1",
+    "@vitejs/plugin-react": "^6.3.0",
     "@vitest/coverage-v8": "5.1.0",
     "dotenv": "^18.0.9",
     "e2b": "2.63.0",
