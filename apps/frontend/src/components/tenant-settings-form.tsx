@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { FormEvent, useEffect, useMemo, useRef, useState, type ReactNode, type Ref } from "react";
+import { FormEvent, useEffect, useMemo, useReducer, useRef, useState, type ReactNode, type Ref } from "react";
 
 import type { AdminManagedTool } from "../lib/admin-api";
 import type { TenantSettings } from "@cogniplane/shared-types";
@@ -10,8 +10,6 @@ import { DEVELOPER_INSTRUCTIONS_MAX_LENGTH } from "@cogniplane/shared-types";
 import { SANDBOX_EGRESS_DOMAINS_MAX } from "@cogniplane/shared-types/sandbox-egress";
 import type { TenantSettingsInput } from "../hooks/use-tenant-settings";
 import {
-  buildDraft,
-  parseSandboxEgressText,
   toggleInArray,
   type ApprovalPolicyKind,
   type FormDraft,
@@ -21,10 +19,14 @@ import {
   affectsApprovals,
   APPROVAL_POLICY_LABELS,
   deriveImpactHighlights,
-  diffAgentBehavior,
-  rebaseDraft,
   toBehaviorInput
 } from "./agent-behavior-impact";
+import {
+  initialFormState,
+  selectFormView,
+  tenantSettingsFormReducer,
+  type ApplyRequest
+} from "./tenant-settings-form.state";
 import { AgentBehaviorReviewDialog } from "./agent-behavior-review-dialog";
 import { useAgentBehaviorDraftStore } from "./agent-behavior-draft-provider";
 import { Label } from "@/components/ui/label";
@@ -59,11 +61,6 @@ type Props = {
   /** Shown before the settings version, such as the last recorded save. */
   meta?: ReactNode;
 };
-
-// The approval mode and its granular categories rebase together, so they conflict together.
-function conflictField(field: string): string {
-  return field === "granularCategories" ? "approvalPolicy" : field;
-}
 
 function toolLabel(id: string, readOnly = false): string {
   return id.replaceAll("_", " ").replace(/\b\w/g, (c) => c.toUpperCase()) + (readOnly ? " (read only)" : "");
@@ -113,21 +110,17 @@ export function TenantSettingsForm({
   meta
 }: Props) {
   const draftStore = useAgentBehaviorDraftStore();
-  const [restored] = useState(() => draftStore?.read());
-  // The saved settings that the draft started from. Its version goes into
-  // expectedVersion. It only moves to newer settings when the draft has no
-  // changes, after a successful apply, or when the administrator asks.
-  const [baseline, setBaseline] = useState<TenantSettings>(restored?.baseline ?? settings);
-  const [draft, setDraft] = useState<FormDraft>(() => restored?.draft ?? buildDraft(settings));
-  const [reviewOpen, setReviewOpen] = useState(false);
+  // The reducer owns the baseline, the draft, the review, the apply request and
+  // the confirmed save. See tenant-settings-form.state.ts.
+  const [state, dispatch] = useReducer(tenantSettingsFormReducer, null, () =>
+    initialFormState(settings, draftStore?.read() ?? null)
+  );
+  const { baseline, draft, pendingAcknowledgement } = state;
+  const sending = state.request.phase === "sending";
   // Opens by itself when a review is refused because of the host list.
   const [networkOpen, setNetworkOpen] = useState(false);
   const [egressFocusRequest, setEgressFocusRequest] = useState(0);
-  const [applying, setApplying] = useState(false);
-  const [failed, setFailed] = useState(false);
-  // The draft that the last successful apply sent, until the saved row arrives.
-  const [appliedDraft, setAppliedDraft] = useState<FormDraft | null>(null);
-  const [savedVersion, setSavedVersion] = useState<number | null>(null);
+  // Blocks a second apply before React renders the first one.
   const applyingRef = useRef(false);
   const reviewButtonRef = useRef<HTMLButtonElement>(null);
   const egressRef = useRef<HTMLTextAreaElement>(null);
@@ -135,56 +128,32 @@ export function TenantSettingsForm({
   // Set when the review closes because the draft was saved or discarded.
   const focusStatusOnCloseRef = useRef(false);
 
-  const baselineDraft = useMemo(() => buildDraft(baseline), [baseline]);
-  const changes = useMemo(() => diffAgentBehavior(baselineDraft, draft), [baselineDraft, draft]);
-  const highlights = useMemo(() => deriveImpactHighlights(baselineDraft, draft), [baselineDraft, draft]);
-  const hasChanges = changes.length > 0;
+  const view = useMemo(() => selectFormView(state, settings), [state, settings]);
+  const { changes, hasChanges, egress, conflictVersion } = view;
+  const highlights = useMemo(() => deriveImpactHighlights(view.baselineDraft, draft), [view.baselineDraft, draft]);
   const widening = changes.filter((change) => change.tone === "widens").length;
   // A host list that the server would refuse cannot be reviewed or saved. The
   // administrator sees why next to the list, and the draft stays until fixed.
-  const egress = useMemo(() => parseSandboxEgressText(draft.sandboxEgressText), [draft.sandboxEgressText]);
-  const egressBlocked = egress.errors.length > 0 || egress.tooMany;
-  const newerSaved = settings.version > baseline.version;
-  // A newer version conflicts only when it changed a field that the draft also changed.
-  // A save on another page moves the version too. Then the draft rebases without loss.
-  const editOverlapsNewer = useMemo(() => {
-    if (!newerSaved) return false;
-    const changedSince = new Set(diffAgentBehavior(baselineDraft, buildDraft(settings)).map((change) => conflictField(change.field)));
-    return changes.some((change) => changedSince.has(conflictField(change.field)));
-  }, [newerSaved, baselineDraft, settings, changes]);
-  const conflictVersion =
-    hasChanges && editOverlapsNewer && !applying && appliedDraft === null ? settings.version : null;
+  const egressBlocked = view.hostsBlocked;
+
+  // The reducer compares each new row with the baseline. A newer row can
+  // conflict with the draft or follow it without loss. The view reads the
+  // current prop, so a conflict shows before this effect runs.
+  useEffect(() => {
+    dispatch({ type: "settingsReceived", settings });
+  }, [settings]);
 
   useEffect(() => {
-    draftStore?.write(hasChanges && appliedDraft === null ? { baseline, draft } : null);
-  }, [draftStore, baseline, draft, hasChanges, appliedDraft]);
+    draftStore?.write(hasChanges && pendingAcknowledgement === null ? { baseline, draft } : null);
+  }, [draftStore, baseline, draft, hasChanges, pendingAcknowledgement]);
 
   useEffect(() => {
     if (egressFocusRequest > 0) egressRef.current?.focus();
   }, [egressFocusRequest]);
 
   function updateDraft(recipe: (current: FormDraft) => FormDraft): void {
-    setSavedVersion(null);
-    setDraft(recipe);
+    dispatch({ type: "draftEdited", recipe });
   }
-
-  useEffect(() => {
-    if (applying || !newerSaved) return;
-    if (appliedDraft) {
-      // Our own save arrived. Keep any edit made while it was in flight.
-      // eslint-disable-next-line react-hooks/set-state-in-effect
-      setDraft((current) => rebaseDraft(appliedDraft, current, buildDraft(settings)));
-      setBaseline(settings);
-      setAppliedDraft(null);
-      setSavedVersion(settings.version);
-      return;
-    }
-    // An overlapping change: the administrator decides (see conflictVersion).
-    if (hasChanges && editOverlapsNewer) return;
-    // Nothing to lose: follow the newer saved settings and keep the edits.
-    setDraft((current) => rebaseDraft(baselineDraft, current, buildDraft(settings)));
-    setBaseline(settings);
-  }, [settings, newerSaved, applying, appliedDraft, hasChanges, editOverlapsNewer, baselineDraft]);
 
   const sortedTools = useMemo(
     () => [...(managedTools ?? [])].sort((a, b) => a.id.localeCompare(b.id)),
@@ -200,41 +169,36 @@ export function TenantSettingsForm({
     event?.preventDefault();
     if (egressBlocked) {
       setNetworkOpen(true);
-      // A closed list cannot take focus. The effect below runs once it is open.
+      // A closed list cannot take focus. The effect above runs once it is open.
       setEgressFocusRequest((count) => count + 1);
       return;
     }
-    if (!hasChanges) return;
-    setFailed(false);
-    setReviewOpen(true);
+    // The reducer opens the review only for a draft with changes.
+    dispatch({ type: "reviewOpened" });
   }
 
   async function apply(): Promise<void> {
-    if (applyingRef.current || saving || !hasChanges || egressBlocked || conflictVersion !== null) return;
+    if (applyingRef.current || saving || !view.canApply) return;
     applyingRef.current = true;
-    setApplying(true);
-    setFailed(false);
-    const sent = draft;
-    const ok = await onSave(toBehaviorInput(sent, baseline.version));
+    // Later edits and rows do not change what this request sends.
+    const request: ApplyRequest = { sent: draft, expectedVersion: baseline.version };
+    dispatch({ type: "applyStarted", request });
+    const ok = await onSave(toBehaviorInput(request.sent, request.expectedVersion));
     applyingRef.current = false;
-    setApplying(false);
     if (ok) {
       // Clear even if navigation unmounted the form while the save was pending.
-      if (draftStore?.read()?.draft === sent) draftStore.write(null);
+      if (draftStore?.read()?.draft === request.sent) draftStore.write(null);
       focusStatusOnCloseRef.current = true;
-      setAppliedDraft(sent);
-      setReviewOpen(false);
+      dispatch({ type: "applySucceeded", sent: request.sent });
       return;
     }
-    setFailed(true);
+    dispatch({ type: "applyFailed" });
     // A version conflict shows as newer saved settings after this refetch.
     onReload?.();
   }
 
   function rebaseOnLatest(): void {
-    setDraft((current) => rebaseDraft(baselineDraft, current, buildDraft(settings)));
-    setBaseline(settings);
-    setFailed(false);
+    dispatch({ type: "rebaseRequested", settings });
   }
 
   function restoreFocus(): void {
@@ -246,14 +210,10 @@ export function TenantSettingsForm({
 
   function discard(): void {
     draftStore?.write(null);
-    const latest = newerSaved ? settings : baseline;
-    setBaseline(latest);
-    setDraft(buildDraft(latest));
-    setFailed(false);
+    dispatch({ type: "discarded", settings });
     // The discard buttons go away with the changes.
-    if (reviewOpen) focusStatusOnCloseRef.current = true;
+    if (state.reviewOpen) focusStatusOnCloseRef.current = true;
     else saveStatusRef.current?.focus();
-    setReviewOpen(false);
   }
 
   return (
@@ -278,7 +238,7 @@ export function TenantSettingsForm({
 
         <SaveBar
           dirty={hasChanges || egressBlocked}
-          busy={applying}
+          busy={sending}
           status={hasChanges || egressBlocked ? (
             <>
               {hasChanges ? (
@@ -298,9 +258,9 @@ export function TenantSettingsForm({
                 </span>
               ) : null}
             </>
-          ) : savedVersion !== null ? (
+          ) : state.savedVersion !== null ? (
             <span className="text-success">
-              Saved as v{savedVersion}. Changes that the runtime uses apply from each session&apos;s next turn.
+              Saved as v{state.savedVersion}. Changes that the runtime uses apply from each session&apos;s next turn.
             </span>
           ) : null}
           cancelLabel="Discard changes"
@@ -312,18 +272,18 @@ export function TenantSettingsForm({
       </form>
 
       <AgentBehaviorReviewDialog
-        open={reviewOpen}
+        open={state.reviewOpen}
         changes={changes}
         highlights={highlights}
         showProjectNote={affectsApprovals(changes)}
-        applying={applying || saving}
-        failure={failed ? (saveError ?? "The server did not confirm the save.") : null}
+        applying={sending || saving}
+        failure={state.request.phase === "failed" ? (saveError ?? "The server did not confirm the save.") : null}
         conflictVersion={conflictVersion}
         toolLabel={(id) => {
           const tool = sortedTools.find((entry) => entry.id === id);
           return tool ? toolLabel(tool.id, tool.readOnly) : id;
         }}
-        onBack={() => setReviewOpen(false)}
+        onBack={() => dispatch({ type: "reviewClosed" })}
         onApply={() => void apply()}
         onRebase={rebaseOnLatest}
         onDiscard={discard}
@@ -366,7 +326,10 @@ function ApprovalsRow(props: { draft: FormDraft; updateDraft: UpdateDraft; polic
           type="checkbox"
           checked={draft.autoApproveReadOnlyTools}
           disabled={never}
-          onChange={(event) => updateDraft((current) => ({ ...current, autoApproveReadOnlyTools: event.target.checked }))}
+          onChange={(event) => {
+            const checked = event.target.checked;
+            updateDraft((current) => ({ ...current, autoApproveReadOnlyTools: checked }));
+          }}
           className="size-4 accent-primary disabled:cursor-not-allowed disabled:opacity-50"
         />
         Auto-approve read-only tools
@@ -388,7 +351,10 @@ function CommandExecutionRow(props: { draft: FormDraft; updateDraft: UpdateDraft
           aria-label="Allow command execution"
           checked={draft.allowCommandExecution}
           disabled={!isOwner}
-          onChange={(event) => updateDraft((current) => ({ ...current, allowCommandExecution: event.target.checked }))}
+          onChange={(event) => {
+            const checked = event.target.checked;
+            updateDraft((current) => ({ ...current, allowCommandExecution: checked }));
+          }}
           className="size-4 accent-primary disabled:cursor-not-allowed disabled:opacity-50"
         />
         Allow
@@ -433,7 +399,10 @@ function SandboxNetworkRow({ draft, updateDraft, egress, open, onOpenChange, tex
           aria-invalid={problems.length > 0}
           aria-describedby="sandbox-egress-help sandbox-egress-problems"
           value={draft.sandboxEgressText}
-          onChange={(event) => updateDraft((current) => ({ ...current, sandboxEgressText: event.target.value }))}
+          onChange={(event) => {
+            const text = event.target.value;
+            updateDraft((current) => ({ ...current, sandboxEgressText: text }));
+          }}
           placeholder={"pypi.org\nfiles.pythonhosted.org\n*.example.com"}
         />
         <div id="sandbox-egress-problems" aria-live="polite">
@@ -523,12 +492,10 @@ function InstructionsRow(props: { draft: FormDraft; updateDraft: UpdateDraft }) 
           maxLength={DEVELOPER_INSTRUCTIONS_MAX_LENGTH}
           aria-describedby="developer-instructions-count"
           value={draft.developerInstructions}
-          onChange={(event) =>
-            updateDraft((current) => ({
-              ...current,
-              developerInstructions: event.target.value
-            }))
-          }
+          onChange={(event) => {
+            const text = event.target.value;
+            updateDraft((current) => ({ ...current, developerInstructions: text }));
+          }}
           placeholder="Optional guidance added at the start of every chat. Use it to set tone, limits, or context for all agent sessions."
           rows={6}
         />
