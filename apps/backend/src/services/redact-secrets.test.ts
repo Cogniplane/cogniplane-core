@@ -1,5 +1,7 @@
 import { test, expect } from "vitest";
 
+import { isSensitiveQueryParameterName } from "../lib/sensitive-query-params.js";
+import { randomText, runIsolated, seededRandom } from "../test-helpers/isolated-timing.js";
 import { redactAppData, redactSecrets } from "./redact-secrets.js";
 
 test("redaction preserves app data types and removes nested credentials", () => {
@@ -348,4 +350,109 @@ test("redactSecrets strips every credential query name that URL validation refus
   expect(result).toBe(
     "https://x/?key=REDACTED&api-key=REDACTED&x_api_key=REDACTED&secret=REDACTED&auth=REDACTED&signature=REDACTED&sig=REDACTED&idtoken=REDACTED&page=2&monkey=keep"
   );
+});
+
+// These rules replaced the regexes below, which took quadratic time on some
+// long inputs, and a recursive query scan that overflowed the stack. On short
+// text the old forms are safe, so they give the expected output.
+const REGEX_JWT_PATTERN = /\beyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g;
+const REGEX_PEM_PATTERN =
+  /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----/g;
+const QUERY_PATTERN = /([?&])([^=&\s"';#?]+)=(?!\$\{)([^\s&"';#]+)/g;
+function recursiveQueryRedaction(_match: string, separator: string, name: string, value: string): string {
+  return isSensitiveQueryParameterName(name)
+    ? `${separator}${name}=REDACTED`
+    : `${separator}${name}=${value.replace(QUERY_PATTERN, recursiveQueryRedaction)}`;
+}
+
+function compareOnRandomText(
+  seed: number, alphabet: readonly string[], expected: (text: string) => string
+): { mismatches: string[]; changed: number } {
+  const random = seededRandom(seed);
+  const mismatches: string[] = [];
+  let changed = 0;
+  for (let i = 0; i < 10_000; i += 1) {
+    const text = randomText(random, alphabet, 24);
+    const want = expected(text);
+    if (want !== text) changed += 1;
+    if (redactSecrets(text) !== want) mismatches.push(JSON.stringify(text));
+  }
+  return { mismatches, changed };
+}
+
+test("redactSecrets redacts the same JWTs as the regex on random text", () => {
+  const alphabet = ["eyJ", "eyJ", "-", "_", ".", ".", "x", "Z", "1", " ", "!", "é", "eyJ.a.b ", " eyJx.y-"];
+  const result = compareOnRandomText(1, alphabet, (text) => text.replace(REGEX_JWT_PATTERN, "[REDACTED]"));
+  expect(result.mismatches).toEqual([]);
+  expect(result.changed).toBeGreaterThan(2_000);
+});
+
+test("redactSecrets redacts the same PEM blocks as the regex on random text", () => {
+  const alphabet = ["-----BEGIN PRIVATE KEY-----", "-----END PRIVATE KEY-----", "-----BEGIN RSA PRIVATE KEY-----",
+    "-----END RSA PRIVATE KEY-----", "-----BEGIN ", "-----END ", "PRIVATE KEY", "-----", "KEY-----", "x", "\n", " "];
+  const result = compareOnRandomText(2, alphabet, (text) => text.replace(REGEX_PEM_PATTERN, "[REDACTED]"));
+  expect(result.mismatches).toEqual([]);
+  expect(result.changed).toBeGreaterThan(2_000);
+});
+
+test("redactSecrets redacts the same nested query values as the recursive scan on random text", () => {
+  const alphabet = ["?", "&", "=", "token", "next", "a", "${", "#", " ", "x", "'", "%74oken", "?a=", "?next=", "=${x}", "sig",
+    "?token=", "?next=x?sig="];
+  const result = compareOnRandomText(3, alphabet, (text) => text.replace(QUERY_PATTERN, recursiveQueryRedaction));
+  expect(result.mismatches).toEqual([]);
+  expect(result.changed).toBeGreaterThan(2_000);
+});
+
+test("redactSecrets keeps JWT word boundaries", () => {
+  expect(redactSecrets("id-eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2ln-")).toBe("id-[REDACTED]-");
+  expect(redactSecrets("xeyJa.b.c")).toBe("xeyJa.b.c");
+  // A failed start skips its run; a later run still matches.
+  expect(redactSecrets("eyJ-eyJ.a eyJb.c.d")).toBe("eyJ-eyJ.a [REDACTED]");
+  expect(redactSecrets("eyJa.b.c eyJd.e.f")).toBe("[REDACTED] [REDACTED]");
+});
+
+test("redactSecrets redacts a PEM block to its first END line", () => {
+  expect(redactSecrets(
+    "-----BEGIN PRIVATE KEY-----\nA\n-----BEGIN RSA PRIVATE KEY-----\nB\n-----END RSA PRIVATE KEY-----\nafter"
+  )).toBe("[REDACTED]\nafter");
+  expect(redactSecrets(
+    "k1 -----BEGIN EC PRIVATE KEY-----\nA\n-----END EC PRIVATE KEY----- mid -----BEGIN PRIVATE KEY-----\nB\n-----END PRIVATE KEY----- end"
+  )).toBe("k1 [REDACTED] mid [REDACTED] end");
+});
+
+test("redactSecrets follows a deep chain of nested query parameters", () => {
+  // The recursive scan threw RangeError (stack overflow) here.
+  const chain = "?a=".repeat(10_000);
+  expect(redactSecrets(`${chain}?token=abc`)).toBe(`${chain}?token=REDACTED`);
+  expect(redactSecrets("?next=x?%74oken=abc")).toBe("?next=x?%74oken=REDACTED");
+  expect(redactSecrets("?next=x?token=${t}")).toBe("?next=x?token=${t}");
+  expect(redactSecrets("?next=x?token=")).toBe("?next=x?token=");
+});
+
+// The old rules needed hours on the JWT input and over 10 s on the PEM input,
+// and overflowed the stack on the query input. In a separate process, a
+// regression fails at the kill timeout instead of blocking the test run.
+// Measured on an Intel i5-12600K: about 40 ms for each JWT input, 15 ms for
+// the PEM input, 80 ms for the query input.
+test("redactSecrets stays linear on large adversarial input", { timeout: 60_000 }, () => {
+  type Timed = { ms: number; result: unknown };
+  const runs = runIsolated<Record<string, Timed>>(`
+    const { redactSecrets } = await importSource("src/services/redact-secrets.ts");
+    redactSecrets("warm up Bearer abc");
+    print({
+      // 4,000,000 characters: one run of 1,000,000 possible JWT starts.
+      jwtRun: timed(() => redactSecrets("eyJ-".repeat(1_000_000)).length),
+      jwtRunThenToken: timed(() => redactSecrets("eyJ-".repeat(1_000_000) + " eyJa.b.c").slice(-11)),
+      // 100,000 BEGIN lines and no END line.
+      pemHeaders: timed(() => redactSecrets("-----BEGIN PRIVATE KEY-----\\n".repeat(100_000) + "Bearer abc").slice(-17)),
+      // 300,000 nested parameters.
+      nestedQuery: timed(() => redactSecrets("?a=".repeat(300_000) + "?token=abc").slice(-15))
+    });
+  `);
+
+  expect(runs.jwtRun!.result).toBe(4_000_000);
+  expect(runs.jwtRunThenToken!.result).toBe(" [REDACTED]");
+  expect(runs.pemHeaders!.result).toBe("Bearer [REDACTED]");
+  expect(runs.nestedQuery!.result).toBe("?token=REDACTED");
+  for (const [name, run] of Object.entries(runs)) expect(run.ms, name).toBeLessThan(2_000);
 });

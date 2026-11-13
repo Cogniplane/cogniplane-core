@@ -17,6 +17,10 @@ shows provider status, scan metrics, queue state and the breaker timeline (`GET
   (`PII_BREAKER_*`) opens after repeated failures; with `REDIS_URL`, replicas
   share its state.
 - A rule-based detector always runs; provider findings are merged with it.
+  Its rules run on the event loop in linear time; `PII_ARTIFACT_MAX_BYTES`
+  bounds the text of one file scan, so a higher limit blocks the backend for
+  longer. A new rule needs a large-input case in the child-process test of
+  `rule-based-pii-detector.test.ts`.
 - Modes (`services/pii/pii-protection-service.ts`):
 
 | Mode | Chat prompts | Files (uploads, imports) |

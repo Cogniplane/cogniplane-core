@@ -102,6 +102,10 @@ redirect and hide. Every rule is enforced in the backend.
   numbers and booleans under those names stay; a nested object is walked, not
   blanked; paging fields (`pageToken`, `nextPageToken`, ...) stay.
   `lib/sanitize-url.ts` uses the same parameter list for logged URLs.
+- Each `redactSecrets()` rule must take linear time. It runs on the event
+  loop, so a regex that reads a long run again from each start position lets
+  one tenant's text stop the backend for all tenants. A new rule needs a
+  large-input case in the child-process test of `redact-secrets.test.ts`.
 
 ## HTTP controls
 

@@ -9,10 +9,11 @@ const BEARER_TOKEN_PATTERN = /(\bBearer\s+)(?!\$\{)([^\s"',;]+)/gi;
 const GITHUB_TOKEN_PATTERN =
   /\b(?:gh(?:o|u|s|r|p)_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+)\b/g;
 
-// PEM private-key blocks (RSA, EC, ED25519, PKCS#8, ...). Multiline; lazy
-// match so adjacent blocks aren't merged.
-const PEM_PRIVATE_KEY_PATTERN =
-  /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----/g;
+// PEM private-key blocks (RSA, EC, ED25519, PKCS#8, ...): from a BEGIN line to
+// the first END line after it, so adjacent blocks stay separate. See
+// redactPemBlocks.
+const PEM_PRIVATE_KEY_BEGIN = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/g;
+const PEM_PRIVATE_KEY_END = /-----END [A-Z0-9 ]*PRIVATE KEY-----/g;
 
 // Provider API keys. Anthropic must precede OpenAI because `sk-ant-...` also
 // satisfies the OpenAI prefix.
@@ -26,7 +27,9 @@ const GOOGLE_API_KEY_PATTERN = /\bAIza[0-9A-Za-z_-]{35}\b/g;
 // `{hex}.{alnum}` shape with a long-enough id to avoid matching ordinary text.
 const ZAI_API_KEY_PATTERN = /\b[0-9a-f]{20,}\.[A-Za-z0-9]{12,}\b/g;
 const RUNTIME_TOKEN_PATTERN = /\brt_[A-Za-z0-9._-]+\b/g;
-const JWT_PATTERN = /\beyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g;
+// A JWT starts with `eyJ` (base64url of `{"`) and has three dot-separated
+// segments. Sticky: redactJwts tries it only at a possible start.
+const JWT_AT = /eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/y;
 const STRIPE_KEY_PATTERN = /\b(?:(?:sk|rk)_(?:live|test)|whsec)_[A-Za-z0-9]{16,}\b/g;
 const GITLAB_TOKEN_PATTERN = /\bglpat-[A-Za-z0-9_-]{20,}\b/g;
 const NPM_TOKEN_PATTERN = /\bnpm_[A-Za-z0-9]{20,}\b/g;
@@ -41,14 +44,79 @@ const SENDGRID_KEY_PATTERN = /\bSG\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{40,}\b/g;
 // surrounding text. The name check is shared with sanitize-url.ts and
 // url-validation.ts.
 const URL_QUERY_PARAMETER_PATTERN = /([?&])([^=&\s"';#?]+)=(?!\$\{)([^\s&"';#]+)/g;
+// The same parameter inside a value. Its value runs to the end of the outer
+// value, so a lookahead checks that it is not empty and the pattern does not
+// read it.
+const NESTED_URL_QUERY_PARAMETER = /([?&])([^=&\s"';#?]+)=(?!\$\{)(?=[^\s&"';#])/;
 
 // A non-credential value can hold a nested URL (`?next=https://x/?token=…`),
-// so it is scanned again. Replacer calls run after all outer matches are
-// found, so reusing the global pattern here is safe.
+// so it is scanned again. A value has no `&`, and a nested value runs to the
+// end of the outer value, so one scan of a value finds at most one nested
+// parameter. The loop follows that chain. A recursive scan overflowed the
+// stack at about 2,000 levels (`"?a=".repeat(2000)`), and a scan that read
+// each nested value to its end took quadratic time.
 function redactQueryParameter(_match: string, separator: string, name: string, value: string): string {
-  return isSensitiveQueryParameterName(name)
-    ? `${separator}${name}=REDACTED`
-    : `${separator}${name}=${value.replace(URL_QUERY_PARAMETER_PATTERN, redactQueryParameter)}`;
+  let redacted = `${separator}${name}=`;
+  for (;;) {
+    if (isSensitiveQueryParameterName(name)) return `${redacted}REDACTED`;
+    const nested = NESTED_URL_QUERY_PARAMETER.exec(value);
+    if (!nested) return redacted + value;
+    const valueStart = nested.index + nested[0].length;
+    redacted += value.slice(0, valueStart);
+    name = nested[2]!;
+    value = value.slice(valueStart);
+  }
+}
+
+// A global regex starts a new attempt at each position. When a failed attempt
+// reads to the end of a long run and the run has many possible starts, the
+// regex takes quadratic time. Each function below finds the same matches as
+// the regex in its comment and reads each character a fixed number of times.
+
+const isWordCode = (code: number) =>
+  (code >= 48 && code <= 57) || (code >= 65 && code <= 90) || (code >= 97 && code <= 122) || code === 95;
+const isJwtCode = (code: number) => isWordCode(code) || code === 45;
+
+// Replaces /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----/g.
+// That regex read to the end of the text from each BEGIN line without an END
+// line. When no END line follows one BEGIN line, none follows a later one, so
+// the search stops there.
+function redactPemBlocks(value: string): string {
+  let redacted = "";
+  let copied = 0;
+  PEM_PRIVATE_KEY_BEGIN.lastIndex = 0;
+  for (let begin = PEM_PRIVATE_KEY_BEGIN.exec(value); begin; begin = PEM_PRIVATE_KEY_BEGIN.exec(value)) {
+    PEM_PRIVATE_KEY_END.lastIndex = PEM_PRIVATE_KEY_BEGIN.lastIndex;
+    if (!PEM_PRIVATE_KEY_END.exec(value)) break;
+    redacted += `${value.slice(copied, begin.index)}[REDACTED]`;
+    copied = PEM_PRIVATE_KEY_BEGIN.lastIndex = PEM_PRIVATE_KEY_END.lastIndex;
+  }
+  return copied === 0 ? value : redacted + value.slice(copied);
+}
+
+// Replaces /\beyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g. That
+// regex tried each `eyJ` in a run of token characters (`"eyJ-".repeat(n)`)
+// and read the run to its end each time. All starts in one run reach the same
+// dots, so they all match or all fail. After a failed start, skip the run.
+function redactJwts(value: string): string {
+  let redacted = "";
+  let copied = 0;
+  let start = value.indexOf("eyJ");
+  while (start >= 0) {
+    let next = start + 1;
+    // `\b` before the `e`.
+    if (!isWordCode(value.charCodeAt(start - 1))) {
+      JWT_AT.lastIndex = start;
+      if (JWT_AT.exec(value)) {
+        redacted += `${value.slice(copied, start)}[REDACTED]`;
+        copied = next = JWT_AT.lastIndex;
+      } else {
+        while (next < value.length && isJwtCode(value.charCodeAt(next))) next += 1;
+      }
+    }
+    start = value.indexOf("eyJ", next);
+  }
+  return copied === 0 ? value : redacted + value.slice(copied);
 }
 
 // Live replay (lastSafeSplit in turn-event-log.ts) cuts held text between two
@@ -56,8 +124,7 @@ function redactQueryParameter(_match: string, separator: string, name: string, v
 // Bearer and URL query rules can match a non-ASCII character. Update it when a
 // rule can.
 function redactInlineSecrets(value: string): string {
-  return value
-    .replace(PEM_PRIVATE_KEY_PATTERN, "[REDACTED]")
+  const beforeJwts = redactPemBlocks(value)
     .replace(BEARER_TOKEN_PATTERN, "$1[REDACTED]")
     .replace(GITHUB_TOKEN_PATTERN, "[REDACTED]")
     .replace(ANTHROPIC_KEY_PATTERN, "[REDACTED]")
@@ -66,8 +133,8 @@ function redactInlineSecrets(value: string): string {
     .replace(SLACK_TOKEN_PATTERN, "[REDACTED]")
     .replace(GOOGLE_API_KEY_PATTERN, "[REDACTED]")
     .replace(ZAI_API_KEY_PATTERN, "[REDACTED]")
-    .replace(RUNTIME_TOKEN_PATTERN, "[REDACTED]")
-    .replace(JWT_PATTERN, "[REDACTED]")
+    .replace(RUNTIME_TOKEN_PATTERN, "[REDACTED]");
+  return redactJwts(beforeJwts)
     .replace(STRIPE_KEY_PATTERN, "[REDACTED]")
     .replace(GITLAB_TOKEN_PATTERN, "[REDACTED]")
     .replace(NPM_TOKEN_PATTERN, "[REDACTED]")

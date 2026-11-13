@@ -1,14 +1,55 @@
 import type { PiiEntityType } from "@cogniplane/shared-types";
 import type { PiiFinding } from "./pii-provider.js";
 
+interface RuleMatch {
+  value: string;
+  index: number;
+}
+
 interface RuleDefinition {
   entityType: PiiEntityType;
-  pattern: RegExp;
+  /** The matches in text order, as `matchAll` of a global regex gives them. */
+  matches: (text: string) => Iterable<RuleMatch>;
   confidence: "low" | "medium" | "high";
   validate?: (match: string) => boolean;
 }
 
-const EMAIL_PATTERN = /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g;
+function* regexMatches(text: string, pattern: RegExp): Generator<RuleMatch> {
+  for (const match of text.matchAll(pattern)) yield { value: match[0], index: match.index };
+}
+
+// emailMatches finds the matches of
+// /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g in linear time. With
+// matchAll, that regex tried each start in a long run of local-part characters
+// and read the run to its end each time: quadratic time on "a.".repeat(n) with
+// no "@". emailMatches reads the text before each "@" once. As with the regex,
+// a match starts at the first word boundary in the run of local-part characters
+// before the "@", and the sticky regex below matches the domain.
+const EMAIL_DOMAIN_AT = /[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/y;
+
+const isWordCode = (code: number) =>
+  (code >= 48 && code <= 57) || (code >= 65 && code <= 90) || (code >= 97 && code <= 122) || code === 95;
+// [A-Za-z0-9._%+-]
+const isEmailLocalCode = (code: number) =>
+  isWordCode(code) || code === 46 || code === 37 || code === 43 || code === 45;
+const isWordBoundary = (text: string, index: number) =>
+  isWordCode(text.charCodeAt(index - 1)) !== isWordCode(text.charCodeAt(index));
+
+function* emailMatches(text: string): Generator<RuleMatch> {
+  // The regex does not start a match before the end of the previous match.
+  let previousEnd = 0;
+  for (let at = text.indexOf("@"); at >= 0; at = text.indexOf("@", at + 1)) {
+    let start = at;
+    while (start > previousEnd && isEmailLocalCode(text.charCodeAt(start - 1))) start -= 1;
+    while (start < at && !isWordBoundary(text, start)) start += 1;
+    if (start === at) continue;
+    EMAIL_DOMAIN_AT.lastIndex = at + 1;
+    if (!EMAIL_DOMAIN_AT.exec(text)) continue;
+    previousEnd = EMAIL_DOMAIN_AT.lastIndex;
+    yield { value: text.slice(start, previousEnd), index: start };
+  }
+}
+
 // Phone numbers. Accepts an optional country code and common separators.
 const PHONE_PATTERN =
   /(?:(?:\+?\d{1,3}[\s.-]?)?(?:\(\d{3}\)|\d{3})[\s.-]?\d{3}[\s.-]?\d{4})\b/g;
@@ -18,12 +59,12 @@ const SSN_PATTERN = /\b(?!000|666|9\d{2})\d{3}-(?!00)\d{2}-(?!0000)\d{4}\b/g;
 const CREDIT_CARD_PATTERN = /\b(?:\d[\s-]?){12,18}\d\b/g;
 
 const RULES: RuleDefinition[] = [
-  { entityType: "email", pattern: EMAIL_PATTERN, confidence: "high" },
-  { entityType: "phone", pattern: PHONE_PATTERN, confidence: "medium" },
-  { entityType: "government_id", pattern: SSN_PATTERN, confidence: "high" },
+  { entityType: "email", matches: emailMatches, confidence: "high" },
+  { entityType: "phone", matches: (text) => regexMatches(text, PHONE_PATTERN), confidence: "medium" },
+  { entityType: "government_id", matches: (text) => regexMatches(text, SSN_PATTERN), confidence: "high" },
   {
     entityType: "financial",
-    pattern: CREDIT_CARD_PATTERN,
+    matches: (text) => regexMatches(text, CREDIT_CARD_PATTERN),
     confidence: "high",
     validate: (match) => luhnCheck(match.replace(/[\s-]/g, ""))
   }
@@ -52,9 +93,7 @@ export class RuleBasedPiiDetector {
       if (!allowed.has(rule.entityType)) continue;
       handled.add(rule.entityType);
 
-      for (const match of text.matchAll(rule.pattern)) {
-        const value = match[0];
-        const start = match.index ?? 0;
+      for (const { value, index: start } of rule.matches(text)) {
         if (rule.validate && !rule.validate(value)) continue;
         findings.push({
           entityType: rule.entityType,
@@ -90,9 +129,10 @@ export class RuleBasedPiiDetector {
     findings.push(...textResult.findings);
 
     // Surface header-level hints so the caller can flag entire columns even when values look benign.
+    const columnOffsets = csvColumnHeaderOffsets(headerLine);
     headerHints.forEach((hint, columnIndex) => {
       if (!hint || !allowed.has(hint)) return;
-      const columnOffset = csvColumnHeaderOffset(headerLine, columnIndex);
+      const columnOffset = columnOffsets[columnIndex] ?? -1;
       if (columnOffset < 0) return;
       findings.push({
         entityType: hint,
@@ -149,9 +189,11 @@ function splitCsvRow(row: string): string[] {
   return cells;
 }
 
-function csvColumnHeaderOffset(headerLine: string, columnIndex: number): number {
-  let offset = 0;
-  let column = 0;
+// The start offset of each header cell, in one pass. A scan from the start of
+// the line for each column took quadratic time on a header with many columns
+// that classifyHeader recognizes ("email,".repeat(n)).
+function csvColumnHeaderOffsets(headerLine: string): number[] {
+  const offsets = [0];
   let inQuotes = false;
   for (let i = 0; i < headerLine.length; i++) {
     const ch = headerLine[i];
@@ -161,12 +203,10 @@ function csvColumnHeaderOffset(headerLine: string, columnIndex: number): number 
     } else if (ch === '"') {
       inQuotes = true;
     } else if (ch === ",") {
-      if (column === columnIndex) return offset;
-      column++;
-      offset = i + 1;
+      offsets.push(i + 1);
     }
   }
-  return column === columnIndex ? offset : -1;
+  return offsets;
 }
 
 function classifyHeader(raw: string): PiiEntityType | null {
