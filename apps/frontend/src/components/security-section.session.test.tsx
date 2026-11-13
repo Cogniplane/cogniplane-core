@@ -304,7 +304,7 @@ describe("Settings › Sign-in & security, the session of a first second factor"
   });
 });
 
-// The session-change gate (api-client.ts, "The session token, in order").
+// The session-change gate (session-coordinator.ts, "The session token, in order").
 describe("Settings › Sign-in & security, a refresh at the same time as a first second factor", () => {
   /** The person saves the codes after the enrolment token expired. */
   async function saveCodesLater(backend: ReturnType<typeof installBackend>, done: string) {
