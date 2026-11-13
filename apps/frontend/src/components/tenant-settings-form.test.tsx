@@ -12,6 +12,7 @@ import { makeTenantSettings as makeSettings } from "../test-helpers/tenant-setti
 type SaveFn = (input: TenantSettingsInput) => Promise<boolean>;
 
 function formElement(settings: TenantSettings, onSave: SaveFn, extra: {
+  saving?: boolean;
   isOwner?: boolean;
   saveError?: string | null;
   onReload?: () => void;
@@ -21,7 +22,7 @@ function formElement(settings: TenantSettings, onSave: SaveFn, extra: {
   return (
     <TenantSettingsForm
       settings={settings}
-      saving={false}
+      saving={extra.saving ?? false}
       onSave={onSave}
       saveError={extra.saveError ?? null}
       onReload={extra.onReload}
@@ -100,6 +101,23 @@ describe("drafts across navigation", () => {
     })));
   });
 
+  it("moves restored edits onto a newer version that changed no edited field", async () => {
+    const save = vi.fn(async () => true);
+    const view = render(page(makeSettings({ version: 4 }), save));
+    typeInstructions("mine");
+    view.rerender(page(makeSettings({ version: 4 }), save, false));
+    view.rerender(page(makeSettings({ version: 5, autoApproveReadOnlyTools: false }), save));
+
+    expect(instructionsTextarea().value).toBe("mine");
+    expect(screen.getByText("v5")).toBeTruthy();
+    expect(screen.queryByText(/Organization settings changed/)).toBeNull();
+    fireEvent.click(applyButton(openReview()));
+    await waitFor(() => expect(save).toHaveBeenCalledTimes(1));
+    expect(save).toHaveBeenCalledWith(expect.objectContaining({
+      expectedVersion: 5, developerInstructions: "mine", autoApproveReadOnlyTools: false
+    }));
+  });
+
   it("keeps a failed save through navigation", async () => {
     const settings = makeSettings();
     const save = vi.fn(async () => false);
@@ -138,6 +156,64 @@ describe("drafts across navigation", () => {
     view.rerender(page(makeSettings({ version: 3, developerInstructions: "Later saved text" }), save));
     expect(instructionsTextarea().value).toBe("Later saved text");
     expect(screen.queryByRole("button", { name: "Review changes" })).toBeNull();
+  });
+
+  it("keeps a newer stored draft when an earlier save finishes after navigation", async () => {
+    const settings = makeSettings({ developerInstructions: "Saved" });
+    let finish!: (ok: boolean) => void;
+    const save = vi.fn(() => new Promise<boolean>((resolve) => { finish = resolve; }));
+    const view = render(page(settings, save));
+    typeInstructions("Applied");
+    fireEvent.click(applyButton(openReview()));
+    view.rerender(page(settings, save, false));
+    view.rerender(page(settings, save));
+    typeInstructions("Typed on return");
+    await act(async () => { finish(true); });
+
+    view.rerender(page(settings, save, false));
+    view.rerender(page(settings, save));
+    expect(instructionsTextarea().value).toBe("Typed on return");
+    expect(screen.getByText("1 unsaved change")).toBeTruthy();
+  });
+
+  // The next two cases document current behavior between a confirmed save and
+  // its row. They do not endorse it. Fix them in a separate change.
+  it("current behavior: an edit made after a confirmed save is lost when the form unmounts before the row", async () => {
+    const save = vi.fn(async () => true);
+    const view = render(page(makeSettings({ version: 4, developerInstructions: "old" }), save));
+    typeInstructions("mine");
+    fireEvent.click(applyButton(openReview()));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    typeInstructions("mine plus later edit");
+    view.rerender(page(makeSettings({ version: 4, developerInstructions: "old" }), save, false));
+    view.rerender(page(makeSettings({ version: 5, developerInstructions: "mine" }), save));
+
+    expect(instructionsTextarea().value).toBe("mine");
+    expect(screen.queryByText(/unsaved change/)).toBeNull();
+  });
+
+  it("current behavior: Discard before the row arrives keeps the old value as a draft on the saved version", async () => {
+    const save = vi.fn(async () => true);
+    const view = render(page(makeSettings({ version: 4, developerInstructions: "old" }), save));
+    typeInstructions("mine");
+    fireEvent.click(applyButton(openReview()));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    fireEvent.click(screen.getByRole("button", { name: "Discard changes" }));
+    expect(instructionsTextarea().value).toBe("old");
+    expect(screen.queryByText(/unsaved change/)).toBeNull();
+
+    const saved = makeSettings({ version: 5, developerInstructions: "mine" });
+    view.rerender(page(saved, save));
+    expect(instructionsTextarea().value).toBe("old");
+    expect(screen.getByText("1 unsaved change")).toBeTruthy();
+    expect(screen.getByText("v5")).toBeTruthy();
+    view.rerender(page(saved, save, false));
+    view.rerender(page(saved, save));
+    expect(instructionsTextarea().value).toBe("old");
+
+    fireEvent.click(applyButton(openReview()));
+    await waitFor(() => expect(save).toHaveBeenCalledTimes(2));
+    expect(save).toHaveBeenLastCalledWith(expect.objectContaining({ expectedVersion: 5, developerInstructions: "old" }));
   });
 });
 
@@ -240,12 +316,25 @@ describe("review before apply", () => {
     expect(screen.queryByRole("button", { name: "Review changes" })).toBeNull();
   });
 
-  it("discard restores the saved settings", () => {
+  it("discard restores the saved settings and moves focus to the save status", () => {
     renderForm(makeSettings({ developerInstructions: "Saved instructions" }));
     typeInstructions("Draft");
     fireEvent.click(screen.getByRole("button", { name: "Discard changes" }));
     expect(instructionsTextarea().value).toBe("Saved instructions");
     expect(screen.queryByText(/unsaved change/)).toBeNull();
+    expect(document.activeElement).toBe(screen.getByRole("status"));
+  });
+
+  it("moves focus to the save status when the review closes after Discard my edits", async () => {
+    const { rerender } = renderForm(makeSettings({ version: 4 }));
+    typeInstructions("my draft");
+    rerender(makeSettings({ version: 5, developerInstructions: "theirs" }));
+    const dialog = openReview();
+    fireEvent.click(within(dialog).getByRole("button", { name: "Discard my edits" }));
+
+    expect(screen.queryByRole("dialog")).toBeNull();
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole("status")));
+    expect(instructionsTextarea().value).toBe("theirs");
   });
 });
 
@@ -290,6 +379,21 @@ describe("apply", () => {
     await act(async () => resolve(true));
   });
 
+  it("applies once when two clicks arrive before React renders", async () => {
+    let resolve!: (ok: boolean) => void;
+    const onSave = vi.fn<SaveFn>(() => new Promise((done) => { resolve = done; }));
+    renderForm(makeSettings(), onSave);
+    typeInstructions("Once");
+    const apply = applyButton(openReview());
+    // Inside act, React renders after both clicks, so the button is still enabled for the second one.
+    act(() => {
+      apply.click();
+      apply.click();
+    });
+    expect(onSave).toHaveBeenCalledTimes(1);
+    await act(async () => resolve(true));
+  });
+
   it("keeps an edit made during the save without sending it", async () => {
     let resolve!: (ok: boolean) => void;
     const onSave = vi.fn<SaveFn>(() => new Promise((done) => { resolve = done; }));
@@ -305,6 +409,41 @@ describe("apply", () => {
     expect(instructionsTextarea().value).toBe("Typed later");
     expect(screen.getByText("1 unsaved change")).toBeTruthy();
     expect(screen.getByText("v2")).toBeTruthy();
+  });
+
+  it.each([
+    ["an edit", "Typed later"],
+    ["an edit that undoes the sent change", ""]
+  ])("keeps %s made during the save when the result and the row arrive in one render", async (_name, later) => {
+    let resolve!: (ok: boolean) => void;
+    const onSave = vi.fn<SaveFn>(() => new Promise((done) => { resolve = done; }));
+    const { rerender } = renderForm(makeSettings(), onSave);
+    typeInstructions("Reviewed");
+    fireEvent.click(applyButton(openReview()));
+    typeInstructions(later);
+    await act(async () => {
+      resolve(true);
+      rerender(makeSettings({ version: 2, developerInstructions: "Reviewed" }));
+    });
+
+    expect(onSave).toHaveBeenCalledTimes(1);
+    expect(onSave).toHaveBeenCalledWith(expect.objectContaining({ expectedVersion: 1, developerInstructions: "Reviewed" }));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(instructionsTextarea().value).toBe(later);
+    expect(screen.getByText("1 unsaved change")).toBeTruthy();
+    expect(screen.getByText("v2")).toBeTruthy();
+  });
+
+  it("does not apply while the page reports a save in progress", () => {
+    const onSave = vi.fn<SaveFn>(async () => true);
+    renderForm(makeSettings(), onSave, { saving: true });
+    typeInstructions("Draft");
+    const dialog = openReview();
+    expect(applyButton(dialog).textContent).toBe("Applying…");
+    expect(applyButton(dialog).disabled).toBe(true);
+    expect((within(dialog).getByRole("button", { name: "Back to editing" }) as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(applyButton(dialog));
+    expect(onSave).not.toHaveBeenCalled();
   });
 
   it("confirms a successful save and resyncs to the saved row", async () => {
