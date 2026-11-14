@@ -137,4 +137,27 @@ describe.skipIf(!adminDatabaseUrl())("project skills runtime isolation", () => {
     expect(await skills.listRuntimeSkills(tenant, project, member, true)).toEqual([]);
   });
 
+  // GHSA-v366-9wpc-xrm7: every session in a project gives no personal authority,
+  // also a personal chat that its owner moved into the project.
+  test("runtime capabilities give personal authority only to a session in no project", async () => {
+    const tenant = await seedTenant(), owner = await seedUser(), viewer = await seedUser();
+    for (const user of [owner, viewer]) await seedMembership(tenant, user);
+    const projects = new ProjectStore(appPool()), sessions = new SessionStore(appPool());
+    const project = (await projects.create(tenant, owner, "Shared")).projectId;
+    await superuserPool().query("INSERT INTO project_memberships (tenant_id,project_id,user_id,role) VALUES ($1,$2,$3,'viewer')",
+      [tenant, project, viewer]);
+    const chat = (await projects.createSession(tenant, owner, project, "Chat"))!;
+    const own = await seedSession(tenant, owner);
+
+    expect(await sessions.getRuntimeCapabilities(tenant, own, owner))
+      .toMatchObject({ personalUserId: owner, projectId: null, personalAuthority: true });
+    expect(await sessions.getRuntimeCapabilities(tenant, chat, owner))
+      .toMatchObject({ personalUserId: null, projectId: project, personalAuthority: false });
+    expect(await sessions.getRuntimeCapabilities(tenant, chat, viewer))
+      .toMatchObject({ projectId: null, personalAuthority: false });
+    expect(await projects.setSession(tenant, owner, project, own)).toBe(true);
+    expect(await sessions.getRuntimeCapabilities(tenant, own, owner))
+      .toMatchObject({ personalUserId: null, projectId: project, personalAuthority: false });
+  });
+
 });

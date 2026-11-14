@@ -62,6 +62,7 @@ import {
   buildMemorySectionLines,
   loadWorkspaceMemories
 } from "../memory-workspace-section.js";
+import { labelProjectHistory } from "./project-history.js";
 import type { SkillBundleStorage } from "../skills/skill-bundle-storage.js";
 import { EventType, type BaseEvent } from "@ag-ui/client";
 
@@ -931,22 +932,28 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
         let lastUser = preceding.length - 1;
         while (lastUser >= 0 && preceding[lastUser]!.role !== "user") lastUser--;
         const earlier = preceding.slice(0, lastUser < 0 ? preceding.length : lastUser);
-        conversationMessages = earlier
+        // Other members write to the same chat. Each user message keeps its
+        // author as a server-written label (project-history.ts).
+        conversationMessages = labelProjectHistory(earlier
           .filter((message): message is typeof message & { role: "user" | "assistant" } =>
             (message.role === "user" || message.role === "assistant") && Boolean(message.content))
-          .map(({ role, content }) => ({ role, content }));
+          .map(({ role, content, userId }) => ({ role, content, userId })), state.userId);
         if (firstTurnOfRuntime) lostWorkspaceTurnId = previousTurnWithWorkspaceWrites(earlier);
         if (!await this.stores.executions!.isCurrent(state.execution, state.runtimeId))
           throw new SessionExecutionError("execution_stopped", 403);
       }
 
       // Recent memories enter model input as a labelled data message. They are read
-      // for every turn, so an edit or a delete in settings applies at once.
+      // for every turn, so an edit or a delete in settings applies at once. A
+      // project turn gets none: other members write its input and read its
+      // replies (services/personal-authority.ts).
       let memoryContext: string | null = null;
-      await this.waitForTurnSetup(
-        this.loadMemoryContext(state, session.runtimePolicy).then((text) => { memoryContext = text; }),
-        turnAbort.signal
-      );
+      if (!projectId && !state.execution?.projectId) {
+        await this.waitForTurnSetup(
+          this.loadMemoryContext(state, session.runtimePolicy).then((text) => { memoryContext = text; }),
+          turnAbort.signal
+        );
+      }
 
       // An abort raised during onBeforeTurn (client disconnect, session teardown)
       // is NOT short-circuited here: the run is still started so the stream leads
@@ -1818,6 +1825,11 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
   ): Promise<{ durableWrite?: DurableWriteApproval; refusal?: string }> {
     if (request.server?.mode !== "managed" || !this.managedToolCatalog?.get(request.name)?.requiresUserApproval) {
       return {};
+    }
+    // A project turn gets no personal authority (services/personal-authority.ts).
+    // The card of a replacement would also show the saved text in a shared chat.
+    if (state.execution?.projectId) {
+      return { refusal: "Nothing was saved: saved memories are not available in a project chat." };
     }
     if (!request.policyApproval) {
       return { refusal: "Nothing was saved: the approval could not be tied to this exact call. Ask again." };

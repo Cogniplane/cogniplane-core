@@ -1,4 +1,4 @@
-import { test, expect } from "vitest";
+import { test, expect, vi } from "vitest";
 
 import type { AppConfig } from "../../config.js";
 
@@ -383,11 +383,14 @@ test("resolveSessionIntegrations grants no tools when a binding probe names no a
   await expect(service.resolveSessionIntegrations("tenant-1", "user-1")).resolves.toEqual({ toolIds: [], accounts: {} });
 });
 
+/** A session in no project: personal connections are allowed. */
+const personal = async () => true;
+
 test("checkToolCall allows a tool that belongs to no integration", async () => {
   const service = new IntegrationRegistryService(buildConfig(), new FakeStateStore([]), probes);
 
   await expect(service.checkToolCall({ tenantId: "tenant-1", userId: "user-1", toolName: "write_artifact",
-    boundAccounts: {} })).resolves.toBeNull();
+    boundAccounts: {}, personalConnectionsAllowed: personal })).resolves.toBeNull();
 });
 
 test.each([
@@ -398,14 +401,14 @@ test.each([
   const service = new IntegrationRegistryService(buildConfig(), store, { github: accountProbe("gh-1") });
 
   await expect(service.checkToolCall({ tenantId: "tenant-1", userId: "user-1", toolName,
-    boundAccounts: { github: "gh-1" } })).resolves.toBe(message);
+    boundAccounts: { github: "gh-1" }, personalConnectionsAllowed: personal })).resolves.toBe(message);
 });
 
 test("checkToolCall refuses a call when the integration state row is gone", async () => {
   const service = new IntegrationRegistryService(buildConfig(), new FakeStateStore([]), { github: accountProbe("gh-1") });
 
   await expect(service.checkToolCall({ tenantId: "tenant-1", userId: "user-1", toolName: "github_read_file",
-    boundAccounts: { github: "gh-1" } })).resolves.toMatch(/disabled/);
+    boundAccounts: { github: "gh-1" }, personalConnectionsAllowed: personal })).resolves.toMatch(/disabled/);
 });
 
 test.each([
@@ -417,7 +420,7 @@ test.each([
   const service = new IntegrationRegistryService(buildConfig(), store, { github: accountProbe(current) });
 
   await expect(service.checkToolCall({ tenantId: "tenant-1", userId: "user-1", toolName: "github_read_file",
-    boundAccounts: { github: "gh-1" } })).resolves.toBe(expected);
+    boundAccounts: { github: "gh-1" }, personalConnectionsAllowed: personal })).resolves.toBe(expected);
 });
 
 test("checkToolCall skips the account comparison for a context without a record", async () => {
@@ -425,7 +428,7 @@ test("checkToolCall skips the account comparison for a context without a record"
   const service = new IntegrationRegistryService(buildConfig(), store, { github: accountProbe("gh-2") });
 
   await expect(service.checkToolCall({ tenantId: "tenant-1", userId: "user-1", toolName: "github_read_file",
-    boundAccounts: undefined })).resolves.toBeNull();
+    boundAccounts: undefined, personalConnectionsAllowed: personal })).resolves.toBeNull();
 });
 
 test("checkToolCall refuses a turn that recorded accounts but none for the integration", async () => {
@@ -433,7 +436,7 @@ test("checkToolCall refuses a turn that recorded accounts but none for the integ
   const service = new IntegrationRegistryService(buildConfig(), store, { github: accountProbe("gh-1") });
 
   await expect(service.checkToolCall({ tenantId: "tenant-1", userId: "user-1", toolName: "github_read_file",
-    boundAccounts: { notion: "n-1" } })).resolves.toMatch(/account changed/);
+    boundAccounts: { notion: "n-1" }, personalConnectionsAllowed: personal })).resolves.toMatch(/account changed/);
 });
 
 test("checkToolCall does not compare accounts for a probe that cannot name one", async () => {
@@ -441,7 +444,7 @@ test("checkToolCall does not compare accounts for a probe that cannot name one",
   const service = new IntegrationRegistryService(buildConfig(), store, { github: probe(true) });
 
   await expect(service.checkToolCall({ tenantId: "tenant-1", userId: "user-1", toolName: "github_read_file",
-    boundAccounts: {} })).resolves.toBeNull();
+    boundAccounts: {}, personalConnectionsAllowed: personal })).resolves.toBeNull();
 });
 
 test.each([["first", ["shared-on", "shared-off"]], ["second", ["shared-off", "shared-on"]]])(
@@ -458,5 +461,44 @@ test.each([["first", ["shared-on", "shared-off"]], ["second", ["shared-off", "sh
     const service = new IntegrationRegistryService(buildConfig(), store, {}, registry);
 
     await expect(service.checkToolCall({ tenantId: "tenant-1", userId: "user-1", toolName: "shared_tool",
-      boundAccounts: undefined })).resolves.toBe("shared-off reads are disabled for this organization.");
+      boundAccounts: undefined, personalConnectionsAllowed: personal })).resolves.toBe("shared-off reads are disabled for this organization.");
   });
+
+// GHSA-v366-9wpc-xrm7: a project session gets no personal connection. An
+// integration without a connection probe acts for the organization and stays.
+function projectBoundaryService() {
+  const registry = new IntegrationRegistry([]);
+  registry.register({ id: "personal-docs", name: "Personal Docs", description: "", longDescription: "",
+    logoSlug: "personal-docs", status: "available", category: "Test", readToolIds: ["personal_read"],
+    writeToolIds: [], configMode: "none", connectionProbe: accountProbe("account-1") });
+  registry.register({ id: "org-docs", name: "Org Docs", description: "", longDescription: "",
+    logoSlug: "org-docs", status: "available", category: "Test", readToolIds: ["org_read"],
+    writeToolIds: [], configMode: "none" });
+  const store = new FakeStateStore([
+    makeState({ tenantId: "tenant-1", integrationId: "personal-docs", readsEnabled: true }),
+    makeState({ tenantId: "tenant-1", integrationId: "org-docs", readsEnabled: true })
+  ]);
+  return new IntegrationRegistryService(buildConfig(), store, {}, registry);
+}
+
+test("resolveSessionIntegrations leaves out personal connections for a project session", async () => {
+  const service = projectBoundaryService();
+  await expect(service.resolveSessionIntegrations("tenant-1", "user-1"))
+    .resolves.toEqual({ toolIds: ["personal_read", "org_read"], accounts: { "personal-docs": "account-1" } });
+  await expect(service.resolveSessionIntegrations("tenant-1", "user-1", { personalConnections: false }))
+    .resolves.toEqual({ toolIds: ["org_read"], accounts: {} });
+});
+
+test("checkToolCall refuses a personal connection when the session gives no personal authority", async () => {
+  const service = projectBoundaryService();
+  const projectSession = vi.fn(async () => false);
+  await expect(service.checkToolCall({ tenantId: "tenant-1", userId: "user-1", toolName: "personal_read",
+    boundAccounts: { "personal-docs": "account-1" }, personalConnectionsAllowed: projectSession }))
+    .resolves.toBe("Personal Docs uses your personal connection, so it is not available in a project chat.");
+  // An organization integration does not read the session rule.
+  await expect(service.checkToolCall({ tenantId: "tenant-1", userId: "user-1", toolName: "org_read",
+    boundAccounts: undefined, personalConnectionsAllowed: projectSession })).resolves.toBeNull();
+  expect(projectSession).toHaveBeenCalledTimes(1);
+  await expect(service.checkToolCall({ tenantId: "tenant-1", userId: "user-1", toolName: "personal_read",
+    boundAccounts: { "personal-docs": "account-1" }, personalConnectionsAllowed: personal })).resolves.toBeNull();
+});

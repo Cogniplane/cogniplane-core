@@ -34,6 +34,7 @@ import {
   tenantSettingsToRuntimePolicy
 } from "./admin-config-records.js";
 import { AuditEventStore, type AuditEventInput } from "./audit-event-store.js";
+import { isPersonalManagedToolCategory } from "./personal-authority.js";
 import type { McpServerStore } from "./mcp-server-store.js";
 import type { SkillConfigStore } from "./skills/skill-config-store.js";
 import type { SkillRevisionStore } from "./skills/skill-revision-store.js";
@@ -134,8 +135,9 @@ export class DynamicConfigService {
     this.integrationTools = source;
   }
 
-  private async resolveIntegrations(source: IntegrationToolSource, tenantId: string, userId: string) {
-    const resolved = await source.resolveSessionIntegrations(tenantId, userId);
+  private async resolveIntegrations(source: IntegrationToolSource, tenantId: string, userId: string,
+    personalConnections: boolean) {
+    const resolved = await source.resolveSessionIntegrations(tenantId, userId, { personalConnections });
     return { integrationToolIds: resolved.toolIds, integrationAccounts: resolved.accounts };
   }
 
@@ -223,27 +225,30 @@ export class DynamicConfigService {
   ): Promise<RuntimeConfigBundle> {
     let selection = null;
     let owned: OwnedSkills = {};
+    // Production wiring always reads the runtime capabilities, which also tell
+    // if the session is in a project. The legacy selection read is test wiring.
+    let personalAuthority = true;
     const needsAudience = Boolean(this.stores.personalSkills || this.stores.projectSkills);
     if (session && this.stores.sessions) {
-      if (needsAudience) {
-        if (!this.stores.sessions.getRuntimeCapabilities) {
-          throw new Error("Session audience is unavailable while resolving personal or project skills");
-        }
+      if (this.stores.sessions.getRuntimeCapabilities) {
         // One row supplies the selection, owner, purpose, and current project assignment.
         const context = await this.stores.sessions.getRuntimeCapabilities(tenantId, session.sessionId, session.userId);
         selection = context.selection;
+        personalAuthority = context.personalAuthority === true;
         if (context.personalUserId && this.stores.personalSkills) {
           owned = { personalSkills: await this.stores.personalSkills.listRuntimeSkills(tenantId, context.personalUserId) };
         } else if (context.projectId && this.stores.projectSkills) {
           owned = { projectSkills: await this.stores.projectSkills.listRuntimeSkills(tenantId, context.projectId, session.userId, true) };
         }
+      } else if (needsAudience) {
+        throw new Error("Session audience is unavailable while resolving personal or project skills");
       } else {
         selection = await this.stores.sessions.getCapabilitySelection(tenantId, session.sessionId, session.userId);
       }
     } else if (session && needsAudience) {
       throw new Error("Session audience is unavailable while resolving personal or project skills");
     }
-    return this.compileForSelection(tenantId, isBetaTester, selection, owned, session);
+    return this.compileForSelection(tenantId, isBetaTester, selection, owned, session, personalAuthority);
   }
 
   async compilePersonalCatalog(tenantId: string, isBetaTester: boolean, userId: string): Promise<RuntimeConfigBundle> {
@@ -252,23 +257,32 @@ export class DynamicConfigService {
     return this.compileForSelection(tenantId, isBetaTester, null, { personalSkills });
   }
 
-  /** The skill read checks the member's current project role. */
+  /**
+   * The skill read checks the member's current project role. Project chats get
+   * no personal authority, so the catalog offers no personal-scope connection.
+   */
   async compileProjectCatalog(tenantId: string, isBetaTester: boolean, projectId: string, userId: string): Promise<RuntimeConfigBundle> {
     const projectSkills = this.stores.projectSkills
       ? await this.stores.projectSkills.listRuntimeSkills(tenantId, projectId, userId) : [];
-    return this.compileForSelection(tenantId, isBetaTester, null, { projectSkills });
+    return this.compileForSelection(tenantId, isBetaTester, null, { projectSkills }, undefined, false);
   }
 
+  /**
+   * `personalAuthority` false (a project session or catalog) leaves out the
+   * member's memories, own chats, personal connections and personal MCP
+   * credentials (services/personal-authority.ts).
+   */
   private async compileForSelection(
     tenantId: string,
     isBetaTester: boolean,
     selection: Awaited<ReturnType<import("./session-store.js").SessionStore["getCapabilitySelection"]>>,
     owned: OwnedSkills,
-    session?: { sessionId: string; userId: string }
+    session?: { sessionId: string; userId: string },
+    personalAuthority = true
   ): Promise<RuntimeConfigBundle> {
     const tenantPolicy = await this.getRuntimePolicy(tenantId);
     const personalCredentialVersions = new Map<string, number>();
-    if (session && this.stores.memberMcpCredentials) {
+    if (session && personalAuthority && this.stores.memberMcpCredentials) {
       const personalServers = personalServersToCheck(
         await this.stores.mcpServers.listMcpServers(tenantId, false, isBetaTester), tenantPolicy.enabledMcpServers);
       const statuses = await this.stores.memberMcpCredentials.listStatuses(tenantId, session.userId, personalServers);
@@ -280,8 +294,11 @@ export class DynamicConfigService {
     // settings can still hold integration tool IDs, so remove them here.
     const runtimePolicy = {
       ...tenantPolicy,
-      enabledToolIds: tenantPolicy.enabledToolIds.filter((toolId) =>
-        this.managedToolCatalog.get(toolId)?.tenantConfigurable !== false)
+      enabledToolIds: tenantPolicy.enabledToolIds.filter((toolId) => {
+        const entry = this.managedToolCatalog.get(toolId);
+        return entry?.tenantConfigurable !== false &&
+          (personalAuthority || !isPersonalManagedToolCategory(entry?.category));
+      })
     };
     return compileRuntimeConfigBundle({
       tenantId,
@@ -293,8 +310,9 @@ export class DynamicConfigService {
       ...owned,
       personalCredentialVersions,
       executingSession: Boolean(session),
+      personalAuthority,
       ...(session && this.integrationTools
-        ? await this.resolveIntegrations(this.integrationTools, tenantId, session.userId)
+        ? await this.resolveIntegrations(this.integrationTools, tenantId, session.userId, personalAuthority)
         : { integrationToolIds: [], integrationAccounts: {} })
     });
   }

@@ -1616,8 +1616,11 @@ describe("DeepAgentsRuntimeAdapter runMessageAGUI (AG-UI)", () => {
 
   it("loads the complete transcript for a long project session", async () => {
     const runtime = makeRuntimeFactory(() => scriptedChatStream());
+    // Two members write to the chat: user-2 sends turns 0, 4, 8... and the
+    // acting member user-1 sends turns 2, 6, 10...
     const messages = Array.from({ length: 601 }, (_, index) => ({
       messageId: `message-${index}`,
+      userId: index % 4 === 0 ? "user-2" : "user-1",
       role: index % 2 === 0 ? "user" : "assistant",
       content: `turn-${index}`,
       toolResults: []
@@ -1657,9 +1660,44 @@ describe("DeepAgentsRuntimeAdapter runMessageAGUI (AG-UI)", () => {
 
       expect(requestedOptions).toEqual({ limit: null });
       const input = runtime.streamInputs[0] as { messages: Array<{ content: string }> };
-      expect(input.messages[0]?.content).toBe("turn-0");
+      // The server labels each user message with its author; replies stay as saved.
+      expect(input.messages[0]?.content).toBe("[Project chat history: message from another project member " +
+        "(member 1), not from the member you are helping now.]\n\nturn-0");
+      expect(input.messages[1]?.content).toBe("turn-1");
+      expect(input.messages[2]?.content)
+        .toBe("[Project chat history: message from the member you are helping now.]\n\nturn-2");
       expect(input.messages.at(-1)?.content).toBe("hello");
       expect(input.messages).toHaveLength(601);
+    } finally {
+      await adapter.close();
+    }
+  });
+
+  it("sends no saved memories in a project turn, also when the runtime policy lists memory_search", async () => {
+    const runtime = makeRuntimeFactory(() => scriptedChatStream());
+    const search = vi.fn(async () => [{ memoryId: "m1", userId: "user-1", slug: "private-repo",
+      content: "My private repository is acme/secret", metadata: {}, createdAt: "", updatedAt: "" }]);
+    const adapter = makeAdapter({
+      factory: runtime.factory,
+      memories: { search },
+      dynamicConfig: makeDynamicConfig({ enabledToolIds: [...testRuntimePolicy.enabledToolIds, "memory_search"] }),
+      executions: { isCurrent: vi.fn(async () => true), bindRuntime: vi.fn(async () => {}) },
+      sessions: {
+        getReadable: async (...args) => ({ ...await fakeSessionAccess.getReadable(...args), projectId: "project-1" })
+      },
+      conversationMessages: { async listBySession() { return { messages: [], hasMore: false }; } }
+    });
+    const execution = { ...sessionInput, executionId: "execution-1", ownerId: "replica-1",
+      projectId: "project-1", expiresAt: new Date(Date.now() + 30_000).toISOString() };
+    try {
+      const session = await adapter.createSession({ ...sessionInput, execution });
+      await collectAGUI(adapter.runMessageAGUI(session, runMessageInput()));
+      // The stream ran, and its input holds no memory of the acting member.
+      expect(runtime.streamConfigs).toHaveLength(1);
+      expect((runtime.streamConfigs[0] as { context?: { memoryContext?: unknown } }).context?.memoryContext).toBeNull();
+      expect(JSON.stringify(runtime.streamInputs[0])).toContain("hello");
+      expect(JSON.stringify(runtime.streamInputs[0])).not.toContain("acme/secret");
+      expect(search).not.toHaveBeenCalled();
     } finally {
       await adapter.close();
     }
@@ -4535,19 +4573,44 @@ describe("memory_save approval presentation and refusal", () => {
       serverId: "managed-memory", args, ruleId: null, explanation: "Saves data for later sessions." });
   }
 
-  function setup(input: { action: PendingAction; existing?: typeof stored | null; serverMode?: "managed" | "proxy"; catalogged?: boolean }) {
+  function setup(input: { action: PendingAction; existing?: typeof stored | null; serverMode?: "managed" | "proxy";
+    catalogged?: boolean; projectId?: string }) {
     const base = makeInterruptingFactory({ rounds: [[input.action], []], mcpToolNames: ["memory_save"],
       mcpToolServers: new Map([["memory_save", "managed-memory"]]) });
     const approvals = createInMemoryApprovalStore();
     const get = vi.fn(async () => input.existing ?? null);
+    const project = input.projectId ? {
+      sessions: { getReadable: async (...args: Parameters<typeof fakeSessionAccess.getReadable>) =>
+        ({ ...await fakeSessionAccess.getReadable(...args), projectId: input.projectId! }) },
+      executions: { isCurrent: vi.fn(async () => true), bindRuntime: vi.fn(async () => {}) },
+      conversationMessages: { async listBySession() { return { messages: [], hasMore: false }; } }
+    } : null;
     const adapter = new DeepAgentsRuntimeAdapter(testConfig,
       makeDynamicConfig({}, { mcpServers: [{ ...memoryServer, mode: input.serverMode ?? "managed" }] }), fakeLog, {
-        sessions: fakeSessionAccess, executions: unusedExecutions, approvals: approvals as never,
+        sessions: project?.sessions ?? fakeSessionAccess, executions: project?.executions ?? unusedExecutions,
+        ...(project ? { conversationMessages: project.conversationMessages as never } : {}),
+        approvals: approvals as never,
         auditEvents: fakeAuditEventStore as never, tenantMembers: fakeTenantMemberStore as never,
         memories: { get } as never
       }, undefined, base.factory, input.catalogged === false ? undefined : catalog);
     return { adapter, approvals, resumes: base.resumes, get };
   }
+
+  it("refuses a save in a project turn without reading or showing the saved text", async () => {
+    const { adapter, approvals, resumes, get } = setup({ projectId: "project-1", existing: stored,
+      action: { interruptId: "int-1", name: "memory_save", args: saveArgs, policyApproval: proofFor(saveArgs) } });
+    const execution = { ...sessionInput, executionId: "execution-1", ownerId: "replica-1",
+      projectId: "project-1", expiresAt: new Date(Date.now() + 30_000).toISOString() };
+    try {
+      const session = await adapter.createSession({ ...sessionInput, execution });
+      await collect(adapter.runMessageAGUI(session, { ...runMessageInput(), toolContextId: "ctx-1" }));
+      expect(resumes).toHaveLength(1);
+      expect(resumes[0]).toEqual([{ type: "reject",
+        message: expect.stringContaining("Nothing was saved: saved memories are not available in a project chat.") }]);
+      expect(approvals.rows.size).toBe(0);
+      expect(get).not.toHaveBeenCalled();
+    } finally { await adapter.close(); }
+  });
 
   const isPrompt = (event: AGUIBaseEvent) =>
     event.type === AGUIEventType.CUSTOM && (event as { name?: string }).name === "approval_required";

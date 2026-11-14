@@ -64,6 +64,8 @@ export async function compileRuntimeConfig(input: {
   /** Connected personal credentials for an executing session. Omit for catalogs. */
   personalCredentialVersions?: ReadonlyMap<string, number>;
   executingSession?: boolean;
+  /** False for a project session or catalog: personal-scope servers are left out. Default true. */
+  personalAuthority?: boolean;
   /**
    * Integration tool IDs this session may use (integration toggle on and user
    * connected). The caller removes integration IDs from
@@ -98,6 +100,7 @@ export async function compileRuntimeConfig(input: {
       hasPersonalCredential: input.personalCredentialVersions?.has(server.serverId) ?? false
     });
     if (!checks.allowedForOrganization || !checks.inSelection || !checks.personalCredentialAccepted ||
+        (input.personalAuthority === false && server.credentialScope === "personal") ||
         enabledMcpServerIds.has(server.serverId)) {
       return [];
     }

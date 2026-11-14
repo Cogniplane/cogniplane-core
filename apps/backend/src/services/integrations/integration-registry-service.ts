@@ -203,8 +203,12 @@ export class IntegrationRegistryService {
    * probe can name its account grants tools only with that account recorded,
    * so a turn never holds tools without the account they were granted for.
    * `checkToolCall` and the credential lookups compare later calls with it.
+   * With `personalConnections: false` (a project session), an integration
+   * that uses the member's own connection (it has a probe) grants nothing
+   * (services/personal-authority.ts).
    */
-  async resolveSessionIntegrations(tenantId: string, userId: string): Promise<{
+  async resolveSessionIntegrations(tenantId: string, userId: string,
+    options: { personalConnections?: boolean } = {}): Promise<{
     toolIds: string[];
     accounts: Record<string, string>;
   }> {
@@ -216,6 +220,7 @@ export class IntegrationRegistryService {
       if (!descriptor || descriptor.status !== "available") continue;
 
       const probe = this.resolveProbe(descriptor);
+      if (probe && options.personalConnections === false) continue;
       if (probe?.connectedAccountId) {
         const accountId = await probe.connectedAccountId(tenantId, userId);
         if (!accountId || !await probe.hasConnection(tenantId, userId)) continue;
@@ -236,14 +241,18 @@ export class IntegrationRegistryService {
    * started: the tenant toggle for the tool's access must still be on, and the
    * connected account must be the one the turn recorded. A turn can wait for
    * an approval while an administrator turns the integration off or the user
-   * connects another account. Returns the refusal message, or null when the
-   * call may run or the tool belongs to no integration.
+   * connects another account. A tool of an integration that uses the member's
+   * own connection is refused when `personalConnectionsAllowed` resolves
+   * false (the session is in a project now). It is read only for such a tool.
+   * Returns the refusal message, or null when the call may run or the tool
+   * belongs to no integration.
    */
   async checkToolCall(input: {
     tenantId: string;
     userId: string;
     toolName: string;
     boundAccounts: Readonly<Record<string, unknown>> | undefined;
+    personalConnectionsAllowed: () => Promise<boolean>;
   }): Promise<string | null> {
     // Every integration that lists the tool must allow it, so the result never
     // depends on the order in which descriptors were registered.
@@ -256,9 +265,12 @@ export class IntegrationRegistryService {
         return `${descriptor.name} ${write ? "writes" : "reads"} are disabled for this organization.`;
       }
 
+      const probe = this.resolveProbe(descriptor);
+      if (probe && !await input.personalConnectionsAllowed()) {
+        return `${descriptor.name} uses your personal connection, so it is not available in a project chat.`;
+      }
       // An early refusal: the credential lookup compares the same account
       // again on the row that holds the token.
-      const probe = this.resolveProbe(descriptor);
       const expected = boundIntegrationAccount(
         input.boundAccounts ? { integrationAccounts: input.boundAccounts } : undefined, descriptor.id);
       if (expected === undefined || !probe?.connectedAccountId) continue;

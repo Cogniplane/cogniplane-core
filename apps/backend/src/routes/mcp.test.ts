@@ -115,7 +115,7 @@ const toolCallRequests = (requests: ProxyRequest[]) => requests.filter((request)
 test("proxy calls use each runtime member's credential and reject a disconnected member before egress", async () => {
   const { upstream, upstreamUrl, upstreamRequests } = await createProxyMcpUpstream();
   const connected = new Map([["alice", "alice-token"], ["bob", "bob-token"]]);
-  const { app, toolContexts } = await createTestApp({
+  const { app, toolContexts, sessions } = await createTestApp({
     resolveMcpServer: async (_tenant, serverId, userId) => {
       const secret = connected.get(userId);
       if (!secret) throw new AdminConfigError("Credential unavailable");
@@ -128,6 +128,7 @@ test("proxy calls use each runtime member's credential and reject a disconnected
   onTestFinished(async () => { await Promise.all([app.close(), upstream.close()]); });
   for (const userId of ["alice", "bob"]) {
     const sessionId = `session-${userId}`;
+    sessions.seed({ sessionId, userId });
     const context = await createTestToolContext(toolContexts, { sessionId, userId,
       metadata: { runtimePolicy: { ...testRuntimePolicy, enabledMcpServers: ["test-proxy"] },
         mcpServerSources: [{ id: "test-proxy", hash: "server-hash", credentialVersion: 1 }] } });
@@ -163,13 +164,14 @@ test("proxy rejects an approved turn after credential rotation or server reconfi
   const { upstream, upstreamUrl, upstreamRequests } = await createProxyMcpUpstream();
   let hash = "original-hash";
   let credentialVersion = 1;
-  const { app, toolContexts } = await createTestApp({
+  const { app, toolContexts, sessions } = await createTestApp({
     resolveMcpServer: async (_tenant, serverId) => ({ id: serverId, description: "Personal proxy",
       mode: "proxy", routePath: `/mcp/${serverId}`, upstreamUrl, transportKind: "http", version: 1,
       hash, credentialScope: "personal", credentialBindingId: "binding-1", credentialVersion,
       upstreamAuth: { type: "bearer", secret: "current-secret" } })
   });
   onTestFinished(async () => { await Promise.all([app.close(), upstream.close()]); });
+  sessions.seed({ sessionId: "approval-session", userId: "alice" });
   const context = await createTestToolContext(toolContexts, { sessionId: "approval-session", userId: "alice",
     metadata: { runtimePolicy: { ...testRuntimePolicy, enabledMcpServers: ["test-proxy"] },
       mcpServerSources: [{ id: "test-proxy", hash: "original-hash", credentialVersion: 1 }] } });
@@ -2596,7 +2598,8 @@ test.each([
 
   // The check gets the account that the turn recorded at its start.
   expect(checkToolCall).toHaveBeenCalledWith({
-    tenantId: "test-tenant", userId: "user-1", toolName: "integration_probe", boundAccounts: { github: "gh-1" }
+    tenantId: "test-tenant", userId: "user-1", toolName: "integration_probe", boundAccounts: { github: "gh-1" },
+    personalConnectionsAllowed: expect.any(Function)
   });
   expect(handler).toHaveBeenCalledTimes(handlerCalls);
   if (refusal) expect(response.json().error.message).toBe(refusal);
@@ -2966,3 +2969,103 @@ test.each(["managed-session-context", "test-proxy"])(
     expect(toolCallRequests(upstreamRequests)).toEqual([]);
   }
 );
+
+// GHSA-v366-9wpc-xrm7: a project chat gets no personal authority. The tool
+// contexts below still list the personal tools and servers, as a context made
+// before the fix or before a move into a project does. The gateway reads the
+// session at dispatch.
+test("a personal-scope MCP server is refused in a project chat before any upstream request", async () => {
+  const { upstream, upstreamUrl, upstreamRequests } = await createProxyMcpUpstream();
+  const { app, toolContexts, sessions } = await createTestApp({
+    resolveMcpServer: async (_tenant, serverId) => ({ id: serverId, description: "Personal proxy",
+      mode: "proxy", routePath: `/mcp/${serverId}`, upstreamUrl, transportKind: "http", version: 1,
+      hash: "server-hash", credentialScope: "personal", credentialBindingId: "binding-1", credentialVersion: 1,
+      upstreamAuth: { type: "bearer", secret: "victim-token" } })
+  });
+  onTestFinished(async () => { await Promise.all([app.close(), upstream.close()]); });
+  const metadata = { runtimePolicy: { ...testRuntimePolicy, enabledMcpServers: ["test-proxy"] },
+    mcpServerSources: [{ id: "test-proxy", hash: "server-hash", credentialVersion: 1 }] };
+  const send = (sessionId: string, runtimeId: string, method: string, params?: Record<string, unknown>) =>
+    app.inject({ method: "POST", url: "/mcp/test-proxy",
+      headers: { authorization: `Bearer ${runtimeToken({ sid: sessionId, uid: "victim", rid: runtimeId })}` },
+      payload: { jsonrpc: "2.0", id: 1, method, ...(params ? { params } : {}) } });
+
+  sessions.seed({ sessionId: "project-session", userId: "victim", projectId: "project-1" });
+  const project = await createTestToolContext(toolContexts, { sessionId: "project-session", userId: "victim", metadata });
+  for (const [method, params] of [["initialize", undefined], ["tools/list", undefined],
+    ["tools/call", { name: "search", arguments: { toolContextId: project.toolContextId } }]] as const) {
+    const response = await send("project-session", project.runtimeId, method, params);
+    expect(response.statusCode).toBe(403);
+    expect(response.json().error).toMatchObject({ code: -32000, message: "MCP server unavailable." });
+  }
+  expect(upstreamRequests).toHaveLength(0);
+
+  // The member's own chat keeps the personal server and its credential.
+  sessions.seed({ sessionId: "own-session", userId: "victim" });
+  const own = await createTestToolContext(toolContexts, { sessionId: "own-session", userId: "victim", metadata });
+  const called = await send("own-session", own.runtimeId, "tools/call",
+    { name: "search", arguments: { toolContextId: own.toolContextId } });
+  expect(called.statusCode).toBe(200);
+  expect(called.json().error).toBeUndefined();
+  expect(toolCallRequests(upstreamRequests).map((request) => request.headers.authorization)).toEqual(["Bearer victim-token"]);
+});
+
+test("an organization MCP server stays available in a project chat", async () => {
+  const { upstream, upstreamUrl, upstreamRequests } = await createProxyMcpUpstream();
+  const { app, toolContexts, sessions } = await createTestApp({ proxyUpstreamUrl: upstreamUrl });
+  onTestFinished(async () => { await Promise.all([app.close(), upstream.close()]); });
+  sessions.seed({ sessionId: "project-session", userId: "test-user", projectId: "project-1" });
+  const context = await createTestToolContext(toolContexts, { sessionId: "project-session",
+    metadata: { runtimePolicy: { ...testRuntimePolicy, enabledMcpServers: ["test-proxy"] } } });
+  const response = await app.inject({ method: "POST", url: "/mcp/test-proxy",
+    headers: { authorization: `Bearer ${runtimeToken({ sid: "project-session", uid: "test-user", rid: context.runtimeId })}` },
+    payload: { jsonrpc: "2.0", id: 1, method: "tools/call",
+      params: { name: "search", arguments: { toolContextId: context.toolContextId } } } });
+  expect(response.statusCode).toBe(200);
+  expect(response.json().error).toBeUndefined();
+  expect(toolCallRequests(upstreamRequests)).toHaveLength(1);
+});
+
+test("read_skill_corpus, which reads the member's own chats, is refused in a project chat", async () => {
+  const { app, toolContexts, sessions } = await createTestApp();
+  onTestFinished(async () => { await app.close(); });
+  sessions.seed({ sessionId: "project-session", userId: "test-user", projectId: "project-1" });
+  const context = await createTestToolContext(toolContexts, { sessionId: "project-session",
+    metadata: { runtimePolicy: { ...testRuntimePolicy, enabledToolIds: [...testRuntimePolicy.enabledToolIds, "read_skill_corpus"] } } });
+  const response = await app.inject({ method: "POST", url: "/mcp/managed-session-context",
+    headers: { authorization: `Bearer ${runtimeToken({ sid: "project-session", uid: "test-user", rid: context.runtimeId })}` },
+    payload: { jsonrpc: "2.0", id: 1, method: "tools/call",
+      params: { name: "read_skill_corpus", arguments: { toolContextId: context.toolContextId, skillId: "any" } } } });
+  expect(response.json().error).toMatchObject({ code: -32000,
+    message: "read_skill_corpus uses your personal data, so it is not available in a project chat." });
+});
+
+test.each([
+  ["a project chat", "project-1", false],
+  ["the member's own chat", null, true]
+] as const)("the integration check reads the personal connection rule for %s", async (_name, projectId, expected) => {
+  let allowed: boolean | undefined;
+  const checkToolCall = vi.fn(async (input: { personalConnectionsAllowed: () => Promise<boolean> }) => {
+    allowed = await input.personalConnectionsAllowed();
+    return allowed ? null : "GitHub uses your personal connection, so it is not available in a project chat.";
+  });
+  const handler = vi.fn(async () => ({ ok: true }));
+  const { app, toolContexts, sessions } = await createTestApp({
+    extraManagedTools: [{ name: "integration_probe", description: "Integration test", readOnly: true,
+      inputSchema: { type: "object" }, handler }],
+    integrationToolCalls: { checkToolCall }
+  });
+  onTestFinished(async () => { await app.close(); });
+  sessions.seed({ sessionId: "session-1", userId: "user-1", projectId });
+  const context = await createTestToolContext(toolContexts, { sessionId: "session-1", userId: "user-1",
+    metadata: { runtimePolicy: { ...testRuntimePolicy, enabledMcpServers: ["managed-session-context"],
+      enabledToolIds: ["integration_probe"] } } });
+  const response = await app.inject({ method: "POST", url: "/mcp/managed-session-context",
+    headers: { authorization: `Bearer ${runtimeToken({ sid: "session-1", uid: "user-1", rid: context.runtimeId })}` },
+    payload: { jsonrpc: "2.0", id: 1, method: "tools/call",
+      params: { name: "integration_probe", arguments: { toolContextId: context.toolContextId } } } });
+  expect(allowed).toBe(expected);
+  expect(handler).toHaveBeenCalledTimes(expected ? 1 : 0);
+  if (expected) expect(response.json().error).toBeUndefined();
+  else expect(response.json().error.message).toMatch(/not available in a project chat/);
+});

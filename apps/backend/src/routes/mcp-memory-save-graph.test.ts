@@ -92,10 +92,11 @@ const ARGS = {
 async function setup(options: { turnContext?: "interactive" | "scheduled" } = {}) {
   const turnContext = options.turnContext ?? "interactive";
   const memories = new FakeMemories();
-  const { app, toolContexts, approvals } = await createTestApp({ memories: memories as never });
+  const { app, toolContexts, approvals, sessions } = await createTestApp({ memories: memories as never });
   cleanups.push(() => app.close());
   const url = await app.listen({ host: "127.0.0.1", port: 0 });
   const sessionId = "e2e-session";
+  sessions.seed({ sessionId, userId: "test-user" });
   const runtimeId = "runtime-e2e-session";
   const runtimePolicy = { ...testRuntimePolicy, approvalPolicy: "never" as const,
     enabledToolIds: [...testRuntimePolicy.enabledToolIds, "memory_search", "memory_save", "memory_delete"] };

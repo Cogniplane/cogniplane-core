@@ -267,10 +267,13 @@ export class SessionStore {
 
   // projectId is set only when the acting member can currently execute in the
   // project. Viewers keep read access to the selection but get no project skills.
+  // personalAuthority is false for every session in a project, whatever the
+  // member's role (services/personal-authority.ts).
   async getRuntimeCapabilities(tenantId: string, sessionId: string, userId: string): Promise<{
     selection: SessionCapabilitySelection | null;
     personalUserId: string | null;
     projectId: string | null;
+    personalAuthority: boolean;
   }> {
     return withTenantScope(this.db, tenantId, async (client) => {
       const result = await client.query(
@@ -290,7 +293,8 @@ export class SessionStore {
         personalUserId: row.project_id === null && row.purpose === "normal" && row.user_id === userId
           ? userId : null,
         projectId: row.project_id !== null && row.purpose === "normal" &&
-          (row.project_role === "owner" || row.project_role === "editor") ? String(row.project_id) : null
+          (row.project_role === "owner" || row.project_role === "editor") ? String(row.project_id) : null,
+        personalAuthority: row.project_id === null
       };
     });
   }

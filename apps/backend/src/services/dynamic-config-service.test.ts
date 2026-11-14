@@ -121,7 +121,7 @@ test("personal skills require a trusted standalone session audience", async () =
     ...makeStores(),
     sessions: {
       async getCapabilitySelection() { throw new Error("Legacy selection lookup must not run"); },
-      async getRuntimeCapabilities() { return { selection: null, personalUserId, projectId: null }; }
+      async getRuntimeCapabilities() { return { selection: null, personalUserId, projectId: null, personalAuthority: true }; }
     },
     personalSkills: {
       async listRuntimeSkills(_tenantId, userId) { reads.push(userId); return [personal]; }
@@ -157,7 +157,7 @@ test("project skills come only from the session's current project for an executi
     ...makeStores(),
     sessions: {
       async getCapabilitySelection() { throw new Error("Legacy selection lookup must not run"); },
-      async getRuntimeCapabilities() { return context; }
+      async getRuntimeCapabilities() { return { ...context, personalAuthority: false }; }
     },
     personalSkills: { async listRuntimeSkills() { throw new Error("Personal skills must not load in project chats"); } },
     projectSkills: { async listRuntimeSkills(_tenantId, projectId, userId, forExecution) {
@@ -875,4 +875,67 @@ test("resolves only the acting member's current personal MCP credential", async 
   server.isPublished = true;
   server.enabled = false;
   await expect(service.getMcpServerForUser("tenant", "docs", "alice")).rejects.toThrow("Unknown MCP server");
+});
+
+// GHSA-v366-9wpc-xrm7: a project session gets no personal authority. Tenant and
+// project authority stay; the member's own chat keeps everything.
+test("a project session compiles without memories, own chats, personal connections or personal credentials", async () => {
+  const mcpServer = (serverId: string, credentialScope: "personal" | "organization"): AdminMcpServerRecord => ({
+    serverId, ownerTenantId: "tenant", serverName: serverId, description: null, transportKind: "http", mode: "proxy",
+    routePath: `/mcp/${serverId}`, upstreamUrl: "https://example.test/mcp", upstreamAuthType: "bearer",
+    upstreamAuthName: null, upstreamAuthConfigured: false, credentialScope, credentialBindingId: "binding-1",
+    version: 1, configHash: `hash-${serverId}`, enabled: true, isPublished: true, createdBy: "admin", createdAt: "", updatedAt: ""
+  });
+  let personalAuthority = true;
+  const credentialReads: string[] = [];
+  const integrationReads: unknown[] = [];
+  const service = new DynamicConfigService(createTestConfig(), {
+    ...makeStores({ mcpServers: { async listMcpServers() { return [mcpServer("docs", "personal"), mcpServer("org-docs", "organization")]; } } }),
+    sessions: {
+      async getCapabilitySelection() { throw new Error("Legacy selection lookup must not run"); },
+      async getRuntimeCapabilities() {
+        return { selection: null, personalUserId: null, projectId: personalAuthority ? null : "project-1", personalAuthority };
+      }
+    },
+    memberMcpCredentials: {
+      async listStatuses(_tenant, userId, servers) {
+        credentialReads.push(userId);
+        return new Map(servers.map((item) => [item.serverId,
+          { status: "connected" as const, credentialVersion: 3, accountLabel: null }]));
+      },
+      async getRuntimeCredential() { throw new Error("unused"); }
+    }
+  }, unusedSkillBundleStorage, makeManagedToolCatalog());
+  service.getRuntimePolicy = async () => ({ ...testRuntimePolicy,
+    enabledToolIds: ["write_artifact", "memory_search", "memory_save", "memory_delete", "read_skill_corpus"],
+    enabledMcpServers: ["docs", "org-docs"] });
+  service.setIntegrationToolSource({
+    async resolveSessionIntegrations(_tenantId, _userId, options): Promise<{ toolIds: string[]; accounts: Record<string, string> }> {
+      integrationReads.push(options);
+      return options?.personalConnections === false
+        ? { toolIds: [], accounts: {} } : { toolIds: ["github_read_file"], accounts: { github: "gh-1" } };
+    }
+  });
+  const session = { sessionId: "s", userId: "member" };
+
+  const own = await service.compileRuntimeConfig("tenant", false, session);
+  expect(own.runtimePolicy.enabledToolIds).toEqual(["write_artifact", "memory_search", "memory_save",
+    "memory_delete", "read_skill_corpus", "github_read_file"]);
+  expect(own.runtimePolicy.enabledMcpServers).toEqual(["docs", "org-docs"]);
+  expect(own.sources.mcpServers.find((source) => source.id === "docs")).toMatchObject({ credentialVersion: 3 });
+  expect(credentialReads).toEqual(["member"]);
+
+  personalAuthority = false;
+  const project = await service.compileRuntimeConfig("tenant", false, session);
+  expect(project.runtimePolicy.enabledToolIds).toEqual(["write_artifact"]);
+  expect(project.runtimePolicy.enabledMcpServers).toEqual(["org-docs"]);
+  expect(project.sources.integrationAccounts).toBeUndefined();
+  expect(project.hash).not.toBe(own.hash);
+  // No member credential is read for a project session.
+  expect(credentialReads).toEqual(["member"]);
+  expect(integrationReads).toEqual([{ personalConnections: true }, { personalConnections: false }]);
+
+  // The project catalog offers no personal-scope connection either.
+  expect((await service.compileProjectCatalog("tenant", false, "project-1", "member")).mcpServers.map((server) => server.id))
+    .toEqual(["org-docs"]);
 });
