@@ -1,10 +1,16 @@
 import { describe, test, expect, vi, onTestFinished } from "vitest";
 
-import Fastify from "fastify";
+import Fastify, { type FastifyServerOptions } from "fastify";
 
-import { get } from "node:http";
+import { randomUUID } from "node:crypto";
+import { get, type IncomingMessage } from "node:http";
 
-import { registerAppLifecycle, registerAppRoutes, stopRemoteExecution } from "./app-bootstrap.js";
+import {
+  FASTIFY_SHUTDOWN_OPTIONS,
+  registerAppLifecycle,
+  registerAppRoutes,
+  stopRemoteExecution
+} from "./app-bootstrap.js";
 import { createTestConfig } from "./test-helpers/test-config.js";
 import { FakeDatabase } from "./test-helpers/fake-database.js";
 import type { Pool } from "./lib/db.js";
@@ -19,6 +25,10 @@ import type { DeepAgentsRuntimeFactory } from "./services/deep-agents/deep-agent
 import { testRuntimePolicy } from "./test-helpers/test-runtime-policy.js";
 import { generateRuntimeToken, runtimeTokenExpiry } from "./services/auth/runtime-token.js";
 import { devDataRoutes } from "./test-helpers/data-routes.js";
+import { registerSessionRoutes } from "./routes/sessions.js";
+import { registerLocalAuthRoutes } from "./routes/auth-local.js";
+import { SHUTDOWN_STAGE_MS } from "./lib/shutdown-budget.js";
+import type { LocalAuth } from "./services/auth/local-auth.js";
 
 type AppDependencies = ReturnType<typeof buildAppDependencies>;
 
@@ -74,6 +84,24 @@ test("shutdown closes the app, maintenance and turn control pools", async () => 
   expect(closed).toEqual(["app", "maintenance", "turn control"]);
 });
 
+test("shutdown stops waiting when the turn control pool does not close", async () => {
+  const app = Fastify();
+  app.decorate("db", { end: async () => {} } as unknown as Pool);
+  const end = vi.fn(() => new Promise<void>(() => {}));
+  registerAppLifecycle({
+    app,
+    config: createTestConfig(),
+    limits: { sweepExpired: () => {} } as AppDependencies["limits"],
+    policyService: { close: async () => {} } as AppDependencies["policyService"],
+    runtimeAdapter: { close: async () => {} } as AppDependencies["runtimeAdapter"],
+    turnControlDb: { end },
+    shutdownStageMs: { cleanup: 5 },
+    schedulerWorker: null
+  });
+  await app.close();
+  expect(end).toHaveBeenCalledOnce();
+});
+
 test("shutdown refuses new turns, interrupts a stuck turn, and saves its status before closing the database", async () => {
   const app = Fastify();
   const events: string[] = [];
@@ -92,7 +120,7 @@ test("shutdown refuses new turns, interrupts a stuck turn, and saves its status 
     } as unknown as AppDependencies["runtimeAdapter"],
     activeTurns,
     messages: { markInterruptedIfActive: async () => { events.push("message"); } },
-    turnDrainWaitMs: 5,
+    shutdownStageMs: { turnWait: 5, turnInterrupt: 5 },
     schedulerWorker: null
   });
   await app.ready();
@@ -120,8 +148,7 @@ test("shutdown waits for scheduled jobs before and after the runtimes close", as
     limits: { sweepExpired: () => {} } as AppDependencies["limits"],
     policyService: { close: async () => {} } as AppDependencies["policyService"],
     runtimeAdapter: { close: async () => { events.push("runtime"); } } as unknown as AppDependencies["runtimeAdapter"],
-    turnDrainWaitMs: 5,
-    schedulerDrainWaitMs: 40,
+    shutdownStageMs: { schedulerDrain: 5, schedulerSettle: 40 },
     schedulerWorker: schedulerWorker as never
   });
   await app.ready();
@@ -172,8 +199,8 @@ test("the lease sweep also closes orphaned replies, and the runtime owner sweep 
   }
 });
 
-async function createRouteTestApp() {
-  const app = Fastify();
+async function createRouteTestApp(options: FastifyServerOptions = {}) {
+  const app = Fastify(options);
 
   app.decorate("config", createTestConfig({ LOCAL_DEV_USER_ID: "admin-user" }));
   app.decorate("db", new FakeDatabase() as unknown as Pool);
@@ -303,7 +330,7 @@ async function createRouteTestApp() {
       async listTenantMembers() { return []; },
       async setUserBetaTester() { return null; }
     },
-    limits: {},
+    limits: { consumeRateLimit: async () => null },
     artifactStorage: {},
     artifactProcessor: {},
     runtimeAdapter: {
@@ -421,8 +448,8 @@ test("registerAppRoutes wires health, admin, and settings endpoints", async () =
   await app.close();
 });
 
-test("app gateway accepts tokens issued by adapter creation and capability refresh", async () => {
-  const { app, deps } = await createRouteTestApp();
+/** A managed MCP server, and runtime tokens that a real adapter issued for it. */
+async function gatewayFixture(app: Awaited<ReturnType<typeof createRouteTestApp>>["app"], deps: AppDependencies) {
   const server = { id: "managed-session-context", description: "Session context", mode: "managed" as const,
     routePath: "/mcp/managed-session-context", upstreamUrl: null, transportKind: "http" as const,
     version: 1, hash: "server-v1" };
@@ -463,8 +490,16 @@ test("app gateway accepts tokens issued by adapter creation and capability refre
   generation += 1;
   await adapter.createSession(actor);
   expect(outgoing).toHaveLength(2);
-  await registerAppRoutes(app, deps, { dataRoutes: devDataRoutes() });
   const payload = { jsonrpc: "2.0", id: 1, method: "initialize", params: {} };
+  const wrongKeyToken = generateRuntimeToken({ tid: actor.tenantId, uid: actor.userId,
+    sid: actor.sessionId, rid: session.runtimeId, exp: runtimeTokenExpiry(60_000) }, app.config.DATA_ENCRYPTION_SECRET);
+  return { server, payload, outgoing, lookup, actor, wrongAuthorization: `Bearer ${wrongKeyToken}` };
+}
+
+test("app gateway accepts tokens issued by adapter creation and capability refresh", async () => {
+  const { app, deps } = await createRouteTestApp();
+  const { server, payload, outgoing, lookup, actor, wrongAuthorization } = await gatewayFixture(app, deps);
+  await registerAppRoutes(app, deps, { dataRoutes: devDataRoutes() });
   for (const authorization of outgoing) {
     const response = await app.inject({ method: "POST", url: server.routePath, remoteAddress: "127.0.0.1",
       headers: { authorization }, payload });
@@ -472,10 +507,8 @@ test("app gateway accepts tokens issued by adapter creation and capability refre
     expect(response.json().result.protocolVersion).toBeTruthy();
     expect(lookup).toHaveBeenLastCalledWith(actor.tenantId, server.id, actor.userId);
   }
-  const wrongKeyToken = generateRuntimeToken({ tid: actor.tenantId, uid: actor.userId,
-    sid: actor.sessionId, rid: session.runtimeId, exp: runtimeTokenExpiry(60_000) }, app.config.DATA_ENCRYPTION_SECRET);
   const denied = await app.inject({ method: "POST", url: server.routePath, remoteAddress: "127.0.0.1",
-    headers: { authorization: `Bearer ${wrongKeyToken}` }, payload });
+    headers: { authorization: wrongAuthorization }, payload });
   expect(denied.statusCode).toBe(401);
   expect(lookup).toHaveBeenCalledTimes(2);
 });
@@ -529,5 +562,242 @@ describe("remote Stop", () => {
     const noTurn = remoteStopDeps({ runtimeTurn: false });
     await stopRemoteExecution(noTurn.deps, signal);
     expect(noTurn.interruptTurn).not.toHaveBeenCalled();
+  });
+});
+
+/** Opens a GET stream and resolves at its first chunk. */
+async function openStream(url: string): Promise<{ response: IncomingMessage; ended: Promise<void>; body: () => string }> {
+  const chunks: string[] = [];
+  const response = await new Promise<IncomingMessage>((resolve, reject) => {
+    get(url, resolve).on("error", reject);
+  });
+  const ended = new Promise<void>((resolve) => {
+    response.on("end", resolve);
+    response.on("close", resolve);
+  });
+  await new Promise<void>((resolve) => {
+    response.on("data", (chunk: Buffer) => {
+      chunks.push(chunk.toString());
+      resolve();
+    });
+  });
+  return { response, ended, body: () => chunks.join("") };
+}
+
+/** Deps with which POST /messages reaches its drain check for `sessionId`. */
+async function prepareMessageRoute(deps: AppDependencies, activeTurns: ActiveTurnsRegistry) {
+  const sessionId = randomUUID();
+  const tenantSettings = await deps.dynamicConfig.getOrCreateTenantSettings("admin-tenant");
+  deps.dynamicConfig.getOrCreateTenantSettings = async () => ({
+    ...tenantSettings, enabledProviders: ["anthropic", "openai", "google"], enabledModelIds: null, modelDefaultEfforts: {}
+  }) as never;
+  Object.assign(deps, {
+    activeTurns,
+    providerCredentials: { hasKey: async () => true },
+    customModels: { list: async () => [] },
+    sessions: {
+      getReadable: async () => ({
+        sessionId, userId: "admin-user", status: "active", purpose: "normal",
+        transcriptFormat: "current", sessionName: "Chat"
+      })
+    }
+  });
+  return sessionId;
+}
+
+function httpClient(address: string) {
+  return (url: string, body?: unknown, headers: Record<string, string> = {}) => fetch(`${address}${url}`, body === undefined
+    ? { method: "GET" }
+    : { method: "POST", headers: { "content-type": "application/json", ...headers }, body: JSON.stringify(body) });
+}
+
+describe("graceful shutdown", () => {
+  test("while turns drain, the gateway answers with its authentication and POST /messages refuses new turns", async () => {
+    const { app, deps } = await createRouteTestApp(FASTIFY_SHUTDOWN_OPTIONS);
+    const { server, payload, outgoing, wrongAuthorization } = await gatewayFixture(app, deps);
+    const activeTurns = new ActiveTurnsRegistry();
+    activeTurns.mark("draining-session", { tenantId: "admin-tenant", userId: "admin-user" });
+    const sessionId = await prepareMessageRoute(deps, activeTurns);
+    await registerAppRoutes(app, deps, { dataRoutes: devDataRoutes() });
+    registerAppLifecycle({
+      app,
+      config: app.config,
+      limits: { sweepExpired: () => {} } as AppDependencies["limits"],
+      policyService: { close: async () => {} } as AppDependencies["policyService"],
+      runtimeAdapter: { close: async () => {} } as unknown as AppDependencies["runtimeAdapter"],
+      activeTurns,
+      // The running turn keeps the drain open until the test ends it.
+      shutdownStageMs: { turnWait: 10_000 },
+      schedulerWorker: null
+    });
+    const post = httpClient(await app.listen({ host: "127.0.0.1", port: 0 }));
+
+    const closed = app.close();
+    try {
+      await vi.waitFor(() => expect(activeTurns.isDraining()).toBe(true));
+
+      // A real loopback request, as the runtime of a draining turn sends it.
+      const gateway = await post(server.routePath, payload, { authorization: outgoing[1]! });
+      expect(gateway.status).toBe(200);
+      expect((await gateway.json()).result.protocolVersion).toBeTruthy();
+      const denied = await post(server.routePath, payload, { authorization: wrongAuthorization });
+      expect(denied.status).toBe(401);
+      await denied.text();
+
+      const message = await post("/messages", { sessionId, text: "hello" });
+      expect(message.status).toBe(503);
+      expect(await message.json()).toMatchObject({ error: "server_draining" });
+    } finally {
+      activeTurns.clear("draining-session");
+      await closed;
+    }
+  });
+
+  test("with local login and email, the drain starts before the wait for password resets, and the resets end before the pools close", async () => {
+    const events: string[] = [];
+    const { app, deps } = await createRouteTestApp(FASTIFY_SHUTDOWN_OPTIONS);
+    vi.spyOn(app.db, "end").mockImplementation(async () => { events.push("database"); });
+    const { server, payload, outgoing } = await gatewayFixture(app, deps);
+    const activeTurns = new ActiveTurnsRegistry();
+    const sessionId = await prepareMessageRoute(deps, activeTurns);
+    let finishReset!: () => void;
+    const requestPasswordReset = vi.fn(() => new Promise<string>((resolve) => {
+      finishReset = () => {
+        events.push("reset");
+        resolve("sent");
+      };
+    }));
+    const mailConfig = createTestConfig({
+      AUTH_MODE: "jwt", AUTH_LOGIN_TYPES: ["local"], SMTP_URL: "smtps://smtp.example.test", MAIL_FROM: "no-reply@example.test"
+    });
+    // The order of app.ts: auth routes, app routes, then the lifecycle.
+    const { passwordResets } = await registerLocalAuthRoutes(app, {
+      db: app.db,
+      config: mailConfig,
+      auditEvents: deps.auditEvents,
+      localAuth: { accounts: { requestPasswordReset } } as unknown as LocalAuth
+    });
+    await registerAppRoutes(app, deps, { dataRoutes: devDataRoutes() });
+    const resetWait = vi.spyOn(passwordResets!, "drain");
+    registerAppLifecycle({
+      app,
+      config: app.config,
+      limits: { sweepExpired: () => {} } as AppDependencies["limits"],
+      policyService: { close: async () => {} } as AppDependencies["policyService"],
+      runtimeAdapter: { close: async () => {} } as unknown as AppDependencies["runtimeAdapter"],
+      activeTurns,
+      passwordResets,
+      schedulerWorker: null
+    });
+    const request = httpClient(await app.listen({ host: "127.0.0.1", port: 0 }));
+    const forgot = (email: string) => request("/auth/local/password/forgot", { email }, { origin: mailConfig.API_ORIGIN });
+
+    expect((await forgot("a@example.com")).status).toBe(202);
+    await vi.waitFor(() => expect(requestPasswordReset).toHaveBeenCalledTimes(1));
+
+    const closed = app.close();
+    try {
+      // The shutdown waits for the pending reset, with the production limit.
+      await vi.waitFor(() => expect(resetWait).toHaveBeenCalledWith(SHUTDOWN_STAGE_MS.passwordResets));
+      expect(activeTurns.isDraining()).toBe(true);
+
+      const message = await request("/messages", { sessionId, text: "hello" });
+      expect(message.status).toBe(503);
+      expect(await message.json()).toMatchObject({ error: "server_draining" });
+      const ready = await request("/ready");
+      expect(ready.status).toBe(503);
+      await ready.text();
+      const gateway = await request(server.routePath, payload, { authorization: outgoing[1]! });
+      expect(gateway.status).toBe(200);
+      expect((await gateway.json()).result.protocolVersion).toBeTruthy();
+      // The same answer, but the shutdown started no new work.
+      expect((await forgot("b@example.com")).status).toBe(202);
+      expect(requestPasswordReset).toHaveBeenCalledTimes(1);
+      expect(events).toEqual([]);
+    } finally {
+      finishReset();
+      await closed;
+    }
+    expect(events).toEqual(["reset", "database"]);
+  });
+
+  test("app.close ends a viewer stream of a turn on another replica, disconnects its reader, and runs the cleanup", async () => {
+    const events: string[] = [];
+    const app = Fastify(FASTIFY_SHUTDOWN_OPTIONS);
+    app.decorate("config", createTestConfig());
+    app.decorate("db", { end: async () => { events.push("database"); } } as unknown as Pool);
+    app.addHook("onRequest", async (request) => {
+      request.auth = { userId: "user-1", tenantId: "tenant-1", isAdmin: false, role: "member" };
+    });
+    // A reader blocked in XREAD until it disconnects, as with ioredis: the
+    // turn runs on another replica and sends no event.
+    const readers: Array<{ disconnects: number; fail?: (error: Error) => void }> = [];
+    const turnBus = {
+      replay: vi.fn(async () => []),
+      reader: () => {
+        const reader = {
+          disconnects: 0,
+          fail: undefined as ((error: Error) => void) | undefined,
+          disconnect() {
+            reader.disconnects += 1;
+            reader.fail?.(new Error("Connection is closed."));
+          }
+        };
+        readers.push(reader);
+        return reader;
+      },
+      waitForEvents: vi.fn((reader: (typeof readers)[number]) =>
+        new Promise<never>((_resolve, reject) => { reader.fail = reject; })),
+      publishStop: vi.fn()
+    };
+    const executions = {
+      currentOwner: vi.fn(async () => ({ executionId: "execution-remote" })),
+      stop: vi.fn(),
+      stopAndGetOwner: vi.fn()
+    };
+    const sessionId = randomUUID();
+    await registerSessionRoutes(app, {
+      sessions: {
+        getReadable: async () => ({ sessionId, userId: "user-1", status: "active", transcriptFormat: "current" })
+      },
+      messages: { listBySession: async () => ({ messages: [], hasMore: false }) },
+      activeTurns: new ActiveTurnsRegistry(),
+      executions,
+      turnBus
+    } as never);
+    registerAppLifecycle({
+      app,
+      config: app.config,
+      limits: { sweepExpired: () => {} } as AppDependencies["limits"],
+      policyService: { close: async () => { events.push("policy"); } } as AppDependencies["policyService"],
+      runtimeAdapter: { close: async () => { events.push("runtime"); } } as unknown as AppDependencies["runtimeAdapter"],
+      schedulerWorker: null
+    });
+    const address = await app.listen({ host: "127.0.0.1", port: 0 });
+    const stream = await openStream(`${address}/sessions/${sessionId}/connect`);
+    try {
+      await vi.waitFor(() => expect(turnBus.waitForEvents).toHaveBeenCalled());
+      expect(app.sseConnections.size).toBe(1);
+
+      const started = Date.now();
+      await app.close();
+
+      // Without the stream registry, server.close() waits for this stream
+      // as long as the remote turn runs, and onClose never runs.
+      expect(Date.now() - started).toBeLessThan(2_000);
+      await stream.ended;
+      expect(stream.body()).toContain("RUN_FINISHED");
+      expect(readers).toHaveLength(1);
+      expect(readers[0]!.disconnects).toBeGreaterThan(0);
+      expect(events).toEqual(["runtime", "policy", "database"]);
+      expect(app.sseConnections.size).toBe(0);
+      // Only the viewer closed: the turn on the other replica is not stopped.
+      expect(executions.stop).not.toHaveBeenCalled();
+      expect(executions.stopAndGetOwner).not.toHaveBeenCalled();
+      expect(turnBus.publishStop).not.toHaveBeenCalled();
+    } finally {
+      stream.response.destroy();
+      await app.close();
+    }
   });
 });

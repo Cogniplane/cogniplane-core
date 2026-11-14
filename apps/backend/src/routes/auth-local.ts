@@ -60,8 +60,6 @@ const CHALLENGE_COOKIE_ATTRIBUTES = { httpOnly: true, secure: true, sameSite: "n
 // Forgot-password requests handled after their answer, per process. The
 // per-IP limit comes first; past this many waiting, a request is dropped.
 const FORGOT_MAX_PENDING = 32;
-// Shutdown waits this long for them, before the database pools close.
-const FORGOT_DRAIN_MS = 5_000;
 
 function requestMeta(request: FastifyRequest): RequestMeta {
   return { ipAddress: request.ip, userAgent: request.headers["user-agent"] ?? null };
@@ -111,6 +109,16 @@ function isLocalSession(request: FastifyRequest): boolean {
   return request.auth?.session?.authSource === "local";
 }
 
+/** Work of the local-auth routes that the app shutdown must wait for. */
+export type LocalAuthRoutes = {
+  /**
+   * Forgot-password requests answered but not yet handled; null without
+   * email. The app lifecycle closes and drains them (stage passwordResets in
+   * lib/shutdown-budget.ts) before the database pools close.
+   */
+  passwordResets: BoundedTasks | null;
+};
+
 export async function registerLocalAuthRoutes(
   app: FastifyInstance,
   {
@@ -127,7 +135,7 @@ export async function registerLocalAuthRoutes(
     limits?: RequestLimitsInterface;
     localAuth: LocalAuth;
   }
-): Promise<void> {
+): Promise<LocalAuthRoutes> {
   const { accounts, mfa, passkeys, challenges, flows, throttle, stepUp, refreshTokens } = localAuth;
 
   /**
@@ -373,15 +381,10 @@ export async function registerLocalAuthRoutes(
   // every address and goes out before any lookup, so neither its body nor
   // its time shows whether an account exists. The work (lookup, link, email
   // in the outbox) runs after it.
+  let passwordResets: BoundedTasks | null = null;
   if (isPasswordRecoveryEnabled(config)) {
     const recoveryTasks = new BoundedTasks(FORGOT_MAX_PENDING);
-    // preClose runs before the onClose hook that ends the pools.
-    app.addHook("preClose", async () => {
-      recoveryTasks.close();
-      if (!(await recoveryTasks.drain(FORGOT_DRAIN_MS))) {
-        app.log.warn("local auth: password reset requests still running at shutdown");
-      }
-    });
+    passwordResets = recoveryTasks;
     app.post("/auth/local/password/forgot", async (request, reply) => {
       const body = await guardPublic<{ email: string }>(request, reply, ForgotPasswordRequestSchema);
       if (!body) return reply;
@@ -732,7 +735,7 @@ export async function registerLocalAuthRoutes(
     return reply.send({ ok: true });
   });
   // Passkey routes exist only when passkeys are on (WEBAUTHN_RP_ID is set).
-  if (!passkeys) return;
+  if (!passkeys) return { passwordResets };
   const passkeyService = passkeys;
 
   /** Stores a public ceremony's challenge; the browser keeps only its id, in a cookie. */
@@ -1074,4 +1077,6 @@ export async function registerLocalAuthRoutes(
       throw error;
     }
   });
+
+  return { passwordResets };
 }

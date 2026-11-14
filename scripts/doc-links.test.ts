@@ -3,6 +3,8 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 import { expect, it } from "vitest";
 
+import { SHUTDOWN_DEADLINE_MS } from "../apps/backend/src/lib/shutdown-budget.js";
+
 // Every relative Markdown link must name a file that exists, and a `#anchor`
 // on a Markdown file must name one of its headings (GitHub slug rules).
 const root = path.resolve(__dirname, "..");
@@ -330,7 +332,7 @@ it("puts a blank line before each heading", () => {
 // longer.
 it("keeps the shutdown numbers in step with SHUTDOWN_DEADLINE_MS", () => {
   const read = (file: string) => readFileSync(path.join(root, file), "utf8");
-  const deadlineMs = Number(/SHUTDOWN_DEADLINE_MS = ([\d_]+)/.exec(read("apps/backend/src/server.ts"))?.[1]?.replace(/_/g, ""));
+  const deadlineMs = SHUTDOWN_DEADLINE_MS;
   expect(deadlineMs).toBeGreaterThan(0);
   const stated = Number(/`SHUTDOWN_DEADLINE_MS` \((\d+) seconds\)/.exec(read("docs/operations.md").replace(/\s+/g, " "))?.[1]);
   expect(stated * 1000).toBe(deadlineMs);

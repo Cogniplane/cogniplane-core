@@ -1,6 +1,7 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { isCorsOriginAllowed } from "./cors.js";
 import { STATIC_SECURITY_HEADERS } from "./security-headers.js";
+import { sseConnectionsOf } from "./sse-connections.js";
 
 export function openSseResponse(app: FastifyInstance, request: FastifyRequest, reply: FastifyReply): void {
   reply.hijack();
@@ -19,4 +20,8 @@ export function openSseResponse(app: FastifyInstance, request: FastifyRequest, r
   reply.raw.setHeader("Cache-Control", "no-store, no-cache, no-transform");
   reply.raw.setHeader("Connection", "keep-alive");
   reply.raw.flushHeaders();
+  // The shutdown closes tracked responses after the turn drain. After that, a
+  // new response closes at once; the stream writer then sees it closed and
+  // stops.
+  sseConnectionsOf(app)?.track(reply.raw);
 }

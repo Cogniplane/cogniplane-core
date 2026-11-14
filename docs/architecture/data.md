@@ -352,6 +352,20 @@ environment its own Redis database: `tenant:delete --flush-redis` flushes it
 | Turn event streams and stop signals | `services/turn-coordination-bus.ts` | Another replica cannot replay a running turn. A stop still takes effect: the database fences the turn at once, and the owner replica aborts it at its next heartbeat ([reconnect and stop](runtime.md#reconnect-and-stop)) |
 | Policy rule cache invalidation (pub/sub) | `services/policy/policy-cache-invalidation.ts` | Other replicas keep cached rules until `ruleCacheTtlMs` |
 
+The two pub/sub channels, turn stop and policy cache invalidation, follow one
+rule (`lib/redis-subscription.ts`). Each has the fallback in the table above,
+so a missed message only makes a change arrive later:
+
+- Startup waits for the first subscribe attempt up to
+  `SUBSCRIBE_ATTEMPT_TIMEOUT_MS`, then continues also when it failed.
+- A failed attempt logs one warning and closes its connection. The next attempt
+  starts after a delay that doubles from `SUBSCRIBE_RETRY_MIN_MS` up to
+  `SUBSCRIBE_RETRY_MAX_MS`. One attempt runs at a time.
+- After a successful subscribe, ioredis reconnects and subscribes again by
+  itself.
+- The shutdown closes the subscription, also during an attempt, and no attempt
+  starts after it.
+
 A command of the shared client (`lib/redis.ts`) waits at most
 `REDIS_COMMAND_TIMEOUT_MS` (2 seconds), also while it waits for a reconnect.
 Without this limit, a half-open connection after a failover kept each command

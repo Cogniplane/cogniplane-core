@@ -22,7 +22,7 @@ import { MemberRemovedError } from "../services/tenant-member-removal.js";
 import { clientIpKey, enforceRateLimit } from "../services/rate-limit-reply.js";
 import type { LocalAuth } from "../services/auth/local-auth.js";
 import type { RequestLimitsInterface } from "../services/request-limits.js";
-import { registerLocalAuthRoutes } from "./auth-local.js";
+import { type LocalAuthRoutes, registerLocalAuthRoutes } from "./auth-local.js";
 import {
   createRefreshTokenRotationService,
   issueSession,
@@ -79,7 +79,10 @@ type AuthRouteDeps = {
   workos?: WorkOS;
 };
 
-export async function registerAuthRoutes(app: FastifyInstance, deps: AuthRouteDeps): Promise<void> {
+/** Work of the auth routes for the app lifecycle; see LocalAuthRoutes. */
+export type AuthRoutes = LocalAuthRoutes;
+
+export async function registerAuthRoutes(app: FastifyInstance, deps: AuthRouteDeps): Promise<AuthRoutes> {
   const { config, integrationDescriptors = new IntegrationRegistry() } = deps;
 
   // Register callbacks from this app's integration services.
@@ -101,7 +104,7 @@ export async function registerAuthRoutes(app: FastifyInstance, deps: AuthRouteDe
   switch (config.AUTH_MODE) {
     case "dev-headers":
       // Identity comes from request headers; there is no session to manage.
-      return;
+      return { passwordResets: null };
     case "jwt": {
       const refreshTokens = createRefreshTokenRotationService(app);
       await registerSessionRoutes(app, { ...deps, refreshTokens });
@@ -110,7 +113,7 @@ export async function registerAuthRoutes(app: FastifyInstance, deps: AuthRouteDe
       }
       if (isLoginTypeEnabled(config, "local")) {
         if (!deps.localAuth || !deps.appDb) throw new Error("Local login is enabled but its services are not wired.");
-        await registerLocalAuthRoutes(app, {
+        return registerLocalAuthRoutes(app, {
           db: deps.appDb,
           config,
           auditEvents: deps.auditEvents,
@@ -118,7 +121,7 @@ export async function registerAuthRoutes(app: FastifyInstance, deps: AuthRouteDe
           localAuth: deps.localAuth
         });
       }
-      return;
+      return { passwordResets: null };
     }
     default: {
       const unknownMode: never = config.AUTH_MODE;

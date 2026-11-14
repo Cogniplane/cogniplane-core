@@ -61,9 +61,18 @@ export class SseWriter {
     await this.waitForDrain();
   }
 
+  /**
+   * Ends the stream. The response closes when its last bytes are sent. A
+   * client that does not read keeps them unsent, so after the drain deadline
+   * the connection closes as a stalled one.
+   */
   end(): void {
     if (this.isClosed) return;
     this.raw.end();
+    if (this.closed) return;
+    const timer = setTimeout(() => this.closeStalledConnection(), this.drainDeadlineMs);
+    timer.unref?.();
+    this.onCloseCallbacks.add(() => clearTimeout(timer));
   }
 
   /** Resolves on drain, on close, or at the deadline, whichever comes first. */

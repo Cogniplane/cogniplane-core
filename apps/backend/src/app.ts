@@ -4,7 +4,7 @@ import cors from "@fastify/cors";
 import cookie from "@fastify/cookie";
 import multipart from "@fastify/multipart";
 
-import { registerAppLifecycle, registerAppRoutes } from "./app-bootstrap.js";
+import { FASTIFY_SHUTDOWN_OPTIONS, registerAppLifecycle, registerAppRoutes } from "./app-bootstrap.js";
 import { buildAppDependencies, buildSchedulerWorker } from "./app-dependencies.js";
 import { SessionExecutionStore } from "./services/session-execution-store.js";
 import { RuntimeSessionStore } from "./services/runtime/runtime-session-store.js";
@@ -22,6 +22,7 @@ import { createDatabase, createMaintenanceDatabase, createTurnControlDatabase } 
 import { assertApplicationRole, assertMaintenanceRole } from "./lib/maintenance-db.js";
 import { getRedis } from "./lib/redis.js";
 import { sanitizeUrl } from "./lib/sanitize-url.js";
+import { registerSseConnections } from "./lib/sse-connections.js";
 import { apiError } from "./lib/http-errors.js";
 import { registerTenantInFlightLimit, TenantInFlightLimiter } from "./lib/tenant-in-flight-limiter.js";
 import { registerSecurityHeaders } from "./lib/security-headers.js";
@@ -161,6 +162,7 @@ export async function buildApp() {
     throw new Error("MAINTENANCE_DATABASE_URL is required for runtime maintenance.");
   }
   const app = Fastify({
+    ...FASTIFY_SHUTDOWN_OPTIONS,
     // Sets `request.ip` from X-Forwarded-For, per the proxy topology, so logs and
     // rate limits see the client and not the load balancer. This does not affect
     // /mcp admission, which checks the raw socket peer for loopback.
@@ -217,6 +219,8 @@ export async function buildApp() {
 
   app.decorate("config", config);
   app.decorate("db", createDatabase(config, app.log));
+  // Before the routes, so every route instance shares the app's registry.
+  registerSseConnections(app);
 
   const privilegedDb = createMaintenanceDatabase(config.MAINTENANCE_DATABASE_URL, app.log);
   // Lease renewal and tool-context checks of running turns: same role as the
@@ -366,7 +370,9 @@ export async function buildApp() {
     )
   });
 
-  await registerAuthRoutes(app, {
+  // The auth routes add no shutdown hook. Their pending work goes to
+  // registerAppLifecycle, which waits for it after the drain started.
+  const authRoutes = await registerAuthRoutes(app, {
     db: config.AUTH_MODE === "jwt" ? privilegedDb : app.db,
     appDb: app.db,
     localAuth,
@@ -418,6 +424,7 @@ export async function buildApp() {
     privilegedDb,
     turnControlDb,
     schedulerWorker,
+    passwordResets: authRoutes.passwordResets,
     // Cross-tenant mail queue: the maintenance pool sees every tenant's
     // outbox. Runs in jwt mode even when email is off, to clean up.
     mailWorker: buildMailWorker(config, privilegedDb, app.log),

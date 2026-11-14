@@ -150,7 +150,7 @@ docker run --rm -e DATABASE_URL=... -e MAINTENANCE_DATABASE_URL=... \
 
 # 2. Backend (port 3001). --stop-timeout: see the shutdown note in operations.md.
 #    Local storage: keep the volume and the two roots; with a bucket, drop them.
-docker run -d --env-file backend.env -p 3001:3001 --stop-timeout 40 \
+docker run -d --env-file backend.env -p 3001:3001 --stop-timeout 60 \
   -v cogniplane-data:/var/lib/cogniplane \
   -e ARTIFACT_STORAGE_ROOT=/var/lib/cogniplane/artifacts \
   -e SKILL_BUNDLE_STORAGE_ROOT=/var/lib/cogniplane/skills \

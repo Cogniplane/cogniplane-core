@@ -81,3 +81,22 @@ test.each(["/health", "/ready"])("%s returns a bare status without build, uptime
     await app.close();
   }
 });
+
+test("readiness reports unavailable during the shutdown, and liveness stays ok", async () => {
+  const query = vi.fn().mockResolvedValue({ rows: [{ "?column?": 1 }] });
+  const app = Fastify();
+  app.decorate("db", { query } as unknown as Pool);
+  let draining = false;
+  await registerHealthRoutes(app, { isDraining: () => draining });
+  await app.ready();
+  try {
+    expect((await app.inject("/ready")).statusCode).toBe(200);
+    draining = true;
+    const ready = await app.inject("/ready");
+    expect(ready.statusCode).toBe(503);
+    expect(ready.json()).toEqual({ status: "unavailable" });
+    expect((await app.inject("/health")).statusCode).toBe(200);
+  } finally {
+    await app.close();
+  }
+});

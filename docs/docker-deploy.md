@@ -111,7 +111,7 @@ store them as you store the database.
   boot. `compose.yaml` sets `NODE_ENV=development` on `backend` and `migrate`
   for this local stack only.
 - Artifacts and skill bundles use local storage in `backend-data`.
-- The backend has `stop_grace_period: 40s`, longer than its shutdown deadline
+- The backend has `stop_grace_period: 60s`, longer than its shutdown deadline
   ([shutdown](operations.md#upgrade)).
 
 ## Troubleshooting

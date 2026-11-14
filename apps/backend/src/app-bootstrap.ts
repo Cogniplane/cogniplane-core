@@ -6,6 +6,12 @@ import type { FastifyInstance } from "fastify";
 import type { AppConfig } from "./config.js";
 import { runtimeTokenSecret } from "./lib/derived-secrets.js";
 import { closeRedis } from "./lib/redis.js";
+import {
+  SHUTDOWN_STAGE_MS,
+  type ShutdownStageMs,
+  waitWithinBudget
+} from "./lib/shutdown-budget.js";
+import { registerSseConnections } from "./lib/sse-connections.js";
 import { buildAdminRouteStores, registerAdminRoutes } from "./routes/admin.js";
 import type { DataRouteControl } from "./services/data-route-control.js";
 import { buildApprovalRouteStores, registerApprovalRoutes } from "./routes/approvals.js";
@@ -36,6 +42,7 @@ import type { StopSignal } from "./services/turn-coordination-bus.js";
 import { buildApiKeyPresenceCheckers } from "./services/runtime/api-key-presence.js";
 import type { SchedulerWorker } from "./services/scheduler-worker.js";
 import type { MailOutboxWorker } from "./services/mail/mail-outbox-worker.js";
+import type { BoundedTasks } from "./lib/bounded-tasks.js";
 import {
   sweepStaleApprovals,
   type StaleApprovalSweeperDeps
@@ -44,6 +51,15 @@ import {
   sweepStaleAssistantMessages,
   type StaleMessageSweeperDeps
 } from "./services/runtime/stale-message-sweeper.js";
+
+/**
+ * Fastify options for the shutdown. By default Fastify answers 503 to every
+ * request from the start of close(), before the preClose drain. Turns that
+ * drain still call the MCP gateway over loopback, and users still approve and
+ * stop them. POST /messages refuses new turns itself (`server_draining`), and
+ * /ready reports the drain to the load balancer.
+ */
+export const FASTIFY_SHUTDOWN_OPTIONS = { return503OnClosing: false } as const;
 
 // How often expired in-memory rate-limit windows are removed.
 const RATE_LIMIT_SWEEP_INTERVAL_MS = 60_000;
@@ -77,14 +93,17 @@ export async function registerAppRoutes(
   routeControls: { dataRoutes: DataRouteControl }
 ): Promise<void> {
   if (deps.turnBus) {
-    await deps.turnBus.subscribeStop(signal => {
+    const turnBus = deps.turnBus;
+    // Register the cleanup first: a close during the subscribe attempt, or a
+    // later failure of this function, must still close the subscription.
+    app.addHook("onClose", async () => { turnBus.close(); });
+    await turnBus.subscribeStop(signal => {
       void stopRemoteExecution(deps, signal).catch(err => {
         app.log.warn({ err, sessionId: signal.sessionId }, "Failed to process remote Stop");
       });
     });
-    app.addHook("onClose", () => deps.turnBus!.close());
   }
-  await registerHealthRoutes(app);
+  await registerHealthRoutes(app, { isDraining: () => deps.activeTurns?.isDraining() ?? false });
   const { hasProviderKey, configuredProviders } = buildApiKeyPresenceCheckers({
     credentials: deps.providerCredentials
   });
@@ -163,16 +182,16 @@ export function registerAppLifecycle(input: {
   runtimeAdapter: AppDependencies["runtimeAdapter"];
   activeTurns?: AppDependencies["activeTurns"];
   messages?: Pick<AppDependencies["messages"], "markInterruptedIfActive">;
-  /** Shorter drain wait for lifecycle tests. */
-  turnDrainWaitMs?: number;
-  // Wait for aborted scheduled jobs to write their outcome before the pools close.
-  schedulerDrainWaitMs?: number;
+  /** Shorter stage limits for lifecycle tests. Production uses SHUTDOWN_STAGE_MS. */
+  shutdownStageMs?: Partial<ShutdownStageMs>;
   privilegedDb?: { end: () => Promise<void> } | null;
   /** The turn control pool; closed with the other pools. */
   turnControlDb?: { end: () => Promise<void> } | null;
   schedulerWorker: SchedulerWorker | null;
   /** Sends and cleans email_outbox; null in dev-headers mode. */
   mailWorker?: MailOutboxWorker | null;
+  /** Answered forgot-password requests (registerAuthRoutes); null without email. */
+  passwordResets?: Pick<BoundedTasks, "close" | "drain"> | null;
   /**
    * Cross-tenant stale-approval recovery. Backed by the privileged store so the
    * sweep spans all tenants. Optional only so tests can omit it; production
@@ -204,17 +223,18 @@ export function registerAppLifecycle(input: {
     runtimeAdapter,
     activeTurns,
     messages,
-    turnDrainWaitMs = 5_000,
-    schedulerDrainWaitMs = 15_000,
     privilegedDb,
     turnControlDb,
     schedulerWorker,
     mailWorker,
+    passwordResets,
     staleApprovalSweeper,
     staleMessageSweeper,
     expiredExecutions,
     runtimeOwners
   } = input;
+  const stageMs: ShutdownStageMs = { ...SHUTDOWN_STAGE_MS, ...input.shutdownStageMs };
+  const sseConnections = registerSseConnections(app);
 
   schedulerWorker?.start(config.SCHEDULER_POLL_INTERVAL_MS);
   mailWorker?.start();
@@ -274,67 +294,116 @@ export function registerAppLifecycle(input: {
     messageSweepInterval.unref();
   }
 
+  // The shutdown runs in stages, each with a limit from SHUTDOWN_STAGE_MS.
+  // The hard deadline of server.ts (SHUTDOWN_DEADLINE_MS) is their sum plus a
+  // margin, so every await below has a limit. Fastify runs preClose
+  // while the server still listens, and buildApp turns off its 503 for
+  // requests during the close (return503OnClosing). So the MCP gateway,
+  // approvals and Stop keep working while turns drain; POST /messages refuses
+  // new turns through activeTurns.
+  //
+  // Every shutdown wait of the app is in this one hook, so the drain starts
+  // before any wait and every wait has a stage in SHUTDOWN_STAGE_MS. Fastify
+  // runs root preClose hooks in registration order, and the routes register
+  // before this function. So a route module must not add its own preClose
+  // hook: it gives its pending work to this function (as passwordResets).
+  let httpCloseTimer: ReturnType<typeof setTimeout> | undefined;
   app.addHook("preClose", async () => {
     activeTurns?.beginDrain();
     schedulerWorker?.stop();
     mailWorker?.stop();
+    passwordResets?.close();
     clearInterval(sweepInterval);
     clearInterval(executionSweepInterval);
     clearInterval(runtimeOwnerInterval);
     if (approvalSweepInterval) clearInterval(approvalSweepInterval);
     if (messageSweepInterval) clearInterval(messageSweepInterval);
-    const waitForTurns = async (budgetMs: number) => {
-      const deadline = Date.now() + budgetMs;
+    const waitForTurns = async (deadline: number) => {
       while (activeTurns?.snapshot().size && Date.now() < deadline) {
         await new Promise<void>((resolve) => setTimeout(resolve, 100));
       }
     };
-    await waitForTurns(turnDrainWaitMs);
+    await waitForTurns(Date.now() + stageMs.turnWait);
     const running = activeTurns?.runningOwners() ?? [];
     if (running.length) {
+      const deadline = Date.now() + stageMs.turnInterrupt;
       for (const owner of running) activeTurns?.requestCancel(owner.sessionId, owner.tenantId);
-      await Promise.all(running.map((owner) => runtimeAdapter.interruptTurn(owner).catch((err) => {
+      const interrupts = Promise.all(running.map((owner) => runtimeAdapter.interruptTurn(owner).catch((err) => {
         app.log.warn({ err, sessionId: owner.sessionId }, "Failed to interrupt turn during shutdown");
       })));
-      await waitForTurns(turnDrainWaitMs);
+      if (!(await waitWithinBudget(interrupts, stageMs.turnInterrupt))) {
+        app.log.warn("Turn interrupts did not return within the shutdown limit");
+      }
+      await waitForTurns(deadline);
     }
-    for (const owner of activeTurns?.runningOwners() ?? []) {
+    const unfinished = (activeTurns?.runningOwners() ?? []).flatMap((owner) => {
       const turn = activeTurns?.identity(owner.sessionId);
-      if (!turn) continue;
-      await messages?.markInterruptedIfActive(owner.tenantId, turn.messageId, owner.userId).catch((err) => {
-        app.log.error({ err, sessionId: owner.sessionId }, "Failed to mark draining turn interrupted");
-      });
+      return turn ? [{ owner, messageId: turn.messageId }] : [];
+    });
+    if (messages && unfinished.length) {
+      const marks = Promise.all(unfinished.map(({ owner, messageId }) =>
+        messages.markInterruptedIfActive(owner.tenantId, messageId, owner.userId).catch((err) => {
+          app.log.error({ err, sessionId: owner.sessionId }, "Failed to mark draining turn interrupted");
+        })));
+      if (!(await waitWithinBudget(marks, stageMs.markInterrupted))) {
+        app.log.error("Interrupted turns were not all saved within the shutdown limit");
+      }
     }
-    // Scheduled turns are not in activeTurns. Let them finish within the same
-    // budget, then abort the rest with the runtimes and wait again, so their
+    // An open SSE response keeps server.close() waiting, and a viewer of a
+    // turn on another replica stays open as long as that turn runs. The turns
+    // of this process have ended or are interrupted now, so end every stream.
+    // A stream opened after this point closes at once.
+    await sseConnections.close(stageMs.streamClose);
+    // Scheduled turns are not in activeTurns. Let them finish within their
+    // limit, then abort the rest with the runtimes and wait again, so their
     // outcome writes finish before onClose closes the database pools.
-    if (schedulerWorker && !(await schedulerWorker.drain(turnDrainWaitMs))) {
+    if (schedulerWorker && !(await schedulerWorker.drain(stageMs.schedulerDrain))) {
       app.log.warn("Scheduled jobs still running at shutdown; aborting them with the runtimes");
     }
     schedulerWorker?.refuseNewTurns();
-    await runtimeAdapter.close();
+    if (!(await waitWithinBudget(runtimeAdapter.close(), stageMs.runtimeClose))) {
+      app.log.error("Runtimes did not close within the shutdown limit");
+    }
     // An aborted job still flushes usage (up to USAGE_FLUSH_DEADLINE_MS) and then
-    // writes its transcript and outcome, so this wait has its own, longer budget.
-    if (schedulerWorker && !(await schedulerWorker.drain(schedulerDrainWaitMs))) {
+    // writes its transcript and outcome, so this wait has its own, longer limit.
+    if (schedulerWorker && !(await schedulerWorker.drain(stageMs.schedulerSettle))) {
       app.log.error("Scheduled jobs did not settle after their runtimes closed; the next start marks their runs orphaned");
+    }
+    // A forgot-password request was answered before its work ran. The work
+    // reads accounts and puts the email in the outbox, so it needs the pools.
+    if (passwordResets && !(await passwordResets.drain(stageMs.passwordResets))) {
+      app.log.warn("Password reset requests still running at shutdown");
     }
     // A message still sending keeps its claim; the claim expires and another
     // process sends it again (at least once).
-    if (mailWorker && !(await mailWorker.drain(turnDrainWaitMs))) {
+    if (mailWorker && !(await mailWorker.drain(stageMs.mailDrain))) {
       app.log.warn("Mail outbox pass still running at shutdown; its claims expire and are sent again later");
     }
     mailWorker?.close();
+    // Fastify calls server.close() after this hook. It waits for the requests
+    // in progress; at the limit, close their connections so onClose runs.
+    httpCloseTimer = setTimeout(() => {
+      app.log.warn("HTTP requests still open at the shutdown limit; closing their connections");
+      app.server.closeAllConnections();
+    }, stageMs.httpClose);
+    httpCloseTimer.unref();
   });
 
   app.addHook("onClose", async () => {
-    await policyService.close();
-    await closeRedis();
-    await app.db.end();
-    if (privilegedDb && privilegedDb !== app.db) {
-      await privilegedDb.end();
-    }
-    if (turnControlDb && turnControlDb !== app.db) {
-      await turnControlDb.end();
+    clearTimeout(httpCloseTimer);
+    const cleanup = (async () => {
+      await policyService.close();
+      await closeRedis();
+      await app.db.end();
+      if (privilegedDb && privilegedDb !== app.db) {
+        await privilegedDb.end();
+      }
+      if (turnControlDb && turnControlDb !== app.db) {
+        await turnControlDb.end();
+      }
+    })();
+    if (!(await waitWithinBudget(cleanup, stageMs.cleanup))) {
+      app.log.error("Redis and database connections did not close within the shutdown limit");
     }
   });
 }

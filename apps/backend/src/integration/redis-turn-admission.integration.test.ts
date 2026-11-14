@@ -129,7 +129,7 @@ describe.skipIf(!adminDatabaseUrl() || !process.env.INTEGRATION_REDIS_URL)("turn
   test("the turn event reader waits its full block time, and the shared client stops a blocking read at its own limit", async () => {
     const config = createTestConfig({ REDIS_URL: process.env.INTEGRATION_REDIS_URL });
     const redis = getRedis(config)!;
-    const bus = new TurnCoordinationBus(redis);
+    const bus = new TurnCoordinationBus(redis, { warn: () => {} });
     const reader = bus.reader();
     onTestFinished(() => { reader.disconnect(); });
     expect(reader.options.commandTimeout).toBe(READER_COMMAND_TIMEOUT_MS);

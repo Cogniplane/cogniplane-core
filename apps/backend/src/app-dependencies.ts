@@ -52,7 +52,7 @@ export function buildAppDependencies(input: {
     stores,
     managedToolCatalog
   });
-  const turnBus = bootstrap.redis ? new TurnCoordinationBus(bootstrap.redis) : undefined;
+  const turnBus = bootstrap.redis ? new TurnCoordinationBus(bootstrap.redis, logger) : undefined;
   // Policy Center — runtime rule engine. Redis pub/sub evicts cached rule sets
   // across replicas after admin mutations; the short TTL remains a fallback
   // for local deployments and transient Redis disconnects.
