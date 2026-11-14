@@ -194,7 +194,7 @@ describe.skipIf(!adminDatabaseUrl())("ApprovalStore.getDecided", () => {
       await superuserPool().query("UPDATE approvals SET expires_at = NOW() - INTERVAL '1 minute' WHERE approval_id = $1",
         [h.approvalId]);
     }
-    if (state === "expired") expect(await store.expire(h.tenantId, h.approvalId)).not.toBeNull();
+    if (state === "expired") expect(await store.expire(h.tenantId, h.approvalId, "turn_interrupted")).not.toBeNull();
 
     expect(await store.getDecided(h.tenantId, h.approvalId, h.editorId)).toBeNull();
   });

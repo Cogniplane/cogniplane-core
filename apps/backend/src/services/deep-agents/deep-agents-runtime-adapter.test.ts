@@ -3265,6 +3265,9 @@ describe("approval bookkeeping failures (R10, R56)", () => {
             writes += 1;
             if (writes === 1) throw new Error("connection terminated");
             return null;
+          },
+          async getDecided() {
+            return null;
           }
         } as never,
         auditEvents: fakeAuditEventStore,

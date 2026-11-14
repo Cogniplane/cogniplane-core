@@ -315,23 +315,36 @@ describe.skipIf(!adminDatabaseUrl())("audit events commit with their change", ()
            FROM sessions WHERE tenant_id = $1 AND session_id = $2`, [tenantId, sessionId])).rows[0]!;
         return { ...row, executionCurrent: execution ? await executions.isCurrent(execution) : null };
       };
+      const lease = async () => execution ? (await superuserPool().query<{ status: string; stop_reason: string | null }>(
+        `SELECT status, stop_reason FROM session_executions WHERE tenant_id = $1 AND execution_id = $2`,
+        [tenantId, execution.executionId])).rows[0] : null;
+      /** The turn ends: the lease is finished and the saved sandbox stays. */
+      const endTurn = async () => { if (execution) await executions.release(execution); };
       const events = async (type: string) =>
         (await auditRows(tenantId, { type })).filter((row) => row.session_id === sessionId);
       const send = (method: "POST" | "DELETE", action?: "archive" | "restore") =>
         app.inject({ method, url: action ? `/sessions/${sessionId}/${action}` : `/sessions/${sessionId}` });
       const failEvents = (type: string) =>
         fault(`NEW.event_type = ${sqlText(type)} AND NEW.session_id = ${sqlText(sessionId)}`);
-      return { tenantId, userId, sessionId, state, events, send, failEvents, abortSession, destroySandbox };
+      return { tenantId, userId, sessionId, state, lease, endTurn, events, send, failEvents, abortSession, destroySandbox };
     }
 
-    test("a failed archive or restore event keeps the status, the sandbox and the lease", async () => {
+    test("a failed archive or restore event keeps the status, the sandbox and the lease record", async () => {
       const c = await chatRoutes();
-      const active = { status: "active", sandbox_id: "sandbox-one", archived: false, deleted: false, executionCurrent: true };
+      // Archive needs an idle session: a live turn refuses it before any write.
+      expect((await c.send("POST", "archive")).statusCode).toBe(409);
+      expect(await c.state()).toMatchObject({ status: "active", sandbox_id: "sandbox-one", executionCurrent: true });
+      expect(await c.events("session.archived")).toEqual([]);
+      await c.endTurn();
+      const active = { status: "active", sandbox_id: "sandbox-one", archived: false, deleted: false, executionCurrent: false };
+      const finished = { status: "finished", stop_reason: null };
       expect(await c.state()).toEqual(active);
+      expect(await c.lease()).toEqual(finished);
 
       let removeFault = await c.failEvents("session.archived");
       expect((await c.send("POST", "archive")).statusCode).toBe(500);
       expect(await c.state()).toEqual(active);
+      expect(await c.lease()).toEqual(finished);
       expect(await c.events("session.archived")).toEqual([]);
       expect(c.destroySandbox).not.toHaveBeenCalled();
 
@@ -341,6 +354,7 @@ describe.skipIf(!adminDatabaseUrl())("audit events commit with their change", ()
       expect(archived.json().session.status).toBe("archived");
       const afterArchive = { status: "archived", sandbox_id: null, archived: true, deleted: false, executionCurrent: false };
       expect(await c.state()).toEqual(afterArchive);
+      expect(await c.lease()).toEqual(finished);
       expect(c.destroySandbox).toHaveBeenCalledExactlyOnceWith({ tenantId: c.tenantId, sessionId: c.sessionId, sandboxId: "sandbox-one" });
       // A retry changes nothing and writes no second event.
       expect((await c.send("POST", "archive")).statusCode).toBe(200);
