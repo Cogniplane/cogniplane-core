@@ -92,6 +92,7 @@ export function buildAppDependencies(input: {
     db,
     stores,
     artifactStorage: bootstrap.artifactStorage,
+    storageGc: bootstrap.storageGc,
     tenantOrgSettingsPrivileged: bootstrap.tenantOrgSettingsPrivileged,
     redis: bootstrap.redis,
     extractPdfText,
@@ -187,6 +188,7 @@ export function buildAppDependencies(input: {
     managedToolFactoryRegistry,
     limits: bootstrap.limits,
     artifactStorage: bootstrap.artifactStorage,
+    storageGc: bootstrap.storageGc,
     artifactProcessor: bootstrap.artifactProcessor,
     runtimeAdapter: deepAgentsAdapter,
     // The same adapter exposed concretely for the admin/health routes that

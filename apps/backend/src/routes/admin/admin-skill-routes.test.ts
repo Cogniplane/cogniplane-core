@@ -131,6 +131,7 @@ function createFakeDynamicConfig(
         dryRun: false,
         deletedRevisionIds: [],
         deletedBundleStorageUris: [],
+        pendingBundleStorageUris: [],
         keptRevisionDecisions: [],
         failures: []
       };

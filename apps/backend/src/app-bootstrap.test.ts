@@ -235,7 +235,7 @@ async function createRouteTestApp() {
         throw new Error("Not implemented in test.");
       },
       async cleanupInactiveSkillRevisions() {
-        return { dryRun: false, deletedRevisionIds: [], deletedBundleStorageUris: [], keptRevisionDecisions: [], failures: [] };
+        return { dryRun: false, deletedRevisionIds: [], deletedBundleStorageUris: [], pendingBundleStorageUris: [], keptRevisionDecisions: [], failures: [] };
       },
       async listMcpServers() {
         return [];

@@ -19,7 +19,8 @@ import { SkillConfigStore } from "../services/skills/skill-config-store.js";
 import { importSkillBundleFromInline, importSkillBundleFromZip } from "../services/skills/skill-import-service.js";
 import { cleanupInactiveSkillRevisions } from "../services/skills/skill-revision-cleanup-service.js";
 import { SkillRevisionStore } from "../services/skills/skill-revision-store.js";
-import { adminDatabaseUrl, appPool, superuserPool } from "./support/database.js";
+import { StorageGc } from "../services/storage/storage-gc.js";
+import { adminDatabaseUrl, appPool, maintenancePool, superuserPool } from "./support/database.js";
 import { seedTenantGraph } from "./support/fixtures.js";
 
 // Skill bundle import and cleanup against a real database, with local storage
@@ -427,6 +428,21 @@ describe.skipIf(!adminDatabaseUrl())("skill bundle import", () => describe.each(
 
 const retention = { SKILL_BUNDLE_RETENTION_DAYS: 30 };
 
+function bundleGc(storage: SkillBundleStorage) {
+  return new StorageGc({
+    maintenanceDb: maintenancePool(),
+    artifactStorage: { delete: async () => { throw new Error("no artifact in this test"); } },
+    skillBundleStorage: storage
+  });
+}
+
+async function queuedBundles(tenantId: string) {
+  return (await superuserPool().query<{ storage_uri: string; attempts: number; last_error: string | null }>(
+    "SELECT storage_uri, attempts, last_error FROM skill_bundle_storage_gc WHERE tenant_id = $1 ORDER BY storage_uri",
+    [tenantId]
+  )).rows;
+}
+
 /** Skill with an old inactive revision of bytes X and an active latest revision of bytes Y. */
 async function seedCleanupCandidate(backend: Backend) {
   const target = await seed();
@@ -445,7 +461,8 @@ async function seedCleanupCandidate(backend: Backend) {
     config: retention,
     skills: target.skills,
     skillRevisions: target.revisions,
-    skillBundleStorage: storage,
+    // The production queue and reference check, on the maintenance pool.
+    bundleGc: bundleGc(storage),
     dryRun
   });
   return { target, name, oldArchive, old, current, cleanup };
@@ -493,9 +510,10 @@ describe.skipIf(!adminDatabaseUrl())("skill revision cleanup", () => describe.ea
     expect(await backend.stored()).toEqual(before);
   });
 
-  test("a storage failure is reported, and a retry neither repeats it nor touches the active bundle", async () => {
+  test("a failed bundle delete keeps the URI queued, and the next cleanup deletes it without touching the active bundle", async () => {
     const backend = await create();
     const candidate = await seedCleanupCandidate(backend);
+    const oldUri = candidate.old.revision.bundleStorageUri!;
     const failing: SkillBundleStorage = {
       backend: backend.storage.backend,
       storeBundle: (input) => backend.storage.storeBundle(input),
@@ -505,17 +523,80 @@ describe.skipIf(!adminDatabaseUrl())("skill revision cleanup", () => describe.ea
 
     const report = await candidate.cleanup(failing);
 
-    // The row goes first; the bytes it named stay when the storage delete fails.
-    expect(report.deletedRevisionIds).toEqual([candidate.old.revision.skillRevisionId]);
-    expect(report.deletedBundleStorageUris).toEqual([]);
-    expect(report.failures.map((failure) => failure.skillRevisionId)).toEqual([candidate.old.revision.skillRevisionId]);
+    // The row goes; the URI it named stays queued when the storage delete fails.
+    expect(report).toMatchObject({
+      deletedRevisionIds: [candidate.old.revision.skillRevisionId],
+      deletedBundleStorageUris: [],
+      pendingBundleStorageUris: [oldUri],
+      failures: []
+    });
     expect((await revisionRows(candidate.target.tenantId, candidate.name)).map((row) => row.id))
       .toEqual([candidate.current.revision.skillRevisionId]);
-    expect(await backend.stored()).toContain(candidate.old.revision.bundleStorageUri);
+    expect(await backend.stored()).toContain(oldUri);
+    expect(await queuedBundles(candidate.target.tenantId)).toEqual([
+      { storage_uri: oldUri, attempts: 1, last_error: "injected storage failure" }
+    ]);
 
+    // An admin runs cleanup again; the queued URI is retried at once.
     const retry = await candidate.cleanup(backend.storage);
 
-    expect(retry).toMatchObject({ deletedRevisionIds: [], deletedBundleStorageUris: [], failures: [] });
+    expect(retry).toMatchObject({
+      deletedRevisionIds: [], deletedBundleStorageUris: [oldUri], pendingBundleStorageUris: [], failures: []
+    });
+    expect(await backend.stored()).toEqual([candidate.current.revision.bundleStorageUri]);
+    expect(await queuedBundles(candidate.target.tenantId)).toEqual([]);
     expect(await readNotes(backend.storage, candidate.current.revision.bundleStorageUri!)).toBe("Current notes.");
+  });
+
+  test("a process stop after the revision delete keeps the URI queued, and the worker drain deletes it", async () => {
+    const backend = await create();
+    const candidate = await seedCleanupCandidate(backend);
+    const oldUri = candidate.old.revision.bundleStorageUri!;
+    // The process stops between the delete commit and the bundle delete.
+    const stopped = {
+      collectSkillBundle: async () => { throw new Error("process stopped"); },
+      retryTenantSkillBundles: async () => new Map()
+    };
+    await expect(cleanupInactiveSkillRevisions({
+      tenantId: candidate.target.tenantId, config: retention, skills: candidate.target.skills,
+      skillRevisions: candidate.target.revisions, bundleGc: stopped
+    })).rejects.toThrow("process stopped");
+    expect(await revisionRows(candidate.target.tenantId, candidate.name))
+      .toEqual([{ id: candidate.current.revision.skillRevisionId, uri: candidate.current.revision.bundleStorageUri }]);
+    expect((await queuedBundles(candidate.target.tenantId)).map((row) => row.storage_uri)).toEqual([oldUri]);
+
+    // A new process. The row keeps the lease of the stopped attempt until it ends.
+    const restarted = bundleGc(backend.storage);
+    await restarted.drain();
+    expect(await backend.stored()).toContain(oldUri);
+    await superuserPool().query(
+      "UPDATE skill_bundle_storage_gc SET next_attempt_at = NOW() WHERE tenant_id = $1", [candidate.target.tenantId]);
+    await restarted.drain();
+
+    expect(await backend.stored()).toEqual([candidate.current.revision.bundleStorageUri]);
+    expect(await queuedBundles(candidate.target.tenantId)).toEqual([]);
+  });
+
+  test("a queued bundle that a revision of another tenant names stays, and its queue row goes", async () => {
+    const backend = await create();
+    const candidate = await seedCleanupCandidate(backend);
+    const oldUri = candidate.old.revision.bundleStorageUri!;
+    const other = await seed();
+    const otherName = uniqueName("shares");
+    const sharing = await importZip(other, backend.storage, await bundleArchive(otherName), `${otherName}.zip`);
+    // Point the other tenant's revision at the same stored bundle.
+    await superuserPool().query(
+      "UPDATE admin_skill_revisions SET bundle_storage_uri = $2 WHERE skill_revision_id = $1",
+      [sharing.revision.skillRevisionId, oldUri]);
+
+    const report = await candidate.cleanup(backend.storage);
+
+    expect(report).toMatchObject({
+      deletedRevisionIds: [candidate.old.revision.skillRevisionId],
+      deletedBundleStorageUris: [],
+      pendingBundleStorageUris: []
+    });
+    expect(await backend.stored()).toContain(oldUri);
+    expect(await queuedBundles(candidate.target.tenantId)).toEqual([]);
   });
 }));

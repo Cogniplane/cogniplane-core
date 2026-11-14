@@ -8,6 +8,12 @@ import { SessionExecutionError, sessionBusySql, sessionExecutionBusySql } from "
 import type { PoolClient } from "pg";
 import { sessionReadAccessSql, sessionTrashAccessSql } from "./session-access.js";
 import type { ArtifactStorage } from "./artifacts/artifact-storage.js";
+import {
+  type ArtifactObjectGcRow,
+  claimArtifactObjectGc,
+  collectArtifactObject,
+  enqueueSessionStorageGc,
+} from "./storage/storage-gc.js";
 import { AuditEventStore, type AuditEventInput } from "./audit-event-store.js";
 import { uuidv7 } from "../lib/uuid.js";
 import { isoTimestamp, utcMicrosText } from "../lib/db-mappers.js";
@@ -129,12 +135,6 @@ export type SessionLifecycleTransition = {
  */
 export type SessionLifecycleAudit = (transition: SessionLifecycleTransition) => AuditEventInput;
 
-type SessionStorageGcRow = {
-  tenant_id: string;
-  session_id: string;
-  storage_key: string;
-};
-
 type SessionRuntimeGcRow = {
   tenant_id: string;
   session_id: string;
@@ -146,7 +146,7 @@ type SessionPurgeCandidate = SessionRuntimeGcRow;
 type CommittedSessionPurge = {
   deletedSessions: number;
   releasedSandboxes: Array<{ tenantId: string; sessionId: string; sandboxId: string }>;
-  storageGc: SessionStorageGcRow[];
+  storageGc: ArtifactObjectGcRow[];
   runtimeGc: SessionRuntimeGcRow[];
 };
 
@@ -792,11 +792,11 @@ export class SessionStore {
         [candidate.tenant_id, candidate.session_id],
       );
       for (const artifact of artifacts.rows) {
-        await db.query(
-          `INSERT INTO session_storage_gc (tenant_id, session_id, storage_key)
-           VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
-          [candidate.tenant_id, candidate.session_id, artifact.storage_key],
-        );
+        await enqueueSessionStorageGc(db, {
+          tenantId: candidate.tenant_id,
+          sessionId: candidate.session_id,
+          storageKey: artifact.storage_key,
+        });
       }
       await db.query(
         `INSERT INTO session_runtime_gc (tenant_id, session_id, user_id)
@@ -836,24 +836,7 @@ export class SessionStore {
     db: PoolClient,
     limit: number,
   ): Promise<Pick<CommittedSessionPurge, "storageGc" | "runtimeGc">> {
-    const storageGc = await db.query<SessionStorageGcRow>(
-      `WITH candidates AS (
-         SELECT tenant_id, session_id, storage_key
-         FROM session_storage_gc
-         WHERE next_attempt_at <= NOW()
-         ORDER BY next_attempt_at, created_at, tenant_id, session_id, storage_key
-         LIMIT $1
-         FOR UPDATE SKIP LOCKED
-       )
-       UPDATE session_storage_gc AS gc
-       SET attempts=gc.attempts+1, next_attempt_at=NOW() + INTERVAL '1 hour'
-       FROM candidates
-       WHERE gc.tenant_id=candidates.tenant_id
-         AND gc.session_id=candidates.session_id
-         AND gc.storage_key=candidates.storage_key
-       RETURNING gc.tenant_id, gc.session_id, gc.storage_key`,
-      [limit],
-    );
+    const storageGc = await claimArtifactObjectGc(db, "session_storage_gc", limit);
     const runtimeGc = await db.query<SessionRuntimeGcRow>(
       `WITH candidates AS (
          SELECT tenant_id, session_id, user_id
@@ -870,7 +853,7 @@ export class SessionStore {
        RETURNING gc.tenant_id, gc.session_id, gc.user_id`,
       [limit],
     );
-    return { storageGc: storageGc.rows, runtimeGc: runtimeGc.rows };
+    return { storageGc, runtimeGc: runtimeGc.rows };
   }
 
   /** After the commit: deletes the leased objects and threads, then kills the released sandboxes. */
@@ -880,51 +863,10 @@ export class SessionStore {
     options: SessionTrashCleanupOptions,
   ): Promise<SessionCleanupResult> {
     let deletedObjects = 0;
+    // The reference check reads every tenant: one object can have
+    // references in more than one tenant (storage-references.ts).
     for (const pending of committed.storageGc) {
-      const refs = await this.maintenanceDb.query(
-        // Storage keys are global object pointers and may be referenced by any
-        // tenant. Download-token rows cascade with their artifact/session, so
-        // artifact rows and project-file versions are the durable references.
-        `SELECT 1 FROM project_file_versions
-           WHERE storage_key=$1
-         UNION ALL SELECT 1 FROM artifacts
-           WHERE storage_key=$1 AND status <> 'deleted'
-         LIMIT 1`,
-        [pending.storage_key],
-      );
-      if (refs.rowCount) {
-        await this.maintenanceDb.query(
-          `DELETE FROM session_storage_gc
-           WHERE tenant_id=$1 AND session_id=$2 AND storage_key=$3`,
-          [pending.tenant_id, pending.session_id, pending.storage_key],
-        );
-        continue;
-      }
-      try {
-        await storage.delete(pending.storage_key);
-        const removed = await this.maintenanceDb.query(
-          `DELETE FROM session_storage_gc
-           WHERE tenant_id=$1 AND session_id=$2 AND storage_key=$3
-             AND NOT EXISTS (
-               SELECT 1 FROM project_file_versions
-               WHERE storage_key=$3
-             )
-             AND NOT EXISTS (
-               SELECT 1 FROM artifacts
-               WHERE storage_key=$3 AND status <> 'deleted'
-             )`,
-          [pending.tenant_id, pending.session_id, pending.storage_key],
-        );
-        deletedObjects += removed.rowCount ?? 0;
-      } catch (error) {
-        await this.maintenanceDb.query(
-          `UPDATE session_storage_gc
-           SET next_attempt_at=NOW() + LEAST(INTERVAL '1 hour', INTERVAL '1 minute' * power(2, LEAST(attempts, 6))),
-               last_error=$4
-           WHERE tenant_id=$1 AND session_id=$2 AND storage_key=$3`,
-          [pending.tenant_id, pending.session_id, pending.storage_key, error instanceof Error ? error.message : String(error)],
-        );
-      }
+      if (await collectArtifactObject(this.maintenanceDb, storage, pending) === "deleted") deletedObjects += 1;
     }
 
     let purgedRuntimes = 0;

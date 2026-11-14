@@ -399,6 +399,7 @@ export async function buildApp() {
     sessionTrash: deps.sessions,
     scheduledSessions: deps.sessions,
     sessionStorage: deps.artifactStorage,
+    storageGc: deps.storageGc,
     logger: app.log
   });
 

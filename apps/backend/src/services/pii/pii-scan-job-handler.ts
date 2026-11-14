@@ -1,10 +1,10 @@
-import type { ArtifactStorage } from "../artifacts/artifact-storage.js";
 import type {
   ArtifactPiiDetail,
   ArtifactRecord,
   ArtifactStore
 } from "../artifacts/artifact-store.js";
 import type { AuditEventStore } from "../audit-event-store.js";
+import type { StorageGc, StorageGcOutcome } from "../storage/storage-gc.js";
 import type { MessagePiiDetail, MessageStore } from "../message-store.js";
 import type { PiiImportScopeRegistry } from "./pii-import-scopes.js";
 import type {
@@ -58,6 +58,7 @@ type ArtifactPiiStoreCapability = {
     artifactId: string
   ): Promise<Pick<ArtifactRecord, "storageKey" | "status"> | null>;
   setPiiDetail: ArtifactStore["setPiiDetail"];
+  rejectStoredObject: ArtifactStore["rejectStoredObject"];
 };
 
 export type PiiScanJobHandlerDeps = {
@@ -66,8 +67,8 @@ export type PiiScanJobHandlerDeps = {
   piiScanJobs: PiiScanJobStoreCapability;
   messages: Pick<MessageStore, "setPiiDetail">;
   artifacts: ArtifactPiiStoreCapability;
-  /** Deletes stored object bytes on a block so they don't persist. */
-  storage: Pick<ArtifactStorage, "delete">;
+  /** Deletes the object that a block queued; a failure stays queued for the worker. */
+  storageGc: Pick<StorageGc, "collectArtifactObject">;
   subjectReader: PiiScanSubjectReader;
   // `createSystemEvent` records an event for a job with no source user.
   auditEvents?: Pick<AuditEventStore, "create" | "hasPiiScanRunEvent"> &
@@ -75,6 +76,16 @@ export type PiiScanJobHandlerDeps = {
   logger: PiiScanJobLogger;
   importScopes?: Pick<PiiImportScopeRegistry, "findBySubjectKind">;
 };
+
+type SubjectDetail = {
+  status: "scanned" | "blocked" | "transformed" | "failed";
+  modeApplied: PiiScanMode;
+  policyRevision?: number;
+  blockReason?: string;
+  findingsCount?: number;
+} & ImageCoverageDetail;
+
+type RejectedObjectCleanup = { objectDeleted: boolean; objectCleanup: StorageGcOutcome };
 
 export class PiiScanJobHandler {
   constructor(private readonly deps: PiiScanJobHandlerDeps) {}
@@ -341,19 +352,21 @@ export class PiiScanJobHandler {
     }
 
     if (action === "block") {
-      // Purge stored bytes BEFORE the terminal status flip (same ordering as the
-      // sync enqueuer) so a `blocked` row never coexists with a silent orphan.
-      // Artifacts only — messages have no stored object. A resumed block
-      // deletes again: a delete of a missing object succeeds.
-      const objectDeleted = await this.purgeBlockedObject(job, auditOptions);
-
-      await this.writeSubjectDetail(job, {
-        status: "blocked",
+      const blocked = {
+        status: "blocked" as const,
         ...policy,
         blockReason: decision.blockReason,
         findingsCount: findings.length,
         ...coverage
-      });
+      };
+      // Same order as the sync enqueuer. For an artifact, the `blocked`
+      // verdict and the queued object delete commit together, so no failure
+      // after this point loses the key. A resumed block queues and deletes
+      // again: a delete of a missing object succeeds. Messages have no
+      // stored object.
+      let cleanup: RejectedObjectCleanup | undefined;
+      if (job.subjectType === "artifact") cleanup = await this.rejectStoredObject(job, blocked, auditOptions);
+      else await this.writeSubjectDetail(job, blocked);
       await this.emitAudit(job, "pii_blocked", {
         scanRunId: job.scanRunId,
         ...recorded,
@@ -363,7 +376,8 @@ export class PiiScanJobHandler {
         providerType,
         providerModel,
         blockReason: decision.blockReason,
-        objectDeleted
+        objectDeleted: cleanup?.objectDeleted,
+        objectCleanup: cleanup?.objectCleanup
       }, auditOptions);
       await this.deps.piiScanRuns.update(job.tenantId, job.scanRunId, {
         status: "blocked", ...recorded, actionTaken: "block", findings,
@@ -398,38 +412,42 @@ export class PiiScanJobHandler {
   }
 
   /**
-   * Best-effort delete of an artifact's stored bytes on a block. Re-fetches the
-   * CURRENT backend + key via ArtifactStore.get rather than trusting the job's
-   * frozen payload: a re-upload/migration could have changed the key or backend,
-   * and a missing/already-deleted row means there's nothing to purge (idempotent
-   * re-run). Returns undefined for messages (no object) or when the row is gone,
-   * true on delete, false on a delete failure (escalated to a queryable audit).
+   * Blocks an artifact and gives up its object: `rejectStoredObject` writes
+   * the verdict, and queues the key that the row holds now (not the job's
+   * frozen payload: a re-upload or a migration can change it), in one
+   * transaction. Then this call tries the delete; a failure stays queued for
+   * the worker. Undefined when the row is gone or deleted: nothing to
+   * release, and the verdict has no row to go to.
    */
-  private async purgeBlockedObject(
+  private async rejectStoredObject(
     job: PiiScanJobRecord,
+    detail: SubjectDetail,
     auditOptions: { once: boolean }
-  ): Promise<boolean | undefined> {
-    if (job.subjectType !== "artifact") return undefined;
-
-    const artifact = await this.deps.artifacts.get(job.tenantId, job.subjectId);
-    if (!artifact || artifact.status === "deleted") return undefined;
-
-    try {
-      await this.deps.storage.delete(artifact.storageKey);
-      return true;
-    } catch (error) {
+  ): Promise<RejectedObjectCleanup | undefined> {
+    const released = await this.deps.artifacts.rejectStoredObject(job.tenantId, job.subjectId, {
+      pii: this.artifactDetail(job, detail)
+    });
+    if (!released) return undefined;
+    const outcome = await this.deps.storageGc.collectArtifactObject({
+      queue: "session_storage_gc",
+      tenantId: job.tenantId,
+      ownerId: released.sessionId,
+      storageKey: released.storageKey
+    });
+    if (outcome === "pending") {
       this.deps.logger.error(
-        { err: error, tenantId: job.tenantId, artifactId: job.subjectId, jobId: job.jobId },
-        "Failed to delete stored object for PII-blocked artifact"
+        { tenantId: job.tenantId, artifactId: job.subjectId, jobId: job.jobId },
+        "Failed to delete stored object for PII-blocked artifact; it stays queued for retry"
       );
       await this.emitAudit(job, "pii_block_object_orphaned", {
         scanRunId: job.scanRunId,
         subjectType: "artifact",
         subjectId: job.subjectId,
-        storageKey: artifact.storageKey
+        storageKey: released.storageKey,
+        retry: "queued"
       }, auditOptions);
-      return false;
     }
+    return { objectDeleted: outcome === "deleted", objectCleanup: outcome };
   }
 
   private async emitAudit(
@@ -474,16 +492,7 @@ export class PiiScanJobHandler {
     }
   }
 
-  private async writeSubjectDetail(
-    job: PiiScanJobRecord,
-    detail: {
-      status: "scanned" | "blocked" | "transformed" | "failed";
-      modeApplied: PiiScanMode;
-      policyRevision?: number;
-      blockReason?: string;
-      findingsCount?: number;
-    } & ImageCoverageDetail
-  ): Promise<void> {
+  private async writeSubjectDetail(job: PiiScanJobRecord, detail: SubjectDetail): Promise<void> {
     if (job.subjectType === "message") {
       const pii: MessagePiiDetail = {
         status: detail.status,
@@ -497,6 +506,13 @@ export class PiiScanJobHandler {
       return;
     }
 
+    await this.deps.artifacts.setPiiDetail(job.tenantId, job.subjectId, this.artifactDetail(job, detail));
+  }
+
+  private artifactDetail(
+    job: PiiScanJobRecord,
+    detail: SubjectDetail
+  ): ArtifactPiiDetail {
     const artifactPii: ArtifactPiiDetail = {
       status: detail.status,
       modeApplied: detail.modeApplied,
@@ -513,7 +529,7 @@ export class PiiScanJobHandler {
     if (detail.imageScan !== undefined) artifactPii.imageScan = detail.imageScan;
     if (detail.imagePagesScanned !== undefined) artifactPii.imagePagesScanned = detail.imagePagesScanned;
     if (detail.imagePageCount !== undefined) artifactPii.imagePageCount = detail.imagePageCount;
-    await this.deps.artifacts.setPiiDetail(job.tenantId, job.subjectId, artifactPii);
+    return artifactPii;
   }
 }
 

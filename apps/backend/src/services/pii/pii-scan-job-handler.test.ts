@@ -303,12 +303,21 @@ function buildDeps(overrides: {
         },
         async get() {
           return artifactGet();
+        },
+        // One transaction: the verdict, the release, and the key the row holds now.
+        async rejectStoredObject(tenantId: string, artifactId: string, input: { pii: Record<string, unknown> }) {
+          const current = artifactGet();
+          if (!current || current.status === "deleted") return null;
+          artifactPiiCalls.push({ tenantId, artifactId, pii: input.pii });
+          return { sessionId: "session-1", storageKey: current.storageKey };
         }
       },
-      storage: {
-        async delete(storageKey: string) {
-          if (storageDeleteThrows) throw storageDeleteThrows;
-          deleteCalls.push(storageKey);
+      storageGc: {
+        async collectArtifactObject(row: { storageKey: string }) {
+          // A failed delete stays queued for the worker.
+          if (storageDeleteThrows) return "pending" as const;
+          deleteCalls.push(row.storageKey);
+          return "deleted" as const;
         }
       },
       subjectReader: reader,
@@ -544,6 +553,7 @@ test("PiiScanJobHandler emits pii_blocked audit event for block decisions", asyn
   const payload = auditCalls[0].payload as Record<string, unknown>;
   expect(payload.blockReason).toBe("email");
   expect(payload.objectDeleted).toBe(true);
+  expect(payload.objectCleanup).toBe("deleted");
 });
 
 const blockDecision = {
@@ -579,7 +589,7 @@ test("PiiScanJobHandler does not delete an object for a message block", async ()
   expect(deleteCalls).toEqual([]);
 });
 
-test("PiiScanJobHandler blocks anyway and audits the orphan when delete fails", async () => {
+test("PiiScanJobHandler blocks anyway and keeps the key queued when delete fails", async () => {
   const { deps, auditCalls, updateCalls, setStorageDeleteThrows } = buildDeps({
     decision: blockDecision,
     withAuditEvents: true
@@ -590,11 +600,11 @@ test("PiiScanJobHandler blocks anyway and audits the orphan when delete fails", 
 
   // The block still lands: scan run flipped to blocked.
   expect(updateCalls.some((c) => c.patch.status === "blocked")).toBe(true);
-  // The orphan is queryable, and the pii_blocked payload records objectDeleted:false.
+  // The failure is queryable, and the key stays queued for the worker.
   const orphan = auditCalls.find((a) => a.type === "pii_block_object_orphaned");
-  expect(orphan).toBeTruthy();
+  expect(orphan?.payload).toMatchObject({ retry: "queued" });
   const blocked = auditCalls.find((a) => a.type === "pii_blocked");
-  expect((blocked!.payload as Record<string, unknown>).objectDeleted).toBe(false);
+  expect(blocked!.payload).toMatchObject({ objectDeleted: false, objectCleanup: "pending" });
 });
 
 test("PiiScanJobHandler writes a system audit event when sourceUserId is null", async () => {

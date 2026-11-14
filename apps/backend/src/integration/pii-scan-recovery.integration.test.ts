@@ -171,7 +171,7 @@ describe.skipIf(!adminDatabaseUrl())("PII recovery races", () => {
     const deps: PiiScanJobHandlerDeps = {
       piiScanRuns: runs, piiScanJobs: jobs, artifacts,
       messages: { setPiiDetail: vi.fn() },
-      storage: { delete: vi.fn() },
+      storageGc: { collectArtifactObject: vi.fn(async () => "deleted" as const) },
       piiProtection: { evaluateTextWithPolicy: vi.fn(), evaluateArtifactWithPolicy: vi.fn() },
       subjectReader: { readMessageText: vi.fn(), readArtifact: vi.fn() },
       logger: { error: vi.fn(), warn: vi.fn() }
@@ -201,7 +201,11 @@ describe.skipIf(!adminDatabaseUrl())("PII recovery races", () => {
     expect(b).toBeDefined();
     const deleting = gate();
     const releaseDelete = gate();
-    h.deps.storage.delete = async () => { deleting.resolve(); await releaseDelete.promise; };
+    h.deps.storageGc.collectArtifactObject = async () => {
+      deleting.resolve();
+      await releaseDelete.promise;
+      return "deleted";
+    };
     const handler = new PiiScanJobHandler(h.deps);
     const first = handler.finishFailedJob(a);
     await deleting.promise;

@@ -40,6 +40,7 @@ import type { McpServerStore } from "./mcp-server-store.js";
 import type { SkillConfigStore } from "./skills/skill-config-store.js";
 import type { SkillRevisionStore } from "./skills/skill-revision-store.js";
 import type { SkillBundleStorage } from "./skills/skill-bundle-storage.js";
+import type { StorageGc } from "./storage/storage-gc.js";
 import {
   buildDefaultTenantSettingsInput,
   type TenantSettingsStore,
@@ -90,10 +91,12 @@ type DynamicConfigStores = {
     | "activateSkillRevision"
     | "listAllSkillRevisions"
     | "listActiveRuntimeSkillReferences"
+    | "listAcceptedSubmissionRevisions"
     | "deleteSkillRevision"
-    | "countSkillRevisionsByBundleStorageUri"
     | "importSkillBundle"
   >;
+  /** Deletes the bundles that revision cleanup queues. Revision cleanup refuses to run without it. */
+  storageGc?: Pick<StorageGc, "collectSkillBundle" | "retryTenantSkillBundles">;
   mcpServers: Pick<
     McpServerStore,
     | "listMcpServers"
@@ -369,12 +372,15 @@ export class DynamicConfigService {
   async cleanupInactiveSkillRevisions(tenantId: string, input: {
     dryRun?: boolean;
   }): Promise<SkillRevisionCleanupReport> {
+    if (!this.stores.storageGc) {
+      throw new Error("Skill revision cleanup needs the storage cleanup queue (storageGc).");
+    }
     return cleanupInactiveSkillRevisionsReport({
       tenantId,
       config: this.config,
       skills: this.stores.skills,
       skillRevisions: this.stores.skillRevisions,
-      skillBundleStorage: this.skillBundleStorage,
+      bundleGc: this.stores.storageGc,
       dryRun: input.dryRun
     });
   }

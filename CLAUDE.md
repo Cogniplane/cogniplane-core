@@ -69,7 +69,7 @@ cited file.
 | Local accounts, revocation, MFA, passkeys, operator commands | [local accounts](docs/architecture/local-accounts.md) |
 | SMTP, account emails, email outbox | [email](docs/architecture/email.md) |
 | Step-up, data routes, weaker controls, skill releases, owner notices | [sensitive changes](docs/architecture/sensitive-changes.md) |
-| RLS, [add a tenant table](docs/architecture/data.md#add-a-tenant-table), tenant settings, Redis, retention, audit, usage and feedback, rate limits | [data](docs/architecture/data.md) |
+| RLS, [add a tenant table](docs/architecture/data.md#add-a-tenant-table), tenant settings, Redis, retention, [stored objects and cleanup queues](docs/architecture/data.md#stored-objects), audit, usage and feedback, rate limits | [data](docs/architecture/data.md) |
 | Projects, artifacts, uploads, downloads, workspace sync | [projects and files](docs/architecture/projects-and-files.md) |
 | PII detection, scan jobs, PII policy | [PII protection](docs/architecture/pii.md) |
 | Skills, skill bundles, capability resolution | [skills](docs/architecture/skills.md) |

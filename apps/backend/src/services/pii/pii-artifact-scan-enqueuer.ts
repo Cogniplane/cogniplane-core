@@ -1,6 +1,6 @@
-import type { ArtifactStorage } from "../artifacts/artifact-storage.js";
-import type { ArtifactStore } from "../artifacts/artifact-store.js";
+import type { ArtifactPiiDetail, ArtifactStore } from "../artifacts/artifact-store.js";
 import type { AuditEventStore } from "../audit-event-store.js";
+import type { StorageGc, StorageGcOutcome } from "../storage/storage-gc.js";
 import { piiSubjectForSource, type PiiImportScopeRegistry } from "./pii-import-scopes.js";
 import { PII_POLICY_INVALID_CODE, PII_POLICY_INVALID_MESSAGE } from "./pii-policy.js";
 import type { PiiFinding } from "./pii-provider.js";
@@ -100,9 +100,9 @@ export class PiiArtifactScanEnqueuer {
       importScopes?: Pick<PiiImportScopeRegistry, "findBySubjectKind">;
       piiScanRuns: Pick<PiiScanRunStore, "create" | "update" | "recordDecision">;
       piiScanJobs: Pick<PiiScanJobStore, "enqueueArtifactScan">;
-      artifacts: Pick<ArtifactStore, "setPiiDetail" | "update">;
-      /** Deletes the stored object bytes on a block so they don't persist. */
-      storage: Pick<ArtifactStorage, "delete">;
+      artifacts: Pick<ArtifactStore, "setPiiDetail" | "update" | "rejectStoredObject">;
+      /** Deletes the object that a rejection queued; a failure stays queued for the worker. */
+      storageGc: Pick<StorageGc, "collectArtifactObject">;
       subjectReader: PiiArtifactSubjectReader;
       auditEvents?: Pick<AuditEventStore, "create">;
       logger?: PiiArtifactScanLogger;
@@ -274,11 +274,10 @@ export class PiiArtifactScanEnqueuer {
     scanRunId: string,
     decision: PiiScanRunDecision
   ): Promise<void> {
-    // Purge the stored bytes BEFORE the terminal `blocked` state, so a
-    // terminal status never coexists with a silent orphan: if the delete fails
-    // we record it (objectDeleted:false + orphan audit).
-    const objectDeleted = await this.purgeRejectedObject(input, scanRunId);
-    await this.deps.artifacts.setPiiDetail(input.tenantId, input.artifactId, {
+    // The `blocked` verdict and the queued object delete commit together, so
+    // no failure after this point loses the key. A failure of this write
+    // leaves the recorded decision for recovery.
+    const { objectDeleted, objectCleanup } = await this.rejectStoredObject(input, scanRunId, {
       status: "blocked",
       modeApplied: decision.mode,
       policyRevision: decision.policyRevision,
@@ -298,7 +297,8 @@ export class PiiArtifactScanEnqueuer {
       providerType: decision.providerType,
       providerModel: decision.providerModel,
       blockReason: decision.blockReason,
-      objectDeleted
+      objectDeleted,
+      objectCleanup
     });
     // Record the mode that the evaluation applied. The scan run was created
     // with the routed mode, from the same read.
@@ -315,33 +315,45 @@ export class PiiArtifactScanEnqueuer {
   }
 
   /**
-   * Best-effort delete of the stored object of a rejected upload (a block or a
-   * failed synchronous scan). Returns whether the bytes were purged. Never
-   * throws — the rejection must stand even if cleanup fails; a failure is
-   * escalated to a queryable audit event (`pii_block_object_orphaned`) so the
-   * residual orphan is discoverable.
+   * Rejects the upload and gives up its object (a block, or a permanent scan
+   * error): `ArtifactStore.rejectStoredObject` writes `pii` and queues the
+   * current key in one transaction, then this call tries the delete. The
+   * delete keeps an object that a live row of any tenant still references.
+   * A failed delete stays queued: the scheduler worker retries it, and the
+   * `pii_block_object_orphaned` audit event records the failure.
    */
-  private async purgeRejectedObject(
-    input: EnqueueArtifactPiiScanInput,
-    scanRunId: string
-  ): Promise<boolean> {
-    try {
-      await this.deps.storage.delete(input.storageKey);
-      return true;
-    } catch (error) {
+  private async rejectStoredObject(
+    input: SyncScanInput,
+    scanRunId: string,
+    pii: ArtifactPiiDetail,
+    status?: "failed"
+  ): Promise<{ objectDeleted: boolean; objectCleanup: StorageGcOutcome | "row_gone" }> {
+    const released = await this.deps.artifacts.rejectStoredObject(input.tenantId, input.artifactId, {
+      pii,
+      ...(status ? { status } : {})
+    });
+    if (!released) return { objectDeleted: false, objectCleanup: "row_gone" };
+    const outcome = await this.deps.storageGc.collectArtifactObject({
+      queue: "session_storage_gc",
+      tenantId: input.tenantId,
+      ownerId: released.sessionId,
+      storageKey: released.storageKey
+    });
+    if (outcome === "pending") {
       this.deps.logger?.error?.(
-        { err: error, tenantId: input.tenantId, artifactId: input.artifactId, scanRunId },
-        "Failed to delete stored object for PII-rejected artifact"
+        { tenantId: input.tenantId, artifactId: input.artifactId, scanRunId },
+        "Failed to delete stored object for PII-rejected artifact; it stays queued for retry"
       );
       await this.emitAudit(input, "pii_block_object_orphaned", {
         scanRunId,
         subjectType: "artifact",
         subjectId: input.artifactId,
-        storageKey: input.storageKey,
-        source: input.source
+        storageKey: released.storageKey,
+        source: input.source,
+        retry: "queued"
       });
-      return false;
     }
+    return { objectDeleted: outcome === "deleted", objectCleanup: outcome };
   }
 
   private async applyAllowDecision(
@@ -381,7 +393,16 @@ export class PiiArtifactScanEnqueuer {
     // A permanent rejection (an unscannable type, an unreadable PDF, an
     // oversized file) leaves bytes nobody can use, so they go. A provider
     // error is not a verdict: the content was never scanned, so keep it.
-    if (PERMANENT_PII_ERROR_CODES.has(errorCode)) await this.purgeRejectedObject(input, scanRunId);
+    if (PERMANENT_PII_ERROR_CODES.has(errorCode)) {
+      // The failed verdict and the queued delete commit together.
+      await this.rejectStoredObject(input, scanRunId, this.failedDetail(input, scanRunId, errorMessage), "failed");
+      await this.deps.piiScanRuns.update(input.tenantId, scanRunId, {
+        status: "failed",
+        errorMessage,
+        completedAt: new Date()
+      });
+      return { kind: "failed", scanRunId, errorCode, errorMessage };
+    }
     await this.deps.piiScanRuns.update(input.tenantId, scanRunId, {
       status: "failed",
       errorMessage,
@@ -481,15 +502,20 @@ export class PiiArtifactScanEnqueuer {
     scanRunId: string,
     errorMessage: string
   ): Promise<void> {
-    await this.deps.artifacts.setPiiDetail(input.tenantId, input.artifactId, {
+    await this.deps.artifacts.setPiiDetail(input.tenantId, input.artifactId,
+      this.failedDetail(input, scanRunId, errorMessage));
+    await this.deps.artifacts.update(input.tenantId, input.artifactId, {
+      status: "failed"
+    });
+  }
+
+  private failedDetail(input: SyncScanInput, scanRunId: string, errorMessage: string): ArtifactPiiDetail {
+    return {
       status: "failed",
       modeApplied: input.mode,
       policyRevision: input.read.revision,
       scanRunId,
       summaryText: errorMessage
-    });
-    await this.deps.artifacts.update(input.tenantId, input.artifactId, {
-      status: "failed"
-    });
+    };
   }
 }

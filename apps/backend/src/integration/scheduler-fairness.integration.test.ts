@@ -32,9 +32,9 @@ const minutesAgo = (minutes: number) => new Date(Date.now() - minutes * MINUTE);
 // not due again while the test runs.
 
 // listDueJobs reads the due jobs of all tenants, and the suite database holds
-// due jobs of other test files. Each test moves those out of the due window
-// and puts them back after. This file's own jobs are turned off after each
-// test.
+// jobs of other test files. Each test moves all enabled jobs out of the due
+// window, including future jobs that can become due during the test, and puts
+// them back after. This file's own jobs are turned off after each test.
 let parkedJobIds: string[] = [];
 let testTenantIds: string[] = [];
 
@@ -42,7 +42,7 @@ beforeEach(async () => {
   if (!adminDatabaseUrl()) return;
   const parked = await superuserPool().query<{ job_id: string }>(
     `UPDATE scheduled_jobs SET next_run_at = next_run_at + INTERVAL '1000000 hours'
-     WHERE enabled AND next_run_at <= NOW()
+     WHERE enabled AND next_run_at IS NOT NULL
      RETURNING job_id`
   );
   parkedJobIds = parked.rows.map((row) => row.job_id);
