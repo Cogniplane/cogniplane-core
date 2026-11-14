@@ -330,7 +330,7 @@ async function createRouteTestApp(options: FastifyServerOptions = {}) {
       async listTenantMembers() { return []; },
       async setUserBetaTester() { return null; }
     },
-    limits: {},
+    limits: { consumeRateLimit: async () => null },
     artifactStorage: {},
     artifactProcessor: {},
     runtimeAdapter: {
