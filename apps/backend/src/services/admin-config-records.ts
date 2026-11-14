@@ -318,7 +318,17 @@ export type RuntimeConfigBundle = {
 export type SkillRevisionCleanupReport = {
   dryRun: boolean;
   deletedRevisionIds: number[];
+  /**
+   * Bundles that this call deleted from storage. A dry run lists the bundles
+   * of the revisions it would delete.
+   */
   deletedBundleStorageUris: string[];
+  /**
+   * Bundles whose delete failed in this call. They stay queued
+   * (`skill_bundle_storage_gc`); the scheduler worker and the next cleanup
+   * retry them. Always empty in a dry run.
+   */
+  pendingBundleStorageUris: string[];
   keptRevisionDecisions: Array<{ skillRevisionId: number; reason: string }>;
   failures: Array<{ skillRevisionId: number; reason: string }>;
 };

@@ -61,10 +61,18 @@ shows provider status, scan metrics, queue state and the breaker timeline (`GET
   (`runSyncBlock`). In `detect` and `transform` modes a readable file is
   queued (`runAsync`).
 - The synchronous scan records its decision on the scan run before it acts,
-  as a queued scan does. Then it deletes the bytes (block only), writes the
-  verdict and the audit event, and closes the scan run last. A write that
-  fails after the record does not turn into "not scanned": recovery finishes
-  the decision.
+  as a queued scan does. Then it writes the verdict, and closes the scan run
+  last. A write that fails after the record does not turn into "not scanned":
+  recovery finishes the decision.
+- A block, and a permanent scan error of the synchronous scan, give up the
+  object (`ArtifactStore.rejectStoredObject`). One transaction writes the
+  verdict, marks the artifact released (`storage_released_at`) and queues the
+  key that the row holds now in `session_storage_gc`. Then the scan tries the
+  delete, writes the audit event (`objectDeleted`, `objectCleanup`) and closes
+  the run. A failed delete stays queued for the scheduler worker and writes
+  `pii_block_object_orphaned` (`retry: "queued"`). The artifact stays
+  unreadable meanwhile. A key that a live row of any tenant still names is not
+  deleted ([stored objects](data.md#stored-objects)).
 - Agent project drafts (`project_write_file`, `project_reconcile_conflict`):
   `ProjectFileStore.createAgentDraftFromContent` scans the bytes at once with
   the uploads scope and mode, before it stores them. A block refuses the draft

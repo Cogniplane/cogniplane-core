@@ -14,6 +14,7 @@ import { RedisRequestLimits } from "./redis-request-limits.js";
 import { RequestLimits, type RequestLimitsInterface } from "./request-limits.js";
 import { createSkillBundleStorage } from "./skills/skill-bundle-storage.js";
 import { SkillMarketplaceService } from "./skills/skill-marketplace-service.js";
+import { StorageGc } from "./storage/storage-gc.js";
 import { TenantOrgSettingsStore } from "./tenant-org-settings-store.js";
 
 import type { Stores } from "./build-stores.js";
@@ -34,6 +35,9 @@ export function buildBootstrapServices(input: {
   const skillBundleStorage = createSkillBundleStorage(config);
   const artifactStorage = createArtifactStorage(config);
   const skillMarketplace = new SkillMarketplaceService(config);
+  // Storage cleanup queues of every tenant: the reference checks must read
+  // all tenants, so it runs on the maintenance pool (storage/storage-gc.ts).
+  const storageGc = new StorageGc({ maintenanceDb: privilegedDb, artifactStorage, skillBundleStorage, logger });
   const dynamicConfig = new DynamicConfigService(
     config,
     {
@@ -45,7 +49,8 @@ export function buildBootstrapServices(input: {
       mcpServers: stores.mcpServers,
       memberMcpCredentials: stores.memberMcpCredentials,
       tenantMembers: stores.tenantMembers,
-      tenantSettings: stores.tenantSettings
+      tenantSettings: stores.tenantSettings,
+      storageGc
     },
     skillBundleStorage,
     managedToolCatalog
@@ -92,6 +97,7 @@ export function buildBootstrapServices(input: {
   return {
     skillBundleStorage,
     artifactStorage,
+    storageGc,
     skillMarketplace,
     dynamicConfig,
     redis,

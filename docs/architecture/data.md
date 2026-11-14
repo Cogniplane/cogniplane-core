@@ -1,8 +1,8 @@
 # Data and tenancy
 
 Scope: tenant isolation, database pools, tenant settings, user settings,
-retention and deletion, foreign-key indexes, persistence, audit, usage, rate
-limits. Projects and artifacts are in [projects and
+retention and deletion, stored objects and their cleanup queues, foreign-key
+indexes, persistence, audit, usage, rate limits. Projects and artifacts are in [projects and
 files](projects-and-files.md). PII is in [PII protection](pii.md).
 The SQL in `apps/backend/db/migrations/` is authoritative for the schema.
 
@@ -42,8 +42,14 @@ The SQL in `apps/backend/db/migrations/` is authoritative for the schema.
    `apps/backend/src/integration/rls-write-paths.integration.test.ts`.
    `rls-catalog.integration.test.ts` and that test fail for a tenant table that
    lacks either.
-5. If the table holds storage keys, add them to the cleanup list in
-   `services/tenant-deletion-service.ts`.
+5. If the table holds an artifact storage key or a skill bundle URI, add the
+   column to `STORAGE_LOCATOR_COLUMNS` (`services/storage/storage-references.ts`)
+   as `live`, `derived` or `queue` ([stored objects](#stored-objects)). A
+   `live` column also goes into the reference check of its storage class in
+   that file, and a `live` or `queue` column into `enqueueCleanup` in
+   `services/tenant-deletion-service.ts`. `integration/storage-references.integration.test.ts`
+   fails for a column that the list does not classify, and for a tenant
+   column that it has no seeder for.
 6. If a column stores a user id without a foreign key to `users`, add it to
    `USER_ID_COLUMNS_WITHOUT_FOREIGN_KEY` in the same file. Tenant deletion
    reads foreign keys to `users` from the catalog. A `user_id`, `*_user_id` or
@@ -171,7 +177,8 @@ Fields that agents change most often (the full list is `TenantSettingsSchema` in
   date, so its own 30 days do not restart. The `project_file_retention_deleted`
   audit event lists these drafts in `detachedFileIds`.
 - Skill revision cleanup runs only when an admin calls it
-  ([skills](skills.md#import-and-lifecycle)).
+  ([skills](skills.md#import-and-lifecycle)). Its bundle deletes go through
+  the storage queues ([stored objects](#stored-objects)).
 - Spending records stay when sessions or messages are deleted.
 - Tenant deletion is an operator command. See
   [operations](../operations.md#delete-a-tenant). `app_user` cannot delete a
@@ -179,6 +186,44 @@ Fields that agents change most often (the full list is `TenantSettingsSchema` in
   boundary](../database-roles.md#tenant-deletion-boundary)).
 - Session purge and tenant deletion need the [foreign-key
   indexes](#foreign-key-indexes).
+
+## Stored objects
+
+Artifact storage keys and skill bundle URIs live in two backends.
+`STORAGE_LOCATOR_COLUMNS` (`services/storage/storage-references.ts`) lists
+every column that holds one, with its role:
+
+- `live`: the row keeps its object. Artifacts count unless their status is
+  `deleted` or a PII rejection released them (`storage_released_at`); every
+  project file version counts; every skill revision counts, also of the
+  `system` tenant.
+- `derived`: `artifact_download_tokens.storage_key` copies an artifact key and
+  cascades with the artifact.
+- `queue`: `session_storage_gc`, `project_file_storage_gc`,
+  `skill_bundle_storage_gc` and `tenant_deletion_cleanup` hold locators until
+  the object is gone. A queue row never keeps an object, so two queues that
+  hold the same locator do not keep each other.
+
+Rules:
+
+- A change that drops the last pointer to an object writes the queue row in
+  its own transaction: session purge, project file retention, a PII rejection
+  (`ArtifactStore.rejectStoredObject`) and skill revision cleanup
+  (`SkillRevisionStore.deleteSkillRevision`). The object delete runs after the
+  commit. A storage error or a process stop keeps the row, with backoff up to
+  one hour.
+- Before a delete, the collector (`services/storage/storage-gc.ts`) checks the
+  live columns of every tenant on the maintenance pool: one object can have
+  references in more than one tenant. A referenced object stays and its queue
+  row goes. Session purge, project file retention and tenant deletion use the
+  same checks.
+- The scheduler worker drains the session, project-file and skill-bundle
+  storage queues on each tick (`StorageGc.drain`),
+  also when the scheduler, Trash retention and scheduled session retention are
+  off ([background workers](runtime.md#background-workers)).
+- Tenant deletion copies the tenant's live and queued locators into
+  `tenant_deletion_cleanup` before the tenant cascade removes them. The
+  operator command drains that queue ([operations](../operations.md#delete-a-tenant)).
 
 ## Foreign-key indexes
 

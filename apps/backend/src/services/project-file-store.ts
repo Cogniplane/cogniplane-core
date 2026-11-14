@@ -28,6 +28,8 @@ import {
 import { withTenantScope, withTransaction, type Pool } from "../lib/db.js";
 import { uuidv7 } from "../lib/uuid.js";
 import { requireProjectAccess } from "./project-access.js";
+import { claimArtifactObjectGc, collectArtifactObject } from "./storage/storage-gc.js";
+import { artifactObjectReferencedSql } from "./storage/storage-references.js";
 import type { AuditEventType } from "./audit-event-types.js";
 import { AuditEventStore } from "./audit-event-store.js";
 import { isoTimestamp, utcMicrosText } from "../lib/db-mappers.js";
@@ -294,26 +296,22 @@ export class ProjectFileStore {
       if (doomedFiles.length) {
         const { placeholders, params } = fileValues(doomedFiles);
         // Versions of detached drafts are outside the removed set, so the
-        // first NOT EXISTS keeps every object that they share.
+        // reference check keeps every object that they share. It reads every
+        // tenant: this transaction is on the maintenance pool.
+        const referenced = artifactObjectReferencedSql("v.storage_key", {
+          ignoreProjectFileVersion: (live) => `EXISTS (
+            SELECT 1 FROM (VALUES ${placeholders}) AS removed(tenant_id, project_id, file_id)
+            WHERE removed.tenant_id=${live}.tenant_id AND removed.project_id=${live}.project_id
+              AND removed.file_id=${live}.file_id
+          )`,
+        });
         await db.query(
         `INSERT INTO project_file_storage_gc (tenant_id, project_id, storage_key)
          SELECT DISTINCT v.tenant_id, v.project_id, v.storage_key
          FROM project_file_versions v
            JOIN (VALUES ${placeholders}) AS doomed(tenant_id, project_id, file_id)
              ON doomed.tenant_id=v.tenant_id AND doomed.project_id=v.project_id AND doomed.file_id=v.file_id
-         WHERE NOT EXISTS (
-           SELECT 1 FROM project_file_versions live
-           WHERE live.storage_key=v.storage_key
-             AND NOT EXISTS (
-               SELECT 1 FROM (VALUES ${placeholders}) AS removed(tenant_id, project_id, file_id)
-               WHERE removed.tenant_id=live.tenant_id AND removed.project_id=live.project_id
-                 AND removed.file_id=live.file_id
-             )
-         )
-         AND NOT EXISTS (
-           SELECT 1 FROM artifacts a
-           WHERE a.storage_key=v.storage_key AND a.status <> 'deleted'
-         )
+         WHERE NOT ${referenced}
          ON CONFLICT DO NOTHING`,
           params,
         );
@@ -376,75 +374,22 @@ export class ProjectFileStore {
       // they can occupy the head of the bounded pending query.
       await db.query(
         `DELETE FROM project_file_storage_gc gc
-         WHERE EXISTS (SELECT 1 FROM project_file_versions v WHERE v.storage_key=gc.storage_key)
-            OR EXISTS (SELECT 1 FROM artifacts a WHERE a.storage_key=gc.storage_key AND a.status <> 'deleted')`,
-      );
-      const pending = await db.query(
-        `WITH candidates AS (
-           SELECT tenant_id, project_id, storage_key
-           FROM project_file_storage_gc
-           WHERE next_attempt_at <= NOW()
-           ORDER BY next_attempt_at, created_at, tenant_id, project_id, storage_key
-           LIMIT $1
-           FOR UPDATE SKIP LOCKED
-         )
-         UPDATE project_file_storage_gc AS gc
-         SET attempts=gc.attempts+1, next_attempt_at=NOW() + INTERVAL '1 hour'
-         FROM candidates
-         WHERE gc.tenant_id=candidates.tenant_id
-           AND gc.project_id=candidates.project_id
-           AND gc.storage_key=candidates.storage_key
-         RETURNING gc.tenant_id, gc.project_id, gc.storage_key`,
-        [batchSize],
+         WHERE ${artifactObjectReferencedSql("gc.storage_key")}`,
       );
       return {
         deletedFiles: doomedFiles.length,
-        pending: pending.rows.map((row) => ({
-          tenantId: String(row.tenant_id),
-          projectId: String(row.project_id),
-          storageKey: String(row.storage_key),
-        })),
+        pending: await claimArtifactObjectGc(db, "project_file_storage_gc", batchSize),
       };
     });
 
     let deletedObjects = 0;
     for (const pending of result.pending) {
-      const refs = await this.maintenanceDb.query(
-        `SELECT 1 FROM project_file_versions
-           WHERE storage_key=$1
-         UNION ALL SELECT 1 FROM artifacts
-           WHERE storage_key=$1 AND status <> 'deleted' LIMIT 1`,
-        [pending.storageKey],
-      );
-      if (refs.rowCount) {
-        await this.maintenanceDb.query(
-          `DELETE FROM project_file_storage_gc WHERE tenant_id=$1 AND project_id=$2 AND storage_key=$3`,
-          [pending.tenantId, pending.projectId, pending.storageKey],
-        );
-        continue;
-      }
-      try {
-        await storage.delete(pending.storageKey);
-        const removed = await this.maintenanceDb.query(
-          `DELETE FROM project_file_storage_gc
-           WHERE tenant_id=$1 AND project_id=$2 AND storage_key=$3
-             AND NOT EXISTS (SELECT 1 FROM project_file_versions WHERE storage_key=$3)
-             AND NOT EXISTS (SELECT 1 FROM artifacts WHERE storage_key=$3 AND status <> 'deleted')`,
-          [pending.tenantId, pending.projectId, pending.storageKey],
-        );
-        deletedObjects += removed.rowCount ?? 0;
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
+      const outcome = await collectArtifactObject(this.maintenanceDb, storage, pending);
+      if (outcome === "deleted") deletedObjects += 1;
+      if (outcome === "pending") {
         this.logger.warn(
-          { err: error, tenantId: pending.tenantId, projectId: pending.projectId, storageKey: pending.storageKey },
-          "Failed to delete an expired project file object; will retry",
-        );
-        await this.maintenanceDb.query(
-          `UPDATE project_file_storage_gc
-           SET next_attempt_at=NOW() + LEAST(INTERVAL '1 hour', INTERVAL '1 minute' * power(2, LEAST(attempts, 6))),
-               last_error=$4
-           WHERE tenant_id=$1 AND project_id=$2 AND storage_key=$3`,
-          [pending.tenantId, pending.projectId, pending.storageKey, message],
+          { tenantId: pending.tenantId, projectId: pending.ownerId, storageKey: pending.storageKey },
+          "An expired project file object stays queued (its last_error has the cause); will retry",
         );
       }
     }

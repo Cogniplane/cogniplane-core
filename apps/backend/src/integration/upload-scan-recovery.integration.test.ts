@@ -14,6 +14,7 @@ import { PII_SCAN_INTERRUPTED, PiiScanJobStore, type PiiScanJobRecord } from "..
 import { PiiScanRunStore } from "../services/pii/pii-scan-run-store.js";
 import { SchedulerWorker } from "../services/scheduler-worker.js";
 import { SessionStore } from "../services/session-store.js";
+import { StorageGc } from "../services/storage/storage-gc.js";
 import { adminDatabaseUrl, appPool, maintenancePool, superuserPool } from "./support/database.js";
 import { seedTenantGraph } from "./support/fixtures.js";
 
@@ -38,6 +39,8 @@ async function setup(mode: PiiProtectionSettings["mode"] = "block") {
   const auditEvents = new AuditEventStore(appPool());
   const objects = new Map<string, string>();
   const deleted: string[] = [];
+  // `deleteFails`: the object storage refuses deletes until it is cleared.
+  const faults = { deleteFails: false };
   const storage = {
     async put(input: { storageKey: string; stream: Readable }) {
       let body = "";
@@ -46,10 +49,17 @@ async function setup(mode: PiiProtectionSettings["mode"] = "block") {
       return { storageBackend: "local" as const, storageKey: input.storageKey, fileSizeBytes: body.length, checksumSha256: "sum" };
     },
     async delete(storageKey: string) {
+      if (faults.deleteFails) throw new Error("bucket unavailable");
       deleted.push(storageKey);
       objects.delete(storageKey);
     }
   };
+  // The production queue and reference check, on the maintenance pool.
+  const storageGc = new StorageGc({
+    maintenanceDb: maintenancePool(),
+    artifactStorage: storage,
+    skillBundleStorage: { deleteBundle: async () => { throw new Error("no bundle in this test"); } }
+  });
   const importScopes = new PiiImportScopeRegistry();
   const read: PiiPolicyRead = {
     tenantId,
@@ -83,13 +93,13 @@ async function setup(mode: PiiProtectionSettings["mode"] = "block") {
   const logger = { warn: vi.fn(), error: vi.fn(), info: vi.fn() };
   const handler = new PiiScanJobHandler({
     piiProtection, piiScanRuns: runs, piiScanJobs: jobs, messages: { setPiiDetail: vi.fn() },
-    artifacts, storage, subjectReader, auditEvents, logger, importScopes
+    artifacts, storageGc, subjectReader, auditEvents, logger, importScopes
   });
   const enqueuer = (runStore: Pick<PiiScanRunStore, "create" | "update" | "recordDecision"> = runs,
-    artifactStore: Pick<ArtifactStore, "setPiiDetail" | "update"> = artifacts) =>
+    artifactStore: Pick<ArtifactStore, "setPiiDetail" | "update" | "rejectStoredObject"> = artifacts) =>
     new PiiArtifactScanEnqueuer({
       piiProtection, importScopes, piiScanRuns: runStore, piiScanJobs: jobs,
-      artifacts: artifactStore, storage, subjectReader, auditEvents, logger
+      artifacts: artifactStore, storageGc, subjectReader, auditEvents, logger
     });
   const admission = (scanEnqueuer: Pick<PiiArtifactScanEnqueuer, "plan" | "enqueue">) => new UploadAdmission({
     sessions: new SessionStore(appPool()), artifacts, storage, piiScanEnqueuer: scanEnqueuer, logger
@@ -102,19 +112,27 @@ async function setup(mode: PiiProtectionSettings["mode"] = "block") {
       stream: Readable.from([Buffer.from("jane@example.com")])
     });
   };
-  // One worker tick that drains PII work. Other tenants' leftover jobs are
-  // claimed by the tick but not run.
-  const tick = () => new SchedulerWorker({
+  // One worker tick that drains PII work and the storage queues, and waits
+  // for the background work that the tick starts. Other tenants' leftover jobs
+  // are claimed by the tick but not run.
+  const tick = async () => {
+    const worker = workerFor();
+    await worker.tick();
+    expect(await worker.drain(10_000)).toBe(true);
+  };
+  const workerFor = () => new SchedulerWorker({
     settings: {} as never, sessions: {} as never, messages: {} as never, toolContexts: {} as never,
     runtimeAdapter: {} as never, turnAdmission: {} as never,
     resolveRuntime: async () => ({ kind: "error", message: "unused" }),
     auditEvents, logger,
+    // Drains the storage queues of every tenant, with the fake storage above.
+    storageGc,
     piiScanJobs: jobs,
     piiScanJobHandler: {
       execute: (job: PiiScanJobRecord) => job.tenantId === tenantId ? handler.execute(job) : Promise.resolve(),
       finishFailedJob: (job: PiiScanJobRecord) => job.tenantId === tenantId ? handler.finishFailedJob(job) : Promise.resolve()
     }
-  }, { schedulingEnabled: false, maxConcurrentJobs: 1, maxConcurrentPiiJobs: 100, jobTimeoutMs: 1_000, abortSettleGraceMs: 0 }).tick();
+  }, { schedulingEnabled: false, maxConcurrentJobs: 1, maxConcurrentPiiJobs: 100, jobTimeoutMs: 1_000, abortSettleGraceMs: 0 });
   // Older than the tick's cutoff (job timeout + grace + 60 s).
   const age = async (artifactId: string) => {
     await superuserPool().query(
@@ -147,6 +165,10 @@ async function setup(mode: PiiProtectionSettings["mode"] = "block") {
     );
     return { runs: scanRuns.rows, jobs: scanJobs.rows };
   };
+  // This tenant's keys in the session object queue.
+  const queuedKeys = async () => (await superuserPool().query<{ storage_key: string }>(
+    "SELECT storage_key FROM session_storage_gc WHERE tenant_id = $1 ORDER BY storage_key", [tenantId]
+  )).rows.map((row) => row.storage_key);
   const auditCount = async (type: string) => Number((await superuserPool().query(
     "SELECT COUNT(*) AS n FROM audit_events WHERE tenant_id = $1 AND event_type = $2",
     [tenantId, type]
@@ -156,8 +178,8 @@ async function setup(mode: PiiProtectionSettings["mode"] = "block") {
     [tenantId]
   )).rows[0].artifact_id as string;
   return {
-    ...graph, artifacts, runs, jobs, storage, deleted, enqueuer, upload, tick, age, artifactState, scanState,
-    auditCount, newestArtifactId, evaluateArtifactWithPolicy, logger
+    ...graph, artifacts, runs, jobs, storage, deleted, faults, enqueuer, upload, tick, age, artifactState, scanState,
+    auditCount, newestArtifactId, evaluateArtifactWithPolicy, logger, queuedKeys, objects
   };
 }
 
@@ -287,17 +309,19 @@ describe.skipIf(!adminDatabaseUrl())("synchronous block decision recovery", () =
     expect(await h.auditCount("pii_blocked")).toBe(1);
   });
 
-  test("fault: the verdict write throws after the purge; one tick finishes the block on the pending upload", async () => {
+  test("fault: the verdict write throws; one tick finishes the block on the pending upload", async () => {
     const h = await setup();
     let failed = false;
     const artifactStore = {
       update: h.artifacts.update.bind(h.artifacts),
-      setPiiDetail: async (...args: Parameters<ArtifactStore["setPiiDetail"]>) => {
+      setPiiDetail: h.artifacts.setPiiDetail.bind(h.artifacts),
+      // The verdict, the release and the queued key are one transaction.
+      rejectStoredObject: async (...args: Parameters<ArtifactStore["rejectStoredObject"]>) => {
         if (!failed) {
           failed = true;
           throw new Error("Connection terminated unexpectedly");
         }
-        return h.artifacts.setPiiDetail(...args);
+        return h.artifacts.rejectStoredObject(...args);
       }
     };
 
@@ -307,6 +331,9 @@ describe.skipIf(!adminDatabaseUrl())("synchronous block decision recovery", () =
     const artifactId = await h.newestArtifactId();
     expect((await h.artifactState(artifactId)).status).toBe("pending");
     expect(await h.auditCount("pii_blocked")).toBe(0);
+    // Nothing was released or queued, and the bytes are still there.
+    expect(await h.queuedKeys()).toEqual([]);
+    expect(h.deleted).toEqual([]);
 
     await h.age(artifactId);
     await h.tick();
@@ -318,6 +345,8 @@ describe.skipIf(!adminDatabaseUrl())("synchronous block decision recovery", () =
     expect((await h.scanState(artifactId)).runs).toMatchObject([{ status: "blocked", pending_decision: null }]);
     expect(await h.auditCount("pii_blocked")).toBe(1);
     expect(h.evaluateArtifactWithPolicy).toHaveBeenCalledTimes(1);
+    expect(h.deleted).toHaveLength(1);
+    expect(await h.queuedKeys()).toEqual([]);
   });
 
   test("fault: the verdict write of an allow throws; one tick makes the upload ready with the recorded verdict", async () => {
@@ -329,6 +358,7 @@ describe.skipIf(!adminDatabaseUrl())("synchronous block decision recovery", () =
     let failed = false;
     const artifactStore = {
       update: h.artifacts.update.bind(h.artifacts),
+      rejectStoredObject: h.artifacts.rejectStoredObject.bind(h.artifacts),
       setPiiDetail: async (...args: Parameters<ArtifactStore["setPiiDetail"]>) => {
         if (!failed) {
           failed = true;
@@ -378,6 +408,94 @@ describe.skipIf(!adminDatabaseUrl())("synchronous block decision recovery", () =
       status: "failed", detail_json: { pii: { status: "failed", summaryText: PII_SCAN_INTERRUPTED } }
     });
     expect(h.deleted).toEqual([]);
+  });
+});
+
+describe.skipIf(!adminDatabaseUrl())("a failed object delete after a PII rejection", () => {
+  const keyOf = async (h: Awaited<ReturnType<typeof setup>>, artifactId: string) => (await superuserPool().query<{
+    storage_key: string; released: boolean;
+  }>(
+    "SELECT storage_key, storage_released_at IS NOT NULL AS released FROM artifacts WHERE tenant_id = $1 AND artifact_id = $2",
+    [h.tenantId, artifactId]
+  )).rows[0]!;
+
+  test("a synchronous block keeps the key queued, and the next worker tick deletes the object", async () => {
+    const h = await setup();
+    h.faults.deleteFails = true;
+
+    const result = await h.upload(h.enqueuer());
+
+    expect(result).toMatchObject({ kind: "blocked" });
+    const artifactId = await h.newestArtifactId();
+    const { storage_key: key, released } = await keyOf(h, artifactId);
+    // The block stands and the artifact stays unreadable; only the bytes wait.
+    expect(released).toBe(true);
+    expect(await h.artifactState(artifactId)).toMatchObject({ status: "failed", detail_json: { pii: { status: "blocked" } } });
+    expect((await h.scanState(artifactId)).runs).toMatchObject([{ status: "blocked", pending_decision: null }]);
+    expect(h.objects.has(key)).toBe(true);
+    expect(await h.queuedKeys()).toEqual([key]);
+    expect(await h.auditCount("pii_block_object_orphaned")).toBe(1);
+
+    // The queue survives a process restart: a new worker reads it from the database.
+    h.faults.deleteFails = false;
+    await superuserPool().query(
+      "UPDATE session_storage_gc SET next_attempt_at = NOW() WHERE tenant_id = $1", [h.tenantId]);
+    await h.tick();
+
+    expect(h.objects.has(key)).toBe(false);
+    expect(h.deleted).toEqual([key]);
+    expect(await h.queuedKeys()).toEqual([]);
+    expect(await h.artifactState(artifactId)).toMatchObject({ status: "failed", detail_json: { pii: { status: "blocked" } } });
+  });
+
+  test("a queued block keeps the key queued, and the next worker tick deletes the object", async () => {
+    const h = await setup("detect");
+    await h.upload(h.enqueuer());
+    const artifactId = await h.newestArtifactId();
+    const { storage_key: key } = await keyOf(h, artifactId);
+    // The job runs under a block verdict while the bucket refuses deletes.
+    h.faults.deleteFails = true;
+    await h.tick();
+
+    expect(await h.artifactState(artifactId)).toMatchObject({ status: "failed", detail_json: { pii: { status: "blocked" } } });
+    expect((await h.scanState(artifactId)).jobs).toMatchObject([{ status: "completed" }]);
+    expect(await keyOf(h, artifactId)).toEqual({ storage_key: key, released: true });
+    expect(h.objects.has(key)).toBe(true);
+    expect(await h.queuedKeys()).toEqual([key]);
+
+    h.faults.deleteFails = false;
+    // Still in backoff: a tick before the retry time leaves the row.
+    await h.tick();
+    expect(await h.queuedKeys()).toEqual([key]);
+    await superuserPool().query(
+      "UPDATE session_storage_gc SET next_attempt_at = NOW() WHERE tenant_id = $1", [h.tenantId]);
+    await h.tick();
+
+    expect(h.objects.has(key)).toBe(false);
+    expect(await h.queuedKeys()).toEqual([]);
+  });
+
+  test("a released key that another live artifact shares stays, and the queue row goes", async () => {
+    const h = await setup();
+    h.faults.deleteFails = true;
+    await h.upload(h.enqueuer());
+    const artifactId = await h.newestArtifactId();
+    const { storage_key: key } = await keyOf(h, artifactId);
+    // A live artifact in another tenant names the same object.
+    const other = await seedTenantGraph();
+    await superuserPool().query(
+      "UPDATE artifacts SET storage_key = $3 WHERE tenant_id = $1 AND artifact_id = $2",
+      [other.tenantId, other.artifactId, key]
+    );
+    h.faults.deleteFails = false;
+    await superuserPool().query(
+      "UPDATE session_storage_gc SET next_attempt_at = NOW() WHERE tenant_id = $1", [h.tenantId]);
+
+    await h.tick();
+
+    expect(h.objects.has(key)).toBe(true);
+    expect(h.deleted).toEqual([]);
+    expect(await h.queuedKeys()).toEqual([]);
   });
 });
 

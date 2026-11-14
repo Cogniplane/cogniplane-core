@@ -19,6 +19,7 @@ import { PiiScanJobHandler } from "../services/pii/pii-scan-job-handler.js";
 import { PiiScanJobStore } from "../services/pii/pii-scan-job-store.js";
 import { PiiScanRunStore } from "../services/pii/pii-scan-run-store.js";
 import { RuleBasedPiiDetector } from "../services/pii/rule-based-pii-detector.js";
+import { StorageGc } from "../services/storage/storage-gc.js";
 import { TenantOrgSettingsStore } from "../services/tenant-org-settings-store.js";
 
 import { adminDatabaseUrl, appPool, maintenancePool, superuserPool } from "./support/database.js";
@@ -50,7 +51,12 @@ async function setup() {
     piiScanRuns,
     piiScanJobs,
     artifacts: new ArtifactStore(appPool()),
-    storage: { delete: async (key: string) => { deleted.push(key); } },
+    // The production queue and reference check, on the maintenance pool.
+    storageGc: new StorageGc({
+      maintenanceDb: maintenancePool(),
+      artifactStorage: { delete: async (key: string) => { deleted.push(key); } },
+      skillBundleStorage: { deleteBundle: async () => { throw new Error("no bundle in this test"); } }
+    }),
     subjectReader: {
       readMessageText: async () => null,
       readArtifact: async ({ artifactId }: { artifactId: string }) => ({

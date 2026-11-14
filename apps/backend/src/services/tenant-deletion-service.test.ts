@@ -168,8 +168,10 @@ class OffboardingDatabase {
         .sort((a, b) => a.kind.localeCompare(b.kind) || a.locator.localeCompare(b.locator));
       return this.result(pending.map(({ kind, locator }) => ({ kind, locator })));
     }
-    if (sql.startsWith("SELECT 1 FROM artifacts") || sql.startsWith("SELECT 1 FROM admin_skill_revisions")) {
-      return this.result([], this.sharedLocators.has(String(values[0])) ? 1 : 0);
+    // The shared reference checks of storage/storage-references.ts.
+    if (sql.startsWith("SELECT") && sql.endsWith("AS referenced") &&
+        (sql.includes("FROM artifacts live_artifact") || sql.includes("FROM admin_skill_revisions live_revision"))) {
+      return this.result([{ referenced: this.sharedLocators.has(String(values[0])) }]);
     }
     if (sql.startsWith("WITH removed AS")) {
       const [requestId, kind, locator, outcome] = values.map(String);
