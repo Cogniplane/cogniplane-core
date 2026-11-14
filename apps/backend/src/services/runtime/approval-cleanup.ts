@@ -1,7 +1,6 @@
 import type { FastifyBaseLogger } from "fastify";
 
 import type { ApprovalStore } from "../auth/approval-store.js";
-import type { AuditEventStore } from "../audit-event-store.js";
 
 export type ApprovalCleanupReason = "turn_interrupted" | "turn_abandoned" | "ttl_expired" | "runtime_terminated";
 
@@ -13,20 +12,20 @@ export type CancelPendingApprovalsInput = {
   runtimeId?: string;
   reason: ApprovalCleanupReason;
   approvals: Pick<ApprovalStore, "listPending" | "expire">;
-  auditEvents: Pick<AuditEventStore, "create">;
   logger: Pick<FastifyBaseLogger, "warn" | "error">;
 };
 
 /**
  * Expire a SINGLE pending approval by id. Used when a per-approval wall-clock
  * TTL fires or a turn ends (the coordinator has already settled its local
- * wait): the DB row must move off `pending` and an
- * `approval.expired` audit row must be written.
+ * wait): the DB row must move off `pending`. `ApprovalStore.expire` writes
+ * the `approval.expired` audit row in the same transaction.
  * Unlike `cancelPendingApprovals` this does NOT touch the other approvals in the
  * session — only the one that aged out.
  *
- * Best-effort: every step is wrapped in try/log. If `expire` returns null the
- * user's decision committed first, so the audit row is skipped.
+ * Best-effort: a failure is logged. The row then stays `pending` with no
+ * audit row, and the stale-approval sweep expires it after `expires_at`. If
+ * `expire` returns null, the user's decision committed first.
  */
 export async function expireApprovalById(input: {
   tenantId: string;
@@ -35,23 +34,12 @@ export async function expireApprovalById(input: {
   approvalId: string;
   reason: ApprovalCleanupReason;
   approvals: Pick<ApprovalStore, "expire">;
-  auditEvents: Pick<AuditEventStore, "create">;
   logger: Pick<FastifyBaseLogger, "warn" | "error">;
 }): Promise<void> {
-  const { tenantId, sessionId, userId, approvalId, reason, approvals, auditEvents, logger } = input;
+  const { sessionId, approvalId, reason, approvals, logger } = input;
 
   try {
-    const expired = await approvals.expire(tenantId, approvalId);
-    if (!expired) return;
-
-    await auditEvents.create({
-      tenantId,
-      sessionId,
-      userId,
-      approvalId,
-      type: "approval.expired",
-      payload: { reason }
-    });
+    await approvals.expire(input.tenantId, approvalId, reason);
   } catch (err) {
     logger.error(
       { err, approvalId, sessionId, reason },
@@ -71,18 +59,17 @@ export async function expireApprovalById(input: {
  * local waits of the matching turns before it calls this function. A wait of another
  * runtime on the same row sees `expired` at its next poll.
  *
- * Behavior, in order, per pending approval (see `expireApprovalById`):
- *   1. Atomically `expire` the DB row. If it returns null (the user's
- *      decision committed first) skip the audit event. That decision has
- *      its own audit row.
- *   2. Emit one `approval.expired` audit row carrying `{ reason }`.
+ * Per pending approval, `expireApprovalById` expires the row and writes one
+ * `approval.expired` audit row carrying `{ reason }`, in one transaction. If
+ * the user's decision committed first, nothing changes: that decision has its
+ * own audit row.
  *
  * Best-effort: every step is wrapped in try/log so a single failing approval
  * cannot block the cleanup of others. Caller is expected to `void` the
  * returned promise — callers should not block on cleanup before responding.
  */
 export async function cancelPendingApprovals(input: CancelPendingApprovalsInput): Promise<void> {
-  const { tenantId, sessionId, userId, reason, approvals, auditEvents, logger } = input;
+  const { tenantId, sessionId, userId, reason, approvals, logger } = input;
 
   let pendingRows;
   try {
@@ -104,7 +91,6 @@ export async function cancelPendingApprovals(input: CancelPendingApprovalsInput)
       approvalId: row.approvalId,
       reason,
       approvals,
-      auditEvents,
       logger
     });
   }

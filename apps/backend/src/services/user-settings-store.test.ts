@@ -33,6 +33,18 @@ class FakeDatabase {
   }
 }
 
+const TRANSACTION_CONTROL = new Set(["BEGIN", "COMMIT", "ROLLBACK"]);
+
+/** The calls of a change, without its transaction control. */
+function workCalls(db: FakeDatabase): { sql: string; params: unknown[] }[] {
+  return db.calls.filter((call) => !TRANSACTION_CONTROL.has(call.sql.trim()));
+}
+
+const jobAudit = {
+  tenantId: "tenant-1", sessionId: null, userId: "user-1",
+  type: "scheduler.job.disabled" as const, payload: { jobId: "job-1", reason: "invalid_cron" }
+};
+
 function fakeJobRow(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     job_id: "job-1",
@@ -187,21 +199,46 @@ describe("UserSettingsStore – scheduler methods", () => {
 
       expect(await store.parkJob("tenant-1", "job-1", 4)).toBe(true);
 
-      expect(db.calls).toHaveLength(1);
-      expect(db.calls[0]?.sql).toContain("next_run_at = NULL");
-      expect(db.calls[0]?.sql).toContain("tenant_id = $1");
-      expect(db.calls[0]?.sql).toContain("revision = $3");
-      expect(db.calls[0]?.sql).not.toContain("scheduled_job_runs");
-      expect(db.calls[0]?.params).toEqual(["tenant-1", "job-1", 4]);
+      const calls = workCalls(db);
+      expect(calls).toHaveLength(1);
+      expect(calls[0]?.sql).toContain("next_run_at = NULL");
+      expect(calls[0]?.sql).toContain("tenant_id = $1");
+      expect(calls[0]?.sql).toContain("revision = $3");
+      expect(calls[0]?.sql).not.toContain("scheduled_job_runs");
+      expect(calls[0]?.params).toEqual(["tenant-1", "job-1", 4]);
     });
 
     it("disables only an enabled job of the claimed revision", async () => {
       db.onQuery(() => ({ rows: [], rowCount: 0 }));
 
-      expect(await store.disableJob("tenant-1", "job-1", 2)).toBe(false);
+      expect(await store.disableJob("tenant-1", "job-1", 2, jobAudit)).toBe(false);
 
-      expect(db.calls[0]?.sql).toContain("enabled = TRUE AND revision = $3");
-      expect(db.calls[0]?.params).toEqual(["tenant-1", "job-1", 2]);
+      const calls = workCalls(db);
+      expect(calls[0]?.sql).toContain("enabled = TRUE AND revision = $3");
+      expect(calls[0]?.params).toEqual(["tenant-1", "job-1", 2]);
+      // No change, no event.
+      expect(calls.some((call) => call.sql.includes("INSERT INTO audit_events"))).toBe(false);
+    });
+
+    it("writes the event of a change that matched the job in the change's transaction", async () => {
+      db.onQuery(() => ({ rows: [], rowCount: 1 }));
+
+      expect(await store.disableJob("tenant-1", "job-1", 2, jobAudit)).toBe(true);
+
+      expect(db.calls.map((call) => call.sql.trim().split(/\s+/).slice(0, 3).join(" "))).toEqual([
+        "BEGIN", "UPDATE scheduled_jobs SET", "INSERT INTO audit_events", "COMMIT"
+      ]);
+    });
+
+    it("rolls the change back when its event cannot be written", async () => {
+      db.onQuery((sql) => {
+        if (sql.includes("INSERT INTO audit_events")) throw new Error("audit insert failed");
+        return { rows: [], rowCount: 1 };
+      });
+
+      await expect(store.pauseJobForSecurityChange("tenant-1", "job-1", jobAudit)).rejects.toThrow("audit insert failed");
+
+      expect(db.calls.map((call) => call.sql.trim()).at(-1)).toBe("ROLLBACK");
     });
   });
 
@@ -350,7 +387,7 @@ describe("UserSettingsStore – scheduler methods", () => {
         }
       ]);
 
-      const call = db.calls[0];
+      const call = workCalls(db)[0]!;
       // Only orphans are eligible: still pending and past the cutoff, claimed
       // with SKIP LOCKED so concurrent sweeps never double-recover a row.
       expect(call.sql).toContain("status = 'pending'");

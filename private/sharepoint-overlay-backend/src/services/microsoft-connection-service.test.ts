@@ -16,10 +16,13 @@ import {
 import type { MicrosoftTenantConfig } from "./microsoft-connection-service.js";
 import type { MicrosoftConnectionRecord, MicrosoftConnectionStore } from "./microsoft-connection-store.js";
 import { OwnerSecurityVersionChangedError } from "../../../../apps/backend/src/services/auth/security-change.js";
+import type { AuditEventInput } from "../../../../apps/backend/src/services/audit-event-store.js";
 
 class InMemoryMicrosoftConnectionStore {
   private records = new Map<string, MicrosoftConnectionRecord>();
   markUsedCount = 0;
+  /** The audit events that the store writes in each change's transaction. */
+  audits: AuditEventInput[] = [];
 
   private key(tenantId: string, userId: string) { return JSON.stringify([tenantId, userId]); }
 
@@ -65,7 +68,8 @@ class InMemoryMicrosoftConnectionStore {
     input: Omit<MicrosoftConnectionRecord, "createdAt" | "updatedAt" | "tokenLastUsedAt"> & {
       tokenLastRefreshedAt: string | null;
       ownerSecurityVersion: number | null;
-    }
+    },
+    audit?: (connection: MicrosoftConnectionRecord) => AuditEventInput
   ): Promise<MicrosoftConnectionRecord> {
     const key = this.key(input.tenantId, input.userId);
     const existing = this.records.get(key);
@@ -80,6 +84,7 @@ class InMemoryMicrosoftConnectionStore {
       createdAt: existing?.createdAt ?? now,
       updatedAt: now
     };
+    if (audit) this.audits.push(audit(record));
     this.records.set(key, record);
     return record;
   }
@@ -100,7 +105,11 @@ class InMemoryMicrosoftConnectionStore {
     return record;
   }
 
-  async delete(tenantId: string, userId: string): Promise<boolean> {
+  async delete(tenantId: string, userId: string,
+    audit?: (removed: MicrosoftConnectionRecord) => AuditEventInput): Promise<boolean> {
+    const removed = this.records.get(this.key(tenantId, userId));
+    if (!removed) return false;
+    if (audit) this.audits.push(audit(removed));
     return this.records.delete(this.key(tenantId, userId));
   }
 
@@ -406,7 +415,9 @@ test("completeAuthorization exchanges code and stores connection", async () => {
     expect(decrypt(store.record!.accessTokenEncrypted, config.DATA_ENCRYPTION_SECRET)).toBe(
       "ms_access_token"
     );
-    expect(auditEvents.events[0]?.type).toBe("user.microsoft.connected");
+    // The event commits with the connection, in the store's transaction.
+    expect(store.audits[0]?.type).toBe("user.microsoft.connected");
+    expect(auditEvents.events).toEqual([]);
     expect(runtimeManager.invalidations).toEqual([
       { tenantId: "tenant-1", userId: "user-1", integrationId: "microsoft" }
     ]);
@@ -548,7 +559,8 @@ test("disconnect removes record and emits audit event", async () => {
   const removed = await service.disconnect("tenant-1", "user-1");
   expect(removed).toBe(true);
   expect(store.record).toBe(null);
-  expect(auditEvents.events[0]?.type).toBe("user.microsoft.disconnected");
+  expect(store.audits[0]?.type).toBe("user.microsoft.disconnected");
+  expect(auditEvents.events).toEqual([]);
   expect(runtimeManager.invalidations).toEqual([
     { tenantId: "tenant-1", userId: "user-1", integrationId: "microsoft" }
   ]);
@@ -572,7 +584,8 @@ test("deleteConnection revokes the connection like a disconnect", async () => {
   // Member removal calls deleteConnection through the integration registry.
   await expect(service.deleteConnection("tenant-1", "user-1")).resolves.toBe(true);
   expect(store.record).toBe(null);
-  expect(auditEvents.events[0]?.type).toBe("user.microsoft.disconnected");
+  expect(store.audits[0]?.type).toBe("user.microsoft.disconnected");
+  expect(auditEvents.events).toEqual([]);
   expect(runtimeManager.invalidations).toEqual([{ tenantId: "tenant-1", userId: "user-1", integrationId: "microsoft" }]);
 });
 

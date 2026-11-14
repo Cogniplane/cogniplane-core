@@ -1,6 +1,6 @@
 import { withTenantScope, type Pool } from "../../../lib/db.js";
 import { isoTimestamp, isoTimestampOrNull } from "../../../lib/db-mappers.js";
-import { AuditEventStore } from "../../audit-event-store.js";
+import { AuditEventStore, type AuditEventInput } from "../../audit-event-store.js";
 import { assertOwnerSecurityVersion, ownerSecurityVersionSql } from "../../auth/security-change.js";
 
 export type GithubConnectionRecord = {
@@ -161,7 +161,9 @@ export class GithubConnectionStore {
     // The callback has no session, so the write is bound to this version:
     // OwnerSecurityVersionChangedError when it is not the owner's current one.
     ownerSecurityVersion: number | null;
-  }): Promise<GithubConnectionRecord> {
+  },
+  // The connect's audit event; it commits in the connect's transaction.
+  audit?: (connection: GithubConnectionRecord) => AuditEventInput): Promise<GithubConnectionRecord> {
     return withTenantScope(this.db, input.tenantId, async (client) => {
       await assertOwnerSecurityVersion(client, input.tenantId, input.userId, input.ownerSecurityVersion);
       const result = await client.query(
@@ -229,7 +231,9 @@ export class GithubConnectionStore {
         ]
       );
 
-      return mapGithubConnection(result.rows[0]);
+      const connection = mapGithubConnection(result.rows[0]);
+      if (audit) await AuditEventStore.createInTransaction(client, audit(connection));
+      return connection;
     });
   }
 
@@ -292,13 +296,15 @@ export class GithubConnectionStore {
    * that it already normalized, and the GitHub user id that the member chose
    * the list for. The check runs under the row lock, so a reconnect to another
    * account between the page load and the save cannot receive the list.
-   * Returns the previous list for the audit event.
+   * Returns the previous list. `audit` builds the change's audit event from the
+   * result, or null for no event; it commits in the change's transaction.
    */
   async setAllowedRepositories(
     tenantId: string,
     userId: string,
     repositories: readonly string[],
-    expectedGithubUserId: string
+    expectedGithubUserId: string,
+    audit?: (result: Extract<SetAllowedRepositoriesResult, { status: "updated" }>) => AuditEventInput | null
   ): Promise<SetAllowedRepositoriesResult> {
     return withTenantScope(this.db, tenantId, async (client) => {
       const current = await client.query(
@@ -323,25 +329,33 @@ export class GithubConnectionStore {
         `,
         [tenantId, userId, [...repositories]]
       );
-      return {
+      const updated = {
         status: "updated",
         previous: toStringArray(row.allowed_repositories),
         record: mapGithubConnection(result.rows[0])
       } as const;
+      const event = audit?.(updated);
+      if (event) await AuditEventStore.createInTransaction(client, event);
+      return updated;
     });
   }
 
-  async delete(tenantId: string, userId: string): Promise<boolean> {
+  /** `audit` builds the disconnect's audit event from the removed row. It commits in the delete's transaction. */
+  async delete(tenantId: string, userId: string,
+    audit?: (removed: GithubConnectionRecord) => AuditEventInput): Promise<boolean> {
     return withTenantScope(this.db, tenantId, async (client) => {
       const result = await client.query(
         `
           DELETE FROM user_github_connections
           WHERE tenant_id = $1 AND user_id = $2
+          RETURNING *
         `,
         [tenantId, userId]
       );
 
-      return (result.rowCount ?? 0) > 0;
+      if (!result.rows[0]) return false;
+      if (audit) await AuditEventStore.createInTransaction(client, audit(mapGithubConnection(result.rows[0])));
+      return true;
     });
   }
 

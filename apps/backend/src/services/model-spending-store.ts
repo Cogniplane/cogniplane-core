@@ -1,6 +1,7 @@
 import { withTenantScope, type Pool } from "../lib/db.js";
 import type { PoolClient } from "pg";
 import { hasModelPrice } from "./token-cost-calculator.js";
+import { AuditEventStore } from "./audit-event-store.js";
 
 export class ModelSpendingError extends Error {
   readonly statusCode = 402;
@@ -84,8 +85,9 @@ export class ModelSpendingStore {
         WHERE tenant_id=$1 AND version=$4 RETURNING tenant_id`, [tenantId,
         policy.monthlyLimitUsd === null ? null : toMicroUsd(policy.monthlyLimitUsd), toMicroUsd(policy.turnReservationUsd), policy.version]);
       if (!result.rowCount) throw Object.assign(new Error("Spending policy changed. Reload and try again."), { statusCode: 409 });
-      await db.query(`INSERT INTO audit_events(tenant_id,user_id,event_type,payload)
-        VALUES ($1,$2,'model_spending_policy_updated',$3::jsonb)`, [tenantId,userId,JSON.stringify(policy)]);
+      await AuditEventStore.createInTransaction(db, {
+        tenantId, sessionId: null, userId, type: "model_spending_policy_updated", payload: { ...policy }
+      });
     });
   }
 
@@ -185,8 +187,9 @@ export class ModelSpendingStore {
         SET status='unknown', updated_at=now() WHERE tenant_id=$1 AND reservation_id=$2 AND status='reserved'
         RETURNING reservation_id`, [tenantId,reservationId]);
       if (!result.rowCount) throw Object.assign(new Error("Only an active reservation can be closed."), { statusCode: 409 });
-      await db.query(`INSERT INTO audit_events(tenant_id,user_id,event_type,payload)
-        VALUES ($1,$2,'model_spending_closed',$3::jsonb)`, [tenantId,userId,JSON.stringify({reservationId})]);
+      await AuditEventStore.createInTransaction(db, {
+        tenantId, sessionId: null, userId, type: "model_spending_closed", payload: { reservationId }
+      });
     });
   }
 
@@ -195,8 +198,9 @@ export class ModelSpendingStore {
       const result = await db.query(`UPDATE model_spending_reservations SET status='settled',charged_microusd=$3,updated_at=now()
         WHERE tenant_id=$1 AND reservation_id=$2 AND status='unknown' RETURNING reservation_id`, [tenantId,reservationId,toMicroUsd(actualUsd)]);
       if (!result.rowCount) throw Object.assign(new Error("Only an unresolved reservation can be reconciled."), { statusCode: 409 });
-      await db.query(`INSERT INTO audit_events(tenant_id,user_id,event_type,payload)
-        VALUES ($1,$2,'model_spending_reconciled',$3::jsonb)`, [tenantId,userId,JSON.stringify({reservationId,actualUsd})]);
+      await AuditEventStore.createInTransaction(db, {
+        tenantId, sessionId: null, userId, type: "model_spending_reconciled", payload: { reservationId, actualUsd }
+      });
     });
   }
 }

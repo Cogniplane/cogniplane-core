@@ -6,7 +6,7 @@ import { startExecutionHeartbeat, stopLostExecution } from "./execution-heartbea
 import { RequestLimitsUnavailableError } from "./redis-request-limits.js";
 import type { RequestLimitsInterface } from "./request-limits.js";
 import { SessionExecutionError, type SessionExecution, type SessionExecutionStore } from "./session-execution-store.js";
-import type { AuditEventStore } from "./audit-event-store.js";
+import type { AuditEventInput, AuditEventStore } from "./audit-event-store.js";
 import { computeNextCronRunAt } from "../lib/cron.js";
 import type { MessageStore } from "./message-store.js";
 import { gateChatPrompt, type ChatPromptGateStores } from "./pii/chat-prompt-pii.js";
@@ -166,7 +166,7 @@ export type SchedulerWorkerDeps = {
    * only because the SQL backing it and its bootstrap wiring live outside
    * this file; when absent the worker parks the job (next_run_at = NULL).
    */
-  disableJob?: (input: { tenantId: string; jobId: string; revision: number }) => Promise<boolean>;
+  disableJob?: (input: { tenantId: string; jobId: string; revision: number; audit?: AuditEventInput }) => Promise<boolean>;
   logger: {
     error(payload: unknown, message: string): void;
     warn(payload: unknown, message: string): void;
@@ -507,7 +507,15 @@ export class SchedulerWorker {
   private async pauseForSecurityChange(job: ScheduledJobRecord): Promise<void> {
     let paused: boolean;
     try {
-      paused = await this.deps.settings.pauseJobForSecurityChange(job.tenantId, job.jobId);
+      // The event commits with the pause. When it fails, the job stays on,
+      // the claim still refuses it, and the next tick tries again.
+      paused = await this.deps.settings.pauseJobForSecurityChange(job.tenantId, job.jobId, {
+        tenantId: job.tenantId,
+        sessionId: null,
+        userId: job.userId,
+        type: "scheduler.job.disabled",
+        payload: { jobId: job.jobId, reason: "security_change", disabled: true }
+      });
     } catch (error) {
       this.deps.logger.error(
         { error, jobId: job.jobId },
@@ -521,20 +529,6 @@ export class SchedulerWorker {
       { jobId: job.jobId, tenantId: job.tenantId, userId: job.userId },
       "Scheduled job paused: its owner's account security changed"
     );
-    try {
-      await this.deps.auditEvents.create({
-        tenantId: job.tenantId,
-        sessionId: null,
-        userId: job.userId,
-        type: "scheduler.job.disabled",
-        payload: { jobId: job.jobId, reason: "security_change", disabled: true }
-      });
-    } catch (auditError) {
-      this.deps.logger.error(
-        { error: auditError, jobId: job.jobId },
-        "Failed to create audit event for a job paused after a security change"
-      );
-    }
   }
 
   /**
@@ -542,8 +536,8 @@ export class SchedulerWorker {
    * run. Disable it (preferred) or, if no disable capability is wired, park it
    * with next_run_at = NULL so it goes dormant. Parking is not a claim, so it
    * writes no run. Both apply only to the listed revision of the job. The
-   * audit event is written only when this call changed the job, so several
-   * replicas that list the same job write one event.
+   * audit event commits with the change, only when this call changed the job,
+   * so several replicas that list the same job write one event.
    */
   private async handleInvalidCronJob(job: DueScheduledJob, error: unknown): Promise<void> {
     const reason = error instanceof Error ? error.message : String(error);
@@ -552,11 +546,28 @@ export class SchedulerWorker {
       "Scheduled job has invalid cron expression; disabling"
     );
 
+    const event = (disabledByThisCall: boolean): AuditEventInput => ({
+      tenantId: job.tenantId,
+      sessionId: null,
+      userId: job.userId,
+      type: "scheduler.job.disabled",
+      payload: {
+        jobId: job.jobId,
+        reason: "invalid_cron",
+        cronExpression: job.cronExpression,
+        timeZone: job.timeZone,
+        errorMessage: reason,
+        disabled: disabledByThisCall
+      }
+    });
+
     // Undefined: the disable is not wired or failed, so park the job.
     let disabled: boolean | undefined;
     if (this.deps.disableJob) {
       try {
-        disabled = await this.deps.disableJob({ tenantId: job.tenantId, jobId: job.jobId, revision: job.revision });
+        disabled = await this.deps.disableJob({
+          tenantId: job.tenantId, jobId: job.jobId, revision: job.revision, audit: event(true)
+        });
       } catch (disableError) {
         this.deps.logger.error(
           { error: disableError, jobId: job.jobId },
@@ -567,10 +578,9 @@ export class SchedulerWorker {
 
     // Fallback: take the job out of the due query by clearing next_run_at so a
     // per-minute invalid-cron job doesn't re-fire this branch every tick.
-    let parked = false;
     if (disabled === undefined) {
       try {
-        parked = await this.deps.settings.parkJob(job.tenantId, job.jobId, job.revision);
+        await this.deps.settings.parkJob(job.tenantId, job.jobId, job.revision, event(false));
       } catch (parkError) {
         this.deps.logger.error(
           { error: parkError, jobId: job.jobId },
@@ -579,30 +589,8 @@ export class SchedulerWorker {
       }
     }
 
-    // Another replica, or an owner edit, changed the job first.
-    if (!disabled && !parked) return;
-
-    try {
-      await this.deps.auditEvents.create({
-        tenantId: job.tenantId,
-        sessionId: null,
-        userId: job.userId,
-        type: "scheduler.job.disabled",
-        payload: {
-          jobId: job.jobId,
-          reason: "invalid_cron",
-          cronExpression: job.cronExpression,
-          timeZone: job.timeZone,
-          errorMessage: reason,
-          disabled: disabled === true
-        }
-      });
-    } catch (auditError) {
-      this.deps.logger.error(
-        { error: auditError, jobId: job.jobId },
-        "Failed to create audit event for invalid-cron job"
-      );
-    }
+    // A change that committed wrote its event. When another replica or an
+    // owner edit changed the job first, this call changed nothing.
   }
 
   /**
@@ -624,7 +612,19 @@ export class SchedulerWorker {
 
     let orphaned;
     try {
-      orphaned = await this.deps.settings.sweepStaleJobRuns(cutoffMs, STALE_RUN_SWEEP_BATCH_SIZE);
+      // Each swept run's event commits with the sweep. A failed event leaves
+      // the batch pending for the next tick.
+      orphaned = await this.deps.settings.sweepStaleJobRuns(cutoffMs, STALE_RUN_SWEEP_BATCH_SIZE, (run) => ({
+        tenantId: run.tenantId,
+        sessionId: run.sessionId,
+        userId: run.userId,
+        type: "scheduler.job.run.failed",
+        payload: {
+          jobId: run.jobId,
+          runId: run.runId,
+          reason: "orphaned_on_sweep"
+        }
+      }));
     } catch (error) {
       this.deps.logger.error({ error }, "Failed to sweep orphaned scheduled job runs");
       return;
@@ -635,24 +635,6 @@ export class SchedulerWorker {
         { runId: run.runId, jobId: run.jobId, sessionId: run.sessionId },
         "Recovered scheduled job run orphaned by a crash/restart"
       );
-      try {
-        await this.deps.auditEvents.create({
-          tenantId: run.tenantId,
-          sessionId: run.sessionId,
-          userId: run.userId,
-          type: "scheduler.job.run.failed",
-          payload: {
-            jobId: run.jobId,
-            runId: run.runId,
-            reason: "orphaned_on_sweep"
-          }
-        });
-      } catch (error) {
-        this.deps.logger.error(
-          { error, runId: run.runId },
-          "Failed to create audit event for orphaned job run"
-        );
-      }
     }
   }
 
@@ -1307,8 +1289,8 @@ export class SchedulerWorker {
   }
 
   /**
-   * Writes the run's outcome, its failure count and a failure-limit disable in
-   * one guarded write, then the audit events. The run event is written only
+   * Writes the run's outcome, its failure count, a failure-limit disable and
+   * their audit events in one guarded write. The run event is written only
    * when this call finished the run. Another writer can have finished it
    * first: the stale-run sweep writes the event of a run that it fails, and
    * then the owner can delete the job, so a missing run can already have its
@@ -1348,10 +1330,40 @@ export class SchedulerWorker {
         summary,
         counts: status === "completed" || outcome.countsTowardDisable,
         disableAtFailures: threshold
+      }, (result) => {
+        const events: AuditEventInput[] = [{
+          tenantId: job.tenantId,
+          sessionId,
+          userId: job.userId,
+          type: status === "completed" ? "scheduler.job.run.completed" : "scheduler.job.run.failed",
+          payload: {
+            jobId: job.jobId,
+            runId,
+            scheduledFor: job.scheduledFor,
+            durationMs,
+            ...(errorMessage ? { errorMessage } : {})
+          }
+        }];
+        if (result.disabled) {
+          events.push({
+            tenantId: job.tenantId,
+            sessionId: null,
+            userId: job.userId,
+            type: "scheduler.job.disabled",
+            payload: {
+              jobId: job.jobId,
+              reason: "repeated_failures",
+              consecutiveFailures: result.consecutiveFailures,
+              threshold,
+              disabled: true
+            }
+          });
+        }
+        return events;
       });
     } catch (error) {
-      // The run stays pending, so the stale-run sweep fails it and writes its
-      // audit event.
+      // The run and its events roll back together. The run stays pending, so
+      // the stale-run sweep fails it and writes its audit event.
       this.deps.logger.error({ error, runId }, "Failed to complete job run record");
       return;
     }
@@ -1370,24 +1382,6 @@ export class SchedulerWorker {
       return;
     }
 
-    try {
-      await this.deps.auditEvents.create({
-        tenantId: job.tenantId,
-        sessionId,
-        userId: job.userId,
-        type: status === "completed" ? "scheduler.job.run.completed" : "scheduler.job.run.failed",
-        payload: {
-          jobId: job.jobId,
-          runId,
-          scheduledFor: job.scheduledFor,
-          durationMs,
-          ...(errorMessage ? { errorMessage } : {})
-        }
-      });
-    } catch (error) {
-      this.deps.logger.error({ error, runId }, "Failed to create audit event for scheduled job");
-    }
-
     // Poison-job guard: the finish disabled a job that failed too many times
     // in a row, so a perpetually-failing per-minute cron can't re-fire every
     // tick forever.
@@ -1397,25 +1391,5 @@ export class SchedulerWorker {
       { jobId: job.jobId, failures, threshold },
       "Scheduled job hit the consecutive-failure limit; disabled"
     );
-    try {
-      await this.deps.auditEvents.create({
-        tenantId: job.tenantId,
-        sessionId: null,
-        userId: job.userId,
-        type: "scheduler.job.disabled",
-        payload: {
-          jobId: job.jobId,
-          reason: "repeated_failures",
-          consecutiveFailures: failures,
-          threshold,
-          disabled: true
-        }
-      });
-    } catch (error) {
-      this.deps.logger.error(
-        { error, jobId: job.jobId },
-        "Failed to create audit event for poison-disabled job"
-      );
-    }
   }
 }

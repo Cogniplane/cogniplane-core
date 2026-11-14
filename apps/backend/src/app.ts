@@ -392,10 +392,10 @@ export async function buildApp() {
     mailWorker: buildMailWorker(config, privilegedDb, app.log),
     // Cross-tenant stale-approval recovery needs a BYPASSRLS pool; reuse the
     // privileged pool (asserted to bypass RLS above) so the sweep can see every
-    // tenant's rows in one statement.
+    // tenant's rows in one statement and write their audit rows in the same
+    // transaction.
     staleApprovalSweeper: {
       approvals: new ApprovalStore(privilegedDb),
-      auditEvents: deps.auditEvents,
       logger: app.log
     },
     // Assistant rows that a killed process left `pending` or `streaming` can

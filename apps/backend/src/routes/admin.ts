@@ -162,7 +162,7 @@ export async function registerAdminRoutes(
   if (stores.modelSpending) await registerAdminModelSpendingRoutes(app, stores.modelSpending);
   await registerAdminSessionRoutes(app);
   await registerAdminSessionDetailRoute(app);
-  await registerAdminArtifactRoutes(app, { auditEvents: stores.auditEvents });
+  await registerAdminArtifactRoutes(app);
   await registerAdminRuntimeRoutes(app, {
     auditEvents: stores.auditEvents,
     runtimeSessions: stores.runtimeSessions,

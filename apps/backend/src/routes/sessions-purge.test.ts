@@ -9,19 +9,33 @@
 import Fastify from "fastify";
 import { describe, expect, it, vi } from "vitest";
 
+import type { AuditEventInput } from "../services/audit-event-store.js";
+import type { SessionLifecycleAudit } from "../services/session-store.js";
 import { registerSessionRoutes, type SessionRouteStores } from "./sessions.js";
 
 const OWNER = { tenantId: "tenant-a", userId: "user-a" };
 const SESSION_ID = "0198c0de-0000-7000-8000-000000000001";
 
+// The fake writes the delete event as SessionStore does, in the transaction of the
+// delete: when `failEvent` is set, the event fails and the row stays.
 function makeFakeSessions(sandboxId: string | null) {
   const rows = new Map([
     [SESSION_ID, { sessionId: SESSION_ID, tenantId: OWNER.tenantId, userId: OWNER.userId, sandboxId }]
   ]);
+  const events: AuditEventInput[] = [];
+  const state = { failEvent: false };
   return {
-    async remove(tenantId: string, sessionId: string, userId: string) {
+    rows,
+    events,
+    state,
+    async remove(tenantId: string, sessionId: string, userId: string, audit?: SessionLifecycleAudit) {
       const row = rows.get(sessionId);
       if (!row || row.tenantId !== tenantId || row.userId !== userId) return null;
+      if (audit) {
+        const event = audit({ previousStatus: "active", status: "deleted", purpose: "normal" });
+        if (state.failEvent) throw new Error("audit unavailable");
+        events.push(event);
+      }
       rows.delete(sessionId);
       return { releasedSandboxId: row.sandboxId };
     }
@@ -48,6 +62,7 @@ function makeAdapterSpy(id: string) {
 
 async function makeApp(sandboxId: string | null = "sandbox-one") {
   const app = Fastify();
+  const sessions = makeFakeSessions(sandboxId);
   const deepAgents = makeAdapterSpy("deep-agents");
   app.addHook("preHandler", async (request) => {
     request.auth = {
@@ -58,12 +73,12 @@ async function makeApp(sandboxId: string | null = "sandbox-one") {
     };
   });
   await registerSessionRoutes(app, {
-    sessions: makeFakeSessions(sandboxId),
+    sessions,
     messages: {},
     runtimeAdapter: deepAgents,
     limits: { consumeRateLimit: async () => null }
   } as unknown as SessionRouteStores);
-  return { app, deepAgents };
+  return { app, deepAgents, sessions };
 }
 
 describe("DELETE /sessions/:sessionId recovery", () => {
@@ -134,5 +149,31 @@ describe("DELETE /sessions/:sessionId sandbox", () => {
     const response = await app.inject({ method: "DELETE", url: `/sessions/${SESSION_ID}`, headers: owner });
     expect(response.statusCode).toBe(204);
     expect(deepAgents.destroySandbox).toHaveBeenCalledOnce();
+  });
+});
+
+describe("DELETE /sessions/:sessionId audit", () => {
+  const owner = { "x-tenant-id": OWNER.tenantId, "x-user-id": OWNER.userId };
+
+  it("writes the delete event in the delete transaction", async () => {
+    const { app, sessions } = await makeApp("sandbox-one");
+    const response = await app.inject({ method: "DELETE", url: `/sessions/${SESSION_ID}`, headers: owner });
+    expect(response.statusCode).toBe(204);
+    expect(sessions.events).toEqual([{
+      tenantId: OWNER.tenantId, sessionId: SESSION_ID, userId: OWNER.userId, type: "session.deleted",
+      payload: { previousStatus: "active", fromTrash: true }
+    }]);
+  });
+
+  // The delete rolled back: the session keeps its sandbox, so the route must not kill it.
+  it("fails the delete and stops nothing when its audit event fails", async () => {
+    const { app, deepAgents, sessions } = await makeApp("sandbox-one");
+    sessions.state.failEvent = true;
+    const response = await app.inject({ method: "DELETE", url: `/sessions/${SESSION_ID}`, headers: owner });
+    expect(response.statusCode).toBe(500);
+    expect(sessions.events).toEqual([]);
+    expect(sessions.rows.has(SESSION_ID)).toBe(true);
+    expect(deepAgents.abortSession).not.toHaveBeenCalled();
+    expect(deepAgents.destroySandbox).not.toHaveBeenCalled();
   });
 });

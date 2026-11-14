@@ -12,10 +12,21 @@ import {
 } from "./notion-connection-service.js";
 import type { NotionConnectionRecord } from "./notion-connection-store.js";
 import { OwnerSecurityVersionChangedError } from "../../auth/security-change.js";
+import type { AuditEventInput } from "../../audit-event-store.js";
 
 class InMemoryNotionConnectionStore {
   record: NotionConnectionRecord | null = null;
   markUsedCount = 0;
+  /** The audit events that the store writes in each change's transaction. */
+  audits: AuditEventInput[] = [];
+  /** The audit insert fails, so the change rolls back. */
+  failAudit = false;
+
+  private audit(event: AuditEventInput | undefined): void {
+    if (!event) return;
+    if (this.failAudit) throw new Error("audit insert failed");
+    this.audits.push(event);
+  }
   // The stored owner_security_version, and the owner's current local version
   // (null: a WorkOS owner). Same rule as ownerSecurityVersionSql.
   ownerSecurityVersion: number | null = null;
@@ -46,26 +57,32 @@ class InMemoryNotionConnectionStore {
     input: Omit<NotionConnectionRecord, "createdAt" | "updatedAt" | "tokenLastUsedAt"> & {
       tokenLastRefreshedAt: string | null;
       ownerSecurityVersion: number | null;
-    }
+    },
+    audit?: (connection: NotionConnectionRecord) => AuditEventInput
   ): Promise<NotionConnectionRecord> {
     const now = new Date().toISOString();
     const { ownerSecurityVersion, ...fields } = input;
     // Same rule as assertOwnerSecurityVersion: the callback write is bound to the current version.
     if (this.currentSecurityVersion !== ownerSecurityVersion) throw new OwnerSecurityVersionChangedError();
-    this.ownerSecurityVersion = ownerSecurityVersion;
-    this.record = {
+    const saved: NotionConnectionRecord = {
       ...fields,
       tokenLastUsedAt: this.record?.tokenLastUsedAt ?? null,
       createdAt: this.record?.createdAt ?? now,
       updatedAt: now
     };
+    // The event commits with the connection, or neither does.
+    this.audit(audit?.(saved));
+    this.ownerSecurityVersion = ownerSecurityVersion;
+    this.record = saved;
     return this.record;
   }
 
-  async delete(): Promise<boolean> {
-    const hadRecord = Boolean(this.record);
+  async delete(_tenantId: string, _userId: string,
+    audit?: (removed: NotionConnectionRecord) => AuditEventInput): Promise<boolean> {
+    if (!this.record) return false;
+    this.audit(audit?.(this.record));
     this.record = null;
-    return hadRecord;
+    return true;
   }
 
   async markTokenUsed(): Promise<void> {
@@ -151,13 +168,12 @@ test("getAuthorizationUrl returns valid Notion URL", async () => {
   expect(browserBinding.options.path).toBe("/integrations/notion/callback");
 });
 
-test.each(["none", "audit", "audit_sync", "runtime", "runtime_sync"])("completeAuthorization stores connection despite %s follow-up failure", async (failure) => {
+test.each(["none", "runtime", "runtime_sync", "audit"])("completeAuthorization stores connection despite %s follow-up failure, but not without an audit event", async (failure) => {
   const config = createTestConfig({ API_ORIGIN: "http://localhost:3000", ...NOTION_OAUTH_OVERRIDES });
   const store = new InMemoryNotionConnectionStore();
+  store.failAudit = failure === "audit";
   const auditEvents = new InMemoryAuditEventStore();
   const runtimeManager = new InMemoryRuntimeManager();
-  if (failure === "audit") auditEvents.create = async () => { throw new Error("audit unavailable"); };
-  if (failure === "audit_sync") auditEvents.create = () => { throw new Error("audit unavailable"); };
   if (failure === "runtime") runtimeManager.invalidateRuntimesForIntegration = async () => { throw new Error("runtime unavailable"); };
   if (failure === "runtime_sync") runtimeManager.invalidateRuntimesForIntegration = () => { throw new Error("runtime unavailable"); };
   const service = new NotionConnectionService(config, store, auditEvents, runtimeManager, undefined, { warn() {} });
@@ -208,6 +224,13 @@ test.each(["none", "audit", "audit_sync", "runtime", "runtime_sync"])("completeA
       state: validStateJwt,
       browserNonce: browserBinding.value
     });
+    if (failure === "audit") {
+      // The connection and its event roll back together.
+      expect(redirectUrl).toMatch(/notionAuth=error/);
+      expect(store.record).toBeNull();
+      expect(runtimeManager.invalidations).toEqual([]);
+      return;
+    }
     expect(redirectUrl).toMatch(/notionAuth=connected/);
     const record = requireValue(store.record, "stored Notion connection");
     expect(record.notionUserId).toBe("notion-user-1");
@@ -216,7 +239,9 @@ test.each(["none", "audit", "audit_sync", "runtime", "runtime_sync"])("completeA
     expect(record.notionOwnerEmail).toBe("test@example.com");
     expect(record.notionOwnerName).toBe("Test User");
     expect(decrypt(record.accessTokenEncrypted, config.DATA_ENCRYPTION_SECRET)).toBe("secret_notion_access_token");
-    if (!failure.startsWith("audit")) expect(auditEvents.events[0]?.type).toBe("user.notion.connected");
+    // The event commits with the connection, in the store's transaction.
+    expect(store.audits[0]?.type).toBe("user.notion.connected");
+    expect(auditEvents.events).toEqual([]);
     if (!failure.startsWith("runtime")) expect(runtimeManager.invalidations).toEqual([
             { tenantId: "tenant-1", userId: "user-1", integrationId: "notion" }
           ]);
@@ -398,7 +423,8 @@ test("disconnect removes record and emits audit event", async () => {
   const removed = await service.disconnect("tenant-1", "user-1");
   expect(removed).toBe(true);
   expect(store.record).toBe(null);
-  expect(auditEvents.events[0]?.type).toBe("user.notion.disconnected");
+  expect(store.audits[0]?.type).toBe("user.notion.disconnected");
+  expect(auditEvents.events).toEqual([]);
   expect(runtimeManager.invalidations).toEqual([
         { tenantId: "tenant-1", userId: "user-1", integrationId: "notion" }
       ]);

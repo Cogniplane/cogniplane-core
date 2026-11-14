@@ -250,7 +250,7 @@ function scopedWorker(tenantId: string, options: {
       caps: { perUser: 5, perTenant: 50 }
     },
     auditEvents: new AuditEventStore(appPool()),
-    disableJob: ({ tenantId: jobTenantId, jobId, revision }) => settings.disableJob(jobTenantId, jobId, revision),
+    disableJob: ({ tenantId: jobTenantId, jobId, revision, audit }) => settings.disableJob(jobTenantId, jobId, revision, audit),
     logger: createSilentLogger()
   }, {
     maxConcurrentJobs: 5,

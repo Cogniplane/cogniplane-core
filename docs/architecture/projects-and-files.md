@@ -160,7 +160,10 @@ Limits:
 - Download: `POST /artifacts/:artifactId/download-token` issues a short-lived
   opaque token (`ARTIFACT_DOWNLOAD_TTL_MS`). `GET /downloads/:token` is public;
   it checks the token's user, current membership and session access, then
-  streams the object through the backend. No storage URL leaves the API.
+  streams the object through the backend. No storage URL leaves the API. The
+  token is spent and the `artifact_downloaded` event written in one
+  transaction, before any byte goes out. When the event cannot be written, the
+  route sends no file and the token stays usable.
 - Before a turn, the artifacts that `artifactIds` in `POST /messages` selects
   are copied to `./artifacts/<name>` in the session workspace
   (`syncArtifactsToWorkspace`, `services/artifacts/artifact-workspace-sync.ts`).

@@ -20,10 +20,18 @@ afterEach(async () => {
 });
 
 async function buildApp(options: { isAdmin?: boolean; setUserBetaTester?: (tenantId: string, userId: string, value: boolean) => Promise<TenantMemberRecord | null> } = {}) {
+  // The events that the store writes in the change's transaction.
+  const transactionAudits = vi.fn((_input: AuditEventInput) => undefined);
+  const setUserBetaTester = options.setUserBetaTester ?? (async (tenantId: string, userId: string, isBetaTester: boolean) =>
+    member(userId, { tenantId, isBetaTester }));
   const tenantMembers = {
     listTenantMembers: vi.fn(async (tenantId: string) => [member("ana", { tenantId }), member("bo", { tenantId, role: "admin" })]),
-    setUserBetaTester: vi.fn(options.setUserBetaTester ?? (async (tenantId: string, userId: string, isBetaTester: boolean) =>
-      member(userId, { tenantId, isBetaTester })))
+    setUserBetaTester: vi.fn(async (tenantId: string, userId: string, isBetaTester: boolean,
+      audit?: (saved: TenantMemberRecord) => AuditEventInput) => {
+      const saved = await setUserBetaTester(tenantId, userId, isBetaTester);
+      if (saved && audit) transactionAudits(audit(saved));
+      return saved;
+    })
   };
   const auditEvents = { create: vi.fn(async (_input: AuditEventInput) => undefined) };
   const app = Fastify();
@@ -34,7 +42,7 @@ async function buildApp(options: { isAdmin?: boolean; setUserBetaTester?: (tenan
     request.auth = { tenantId: "tenant-A", userId: "admin-1", isAdmin, role: isAdmin ? "admin" : "member" };
   });
   await registerAdminUserRoutes(app, { tenantMembers, auditEvents });
-  return { app, tenantMembers, auditEvents };
+  return { app, tenantMembers, auditEvents, transactionAudits };
 }
 
 const setBeta = (userId: string, payload: Record<string, unknown>, query = "") => ({
@@ -73,14 +81,15 @@ describe("admin user routes", () => {
   });
 
   test("marks a member as a beta tester in the caller's tenant and audits it", async () => {
-    const { app, tenantMembers, auditEvents } = await buildApp();
+    const { app, tenantMembers, auditEvents, transactionAudits } = await buildApp();
 
     const response = await app.inject({ ...setBeta("bo", { isBetaTester: true, tenantId: "tenant-B" }), headers: { "user-agent": "test-agent" } });
 
     expect(response.statusCode).toBe(200);
     expect(response.json().user).toMatchObject({ userId: "bo", tenantId: "tenant-A", isBetaTester: true });
-    expect(tenantMembers.setUserBetaTester).toHaveBeenCalledWith("tenant-A", "bo", true);
-    expect(auditEvents.create).toHaveBeenCalledWith(expect.objectContaining({
+    expect(tenantMembers.setUserBetaTester).toHaveBeenCalledWith("tenant-A", "bo", true, expect.any(Function));
+    expect(auditEvents.create).not.toHaveBeenCalled();
+    expect(transactionAudits).toHaveBeenCalledWith(expect.objectContaining({
       tenantId: "tenant-A",
       userId: "admin-1",
       type: "admin.user.beta_tester_updated",
@@ -90,13 +99,14 @@ describe("admin user routes", () => {
   });
 
   test("answers 404 for someone who is not a member, without an audit event", async () => {
-    const { app, auditEvents } = await buildApp({ setUserBetaTester: async () => null });
+    const { app, auditEvents, transactionAudits } = await buildApp({ setUserBetaTester: async () => null });
 
     const response = await app.inject(setBeta("ghost", { isBetaTester: true }));
 
     expect(response.statusCode).toBe(404);
     expect(response.json()).toEqual({ error: "user_not_found" });
     expect(auditEvents.create).not.toHaveBeenCalled();
+    expect(transactionAudits).not.toHaveBeenCalled();
   });
 
   test.each([

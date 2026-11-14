@@ -259,18 +259,16 @@ export async function registerSettingsRoutes(
       userId,
       sectionKey: paramsResult.value.section,
       config: bodyResult.value.config
-    });
-
-    await stores.auditEvents.create({
+    }, (saved) => ({
       tenantId,
       sessionId: null,
       userId,
       type: "user.settings.updated",
       payload: {
-        sectionKey: section.sectionKey,
-        version: section.version
+        sectionKey: saved.sectionKey,
+        version: saved.version
       }
-    });
+    }));
 
     return serialize(UserSettingsSectionEnvelopeSchema, {
       section: {
@@ -353,9 +351,17 @@ export async function registerSettingsRoutes(
     // The store counts and inserts in one locked transaction, so concurrent
     // requests cannot pass the check together.
     const maxActive = stores.config.SCHEDULED_JOB_MAX_ACTIVE_PER_USER;
+    // sessionId: null — this is a non-interactive (route-driven) audit event.
     const created = await stores.settings.createScheduledJob(
       { jobId: uuidv7(), ...persistenceInputResult.value, ...(await scheduledJobOwnerSession(request, stores)) },
-      { maxActive }
+      { maxActive },
+      (saved) => ({
+        tenantId,
+        sessionId: null,
+        userId,
+        type: "user.scheduled_job.created",
+        payload: buildScheduledJobAuditPayload(saved)
+      })
     );
     if (created.status === "limit_reached") {
       reply.code(409);
@@ -365,15 +371,6 @@ export async function registerSettingsRoutes(
       );
     }
     const job = created.job;
-
-    // sessionId: null — this is a non-interactive (route-driven) audit event.
-    await stores.auditEvents.create({
-      tenantId,
-      sessionId: null,
-      userId,
-      type: "user.scheduled_job.created",
-      payload: buildScheduledJobAuditPayload(job)
-    });
 
     reply.code(201);
     return serialize(ScheduledJobEnvelopeSchema, { scheduledJob: job });
@@ -441,7 +438,18 @@ export async function registerSettingsRoutes(
     const maxActive = stores.config.SCHEDULED_JOB_MAX_ACTIVE_PER_USER;
     const updated = await stores.settings.updateScheduledJob(
       { jobId: paramsResult.value.jobId, ...persistenceInputResult.value, ...(await scheduledJobOwnerSession(request, stores)) },
-      { maxActive }
+      { maxActive },
+      // sessionId: null — this is a non-interactive (route-driven) audit event.
+      (saved) => ({
+        tenantId,
+        sessionId: null,
+        userId,
+        type: "user.scheduled_job.updated",
+        payload: {
+          ...buildScheduledJobAuditPayload(saved),
+          ...(existing.pausedReason ? { previousPausedReason: existing.pausedReason } : {})
+        }
+      })
     );
 
     if (updated.status === "not_found") {
@@ -456,18 +464,6 @@ export async function registerSettingsRoutes(
       );
     }
     const job = updated.job;
-
-    // sessionId: null — this is a non-interactive (route-driven) audit event.
-    await stores.auditEvents.create({
-      tenantId,
-      sessionId: null,
-      userId,
-      type: "user.scheduled_job.updated",
-      payload: {
-        ...buildScheduledJobAuditPayload(job),
-        ...(existing.pausedReason ? { previousPausedReason: existing.pausedReason } : {})
-      }
-    });
 
     return serialize(ScheduledJobEnvelopeSchema, { scheduledJob: job });
   });
@@ -494,25 +490,24 @@ export async function registerSettingsRoutes(
       return paramsResult.response;
     }
 
+    // sessionId: null — this is a non-interactive (route-driven) audit event.
     const removed = await stores.settings.deleteScheduledJob(
       tenantId,
       paramsResult.value.jobId,
-      userId
+      userId,
+      {
+        tenantId,
+        sessionId: null,
+        userId,
+        type: "user.scheduled_job.deleted",
+        payload: { jobId: paramsResult.value.jobId }
+      }
     );
 
     if (!removed) {
       reply.code(404);
       return notFoundError("scheduled_job_not_found");
     }
-
-    // sessionId: null — this is a non-interactive (route-driven) audit event.
-    await stores.auditEvents.create({
-      tenantId,
-      sessionId: null,
-      userId,
-      type: "user.scheduled_job.deleted",
-      payload: { jobId: paramsResult.value.jobId }
-    });
 
     reply.code(204);
     return null;

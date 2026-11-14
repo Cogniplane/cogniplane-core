@@ -1,5 +1,6 @@
 import type { LoginType } from "../config.js";
 import { type Pool, withTenantScope } from "../lib/db.js";
+import { AuditEventStore, type AuditEventInput } from "./audit-event-store.js";
 
 import type { TenantMemberRecord } from "./admin-config-records.js";
 import { mapTenantMember } from "./admin-config-store-mappers.js";
@@ -215,7 +216,9 @@ export class TenantMemberStore {
   async setUserBetaTester(
     tenantId: string,
     userId: string,
-    isBetaTester: boolean
+    isBetaTester: boolean,
+    // The change's audit event; it commits in the change's transaction.
+    audit?: (member: TenantMemberRecord) => AuditEventInput
   ): Promise<TenantMemberRecord | null> {
     return withTenantScope(this.db, tenantId, async (client) => {
       const result = await client.query(
@@ -242,11 +245,13 @@ export class TenantMemberStore {
 
       const userRow = userResult.rows[0] as Record<string, unknown> | undefined;
 
-      return mapTenantMember({
+      const member = mapTenantMember({
         ...membershipRow,
         email: userRow?.email ?? null,
         display_name: userRow?.display_name ?? null
       });
+      if (audit) await AuditEventStore.createInTransaction(client, audit(member));
+      return member;
     });
   }
 

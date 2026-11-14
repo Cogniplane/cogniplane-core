@@ -102,7 +102,7 @@ describe.skipIf(!adminDatabaseUrl())("ApprovalStore.resolve", () => {
       await blocker.query("BEGIN");
       await blocker.query("SELECT approval_id FROM approvals WHERE approval_id=$1 FOR UPDATE", [approvalId]);
       pending.push(store.resolve(owner.tenantId, approvalId, owner.userId, "approve"));
-      pending.push(rival === "expiry" ? store.expire(owner.tenantId, approvalId)
+      pending.push(rival === "expiry" ? store.expire(owner.tenantId, approvalId, "turn_interrupted")
         : store.resolve(owner.tenantId, approvalId, owner.userId, "reject"));
       // Prove both UPDATEs reached Postgres and wait on locks before release.
       await vi.waitFor(async () => {
@@ -119,7 +119,7 @@ describe.skipIf(!adminDatabaseUrl())("ApprovalStore.resolve", () => {
       expect(winner.decision).toBe(results[0] ? "approve" : rival === "expiry" ? null : "reject");
       expect(winner.resolved_at).toBeInstanceOf(Date);
       expect(await store.resolve(owner.tenantId, approvalId, owner.userId, "reject")).toBeNull();
-      expect(await store.expire(owner.tenantId, approvalId)).toBeNull();
+      expect(await store.expire(owner.tenantId, approvalId, "turn_interrupted")).toBeNull();
       expect(await row(approvalId)).toEqual(winner);
     } finally {
       await blocker.query("ROLLBACK");

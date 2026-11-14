@@ -1,5 +1,5 @@
 import { withTenantScope, type Pool } from "../../../../apps/backend/src/lib/db.js";
-import { AuditEventStore } from "../../../../apps/backend/src/services/audit-event-store.js";
+import { AuditEventStore, type AuditEventInput } from "../../../../apps/backend/src/services/audit-event-store.js";
 import {
   assertOwnerSecurityVersion,
   ownerSecurityVersionSql
@@ -152,7 +152,9 @@ export class MicrosoftConnectionStore {
     // OwnerSecurityVersionChangedError when it is not the owner's current one.
     // Only the callback calls upsert; a token refresh uses updateRefreshedToken.
     ownerSecurityVersion: number | null;
-  }): Promise<MicrosoftConnectionRecord> {
+  },
+  // The connect's audit event; it commits in the connect's transaction.
+  audit?: (connection: MicrosoftConnectionRecord) => AuditEventInput): Promise<MicrosoftConnectionRecord> {
     return withTenantScope(this.db, input.tenantId, async (client) => {
       await assertOwnerSecurityVersion(client, input.tenantId, input.userId, input.ownerSecurityVersion);
       const result = await client.query(
@@ -185,7 +187,9 @@ export class MicrosoftConnectionStore {
           input.refreshTokenExpiresAt, input.tokenLastRefreshedAt, input.ownerSecurityVersion
         ]
       );
-      return mapMicrosoftConnection(result.rows[0]);
+      const connection = mapMicrosoftConnection(result.rows[0]);
+      if (audit) await AuditEventStore.createInTransaction(client, audit(connection));
+      return connection;
     });
   }
 
@@ -232,13 +236,17 @@ export class MicrosoftConnectionStore {
     });
   }
 
-  async delete(tenantId: string, userId: string): Promise<boolean> {
+  /** `audit` builds the disconnect's audit event from the removed row. It commits in the delete's transaction. */
+  async delete(tenantId: string, userId: string,
+    audit?: (removed: MicrosoftConnectionRecord) => AuditEventInput): Promise<boolean> {
     return withTenantScope(this.db, tenantId, async (client) => {
       const result = await client.query(
-        `DELETE FROM user_microsoft_connections WHERE tenant_id = $1 AND user_id = $2`,
+        `DELETE FROM user_microsoft_connections WHERE tenant_id = $1 AND user_id = $2 RETURNING *`,
         [tenantId, userId]
       );
-      return (result.rowCount ?? 0) > 0;
+      if (!result.rows[0]) return false;
+      if (audit) await AuditEventStore.createInTransaction(client, audit(mapMicrosoftConnection(result.rows[0])));
+      return true;
     });
   }
 

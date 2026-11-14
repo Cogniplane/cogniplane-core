@@ -16,7 +16,7 @@ import { uuidv7 } from "../lib/uuid.js";
 import { ToolContextUnavailableError, type ToolExecutionContext } from "../services/auth/tool-execution-context-store.js";
 import { type ArtifactDetail, type ArtifactDownloadTokenRecord, type ArtifactPiiDetail, type ArtifactRecord, type ArtifactStore, isArtifactPiiEligible, UPLOAD_SCAN_PENDING_KEY } from "../services/artifacts/artifact-store.js";
 import { LocalArtifactStorage } from "../services/artifacts/artifact-storage.js";
-import type { SessionRecord } from "../services/session-store.js";
+import type { SessionLifecycleAudit, SessionRecord } from "../services/session-store.js";
 import { SessionUploadAccessError } from "../services/session-upload-access.js";
 import type { MessageRecord, ToolResultRecord, MessageStore } from "../services/message-store.js";
 import { ActiveTurnsRegistry } from "../services/active-turns-registry.js";
@@ -96,6 +96,9 @@ import { registerSessionRoutes, type SessionRouteStores } from "../routes/sessio
 
 class InMemorySessionStore {
   private readonly sessions = new Map<string, SessionRecord>();
+
+  // The lifecycle events that SessionStore writes in its transactions.
+  constructor(private readonly auditEvents: InMemoryAuditEventStore) {}
 
   getRetentionDays(): number {
     return SESSION_TRASH_RETENTION_DAYS;
@@ -205,32 +208,41 @@ class InMemorySessionStore {
     return updated;
   }
 
-  async setArchived(tenantId: string, sessionId: string, userId: string, archived: boolean) {
+  async setArchived(tenantId: string, sessionId: string, userId: string, archived: boolean, audit?: SessionLifecycleAudit) {
     const session = await this.getOwned(tenantId, sessionId, userId);
     if (!session || session.status !== (archived ? "active" : "archived")) return null;
     const now = new Date().toISOString();
     const updated: SessionRecord = { ...session, status: archived ? "archived" : "active", updatedAt: now };
     if (archived) updated.archivedAt = now;
     else delete updated.archivedAt;
+    if (audit) {
+      await this.auditEvents.create(audit({ previousStatus: session.status, status: updated.status, purpose: updated.purpose ?? "normal" }));
+    }
     this.sessions.set(sessionId, updated);
     return { session: updated, releasedSandboxId: null };
   }
 
-  async remove(_tenantId: string, sessionId: string, userId: string) {
+  async remove(_tenantId: string, sessionId: string, userId: string, audit?: SessionLifecycleAudit) {
     const session = this.sessions.get(sessionId);
     if (!session || session.userId !== userId || session.status === "deleted") {
       return null;
+    }
+    if (audit) {
+      await this.auditEvents.create(audit({ previousStatus: session.status, status: "deleted", purpose: session.purpose ?? "normal" }));
     }
     const now = new Date().toISOString();
     this.sessions.set(sessionId, { ...session, status: "deleted", deletedAt: now, updatedAt: now });
     return { releasedSandboxId: null };
   }
 
-  async restoreDeleted(_tenantId: string, sessionId: string, userId: string): Promise<SessionRecord | null> {
+  async restoreDeleted(_tenantId: string, sessionId: string, userId: string, audit?: SessionLifecycleAudit): Promise<SessionRecord | null> {
     const session = this.sessions.get(sessionId);
     if (!session || session.userId !== userId || session.status !== "deleted") return null;
     const updated = { ...session, status: "active" as const, updatedAt: new Date().toISOString() };
     delete updated.deletedAt;
+    if (audit) {
+      await this.auditEvents.create(audit({ previousStatus: session.status, status: updated.status, purpose: updated.purpose ?? "normal" }));
+    }
     this.sessions.set(sessionId, updated);
     return updated;
   }
@@ -669,9 +681,11 @@ class InMemoryArtifactStore {
     this.artifacts.set(artifact.artifactId, artifact);
     return artifact;
   }
-  async createGenerated(input: Parameters<ArtifactStore["createGenerated"]>[0]) {
+  async createGenerated(...[input, audit]: Parameters<ArtifactStore["createGenerated"]>) {
     await this.sessions.requireUploadAccess(input.tenantId, input.sessionId, input.userId);
-    return this.create(input);
+    const artifact = await this.create(input);
+    await this.auditEvents.create(audit(artifact));
+    return artifact;
   }
   async listBySession(_tenantId: string, sessionId: string, userId: string) {
     return [...this.artifacts.values()].filter((artifact) => artifact.sessionId === sessionId && artifact.userId === userId && artifact.status !== "deleted");
@@ -746,10 +760,12 @@ class InMemoryArtifactStore {
   // Mirrors production single-use semantics: returns the row only on the
   // first call; subsequent calls return null. An expired token is never
   // consumed.
-  async consumeDownloadToken(input: { token: string }) {
+  async consumeDownloadToken(input: Parameters<ArtifactStore["consumeDownloadToken"]>[0]) {
     const downloadToken = await this.resolveGatedDownloadToken(input);
     if (!downloadToken) return null;
     if (new Date(downloadToken.expiresAt).getTime() <= Date.now()) return null;
+    // The audit event commits with the consume: when it fails, the token stays.
+    await this.auditEvents.create(input.audit(downloadToken));
     this.downloadTokens.delete(input.token);
     return downloadToken;
   }
@@ -811,13 +827,15 @@ export async function createTestApp(
     ...appConfigOverrides
   } = configOverrides;
   const db = new FakeDatabase();
-  const sessions = new InMemorySessionStore();
+  const auditEvents = new InMemoryAuditEventStore();
+  const sessions = new InMemorySessionStore(auditEvents);
   const messages = new InMemoryMessageStore();
   const runtimeManager = new FakeRuntimeManager();
   const activeTurns = new ActiveTurnsRegistry();
   const toolContexts = new InMemoryToolContextStore();
   const approvals = createInMemoryApprovalStore();
-  const auditEvents = new InMemoryAuditEventStore();
+  // The approval audit rows that ApprovalStore writes in its transactions.
+  approvals.audit.mockImplementation((event) => auditEvents.create(event));
   const artifacts = new InMemoryArtifactStore(sessions, auditEvents);
   const artifactProcessor = new NoopArtifactProcessor();
   const artifactStorageRoot = await mkdtemp(path.join(os.tmpdir(), "cogniplane-core-artifact-tests-"));
@@ -900,7 +918,6 @@ export async function createTestApp(
   await registerArtifactRoutes(app, {
     sessions,
     artifacts,
-    auditEvents,
     storage: artifactStorage,
     processor: artifactProcessor,
     limits

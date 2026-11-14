@@ -65,11 +65,17 @@ class InMemoryStorage {
   }
 }
 
-function makeArtifactStore(): Pick<ArtifactStore, "create" | "createGenerated" | "getReadable" | "listBySession" | "findLatestReadableDerived"> & { created: Record<string, unknown>[] } {
+function makeArtifactStore(): Pick<ArtifactStore, "create" | "createGenerated" | "getReadable" | "listBySession" | "findLatestReadableDerived"> & {
+  created: Record<string, unknown>[];
+  /** The audit events that createGenerated writes in the artifact's transaction. */
+  audits: unknown[];
+} {
   let counter = 0;
   const records: Record<string, unknown>[] = [];
+  const audits: unknown[] = [];
   return {
     created: records,
+    audits,
     async create(input) {
       const record: ArtifactRecord = {
         artifactId: `artifact-${++counter}`,
@@ -94,8 +100,10 @@ function makeArtifactStore(): Pick<ArtifactStore, "create" | "createGenerated" |
       records.push({ ...record });
       return record;
     },
-    async createGenerated(input) {
-      return this.create(input);
+    async createGenerated(input, audit) {
+      const record = await this.create(input);
+      audits.push(audit(record));
+      return record;
     },
     async getReadable(_tenantId: string, _artifactId: string, _userId: string) { return null; },
     async listBySession(_tenantId: string, _sessionId: string, _userId: string) { return []; },
@@ -442,7 +450,8 @@ test("write_artifact creates artifact and stores content", async () => {
   const storedContent = [...d.storage.stored.values()][0]!.toString("utf-8");
   expect(storedContent).toBe("print('hello')");
 
-  expect(d.auditEvents.created.length).toBe(1);
+  expect(d.artifacts.audits).toEqual([expect.objectContaining({ type: "artifact_generated" })]);
+  expect(d.auditEvents.created).toEqual([]);
 });
 
 test("write_artifact infers MIME type from extension", async () => {

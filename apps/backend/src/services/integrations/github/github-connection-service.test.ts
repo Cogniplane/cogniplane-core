@@ -15,10 +15,21 @@ import {
 import type { GithubConnectionRecord, GithubConnectionStore } from "./github-connection-store.js";
 import { InvalidGithubRepositoryListError } from "./github-repository-allowlist.js";
 import { OwnerSecurityVersionChangedError } from "../../auth/security-change.js";
+import type { AuditEventInput } from "../../audit-event-store.js";
 
 class InMemoryGithubConnectionStore {
   record: GithubConnectionRecord | null = null;
   markUsedCount = 0;
+  /** The audit events that the store writes in each change's transaction. */
+  audits: AuditEventInput[] = [];
+  /** The audit insert fails, so the change rolls back. */
+  failAudit = false;
+
+  private audit(event: AuditEventInput | null | undefined): void {
+    if (!event) return;
+    if (this.failAudit) throw new Error("audit insert failed");
+    this.audits.push(event);
+  }
   // The stored owner_security_version, and the owner's current local version
   // (null: a WorkOS owner). Same rule as ownerSecurityVersionSql.
   ownerSecurityVersion: number | null = null;
@@ -45,12 +56,11 @@ class InMemoryGithubConnectionStore {
   async upsert(input: Omit<GithubConnectionRecord, "createdAt" | "updatedAt" | "tokenLastUsedAt" | "allowedRepositories"> & {
     tokenLastRefreshedAt: string | null;
     ownerSecurityVersion: number | null;
-  }): Promise<GithubConnectionRecord> {
+  }, audit?: (connection: GithubConnectionRecord) => AuditEventInput): Promise<GithubConnectionRecord> {
     const now = new Date().toISOString();
     // Same rule as assertOwnerSecurityVersion: the callback write is bound to the current version.
     if (this.currentSecurityVersion !== input.ownerSecurityVersion) throw new OwnerSecurityVersionChangedError();
-    this.ownerSecurityVersion = input.ownerSecurityVersion;
-    this.record = {
+    const saved: GithubConnectionRecord = {
       tenantId: input.tenantId,
       userId: input.userId,
       githubUserId: input.githubUserId,
@@ -72,6 +82,10 @@ class InMemoryGithubConnectionStore {
       createdAt: this.record?.createdAt ?? now,
       updatedAt: now
     };
+    // The event commits with the connection, or neither does.
+    this.audit(audit?.(saved));
+    this.ownerSecurityVersion = input.ownerSecurityVersion;
+    this.record = saved;
     return this.record;
   }
 
@@ -95,19 +109,24 @@ class InMemoryGithubConnectionStore {
     _tenantId: string,
     _userId: string,
     repositories: readonly string[],
-    expectedGithubUserId: string
+    expectedGithubUserId: string,
+    audit?: Parameters<GithubConnectionStore["setAllowedRepositories"]>[4]
   ) {
     if (!this.record) return { status: "not_connected" } as const;
     if (this.record.githubUserId !== expectedGithubUserId) return { status: "account_changed" } as const;
     const previous = this.record.allowedRepositories;
-    this.record = { ...this.record, allowedRepositories: [...repositories] };
-    return { status: "updated", previous, record: this.record } as const;
+    const updated = { status: "updated" as const, previous, record: { ...this.record, allowedRepositories: [...repositories] } };
+    this.audit(audit?.(updated));
+    this.record = updated.record;
+    return updated;
   }
 
-  async delete(): Promise<boolean> {
-    const hadRecord = Boolean(this.record);
+  async delete(_tenantId: string, _userId: string,
+    audit?: (removed: GithubConnectionRecord) => AuditEventInput): Promise<boolean> {
+    if (!this.record) return false;
+    this.audit(audit?.(this.record));
     this.record = null;
-    return hadRecord;
+    return true;
   }
 
   async markTokenUsed(): Promise<void> {
@@ -130,12 +149,11 @@ function createOAuthConfig() {
   });
 }
 
-test.each(["none", "audit", "audit_sync", "runtime", "runtime_sync"])("authorizes a user despite %s follow-up failure", async (failure) => {
+test.each(["none", "runtime", "runtime_sync", "audit"])("authorizes a user despite %s follow-up failure, but not without an audit event", async (failure) => {
   const config = createOAuthConfig();
   const store = new InMemoryGithubConnectionStore();
+  store.failAudit = failure === "audit";
   const auditEvents = new InMemoryAuditEventStore();
-  if (failure === "audit") auditEvents.create = async () => { throw new Error("audit unavailable"); };
-  if (failure === "audit_sync") auditEvents.create = () => { throw new Error("audit unavailable"); };
   const invalidatedUsers: Array<{ tenantId: string; userId: string; integrationId: string }> = [];
   const service = new GithubConnectionService(config, store, auditEvents, {
     invalidateRuntimesForIntegration(tenantId: string, userId: string, integrationId: string) {
@@ -200,6 +218,15 @@ test.each(["none", "audit", "audit_sync", "runtime", "runtime_sync"])("authorize
       state: authState,
       browserNonce: browserBinding.value
     });
+    if (failure === "audit") {
+      // The connection and its event roll back together: nothing is saved,
+      // and no runtime is refreshed for a connection that does not exist.
+      expect(authRedirect).toMatch(/githubAuth=error/);
+      expect(authRedirect).toMatch(/reason=github_authorization_failed/);
+      expect(store.record).toBeNull();
+      expect(invalidatedUsers).toEqual([]);
+      return;
+    }
     expect(authRedirect).toMatch(/githubAuth=connected/);
     expect(invalidatedUsers).toEqual([
             { tenantId: "tenant-1", userId: "user-1", integrationId: "github" }
@@ -208,7 +235,9 @@ test.each(["none", "audit", "audit_sync", "runtime", "runtime_sync"])("authorize
     expect(store.record?.githubLogin).toBe("octocat");
     expect(store.record?.accessTokenEncrypted).not.toBe("ghu_user_token");
     expect(decrypt(String(store.record?.accessTokenEncrypted), config.DATA_ENCRYPTION_SECRET)).toBe("ghu_user_token");
-    if (!failure.startsWith("audit")) expect(auditEvents.events[0]?.type).toBe("user.github.connected");
+    // The event commits with the connection, in the store's transaction.
+    expect(store.audits[0]?.type).toBe("user.github.connected");
+    expect(auditEvents.events).toEqual([]);
 
     const runtimeCredentials = (await service.getRuntimeCredentials(
       "tenant-1",
@@ -535,8 +564,9 @@ test("setAllowedRepositories validates, lower-cases and de-duplicates the list, 
 
   expect(saved).toEqual(["acme/another.repo_1", "acme/keep", "acme/new"]);
   expect(store.record.allowedRepositories).toEqual(saved);
-  expect(auditEvents.events).toHaveLength(1);
-  expect(auditEvents.events[0]).toMatchObject({
+  expect(auditEvents.events).toEqual([]);
+  expect(store.audits).toHaveLength(1);
+  expect(store.audits[0]).toMatchObject({
     userId: "user-1",
     type: "user.github.repositories_updated",
     payload: {
@@ -559,6 +589,18 @@ test("setAllowedRepositories writes no audit event when the list did not change"
   await service.setAllowedRepositories("tenant-1", "user-1", ["Acme/App"], "1");
 
   expect(auditEvents.events).toEqual([]);
+  expect(store.audits).toEqual([]);
+});
+
+test("setAllowedRepositories keeps the stored list when its audit event cannot be written", async () => {
+  const config = createOAuthConfig();
+  const store = new InMemoryGithubConnectionStore();
+  store.record = { ...githubRecord(config, "1"), allowedRepositories: ["acme/app"] };
+  store.failAudit = true;
+  const service = new GithubConnectionService(config, store, new InMemoryAuditEventStore());
+
+  await expect(service.setAllowedRepositories("tenant-1", "user-1", ["acme/other"], "1")).rejects.toThrow("audit insert failed");
+  expect(store.record.allowedRepositories).toEqual(["acme/app"]);
 });
 
 test.each([
@@ -748,7 +790,7 @@ test("a connection that an older session saved is suspended until a current sess
   // Disconnect still works on a suspended connection and audits the account.
   store.currentSecurityVersion = 5;
   expect(await service.disconnect("tenant-1", "user-1")).toBe(true);
-  expect(auditEvents.events.at(-1)).toMatchObject({ type: "user.github.disconnected", payload: { githubUserId: "777" } });
+  expect(store.audits.at(-1)).toMatchObject({ type: "user.github.disconnected", payload: { githubUserId: "777" } });
   await expect(service.confirm("tenant-1", "user-1", "777", 5)).rejects.toMatchObject({ code: "not_connected" });
 });
 

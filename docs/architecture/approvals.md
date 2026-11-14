@@ -25,10 +25,17 @@ interrupt, one `approvals` row, one AG-UI event and one decision route.
   decision: "approve" | "reject", rememberForTurn? }`).
 - Resume values are keyed by interrupt id, so parallel subagent approvals stay
   apart.
-- Expiry: `APPROVAL_REQUEST_TTL_MS`. On expiry the row becomes `expired`, the
-  audit event `approval.expired` is written, a `runtime_notice` event
+- A decision and its audit event (`approval.approved` or `approval.rejected`)
+  commit in one transaction (`ApprovalStore.resolve`) before the turn resumes.
+  When the write fails, the route returns the error, the turn keeps waiting, and
+  the user can decide again.
+- Expiry: `APPROVAL_REQUEST_TTL_MS`. On expiry the row becomes `expired` and the
+  audit event `approval.expired` is written in the same transaction
+  (`ApprovalStore.expire`), a `runtime_notice` event
   (`approval-expired:<approvalId>`) goes to the turn, and the graph resumes with
-  a reject. `stale-approval-sweeper.ts` expires rows after a process stops.
+  a reject. `stale-approval-sweeper.ts` expires rows after a process stops: each
+  batch and its audit events commit together, and a failed batch stays
+  `pending` for the next sweep.
 - A declined, expired or refused call returns a `declined` tool result. When one
   call of a step is not approved, the other calls of that step do not run.
 
@@ -62,8 +69,10 @@ interrupt, one `approvals` row, one AG-UI event and one decision route.
     not write a decision, but it reads the saved decision as other replicas do.
     That read does not resume the local wait; the wait reads the row itself.
 - A native approval in a turn without an execution lease (`durableNative` off)
-  resumes the local wait before it writes the row. If that write fails, the row
-  stays pending and a later request can still save a decision on it.
+  also writes the row before the local wait resumes. When the write changes no
+  row, the request reads the saved decision: a concurrent request can have
+  saved one first, and that request resumes the wait. When no decision is
+  saved, the local wait accepts the decision.
 - In the browser (`use-agui-custom-events.ts`), a failed decision shows an error
   notice and enables the controls again. After a 404, 409 or 410, the browser
   reads the pending approvals again and shows that list.
