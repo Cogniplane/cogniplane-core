@@ -27,6 +27,7 @@ import { runGatewayAdmission } from "../services/mcp/gateway-admission.js";
 import { forwardRpc } from "../lib/mcp-upstream-client.js";
 import { MCP_REQUEST_BODY_LIMIT_BYTES } from "./mcp.js";
 import { MCP_INVOCATION_META_KEY, type McpInvocationMetadata } from "../services/mcp/invocation-metadata.js";
+import { CALLER_CLOSED_MESSAGE, TOOL_CONTEXT_UNAVAILABLE_MESSAGE } from "../services/mcp/tool-context-binder.js";
 import { AdminConfigError } from "../services/admin-config-error.js";
 import { INTERACTIVE_UI_RESOURCE_URI } from "../services/managed-tools/interactive-ui.js";
 import { GatewayMcpClient } from "../services/deep-agents/gateway-mcp-client.js";
@@ -472,8 +473,9 @@ test.each(["managed-session-context", "test-proxy"].flatMap((serverId) =>
   });
   expect(response.statusCode).toBe(200);
   if (source === "fallback") {
-    expect(findContext).toHaveBeenCalledWith("test-tenant", context.sessionId);
-    expect(requireContext).not.toHaveBeenCalled();
+    expect(findContext).toHaveBeenCalledExactlyOnceWith("test-tenant", context.sessionId);
+    // Only the final check before dispatch reads the bound context, by its own id.
+    expect(requireContext.mock.calls).toEqual(identity === "matching" ? [["test-tenant", context.toolContextId]] : []);
   } else {
     expect(requireContext).toHaveBeenCalledWith("test-tenant", context.toolContextId);
     expect(findContext).not.toHaveBeenCalled();
@@ -2147,7 +2149,7 @@ async function buildProxyApp(
       ...extraMetadata
     }
   });
-  return { app, upstream, upstreamRequests, approvals, toolContext };
+  return { app, upstream, upstreamRequests, approvals, toolContext, toolContexts };
 }
 
 function callProxyTool(
@@ -2600,3 +2602,367 @@ test.each([
   if (refusal) expect(response.json().error.message).toBe(refusal);
   else expect(response.json().error).toBeUndefined();
 });
+
+// Issue 109: a security change can commit while a tool call waits for its
+// checks. The gateway reads the bound context again immediately before the
+// handler or the proxy request. Each test holds one check, ends the context
+// the way a committed security change does (`revoke`), and then releases the
+// check.
+
+/** A check that waits until the test releases it. `entered` resolves when the gateway reaches it. */
+function heldCheck() {
+  let enter!: () => void;
+  let release!: () => void;
+  const entered = new Promise<void>((resolve) => { enter = resolve; });
+  const released = new Promise<void>((resolve) => { release = resolve; });
+  return { entered, release, wait: async () => { enter(); await released; } };
+}
+
+/** Policy Center that holds each decision until the test releases it. */
+function heldPolicyService(service: PolicyService, hold: ReturnType<typeof heldCheck>): McpPolicyService {
+  return {
+    evaluate: (...args) => service.evaluate(...args),
+    gateAction: async (...args) => {
+      await hold.wait();
+      return service.gateAction(...args);
+    }
+  };
+}
+type McpPolicyService = Pick<PolicyService, "gateAction" | "evaluate">;
+
+const heldManagedClaims = { sid: "held-session", uid: "held-user", rid: "held-runtime" };
+
+test.each([
+  { point: "the integration check", revoke: true },
+  { point: "the integration check", revoke: false },
+  { point: "Policy Center", revoke: true },
+  { point: "Policy Center", revoke: false }
+] as const)("a managed call held in $point (context ended: $revoke)", async ({ point, revoke }) => {
+  const hold = heldCheck();
+  const received: Record<string, unknown>[] = [];
+  const { app, toolContexts } = await createTestApp({
+    extraManagedTools: [captureArgumentsTool(received)],
+    ...(point === "Policy Center"
+      ? { policyService: heldPolicyService(makePolicyService([]).service, hold) }
+      : { integrationToolCalls: { checkToolCall: async () => { await hold.wait(); return null; } } })
+  });
+  onTestFinished(async () => { await app.close(); });
+  const context = await createTestToolContext(toolContexts, {
+    sessionId: heldManagedClaims.sid, userId: heldManagedClaims.uid, runtimeId: heldManagedClaims.rid,
+    metadata: { runtimePolicy: captureRuntimePolicy }
+  });
+  const call = () => callManagedTool(app, heldManagedClaims, "capture_arguments", { query: "hello" },
+    { toolContextId: context.toolContextId });
+
+  const pending = call();
+  await hold.entered;
+  if (revoke) toolContexts.revoke(context.toolContextId);
+  hold.release();
+  const response = (await pending).json();
+  // One lookup binds the call, the second one is the final check.
+  expect(toolContexts.requireLookups).toEqual([context.toolContextId, context.toolContextId]);
+
+  if (!revoke) {
+    expect(response.error).toBeUndefined();
+    expect(received).toEqual([{ toolContextId: context.toolContextId, query: "hello" }]);
+    return;
+  }
+  expect(response.error).toEqual({ code: -32000, message: TOOL_CONTEXT_UNAVAILABLE_MESSAGE });
+  expect(JSON.stringify(response)).not.toContain(context.toolContextId);
+  expect(received).toEqual([]);
+  // A new call with the same context is refused before any check.
+  expect((await call()).json().error).toEqual({ code: -32000, message: TOOL_CONTEXT_UNAVAILABLE_MESSAGE });
+  expect(received).toEqual([]);
+});
+
+test("the final check reads the context the call was bound to, not the session's newest context", async () => {
+  const hold = heldCheck();
+  const received: Record<string, unknown>[] = [];
+  const { app, toolContexts } = await createTestApp({
+    extraManagedTools: [captureArgumentsTool(received)],
+    integrationToolCalls: { checkToolCall: async () => { await hold.wait(); return null; } }
+  });
+  onTestFinished(async () => { await app.close(); });
+  const contextFor = () => createTestToolContext(toolContexts, {
+    sessionId: heldManagedClaims.sid, userId: heldManagedClaims.uid, runtimeId: heldManagedClaims.rid,
+    metadata: { runtimePolicy: captureRuntimePolicy }
+  });
+  const first = await contextFor();
+  // No context id in `_meta`, the arguments or the URL: the session fallback binds the call.
+  const call = () => callManagedTool(app, heldManagedClaims, "capture_arguments", { query: "hello" });
+
+  const pending = call();
+  await hold.entered;
+  toolContexts.revoke(first.toolContextId);
+  const second = await contextFor();
+  hold.release();
+  expect((await pending).json().error).toEqual({ code: -32000, message: TOOL_CONTEXT_UNAVAILABLE_MESSAGE });
+  expect(received).toEqual([]);
+
+  // A new call binds to the newer context and runs with it.
+  expect((await call()).json().error).toBeUndefined();
+  expect(received).toEqual([{ toolContextId: second.toolContextId, query: "hello" }]);
+});
+
+test("a managed call whose context ends after its approval was claimed does not run, and the approval stays used", async () => {
+  const { service } = makePolicyService([makePolicyRule({ effect: "require_approval" })]);
+  const hold = heldCheck();
+  const handled: Record<string, unknown>[] = [];
+  const { app, toolContexts, approvals } = await createTestApp({
+    policyService: heldPolicyService(service, hold),
+    extraManagedTools: [captureArgumentsTool(handled)]
+  });
+  onTestFinished(async () => { await app.close(); });
+  const runtimePolicy = seedRuntimePolicySnapshot({ policyEnforcementMode: "enforce" });
+  const toolContext = await createTestToolContext(toolContexts, {
+    sessionId: "policy-session", userId: "test-user", runtimeId: "runtime-policy-session",
+    metadata: { runtimePolicy: {
+      ...runtimePolicy,
+      enabledMcpServers: [...runtimePolicy.enabledMcpServers, "managed-session-context"],
+      enabledToolIds: [...runtimePolicy.enabledToolIds, "capture_arguments"]
+    } }
+  });
+  const proof = createPolicyApprovalProof({
+    toolContextId: toolContext.toolContextId, toolCallId: "call-1", toolName: "capture_arguments",
+    serverId: "managed-session-context", args: { query: "hello" }, ruleId: "pol_test", explanation: "Approval required"
+  });
+  approvals.rows.set(proof.approvalId, policyApprovalRecord({ proof, status: "approved", decision: "approve" }));
+  const call = () => callManagedTool(app,
+    { sid: "policy-session", uid: "test-user", rid: "runtime-policy-session" }, "capture_arguments",
+    { query: "hello" }, approvalMeta(proof));
+
+  const pending = call();
+  await hold.entered;
+  // The gate claimed the approval before it recorded the decision.
+  expect(approvals.consumed.has(proof.approvalId)).toBe(true);
+  toolContexts.revoke(toolContext.toolContextId);
+  hold.release();
+  expect((await pending).json().error).toEqual({ code: -32000, message: TOOL_CONTEXT_UNAVAILABLE_MESSAGE });
+  expect(handled).toEqual([]);
+
+  const retry = await call();
+  expect(retry.json().error).toEqual({ code: -32000, message: TOOL_CONTEXT_UNAVAILABLE_MESSAGE });
+  expect(handled).toEqual([]);
+  expect(approvals.consume).toHaveBeenCalledTimes(1);
+});
+
+test.each([{ revoke: true }, { revoke: false }])(
+  "a proxy call held while the gateway reads the upstream tool metadata (context ended: $revoke)",
+  async ({ revoke }) => {
+    const hold = heldCheck();
+    const { upstream, upstreamUrl, upstreamRequests } = await createProxyMcpUpstream({
+      respond: async (body) => {
+        if (body.method !== "tools/list") {
+          return { jsonrpc: "2.0", id: body.id ?? null, result: { content: [{ type: "text", text: "done" }] } };
+        }
+        await hold.wait();
+        return { jsonrpc: "2.0", id: body.id ?? null, result: { tools: [
+          { name: "echo", inputSchema: { type: "object" }, annotations: { readOnlyHint: false } }
+        ] } };
+      }
+    });
+    const { app, toolContexts } = await createTestApp({ proxyUpstreamUrl: `${upstreamUrl}/` });
+    onTestFinished(async () => { await Promise.all([app.close(), upstream.close()]); });
+    const context = await createTestToolContext(toolContexts, {
+      sessionId: "held-proxy-session", userId: "test-user", runtimeId: "held-proxy-runtime",
+      metadata: { runtimePolicy: seedRuntimePolicySnapshot() }
+    });
+    const call = () => app.inject({
+      method: "POST", url: "/mcp/test-proxy",
+      headers: { authorization: `Bearer ${runtimeToken({ sid: "held-proxy-session", uid: "test-user", rid: "held-proxy-runtime" })}` },
+      payload: { jsonrpc: "2.0", id: 1, method: "tools/call",
+        params: { name: "echo", arguments: { query: "hello" }, ...invocationMeta({ toolContextId: context.toolContextId }) } }
+    });
+
+    const pending = call();
+    await hold.entered;
+    if (revoke) toolContexts.revoke(context.toolContextId);
+    hold.release();
+    const response = (await pending).json();
+    expect(toolContexts.requireLookups).toEqual([context.toolContextId, context.toolContextId]);
+
+    if (!revoke) {
+      expect(response.error).toBeUndefined();
+      expect(toolCallRequests(upstreamRequests)).toHaveLength(1);
+      expect(toolCallRequests(upstreamRequests)[0]!.headers["x-framework-user-id"]).toBe("test-user");
+      return;
+    }
+    expect(response.error).toEqual({ code: -32000, message: TOOL_CONTEXT_UNAVAILABLE_MESSAGE });
+    expect(upstreamRequests.map((request) => request.body.method)).toEqual(["tools/list"]);
+    expect((await call()).json().error).toEqual({ code: -32000, message: TOOL_CONTEXT_UNAVAILABLE_MESSAGE });
+    expect(toolCallRequests(upstreamRequests)).toHaveLength(0);
+  }
+);
+
+test("a proxy call whose context ends after its approval was claimed is not forwarded, and the approval stays used", async () => {
+  const { service } = makePolicyService([makePolicyRule({ effect: "require_approval" })]);
+  const hold = heldCheck();
+  const { app, upstream, upstreamRequests, approvals, toolContext, toolContexts } = await buildProxyApp(
+    heldPolicyService(service, hold), { enforcementMode: "enforce" }
+  );
+  onTestFinished(async () => { await Promise.all([app.close(), upstream.close()]); });
+  const proof = createPolicyApprovalProof({
+    toolContextId: toolContext.toolContextId, toolCallId: "call-1", toolName: "echo", serverId: "test-proxy",
+    args: { query: "hello" }, ruleId: "pol_test", explanation: "Approval required"
+  });
+  approvals.rows.set(proof.approvalId, policyApprovalRecord({ proof, status: "approved", decision: "approve" }));
+
+  const pending = callProxyTool(app, { query: "hello" }, approvalMeta(proof));
+  await hold.entered;
+  expect(approvals.consumed.has(proof.approvalId)).toBe(true);
+  toolContexts.revoke(toolContext.toolContextId);
+  hold.release();
+  expect((await pending).json().error).toEqual({ code: -32000, message: TOOL_CONTEXT_UNAVAILABLE_MESSAGE });
+  expect(toolCallRequests(upstreamRequests)).toHaveLength(0);
+
+  const retry = await callProxyTool(app, { query: "hello" }, approvalMeta(proof));
+  expect(retry.json().error).toEqual({ code: -32000, message: TOOL_CONTEXT_UNAVAILABLE_MESSAGE });
+  expect(toolCallRequests(upstreamRequests)).toHaveLength(0);
+  expect(approvals.consume).toHaveBeenCalledTimes(1);
+});
+
+test("a managed call whose caller closed the request while it waited does not run", async () => {
+  const hold = heldCheck();
+  const received: Record<string, unknown>[] = [];
+  let recordFailure!: (failure: { message: string }) => void;
+  const failed = new Promise<{ message: string }>((resolve) => { recordFailure = resolve; });
+  const { app, toolContexts } = await createTestApp({
+    extraManagedTools: [captureArgumentsTool(received)],
+    integrationToolCalls: { checkToolCall: async () => { await hold.wait(); return null; } },
+    // The gateway records a failed call after it answered, also when nobody reads the answer.
+    activationTracker: {
+      recordFailure: async (_event, _kind, _id, failure) => { recordFailure(failure as { message: string }); },
+      recordInvocation: async () => {},
+      recordSkillInvocationsForTool: async () => []
+    }
+  });
+  onTestFinished(async () => { await app.close(); });
+  const context = await createTestToolContext(toolContexts, {
+    sessionId: heldManagedClaims.sid, userId: heldManagedClaims.uid, runtimeId: heldManagedClaims.rid,
+    metadata: { runtimePolicy: captureRuntimePolicy }
+  });
+  const url = await app.listen({ host: "127.0.0.1", port: 0 });
+  const socketClosed = new Promise<void>((resolve) => {
+    app.server.once("connection", (socket) => socket.once("close", () => resolve()));
+  });
+  const caller = new AbortController();
+  const request = fetch(`${url}/mcp/managed-session-context`, {
+    method: "POST", signal: caller.signal,
+    headers: { "content-type": "application/json", authorization: `Bearer ${runtimeToken(heldManagedClaims)}` },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: {
+      name: "capture_arguments", arguments: { query: "hello" }, ...invocationMeta({ toolContextId: context.toolContextId })
+    } })
+  }).catch(() => "aborted");
+
+  await hold.entered;
+  caller.abort();
+  expect(await request).toBe("aborted");
+  await socketClosed;
+  // The response emits its own close event in the same turn as the socket.
+  await new Promise((resolve) => setImmediate(resolve));
+  hold.release();
+  expect((await failed).message).toBe(CALLER_CLOSED_MESSAGE);
+  expect(received).toEqual([]);
+});
+
+test("a caller that closes the request aborts the proxy request that is already upstream", async () => {
+  const upstream = Fastify();
+  let callStarted!: () => void;
+  const started = new Promise<void>((resolve) => { callStarted = resolve; });
+  let upstreamClosed!: (finished: boolean) => void;
+  const closed = new Promise<boolean>((resolve) => { upstreamClosed = resolve; });
+  let releaseUpstream!: () => void;
+  const upstreamReleased = new Promise<void>((resolve) => { releaseUpstream = resolve; });
+  upstream.post("/", async (request, reply) => {
+    const rpc = request.body as { id: number; method: string };
+    if (rpc.method === "tools/list") {
+      return { jsonrpc: "2.0", id: rpc.id, result: { tools: [
+        { name: "echo", inputSchema: { type: "object" }, annotations: { readOnlyHint: false } }
+      ] } };
+    }
+    reply.raw.once("close", () => upstreamClosed(reply.raw.writableFinished));
+    callStarted();
+    await upstreamReleased;
+    return { jsonrpc: "2.0", id: rpc.id, result: { content: [] } };
+  });
+  const upstreamUrl = await upstream.listen({ host: "127.0.0.1", port: 0 });
+  const { app, toolContexts } = await createTestApp({ proxyUpstreamUrl: `${upstreamUrl}/` });
+  onTestFinished(async () => { releaseUpstream(); await Promise.all([app.close(), upstream.close()]); });
+  const context = await createTestToolContext(toolContexts, {
+    sessionId: "held-proxy-session", userId: "test-user", runtimeId: "held-proxy-runtime",
+    metadata: { runtimePolicy: seedRuntimePolicySnapshot() }
+  });
+  const url = await app.listen({ host: "127.0.0.1", port: 0 });
+  const caller = new AbortController();
+  const request = fetch(`${url}/mcp/test-proxy`, {
+    method: "POST", signal: caller.signal,
+    headers: { "content-type": "application/json",
+      authorization: `Bearer ${runtimeToken({ sid: "held-proxy-session", uid: "test-user", rid: "held-proxy-runtime" })}` },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: {
+      name: "echo", arguments: { query: "hello" }, ...invocationMeta({ toolContextId: context.toolContextId })
+    } })
+  }).catch(() => "aborted");
+
+  await started;
+  caller.abort();
+  expect(await request).toBe("aborted");
+  // The upstream sees its request closed before it answered.
+  expect(await closed).toBe(false);
+});
+
+
+test.each(["managed-session-context", "test-proxy"])(
+  "a caller that closes during the %s server lookup starts no tool action",
+  async (serverId) => {
+    const hold = heldCheck();
+    const received: Record<string, unknown>[] = [];
+    const { upstream, upstreamUrl, upstreamRequests } = await createProxyMcpUpstream();
+    let recordFailure!: (failure: { message: string }) => void;
+    const failed = new Promise<{ message: string }>((resolve) => { recordFailure = resolve; });
+    const { app, toolContexts } = await createTestApp({
+      extraManagedTools: [captureArgumentsTool(received)],
+      resolveMcpServer: async () => {
+        await hold.wait();
+        return {
+          id: serverId, description: "Held server", routePath: `/mcp/${serverId}`,
+          mode: serverId === "test-proxy" ? "proxy" : "managed",
+          upstreamUrl: serverId === "test-proxy" ? `${upstreamUrl}/` : null,
+          transportKind: "http", version: 1, hash: `hash-${serverId}`
+        };
+      },
+      activationTracker: {
+        recordFailure: async (_event, _kind, _id, failure) => { recordFailure(failure as { message: string }); },
+        recordInvocation: async () => { recordFailure({ message: "Tool ran after disconnect." }); },
+        recordSkillInvocationsForTool: async () => []
+      }
+    });
+    onTestFinished(async () => { hold.release(); await Promise.all([app.close(), upstream.close()]); });
+    const context = await createTestToolContext(toolContexts, {
+      sessionId: heldManagedClaims.sid, userId: heldManagedClaims.uid, runtimeId: heldManagedClaims.rid,
+      metadata: { runtimePolicy: { ...captureRuntimePolicy, enabledMcpServers: [...captureRuntimePolicy.enabledMcpServers, "test-proxy"] } }
+    });
+    const url = await app.listen({ host: "127.0.0.1", port: 0 });
+    const socketClosed = new Promise<void>((resolve) => {
+      app.server.once("connection", (socket) => socket.once("close", () => resolve()));
+    });
+    const caller = new AbortController();
+    const request = fetch(`${url}/mcp/${serverId}`, {
+      method: "POST", signal: caller.signal,
+      headers: { "content-type": "application/json", authorization: `Bearer ${runtimeToken(heldManagedClaims)}` },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: {
+        name: serverId === "test-proxy" ? "echo" : "capture_arguments", arguments: { query: "hello" },
+        ...invocationMeta({ toolContextId: context.toolContextId })
+      } })
+    }).catch(() => "aborted");
+
+    await hold.entered;
+    caller.abort();
+    expect(await request).toBe("aborted");
+    await socketClosed;
+    await new Promise((resolve) => setImmediate(resolve));
+    hold.release();
+    expect((await failed).message).toBe(CALLER_CLOSED_MESSAGE);
+    expect(received).toEqual([]);
+    expect(toolCallRequests(upstreamRequests)).toEqual([]);
+  }
+);

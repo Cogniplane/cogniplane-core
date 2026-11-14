@@ -53,7 +53,9 @@ other people in Admin > People (`routes/tenant-local-members.ts`).
   commit, the replica that made the change stops the account's runtimes. Tool
   contexts keep the version that admitted the turn
   (`tool_execution_contexts.owner_security_version`), so the gateway refuses
-  older calls on every replica.
+  older calls on every replica. A call reads its context again immediately
+  before the tool action starts. A tool action whose last check came before the
+  commit is not stopped ([tools](tools.md#mcp-gateway)).
 - Scheduled jobs and personal connections keep the version of the sign-in
   session that saved them; a change pauses or suspends them (see
   [tools](tools.md#personal-connections-after-a-security-change)).

@@ -46,8 +46,13 @@ function accounts() {
   });
 }
 
-/** The production gateway route with one managed test tool. Records each call that reaches the tool. */
-async function gateway(): Promise<{ app: FastifyInstance; calls: string[]; secret: string }> {
+/**
+ * The production gateway route with one managed test tool. Records each call that reaches the tool.
+ * `integrationCheck` runs in place of the integration check, which each call awaits before its handler.
+ */
+async function gateway(
+  integrationCheck: () => Promise<void> = async () => {}
+): Promise<{ app: FastifyInstance; calls: string[]; secret: string }> {
   const config = createTestConfig();
   const calls: string[] = [];
   const catalog = new ManagedToolCatalog();
@@ -76,7 +81,7 @@ async function gateway(): Promise<{ app: FastifyInstance; calls: string[]; secre
     managedToolFactoryRegistry: registry,
     policyService: { gateAction: async () => {} },
     approvals: {},
-    integrationToolCalls: { checkToolCall: async () => null },
+    integrationToolCalls: { checkToolCall: async () => { await integrationCheck(); return null; } },
     runtimeTokenSecret: secret
   } as unknown as McpRouteStores);
   await app.ready();
@@ -154,6 +159,51 @@ describe.skipIf(!adminDatabaseUrl())("MCP gateway after a security change of the
     const next = await turnInProgress(owner, current.security_version, secret);
     expect((await rpc(app, next, "tools/call")).error).toBeUndefined();
     expect(calls).toEqual([owner.userId, owner.userId]);
+  });
+
+  test("refuses a tool call that waited for its checks while the change committed", async () => {
+    const boot = await bootstrapLocalTenant(superuserPool(), ORIGIN, {
+      tenantName: "Gateway", ownerEmail: `${randomUUID()}@example.test`, ownerName: null
+    });
+    const session = await accounts().redeemLink("account_setup", boot.link.url.split("#token=")[1]!, PASSWORD, META);
+    const owner = { tenantId: boot.tenantId, userId: boot.userId };
+    // While a gate is set, the integration check of a call waits until the test releases it.
+    let gate: { reached: () => void; released: Promise<void> } | null = null;
+    const hold = () => {
+      let release!: () => void;
+      const released = new Promise<void>((resolve) => { release = resolve; });
+      const entered = new Promise<void>((resolve) => { gate = { reached: resolve, released }; });
+      return { entered, release };
+    };
+    const { app, calls, secret } = await gateway(async () => {
+      if (!gate) return;
+      const { reached, released } = gate;
+      reached();
+      await released;
+    });
+    const turn = await turnInProgress(owner, session.securityVersion, secret);
+
+    // Without a change, a call that waited runs.
+    let check = hold();
+    let pending = rpc(app, turn, "tools/call");
+    await check.entered;
+    check.release();
+    expect((await pending).error).toBeUndefined();
+    expect(calls).toEqual([owner.userId]);
+
+    // The change commits while the call waits: the tool does not run.
+    check = hold();
+    pending = rpc(app, turn, "tools/call");
+    await check.entered;
+    await accounts().revokeSessions(owner.tenantId, owner.userId, owner.userId, META);
+    check.release();
+    expect((await pending).error).toMatchObject({ code: -32000, message: TOOL_CONTEXT_UNAVAILABLE_MESSAGE });
+    expect(calls).toEqual([owner.userId]);
+
+    // A new call with the same context is refused too.
+    gate = null;
+    expect((await rpc(app, turn, "tools/call")).error).toMatchObject({ code: -32000, message: TOOL_CONTEXT_UNAVAILABLE_MESSAGE });
+    expect(calls).toEqual([owner.userId]);
   });
 
   test("a local owner's context with no version is refused; a WorkOS owner's context has none and works", async () => {
