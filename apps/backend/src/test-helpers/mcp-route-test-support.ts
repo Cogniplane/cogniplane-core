@@ -1,8 +1,14 @@
 import Fastify from "fastify";
 
-/** `respond` replaces the default echo reply, for example with an error envelope. */
+/**
+ * `respond` replaces the default echo reply, for example with an error envelope.
+ * It can return a promise, to hold the reply until a test releases it.
+ */
 export async function createProxyMcpUpstream(
-  options: { respond?: (body: { id?: string | number; method?: string }) => Record<string, unknown> } = {}
+  options: {
+    respond?: (body: { id?: string | number; method?: string }) =>
+      Record<string, unknown> | Promise<Record<string, unknown>>;
+  } = {}
 ) {
   const upstreamRequests: Array<{
     headers: Record<string, string | string[] | undefined>;

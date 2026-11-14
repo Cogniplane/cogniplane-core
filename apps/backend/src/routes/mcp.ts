@@ -11,7 +11,7 @@
 // the runtime token's `sid` claim. Keep all four paths. Do not collapse them
 // into one. The gateway reads an approval proof from `_meta` only.
 
-import type { FastifyBaseLogger, FastifyInstance } from "fastify";
+import type { FastifyBaseLogger, FastifyInstance, FastifyReply } from "fastify";
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
 
@@ -54,7 +54,7 @@ import {
   type PolicyGate,
   type PolicyGateOutcome
 } from "../services/mcp/policy-gate.js";
-import { resolveBoundToolContext } from "../services/mcp/tool-context-binder.js";
+import { resolveBoundToolContext, revalidateBoundToolContext } from "../services/mcp/tool-context-binder.js";
 import { forwardSignedProxyRpc, proxySigningSecret, proxyUpstreamLimits } from "../services/mcp/proxy-forward.js";
 import { runGatewayAdmission } from "../services/mcp/gateway-admission.js";
 import {
@@ -312,6 +312,7 @@ export async function registerMcpRoutes(app: FastifyInstance, stores: McpRouteSt
           upstreamSignatureSecret: proxySigningSecret(app.config),
           upstreamLimits,
           integrationToolCalls: stores.integrationToolCalls,
+          callerClosed: callerClosedSignal(reply),
           logger: request.log
         });
       }
@@ -321,6 +322,23 @@ export async function registerMcpRoutes(app: FastifyInstance, stores: McpRouteSt
     }
     }
   );
+}
+
+/**
+ * Aborts when the caller closes the request before the gateway answered, for
+ * example when the runtime closes its MCP client because its turn stopped.
+ * Fastify's `request.signal` cannot tell this: with a real socket (Node 26,
+ * Fastify 5) it is already aborted when the handler has read the POST body.
+ */
+function callerClosedSignal(reply: FastifyReply): AbortSignal {
+  const controller = new AbortController();
+  const abortIfUnfinished = () => {
+    if (!reply.raw.writableFinished) controller.abort();
+  };
+  reply.raw.once("close", abortIfUnfinished);
+  // The caller can close while admission or the server lookup is still waiting.
+  if (reply.raw.destroyed) abortIfUnfinished();
+  return controller.signal;
 }
 
 function handleInitialize(
@@ -484,6 +502,8 @@ async function handleToolsCall(input: {
   upstreamSignatureSecret: string;
   upstreamLimits: ForwardRpcLimits;
   integrationToolCalls: Pick<IntegrationRegistryService, "checkToolCall">;
+  /** Aborts when the caller closed the request (callerClosedSignal). */
+  callerClosed: AbortSignal;
   logger: Pick<FastifyBaseLogger, "debug" | "warn">;
 }): Promise<RpcResponse> {
   const {
@@ -502,6 +522,7 @@ async function handleToolsCall(input: {
     upstreamSignatureSecret,
     upstreamLimits,
     integrationToolCalls,
+    callerClosed,
     logger
   } = input;
 
@@ -549,6 +570,7 @@ async function handleToolsCall(input: {
           runtimeTokenClaims,
           policyGate,
           integrationToolCalls,
+          callerClosed,
           logger,
           captureContext
         )
@@ -565,6 +587,7 @@ async function handleToolsCall(input: {
           upstreamLimits,
           policyGate,
           proxyToolMetadataCache,
+          callerClosed,
           logger,
           captureContext
         );
@@ -702,6 +725,7 @@ async function handleManagedToolCall(
   runtimeTokenClaims: RuntimeTokenClaims,
   policyGate: PolicyGate,
   integrationToolCalls: Pick<IntegrationRegistryService, "checkToolCall">,
+  callerClosed: AbortSignal,
   logger: Pick<FastifyBaseLogger, "debug" | "warn">,
   captureContext: (context: ToolExecutionContext) => void
 ): Promise<RpcResponse> {
@@ -799,6 +823,13 @@ async function handleManagedToolCall(
       approval = checked.approval;
     }
     const handlerArgs = withoutPolicyApprovalMetadata(args);
+    // The checks above wait for other services, and a security change can
+    // commit meanwhile. Nothing may await between this check and the handler.
+    // A claimed approval stays used when this refuses the call.
+    const refusal = await revalidateBoundToolContext({
+      rpc, tenantId, context, runtimeTokenClaims, toolContexts, callerClosed
+    });
+    if (refusal) return refusal;
     const rawResult = await tool.handler({
       context,
       arguments: handlerArgs,
@@ -964,6 +995,7 @@ async function handleForwardedToolCall(
   upstreamLimits: ForwardRpcLimits,
   policyGate: PolicyGate,
   proxyToolMetadataCache: ProxyToolMetadataCache,
+  callerClosed: AbortSignal,
   logger: Pick<FastifyBaseLogger, "debug" | "warn">,
   captureContext: (context: ToolExecutionContext) => void
 ): Promise<RpcResponse> {
@@ -1028,6 +1060,14 @@ async function handleForwardedToolCall(
   const forwardArgs = withoutPolicyApprovalMetadata(args);
   delete forwardArgs.toolContextId;
 
+  // The metadata refresh and the policy checks above wait for other services,
+  // and a security change can commit meanwhile. Nothing may await between this
+  // check and the upstream request. A claimed approval stays used when this
+  // refuses the call.
+  const refusal = await revalidateBoundToolContext({
+    rpc, tenantId, context, runtimeTokenClaims, toolContexts, callerClosed
+  });
+  if (refusal) return refusal;
   const response = await forwardSignedProxyRpc({
     server,
     rpc: {
@@ -1042,7 +1082,10 @@ async function handleForwardedToolCall(
     sessionId: context.sessionId,
     runtimeId: context.runtimeId,
     signingSecret: upstreamSignatureSecret,
-    limits: upstreamLimits
+    // When the caller closes the request, abort the upstream request too. The
+    // shared metadata refresh above does not get this signal: other calls wait
+    // for the same refresh.
+    limits: { ...upstreamLimits, signal: callerClosed }
   });
   const toolName = String(params.name ?? "");
   const cacheScope = proxyMetadataScope(server, context.userId);

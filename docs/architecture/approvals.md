@@ -62,6 +62,8 @@ interrupt, one `approvals` row, one AG-UI event and one decision route.
   keys at the argument root only).
 - The gateway claims the approval once (`consumed_at`) before dispatch. A
   missing, rejected, expired, mismatched or used proof returns
-  `PolicyBlockedError` (`-32004`).
+  `PolicyBlockedError` (`-32004`). When the last context check before the
+  action refuses the call ([tools](tools.md#mcp-gateway)), the approval stays
+  used.
 - Managed tools with `requiresUserApproval` use the same proof under stricter
   rules: [memory consent](memory.md).

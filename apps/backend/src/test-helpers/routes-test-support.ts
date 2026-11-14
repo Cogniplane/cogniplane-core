@@ -13,7 +13,7 @@ import { SESSION_TRASH_RETENTION_DAYS } from "@cogniplane/shared-types";
 import type { AppConfig } from "../config.js";
 import type { Pool } from "../lib/db.js";
 import { uuidv7 } from "../lib/uuid.js";
-import type { ToolExecutionContext } from "../services/auth/tool-execution-context-store.js";
+import { ToolContextUnavailableError, type ToolExecutionContext } from "../services/auth/tool-execution-context-store.js";
 import { type ArtifactDetail, type ArtifactDownloadTokenRecord, type ArtifactPiiDetail, type ArtifactRecord, type ArtifactStore, isArtifactPiiEligible } from "../services/artifacts/artifact-store.js";
 import { LocalArtifactStorage } from "../services/artifacts/artifact-storage.js";
 import type { SessionRecord } from "../services/session-store.js";
@@ -590,7 +590,19 @@ class InMemoryToolContextStore {
   async currentOwnerSecurityVersion(_tenantId: string, userId: string): Promise<number | null> {
     return this.securityVersions.get(userId) ?? null;
   }
+  /** Each `require` lookup, by tool context id, in order. */
+  readonly requireLookups: string[] = [];
+  private readonly revoked = new Set<string>();
+  /**
+   * Like a security change of the context's owner: from now on every lookup of
+   * the context refuses it, as ToolExecutionContextStore does.
+   */
+  revoke(toolContextId: string): void {
+    this.revoked.add(toolContextId);
+  }
   async require(_tenantId: string, toolContextId: string) {
+    this.requireLookups.push(toolContextId);
+    if (this.revoked.has(toolContextId)) throw new ToolContextUnavailableError(toolContextId);
     const context = this.contexts.get(toolContextId);
     if (!context) throw new Error("Missing tool context.");
     return context;
@@ -600,6 +612,7 @@ class InMemoryToolContextStore {
     let latest: ToolExecutionContext | null = null;
     for (const ctx of this.contexts.values()) {
       if (ctx.tenantId !== tenantId || ctx.sessionId !== sessionId) continue;
+      if (this.revoked.has(ctx.toolContextId)) continue;
       if (new Date(ctx.expiresAt).getTime() <= now) continue;
       if (!latest || ctx.createdAt > latest.createdAt) latest = ctx;
     }

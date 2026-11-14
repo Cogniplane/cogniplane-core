@@ -8,13 +8,18 @@ import type {
 
 /**
  * Generic message for a tool context that is missing, expired, or ended. It
- * must not name the context ID (see the catch below).
+ * must not name the context ID (see lookupFailure).
  */
 export const TOOL_CONTEXT_UNAVAILABLE_MESSAGE =
   "The tool access of this turn was not found, expired, or ended by a security change.";
 
+/** The message when the caller closed the request before the tool action started. */
+export const CALLER_CLOSED_MESSAGE = "The caller closed the request. The tool did not run.";
+
+type RpcId = string | number | undefined;
+
 export async function resolveBoundToolContext(input: {
-  rpc: { id?: string | number | undefined };
+  rpc: { id?: RpcId };
   tenantId: string;
   args: Record<string, unknown>;
   /**
@@ -52,10 +57,7 @@ export async function resolveBoundToolContext(input: {
       context = await toolContexts.findLatestActiveBySession(tenantId, sessionIdFromRuntimeToken);
     }
   } catch (error) {
-    // The model reads this text as the tool result, and the checkpoint keeps it.
-    // The error's own message names the trusted context ID, so it stays out.
-    return { error: failure(rpc.id, -32000, error instanceof ToolContextUnavailableError
-      ? TOOL_CONTEXT_UNAVAILABLE_MESSAGE : "Tool context lookup failed.") };
+    return { error: lookupFailure(rpc.id, error) };
   }
 
   if (!context) {
@@ -64,11 +66,60 @@ export async function resolveBoundToolContext(input: {
 
   // Session fallback can find a newer participant's turn. Every lookup path
   // must bind the context to the token's identity and runtime generation.
-  if (context.tenantId !== tenantId || context.tenantId !== runtimeTokenClaims.tid ||
-      context.sessionId !== runtimeTokenClaims.sid || context.userId !== runtimeTokenClaims.uid ||
-      context.runtimeId !== runtimeTokenClaims.rid) {
-    return { error: failure(rpc.id, -32000, "Tool context does not belong to the authenticated runtime session.") };
-  }
+  const unbound = bindingFailure(rpc.id, context, tenantId, runtimeTokenClaims);
+  if (unbound) return { error: unbound };
 
   return { context };
+}
+
+/**
+ * Read the exact bound context again after asynchronous checks, immediately
+ * before the action. `require` checks the owner's security version, TTL and
+ * applicable execution state. Never use the session fallback here, since it
+ * could find a newer turn's context. Identity fields of a context never change.
+ *
+ * The lookup and action are not atomic. A revocation that commits after this
+ * lookup cannot recall an upstream action. See docs/architecture/tools.md.
+ * Returns a refusal, or null when the action can start with the bound context.
+ */
+export async function revalidateBoundToolContext(input: {
+  rpc: { id?: RpcId };
+  tenantId: string;
+  context: ToolExecutionContext;
+  runtimeTokenClaims: RuntimeTokenClaims;
+  toolContexts: Pick<ToolExecutionContextStore, "require">;
+  callerClosed?: AbortSignal;
+}): Promise<RpcResponse | null> {
+  const { rpc, tenantId, context, runtimeTokenClaims, toolContexts, callerClosed } = input;
+  let current: ToolExecutionContext;
+  try {
+    current = await toolContexts.require(tenantId, context.toolContextId);
+  } catch (error) {
+    return lookupFailure(rpc.id, error);
+  }
+  const unbound = bindingFailure(rpc.id, current, tenantId, runtimeTokenClaims);
+  if (unbound) return unbound;
+  if (callerClosed?.aborted) return failure(rpc.id, -32000, CALLER_CLOSED_MESSAGE);
+  return null;
+}
+
+function lookupFailure(id: RpcId, error: unknown): RpcResponse {
+  // The model reads this text as the tool result, and the checkpoint keeps it.
+  // The error's own message names the trusted context ID, so it stays out.
+  return failure(id, -32000, error instanceof ToolContextUnavailableError
+    ? TOOL_CONTEXT_UNAVAILABLE_MESSAGE : "Tool context lookup failed.");
+}
+
+function bindingFailure(
+  id: RpcId,
+  context: ToolExecutionContext,
+  tenantId: string,
+  claims: RuntimeTokenClaims
+): RpcResponse | null {
+  if (context.tenantId !== tenantId || context.tenantId !== claims.tid ||
+      context.sessionId !== claims.sid || context.userId !== claims.uid ||
+      context.runtimeId !== claims.rid) {
+    return failure(id, -32000, "Tool context does not belong to the authenticated runtime session.");
+  }
+  return null;
 }
