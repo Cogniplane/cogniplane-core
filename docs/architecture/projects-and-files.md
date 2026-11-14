@@ -35,6 +35,10 @@ selections. Routes: `routes/projects.ts`, `project-files.ts`,
   another owner cannot skip the warning. After this 409 the dialog shows the
   warning, and the person confirms or cancels
   (`components/project-members.tsx`). Audit event: `project_member_changed`.
+- Removal from the tenant (`DELETE /tenant/members/:userId`) deletes the
+  member's explicit project roles in the same transaction, so they do not come
+  back with a later membership ([roles](auth.md#roles)). A project whose only
+  owner was removed becomes ownerless.
 - Ownerless project (no owner who is still a tenant member): a tenant owner or
   admin lists them in Admin > Project owners (`GET /admin/projects/ownerless`)
   and makes a current member the owner (`POST

@@ -20,15 +20,23 @@ export type AuthAdmission =
  *   current security version. Every security change (password change, reset,
  *   disable, sign out everywhere) increments it, which ends older sessions.
  *   A local token without `sv` is refused.
+ * - A session that started at or before the tenant's latest removal of the
+ *   user is refused, for both login types (services/tenant-member-removal.ts).
+ *   The membership can exist again only through a later change, and the
+ *   sessions from before the removal must not come back with it. A token
+ *   without `auth_time` is refused when such a removal exists.
  */
 export function checkAuthAdmission(
   config: Pick<AppConfig, "AUTH_LOGIN_TYPES">,
   state: TenantAuthState | null,
-  token: { sv?: number }
+  token: { sv?: number; authTime?: number }
 ): AuthAdmission {
   if (!state) return { ok: false, error: "not_a_member" };
   if (!isLoginTypeEnabled(config, state.loginType) || state.authSource !== state.loginType) {
     return { ok: false, error: "login_type_not_allowed" };
+  }
+  if (state.removedAt !== undefined && (token.authTime === undefined || token.authTime <= state.removedAt)) {
+    return { ok: false, error: "session_revoked" };
   }
   if (state.authSource === "local") {
     if (state.localStatus !== "active" || token.sv === undefined || token.sv !== state.securityVersion) {

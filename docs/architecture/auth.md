@@ -69,6 +69,10 @@ Sign-in types:
 - `GET /downloads/:token` is public: the single-use token is the credential.
 - A valid JWT is not enough: the user must be a member of the tenant (403
   `not_a_member`).
+- A session (`auth_time`) that started at or before the tenant's latest removal
+  of the user gets 403 `session_revoked`, also when the membership exists
+  again (`lib/auth-admission.ts`). `/auth/refresh` revokes the family of such
+  a token, so each refresh family that existed at the removal ends.
 - Request admission and `/auth/refresh` use `PrivilegedAuthStateLookup`
   (`services/tenant-member-store.ts`). Each membership read sends one SELECT
   on the maintenance pool, with tenant and user predicates and no cache. The
@@ -103,7 +107,27 @@ Sign-in types:
   - Both run in `withSecurityChange`. After the commit, the member's interactive
     and scheduled turns stop, for local and WorkOS members.
   - Removal pauses the member's scheduled jobs; an owner reviews them before
-    they run again. Then it deletes the membership.
+    they run again. Then it deletes the member's explicit project roles and the
+    membership, and records the removal in `tenant_member_removals`
+    (`services/tenant-member-removal.ts`). The audit event counts the project
+    roles that it deleted. A project with no owner left appears in Admin >
+    Project owners ([projects](projects-and-files.md)).
+  - A removal lasts, for local and WorkOS members. The tenant table decides
+    membership after the first sign-in, as it decides roles: WorkOS sign-in
+    refuses a removed user ([WorkOS sign-in](#workos-sign-in)), and admission
+    refuses every session that started before the removal ([request
+    authentication](#request-authentication)). A removal in one tenant does not
+    change the user's membership of another tenant. Membership in the WorkOS
+    organization does not change.
+  - Re-admission of a removed user is not a feature. Nothing deletes a removal
+    record. A future re-admission must keep `removed_at`: it is the time before
+    which every session of the user stays refused.
+  - Removals from before migration `091` get a record from their audit event,
+    when the user has no membership now ([upgrade to removal
+    records](../operations.md#upgrade-to-removal-records)).
+  - The member's tool contexts stop in the commit, on every replica: each
+    context lookup requires a current membership of its owner
+    ([tools](tools.md#mcp-gateway)).
   - A removed local account ends for good; its identity row stays for audit.
 - Owners and admins can read the sessions of every member of the tenant: `GET
   /admin/sessions` and `GET /admin/sessions/:sessionId` return message text,
@@ -148,3 +172,9 @@ Sign-in types:
 - Role at first membership: `owner` for the first member of a new tenant;
   otherwise `admin` when the WorkOS role slug is `admin`, else `member`. After
   that the stored role is authoritative ([roles](#roles)).
+- A user that the tenant removed gets 403 `membership_removed` with fixed text,
+  and nothing is written. The check runs under the tenant's membership lock
+  (`services/member-authority.ts`), which the removal route also takes first.
+  So a sign-in that overlaps a removal either commits first, and the removal
+  then deletes its membership, or waits and is refused. The sign-in takes no
+  row lock on an existing tenant before that lock.

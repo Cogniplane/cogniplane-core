@@ -369,6 +369,7 @@ describe("POST /auth/callback", () => {
     userId?: string;
     organizationId?: string;
     workosRoleSlug?: string;
+    removed?: boolean;
   } = {}) {
     const userId = opts.userId ?? "workos-user-123";
     const organizationId = opts.organizationId ?? "org_456";
@@ -388,6 +389,9 @@ describe("POST /auth/callback", () => {
       id: organizationId,
       name: "Acme Inc"
     });
+    // The tenant never removed this user, unless the test says so.
+    harness.pool.onQuery(/FROM tenant_member_removals/, () =>
+      opts.removed ? { rows: [{ "?column?": 1 }], rowCount: 1 } : { rows: [], rowCount: 0 });
   }
 
   test("rejects missing code (400)", async () => {
@@ -623,7 +627,7 @@ describe("POST /auth/callback", () => {
 
     // DB choreography: every multi-statement upsert returns the expected row.
     harness.pool
-      .onQuery(/INSERT INTO tenants/, () => ({
+      .onQuery(/INSERT INTO tenants|FROM tenants WHERE workos_org_id/, () => ({
         rows: [{ login_type: "workos", tenant_id: "tenant-uuid-1" }],
         rowCount: 1
       }))
@@ -700,7 +704,7 @@ describe("POST /auth/callback", () => {
 
     let userWritten = false;
     harness.pool
-      .onQuery(/INSERT INTO tenants/, () => ({ rows: [{ login_type: "workos", tenant_id: "t1" }], rowCount: 1 }))
+      .onQuery(/INSERT INTO tenants|FROM tenants WHERE workos_org_id/, () => ({ rows: [{ login_type: "workos", tenant_id: "t1" }], rowCount: 1 }))
       .onQuery(/SELECT user_id, workos_user_id, auth_source FROM users WHERE email_key/, () => ({
         rows: [{ user_id: "existing-user", workos_user_id: null, ...row }],
         rowCount: 1
@@ -726,6 +730,53 @@ describe("POST /auth/callback", () => {
     expect(parseSetCookie(res.headers["set-cookie"], "cogniplane_refresh")).toBeNull();
   });
 
+  // A removal by the tenant lasts. The sign-in checks it under the tenant's
+  // membership lock, which a removal also takes, and writes nothing.
+  test("refuses a user that the tenant removed (403), with a fixed message and no membership write", async () => {
+    seedWorkOSHappyPath({ workosRoleSlug: "admin", removed: true });
+
+    let membershipWritten = false;
+    harness.pool
+      .onQuery(/INSERT INTO tenants|FROM tenants WHERE workos_org_id/, () => ({ rows: [{ login_type: "workos", tenant_id: "t1" }], rowCount: 1 }))
+      .onQuery(/SELECT user_id, workos_user_id, auth_source FROM users WHERE email_key/, () => ({
+        rows: [{ user_id: "removed-user", workos_user_id: "workos-user-123", auth_source: "workos" }],
+        rowCount: 1
+      }))
+      .onQuery(/UPDATE users/, () => ({ rows: [{ user_id: "removed-user" }], rowCount: 1 }))
+      .onQuery(/tenant_memberships/, () => {
+        membershipWritten = true;
+        return { rows: [], rowCount: 0 };
+      });
+
+    const res = await harness.app.inject({
+      method: "POST",
+      url: "/auth/callback",
+      cookies: {
+        cogniplane_oauth_state: "the-state",
+        cogniplane_oauth_pkce: TEST_PKCE_VERIFIER
+      },
+      payload: { code: "code-1", state: "the-state" }
+    });
+
+    expect(res.statusCode).toBe(403);
+    expect(res.json()).toEqual({
+      error: "membership_removed",
+      message: "An owner or admin removed you from this organization. Ask them if you need access again."
+    });
+    expect(membershipWritten).toBe(false);
+    expect(parseSetCookie(res.headers["set-cookie"], "cogniplane_refresh")).toBeNull();
+    expect(harness.pool.queries.some((q) => q.text.trim() === "ROLLBACK")).toBe(true);
+    // Lock order: the tenant's membership lock, then the email lock, then the
+    // removal check; the same order as every manager change.
+    const texts = harness.pool.queries.map((q) => q.text);
+    const membershipLock = texts.findIndex((text) => text.includes("tenant_membership_changes"));
+    const emailLock = texts.findIndex((text) => text.includes("users:email_key:"));
+    const removalCheck = texts.findIndex((text) => text.includes("tenant_member_removals"));
+    expect(membershipLock).toBeGreaterThan(-1);
+    expect(membershipLock).toBeLessThan(emailLock);
+    expect(emailLock).toBeLessThan(removalCheck);
+  });
+
   // A WorkOS organization whose tenant uses
   // another login type gets no session, and the provisioning transaction
   // rolls back before any user or membership write.
@@ -734,7 +785,7 @@ describe("POST /auth/callback", () => {
 
     let laterQuery = false;
     harness.pool
-      .onQuery(/INSERT INTO tenants/, () => ({ rows: [{ login_type: "local", tenant_id: "t-local" }], rowCount: 1 }))
+      .onQuery(/INSERT INTO tenants|FROM tenants WHERE workos_org_id/, () => ({ rows: [{ login_type: "local", tenant_id: "t-local" }], rowCount: 1 }))
       .onQuery(/FROM users|INSERT INTO users|tenant_memberships/, () => {
         laterQuery = true;
         return { rows: [], rowCount: 0 };
@@ -788,7 +839,7 @@ describe("POST /auth/callback", () => {
 
     let membershipWritten = false;
     harness.pool
-      .onQuery(/INSERT INTO tenants/, () => ({ rows: [{ login_type: "workos", tenant_id: "t1" }], rowCount: 1 }))
+      .onQuery(/INSERT INTO tenants|FROM tenants WHERE workos_org_id/, () => ({ rows: [{ login_type: "workos", tenant_id: "t1" }], rowCount: 1 }))
       .onQuery(/SELECT user_id, workos_user_id, auth_source FROM users WHERE email_key/, () => ({
         rows: [{ user_id: "someone-else", workos_user_id: "workos-someone-else" }],
         rowCount: 1
@@ -822,8 +873,8 @@ describe("POST /auth/callback", () => {
 
     let tenantUpsertSql = "";
     harness.pool
-      .onQuery(/INSERT INTO tenants/, (text) => {
-        tenantUpsertSql = text;
+      .onQuery(/INSERT INTO tenants|FROM tenants WHERE workos_org_id/, (text) => {
+        if (text.includes("INSERT")) tenantUpsertSql = text;
         return { rows: [{ login_type: "workos", tenant_id: "t1" }], rowCount: 1 };
       })
       .onQuery(/SELECT user_id, workos_user_id, auth_source FROM users WHERE email_key/, () => ({ rows: [], rowCount: 0 }))
@@ -845,16 +896,16 @@ describe("POST /auth/callback", () => {
     });
 
     expect(res.statusCode).toBe(200);
-    // The conflict clause must touch only updated_at.
-    const doUpdateClause = tenantUpsertSql.slice(tenantUpsertSql.indexOf("DO UPDATE"));
-    expect(doUpdateClause).not.toMatch(/tenant_name/);
+    // An existing tenant row is not written at all.
+    expect(tenantUpsertSql).toMatch(/ON CONFLICT \(workos_org_id\) DO NOTHING/);
+    expect(tenantUpsertSql).not.toMatch(/DO UPDATE/);
   });
 
   test("existing owner keeps owner role even if WorkOS sends a downgraded slug — no role_changed audit", async () => {
     seedWorkOSHappyPath({ workosRoleSlug: "member" });
 
     harness.pool
-      .onQuery(/INSERT INTO tenants/, () => ({ rows: [{ login_type: "workos", tenant_id: "t1" }], rowCount: 1 }))
+      .onQuery(/INSERT INTO tenants|FROM tenants WHERE workos_org_id/, () => ({ rows: [{ login_type: "workos", tenant_id: "t1" }], rowCount: 1 }))
       .onQuery(/SELECT user_id, workos_user_id, auth_source FROM users WHERE email_key/, () => ({ rows: [], rowCount: 0 }))
       .onQuery(/INSERT INTO users/, () => ({ rows: [{ user_id: "u1" }], rowCount: 1 }))
       .onQuery(/COUNT\(\*\)[\s\S]*FROM tenant_memberships/, () => ({ rows: [{ cnt: "5" }], rowCount: 1 }))
@@ -878,7 +929,7 @@ describe("POST /auth/callback", () => {
     seedWorkOSHappyPath({ workosRoleSlug: "admin" });
 
     harness.pool
-      .onQuery(/INSERT INTO tenants/, () => ({ rows: [{ login_type: "workos", tenant_id: "t1" }], rowCount: 1 }))
+      .onQuery(/INSERT INTO tenants|FROM tenants WHERE workos_org_id/, () => ({ rows: [{ login_type: "workos", tenant_id: "t1" }], rowCount: 1 }))
       .onQuery(/SELECT user_id, workos_user_id, auth_source FROM users WHERE email_key/, () => ({ rows: [], rowCount: 0 }))
       .onQuery(/INSERT INTO users/, () => ({ rows: [{ user_id: "u1" }], rowCount: 1 }))
       .onQuery(/COUNT\(\*\)[\s\S]*FROM tenant_memberships/, () => ({ rows: [{ cnt: "5" }], rowCount: 1 }))
@@ -904,7 +955,7 @@ describe("POST /auth/callback", () => {
     seedWorkOSHappyPath({ workosRoleSlug: "member" });
 
     harness.pool
-      .onQuery(/INSERT INTO tenants/, () => ({ rows: [{ login_type: "workos", tenant_id: "t1" }], rowCount: 1 }))
+      .onQuery(/INSERT INTO tenants|FROM tenants WHERE workos_org_id/, () => ({ rows: [{ login_type: "workos", tenant_id: "t1" }], rowCount: 1 }))
       .onQuery(/SELECT user_id, workos_user_id, auth_source FROM users WHERE email_key/, () => ({ rows: [], rowCount: 0 }))
       .onQuery(/INSERT INTO users/, () => ({ rows: [{ user_id: "u1" }], rowCount: 1 }))
       .onQuery(/COUNT\(\*\)[\s\S]*FROM tenant_memberships/, () => ({ rows: [{ cnt: "5" }], rowCount: 1 }))

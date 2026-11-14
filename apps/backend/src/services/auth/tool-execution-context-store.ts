@@ -6,9 +6,28 @@ import { toolContextExecutionSql } from "../session-execution-store.js";
 import { ownerSecurityVersionSql } from "./security-change.js";
 
 /**
+ * SQL condition: the owner of the context can still act in its tenant. The
+ * owner is still a member of the tenant, and, for a local account, the
+ * account has the version that admitted the turn (ownerSecurityVersionSql).
+ * It applies to every context, interactive or scheduled, for both login
+ * types. A member removal deletes the membership, so every context of the
+ * member stops matching in the commit of the removal, on every replica. The
+ * stop call after the commit reaches only the runtimes of one process
+ * (services/auth/security-change.ts). `context` must be a constant table name
+ * or alias; never pass input.
+ */
+function contextOwnerCurrentSql(context: string): string {
+  return `(EXISTS (SELECT 1 FROM tenant_memberships owner_membership
+      WHERE owner_membership.tenant_id=${context}.tenant_id AND owner_membership.user_id=${context}.user_id)
+    AND ${ownerSecurityVersionSql(context)})`;
+}
+
+const OWNER_CURRENT_SQL = contextOwnerCurrentSql("tool_execution_contexts");
+
+/**
  * Thrown when a `require`/`requireOwned` lookup finds no live tool context
- * (missing row, wrong tenant, wrong owner, expired TTL, or a security change
- * of the owner's local account). Carries a stable
+ * (missing row, wrong tenant, wrong owner, expired TTL, removal of the owner
+ * from the tenant, or a security change of the owner's local account). Carries a stable
  * machine-readable `code` so callers and tests can branch on the contract
  * instead of matching prose in the message.
  */
@@ -24,7 +43,8 @@ export class ToolContextUnavailableError extends Error {
 /**
  * The state of a tool context for the runtime loop (`liveness`):
  * - `live`: a lookup returns the context.
- * - `security_change`: the owner's local account has another security version.
+ * - `security_change`: the owner is no longer a member of the tenant, or the
+ *   owner's local account has another security version.
  * - `ended`: no row, or the TTL expired, or the execution of the turn ended.
  */
 export type ToolContextLiveness = "live" | "security_change" | "ended";
@@ -144,7 +164,7 @@ export class ToolExecutionContextStore {
           FROM tool_execution_contexts
           WHERE tenant_id = $1 AND session_id = $2 AND expires_at > NOW()
             AND ${toolContextExecutionSql("tool_execution_contexts")}
-            AND ${ownerSecurityVersionSql("tool_execution_contexts")}
+            AND ${OWNER_CURRENT_SQL}
           ORDER BY created_at DESC
           LIMIT 1
         `,
@@ -175,7 +195,7 @@ export class ToolExecutionContextStore {
           SET expires_at = NOW() + ($3 * INTERVAL '1 millisecond')
           WHERE tenant_id = $1 AND tool_context_id = $2 AND expires_at > NOW()
             AND ${toolContextExecutionSql("tool_execution_contexts")}
-            AND ${ownerSecurityVersionSql("tool_execution_contexts")}
+            AND ${OWNER_CURRENT_SQL}
           RETURNING expires_at
         `,
         [tenantId, toolContextId, ttlMs]
@@ -189,14 +209,15 @@ export class ToolExecutionContextStore {
    * Tells the runtime if its turn can continue. The runtime calls this at
    * each model start and before each native tool, so it must stay cheap:
    * one read of the context by its unique id, with the same conditions as
-   * `get` (TTL, execution lease, owner's security version) as columns,
+   * `get` (TTL, execution lease, owner's membership and security
+   * version) as columns,
    * so that a dead context also gives its reason. It reads no JSON column.
    */
   async liveness(tenantId: string, toolContextId: string): Promise<ToolContextLiveness> {
     return withTenantScope(this.db, tenantId, async (client) => {
       const result = await client.query<{ owner_current: boolean; usable: boolean }>(
         `
-          SELECT ${ownerSecurityVersionSql("tool_execution_contexts")} AS owner_current,
+          SELECT ${OWNER_CURRENT_SQL} AS owner_current,
             (expires_at > NOW() AND ${toolContextExecutionSql("tool_execution_contexts")}) AS usable
           FROM tool_execution_contexts
           WHERE tenant_id = $1 AND tool_context_id = $2
@@ -233,7 +254,7 @@ export class ToolExecutionContextStore {
           FROM tool_execution_contexts
           WHERE tenant_id = $1 AND tool_context_id = $2 AND expires_at > NOW()
             AND ${toolContextExecutionSql("tool_execution_contexts")}
-            AND ${ownerSecurityVersionSql("tool_execution_contexts")}
+            AND ${OWNER_CURRENT_SQL}
           LIMIT 1
         `,
         [tenantId, toolContextId]

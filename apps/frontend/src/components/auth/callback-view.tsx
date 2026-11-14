@@ -12,7 +12,8 @@ const CALLBACK_FAILURES: Record<string, string> = {
   email_required: "Your sign-in provider did not share an email address. Ask your administrator to add one to your account.",
   no_organization: "Your account does not belong to an organization. Ask your administrator to invite you.",
   wrong_login_type: "Your organization signs in with email and password. Go back and sign in with your password.",
-  email_in_use: "Another account already uses this email address. Ask your administrator for help."
+  email_in_use: "Another account already uses this email address. Ask your administrator for help.",
+  membership_removed: "An owner or admin removed you from this organization. Ask them if you need access again."
 };
 const failureText = (error: string) => CALLBACK_FAILURES[error] ?? `We could not finish signing you in (${error}). Start a new sign-in to continue.`;
 

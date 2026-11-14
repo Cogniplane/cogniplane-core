@@ -83,7 +83,7 @@ describe("POST /auth/refresh, a local session of an older security version", () 
 
     expect(res.statusCode).toBe(200);
     expect(harness.pool.queries.map(({ text, values }) => [text.trim().split("\n")[0], values])).toEqual([
-      ["SELECT tm.role, t.login_type, u.auth_source, li.status AS local_status, li.security_version", ["tenant-1", "user-1"]],
+      ["SELECT tm.role, t.login_type, u.auth_source, li.status AS local_status, li.security_version,", ["tenant-1", "user-1"]],
       ["SELECT email FROM users WHERE user_id = $1 LIMIT 1", ["user-1"]]
     ]);
   });

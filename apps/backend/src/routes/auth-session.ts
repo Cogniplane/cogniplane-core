@@ -308,7 +308,8 @@ export async function registerSessionRoutes(
     let admission: ReturnType<typeof checkAuthAdmission>;
     try {
       admission = checkAuthAdmission(config, await authStates.getAuthState(payload.tid, payload.sub), {
-        sv: payload.sv
+        sv: payload.sv,
+        authTime: payload.auth_time
       });
     } catch (error) {
       request.log.error({ err: error }, "auth refresh: membership lookup failed");

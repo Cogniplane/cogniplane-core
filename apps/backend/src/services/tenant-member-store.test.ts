@@ -158,7 +158,7 @@ test("TenantMemberStore.getAuthState keeps the tenant scope: BEGIN, set_config, 
   expect(db.statements.map(({ via, text, values }) => ({ via, text: text.split("\n")[0], values }))).toEqual([
     { via: "client", text: "BEGIN", values: [] },
     { via: "client", text: "SELECT set_config('app.current_tenant_id', $1, true)", values: ["tenant-1"] },
-    { via: "client", text: "SELECT tm.role, t.login_type, u.auth_source, li.status AS local_status, li.security_version", values: ["tenant-1", "user-1"] },
+    { via: "client", text: "SELECT tm.role, t.login_type, u.auth_source, li.status AS local_status, li.security_version,", values: ["tenant-1", "user-1"] },
     { via: "client", text: "COMMIT", values: [] }
   ]);
 });

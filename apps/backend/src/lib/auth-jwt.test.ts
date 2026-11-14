@@ -352,7 +352,7 @@ test("jwt auth reads the membership with one statement on every request, with no
   }
 
   // One SELECT per request, and no BEGIN, set_config or COMMIT around it.
-  const authStateRead = ["SELECT tm.role, t.login_type, u.auth_source, li.status AS local_status, li.security_version", ["tenant-A", "user-1"]];
+  const authStateRead = ["SELECT tm.role, t.login_type, u.auth_source, li.status AS local_status, li.security_version,", ["tenant-A", "user-1"]];
   expect(pool.queries.map(({ text, values }) => [text.trim().split("\n")[0], values])).toEqual([
     authStateRead, authStateRead, authStateRead, authStateRead
   ]);

@@ -23,7 +23,7 @@ const META: RequestMeta = { ipAddress: "203.0.113.9", userAgent: "integration" }
 const ORIGIN = "https://app.test";
 const PASSWORD = "purple elephants dance quietly";
 const LOCAL_LOGIN: Pick<AppConfig, "AUTH_LOGIN_TYPES"> = { AUTH_LOGIN_TYPES: ["local"] };
-const AUTH_STATE_FIRST_LINE = "SELECT tm.role, t.login_type, u.auth_source, li.status AS local_status, li.security_version";
+const AUTH_STATE_FIRST_LINE = "SELECT tm.role, t.login_type, u.auth_source, li.status AS local_status, li.security_version,";
 
 const tokenOf = (url: string) => url.split("#token=")[1]!;
 const email = () => `${randomUUID()}@example.test`;

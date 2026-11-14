@@ -55,7 +55,12 @@ Rules:
    rules](../configuration.md#startup-rules)); each approval round sets it to
    `TOOL_CONTEXT_TTL_MS` from that moment (`deep-agents-runtime-adapter.ts`).
 4. A context records the owner's security version
-   ([revocation](local-accounts.md#security-version-and-revocation)).
+   ([revocation](local-accounts.md#security-version-and-revocation)). Every
+   lookup (`get`, `liveness`, `extend`, `findLatestActiveBySession`) also
+   requires that the owner is still a member of the tenant, for interactive and
+   scheduled contexts and for both login types. A member removal therefore
+   stops the member's turns at their next tool call or model start on every
+   replica, with the reason `security_change` ([roles](auth.md#roles)).
    - A context of an interactive or a scheduled turn names the execution of
      its turn (`executionId`). Each lookup refuses it when that execution does
      not hold an active lease with the same user and runtime: after a stop, a

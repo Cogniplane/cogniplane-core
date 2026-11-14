@@ -373,6 +373,10 @@ function makeMembersDb(targetRole: string | null, targetAuthSource: "workos" | "
     updateValues: null as unknown[] | null,
     disableJobsCalled: false,
     disableJobsValues: null as unknown[] | null,
+    /** Explicit project roles of the target, which removal deletes. */
+    projectRoles: 2,
+    projectRoleValues: null as unknown[] | null,
+    removalValues: null as unknown[] | null,
     audits: [] as Array<{ type: unknown; payload: unknown }>,
     /** The target's local account status, when the target is local. */
     localStatus: "active" as string,
@@ -456,6 +460,16 @@ function makeMembersDb(targetRole: string | null, targetAuthSource: "workos" | "
         tracked.disableJobsValues = values;
         tracked.statements.push("disable_jobs");
         return { rows: [] };
+      }
+      if (text.includes("DELETE FROM project_memberships")) {
+        tracked.statements.push("delete_project_roles");
+        tracked.projectRoleValues = values;
+        return { rows: [], rowCount: tracked.projectRoles };
+      }
+      if (text.includes("INSERT INTO tenant_member_removals")) {
+        tracked.statements.push("record_removal");
+        tracked.removalValues = values;
+        return { rows: [], rowCount: 1 };
       }
       if (text.includes("DELETE FROM tenant_memberships")) {
         tracked.deleteCalled = true;
@@ -598,8 +612,43 @@ test("DELETE member: happy path returns 200 and fires DELETE scoped to tenant + 
   // The transaction then takes the member's sandboxes.
   expect(tracked.statements.slice(-4)).toEqual(["audit", "lock_chats", "stop_leases", "take_sandboxes"]);
   expect(tracked.audits).toEqual([
-    { type: "tenant.member.removed", payload: { targetUserId: "member-user", previousRole: "member" } }
+    { type: "tenant.member.removed", payload: { targetUserId: "member-user", previousRole: "member", projectRolesRemoved: 2 } }
   ]);
+});
+
+// The removal lasts: the same transaction deletes the member's project roles
+// and records the removal, which WorkOS sign-in and admission read.
+test("DELETE member: deletes the member's project roles and records the removal by the caller", async () => {
+  const { db, tracked } = makeMembersDb("admin");
+  const app = makeMembersApp("owner", "owner-user");
+  onTestFinished(() => app.close());
+  await registerTenantRoutes(app, { dataRoutes: devDataRoutes(), afterSecurityChange: IGNORE_SECURITY_CHANGE, db: db as never, tenantOrgSettings: makeFakeOrgSettingsStore().store });
+  await app.ready();
+
+  const response = await app.inject({ method: "DELETE", url: "/tenant/members/member-user" });
+
+  expect(response.statusCode).toBe(200);
+  expect(tracked.projectRoleValues).toEqual(["tenant-1", "member-user"]);
+  expect(tracked.removalValues).toEqual(["tenant-1", "member-user", "owner-user"]);
+  const steps = tracked.statements;
+  expect(steps.indexOf("lock_membership")).toBeLessThan(steps.indexOf("delete_project_roles"));
+  expect(steps.indexOf("delete_project_roles")).toBeLessThan(steps.indexOf("delete_membership"));
+  expect(steps.indexOf("delete_membership")).toBeLessThan(steps.indexOf("record_removal"));
+  expect(steps.indexOf("record_removal")).toBeLessThan(steps.indexOf("audit"));
+});
+
+test("DELETE member: a refused removal records nothing", async () => {
+  const { db, tracked } = makeMembersDb("admin");
+  const app = makeMembersApp("admin", "admin-user");
+  onTestFinished(() => app.close());
+  await registerTenantRoutes(app, { dataRoutes: devDataRoutes(), afterSecurityChange: IGNORE_SECURITY_CHANGE, db: db as never, tenantOrgSettings: makeFakeOrgSettingsStore().store });
+  await app.ready();
+
+  const response = await app.inject({ method: "DELETE", url: "/tenant/members/member-user" });
+
+  expect(response.statusCode).toBe(403);
+  expect(tracked.statements).not.toContain("delete_project_roles");
+  expect(tracked.statements).not.toContain("record_removal");
 });
 
 // A local account has no other tenant, so removal ends it in the same
@@ -647,7 +696,7 @@ test.each(["workos", "local"] as const)("DELETE member: a %s member's local acco
   // Identity, then the member's chats, then membership, then jobs: the order
   // disable uses too, with the chats where turn admission takes them. The
   // sandbox release at the end locks the chats again (they are already held).
-  const order = ["lock_tenant", "lock_identity", "lock_chats", "lock_membership", "disable_jobs", "delete_membership"];
+  const order = ["lock_tenant", "lock_identity", "lock_chats", "lock_membership", "disable_jobs", "delete_project_roles", "delete_membership", "record_removal"];
   expect(tracked.statements.filter((step) => order.includes(step))).toEqual([...order, "lock_chats"]);
   if (authSource === "local") {
     expect(tracked.statements.indexOf("mark_local_removed")).toBeLessThan(tracked.statements.indexOf("delete_membership"));
@@ -870,7 +919,8 @@ test("DELETE member: disables the removed member's scheduled jobs in the same tr
   // not a best-effort follow-up that a crash could skip.
   // The member's sandboxes are taken last, in the same transaction.
   expect(tracked.statements).toEqual([
-    "lock_tenant", "lock_identity", "lock_chats", "lock_membership", "disable_jobs", "delete_membership", "audit",
+    "lock_tenant", "lock_identity", "lock_chats", "lock_membership", "disable_jobs", "delete_project_roles",
+    "delete_membership", "record_removal", "audit",
     "lock_chats", "stop_leases", "take_sandboxes"
   ]);
 });
