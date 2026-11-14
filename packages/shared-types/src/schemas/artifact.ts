@@ -35,6 +35,40 @@ export const ArtifactPiiDetailSchema = z.object({
 }).passthrough();
 export type ArtifactPiiDetail = z.infer<typeof ArtifactPiiDetailSchema>;
 
+/**
+ * The PII verdicts that let an artifact's bytes leave the store. It is an
+ * allow-list: a failed scan, and any value that is not in the list, keep the
+ * bytes in. PII checks fail closed (docs/decisions.md, D16). The backend
+ * builds its SQL check from this list too.
+ */
+export const ARTIFACT_PII_ELIGIBLE_STATUSES = ["scanned", "transformed"] as const satisfies readonly NonNullable<
+  ArtifactPiiDetail["status"]
+>[];
+
+/**
+ * True when this PII verdict lets the bytes leave the store. No verdict (no
+ * scan applied) is eligible. JSON null is no verdict, as SQL `->>` reads it.
+ */
+export function isArtifactPiiVerdictEligible(piiStatus: unknown): boolean {
+  return piiStatus === undefined || piiStatus === null ||
+    (ARTIFACT_PII_ELIGIBLE_STATUSES as readonly unknown[]).includes(piiStatus);
+}
+
+/**
+ * The one rule for chat context, runtime workspaces, previews, downloads and
+ * project library imports: the artifact is `ready` and its PII verdict is
+ * eligible. The verdict is read from `detail.pii` on its own, never inferred
+ * from `status`: a block on a record that is already `ready` leaves `status`
+ * unchanged and must still deny. The frontend uses it to show what the backend
+ * accepts; the backend is the boundary.
+ */
+export function isArtifactPiiEligible(artifact: { status: string; detail?: { pii?: unknown } | null }): boolean {
+  if (artifact.status !== "ready") return false;
+  const pii = artifact.detail?.pii;
+  const piiStatus: unknown = pii && typeof pii === "object" ? (pii as { status?: unknown }).status : undefined;
+  return isArtifactPiiVerdictEligible(piiStatus);
+}
+
 // `detail` is a JSONB bag with one well-known optional `pii` field; everything
 // else is intentionally untyped because individual handlers stash whatever
 // they need (mime hints, processor diagnostics, etc.).

@@ -2,9 +2,14 @@ import { test, expect } from "vitest";
 
 import {
   isArtifactEligibleForChatContext,
-  isPiiBlockingContext
+  isPiiHoldingArtifact
 } from "./artifact-eligibility.js";
-import type { Artifact, ArtifactPiiDetail } from "@cogniplane/shared-types";
+import {
+  ARTIFACT_PII_ELIGIBLE_STATUSES,
+  isArtifactPiiEligible,
+  type Artifact,
+  type ArtifactPiiDetail
+} from "@cogniplane/shared-types";
 
 function makeArtifact(overrides: Partial<Artifact> = {}): Artifact {
   return {
@@ -29,49 +34,44 @@ function makeArtifact(overrides: Partial<Artifact> = {}): Artifact {
   };
 }
 
-test("isPiiBlockingContext returns false when pii is undefined", () => {
-  expect(isPiiBlockingContext(undefined)).toBe(false);
+const ARTIFACT_STATUSES = ["pending", "processing", "ready", "failed", "deleted"] as const;
+const PII_STATUSES = ["pending", "scanning", "scanned", "blocked", "transformed", "failed"] as const;
+
+test("the eligible verdicts are the backend allow-list: scanned and transformed", () => {
+  expect([...ARTIFACT_PII_ELIGIBLE_STATUSES].sort()).toEqual(["scanned", "transformed"]);
 });
 
-test("isPiiBlockingContext returns false when pii.status is missing", () => {
-  expect(isPiiBlockingContext({} as ArtifactPiiDetail)).toBe(false);
-});
-
-test("isPiiBlockingContext blocks pending, scanning, blocked", () => {
-  expect(isPiiBlockingContext({ status: "pending" })).toBe(true);
-  expect(isPiiBlockingContext({ status: "scanning" })).toBe(true);
-  expect(isPiiBlockingContext({ status: "blocked" })).toBe(true);
-});
-
-test("isPiiBlockingContext does NOT block failed (transient outage)", () => {
-  expect(isPiiBlockingContext({ status: "failed" })).toBe(false);
-});
-
-test("isPiiBlockingContext does NOT block scanned or transformed", () => {
-  expect(isPiiBlockingContext({ status: "scanned" })).toBe(false);
-  expect(isPiiBlockingContext({ status: "transformed" })).toBe(false);
-});
-
-test("isArtifactEligibleForChatContext rejects non-ready artifacts", () => {
-  for (const status of ["pending", "processing", "failed", "deleted"] as const) {
-    expect(isArtifactEligibleForChatContext(makeArtifact({ status }))).toBe(false);
+test("isArtifactEligibleForChatContext answers every (status, PII status) pair as the backend does", () => {
+  for (const status of ARTIFACT_STATUSES) {
+    for (const pii of [undefined, ...PII_STATUSES]) {
+      const artifact = makeArtifact({ status, detail: pii ? { pii: { status: pii } } : {} });
+      const expected = status === "ready" && (pii === undefined || pii === "scanned" || pii === "transformed");
+      expect(isArtifactEligibleForChatContext(artifact), `${status} / ${String(pii)}`).toBe(expected);
+      expect(isArtifactEligibleForChatContext(artifact)).toBe(isArtifactPiiEligible(artifact));
+    }
   }
 });
 
-test("isArtifactEligibleForChatContext accepts ready + no pii", () => {
-  expect(isArtifactEligibleForChatContext(makeArtifact())).toBe(true);
+test("isArtifactEligibleForChatContext refuses a ready file with a failed scan", () => {
+  expect(isArtifactEligibleForChatContext(makeArtifact({ detail: { pii: { status: "failed" } } }))).toBe(false);
 });
 
-test("isArtifactEligibleForChatContext rejects ready + blocking pii", () => {
-  const artifact = makeArtifact({
-    detail: { pii: { status: "blocked" } }
-  });
+test("isArtifactEligibleForChatContext refuses a PII verdict it does not know", () => {
+  const artifact = makeArtifact({ detail: { pii: { status: "quarantined" as never } } });
   expect(isArtifactEligibleForChatContext(artifact)).toBe(false);
 });
 
-test("isArtifactEligibleForChatContext accepts ready + failed pii (transient)", () => {
-  const artifact = makeArtifact({
-    detail: { pii: { status: "failed" } }
-  });
-  expect(isArtifactEligibleForChatContext(artifact)).toBe(true);
+test("isArtifactEligibleForChatContext accepts a ready file with no verdict", () => {
+  expect(isArtifactEligibleForChatContext(makeArtifact())).toBe(true);
+  expect(isArtifactEligibleForChatContext(makeArtifact({ detail: { pii: {} } }))).toBe(true);
+});
+
+test("isPiiHoldingArtifact holds every verdict except none, scanned and transformed", () => {
+  expect(isPiiHoldingArtifact(undefined)).toBe(false);
+  expect(isPiiHoldingArtifact({} as ArtifactPiiDetail)).toBe(false);
+  expect(isPiiHoldingArtifact({ status: "scanned" })).toBe(false);
+  expect(isPiiHoldingArtifact({ status: "transformed" })).toBe(false);
+  for (const status of ["pending", "scanning", "blocked", "failed"] as const) {
+    expect(isPiiHoldingArtifact({ status }), status).toBe(true);
+  }
 });

@@ -466,10 +466,10 @@ export async function registerMessageRoutes(
   });
 }
 
-// An artifact is eligible for chat context only when it is `ready` AND its
-// PII scan is not pending/scanning/blocked. This prevents an async
-// detect/transform scan that hasn't completed, or a blocked document, from
-// leaking into the prompt just because the row happens to be ready.
+// An artifact is eligible for chat context only when `isArtifactPiiEligible`
+// accepts it: `ready`, and no PII verdict or a `scanned` or `transformed` one.
+// A scan that is not complete, a block and a failed scan keep the file out of
+// the prompt, even when the row is ready.
 async function resolveEligibleArtifacts(
   reply: FastifyReply,
   stores: MessageRouteStores,

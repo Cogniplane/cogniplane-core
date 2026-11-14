@@ -76,9 +76,9 @@ async function resolveReadableArtifact(input: {
   artifactId: string;
 }): Promise<ArtifactRecord> {
   const artifact = await input.artifacts.getReadable(input.context.tenantId, input.artifactId, input.context.userId);
-  // Same eligibility as downloads and chat context: ready, and no pending,
-  // scanning, or blocked PII verdict. The answer does not say which, so a
-  // blocked artifact looks the same as a missing one.
+  // Same eligibility as downloads and chat context (`isArtifactPiiEligible`).
+  // The answer does not say why, so a blocked artifact looks the same as a
+  // missing one.
   if (!artifact || artifact.sessionId !== input.context.sessionId || !isArtifactPiiEligible(artifact)) {
     throw new ToolCallError("Artifact not found for tool context.");
   }

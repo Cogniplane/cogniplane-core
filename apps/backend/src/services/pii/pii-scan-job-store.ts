@@ -1,8 +1,10 @@
+import type { PoolClient } from "pg";
 
 import { type Pool, withTenantScope } from "../../lib/db.js";
-import type { PiiScanSubjectType } from "./pii-scan-run-store.js";
+import { insertPiiScanRun, type PiiScanSubjectType } from "./pii-scan-run-store.js";
 import { uuidv7 } from "../../lib/uuid.js";
 import { isoTimestamp } from "../../lib/db-mappers.js";
+import { UPLOAD_SCAN_PENDING_KEY, writeArtifactPiiDetail } from "../artifacts/artifact-store.js";
 
 export type PiiScanJobMode = "detect" | "block" | "transform";
 
@@ -37,6 +39,31 @@ export type PiiScanJobRecord = {
   createdAt: string;
   updatedAt: string;
 };
+
+/** The attempt that a worker claimed. Only that attempt can finish the job. */
+export type PiiScanJobClaim = Pick<PiiScanJobRecord, "tenantId" | "jobId" | "attempts">;
+
+export type EnqueueArtifactPiiScanJobInput = {
+  tenantId: string;
+  artifactId: string;
+  sourceSessionId: string;
+  sourceUserId: string;
+  mode: PiiScanJobMode;
+  payload: PiiScanJobPayload;
+};
+
+/** An upload whose scan state nothing will finish. See `listStalledUploads`. */
+export type StalledUpload = { tenantId: string; artifactId: string };
+
+/**
+ * - `requeued`: an open scan run had a recorded decision; a new job finishes it.
+ * - `failed`: the open scan runs, and a pending upload with its PII detail, are failed.
+ * - `skipped`: the upload or its scan state changed since it was listed.
+ */
+export type StalledUploadOutcome = "requeued" | "failed" | "skipped";
+
+/** Stored on a scan run and an upload that recovery closes without a decision. */
+export const PII_SCAN_INTERRUPTED = "pii_scan_interrupted";
 
 export type CreatePiiScanJobInput = {
   tenantId: string;
@@ -97,42 +124,44 @@ export class PiiScanJobStore {
   ) {}
 
   async create(input: CreatePiiScanJobInput): Promise<PiiScanJobRecord> {
-    const jobId = input.jobId ?? uuidv7();
-    const payload = input.payload ?? {};
+    return withTenantScope(this.db, input.tenantId, (client) => insertPiiScanJob(client, input));
+  }
+
+  /**
+   * Opens the queued scan of an upload: scan run `pending`, PII detail
+   * `pending` and job `queued` commit together, or none of them does. A job
+   * row thus exists if and only if its scan run and pending detail exist, and
+   * the worker cannot finish the job before the pending detail is written.
+   */
+  async enqueueArtifactScan(
+    input: EnqueueArtifactPiiScanJobInput
+  ): Promise<{ scanRunId: string; jobId: string }> {
     return withTenantScope(this.db, input.tenantId, async (client) => {
-      const result = await client.query(
-        `
-          INSERT INTO pii_scan_jobs (
-            tenant_id,
-            job_id,
-            scan_run_id,
-            subject_type,
-            subject_id,
-            source_session_id,
-            source_user_id,
-            mode,
-            payload_json,
-            max_attempts,
-            run_after
-          )
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, COALESCE($11, NOW()))
-          RETURNING *
-        `,
-        [
-          input.tenantId,
-          jobId,
-          input.scanRunId,
-          input.subjectType,
-          input.subjectId,
-          input.sourceSessionId ?? null,
-          input.sourceUserId ?? null,
-          input.mode,
-          JSON.stringify(payload),
-          input.maxAttempts ?? 3,
-          input.runAfter ?? null
-        ]
-      );
-      return mapRow(result.rows[0] as Record<string, unknown>);
+      const run = await insertPiiScanRun(client, {
+        tenantId: input.tenantId,
+        subjectType: "artifact",
+        subjectId: input.artifactId,
+        sourceSessionId: input.sourceSessionId,
+        sourceUserId: input.sourceUserId,
+        mode: input.mode,
+        status: "pending"
+      });
+      await writeArtifactPiiDetail(client, input.tenantId, input.artifactId, {
+        status: "pending",
+        modeApplied: input.mode,
+        scanRunId: run.scanRunId
+      });
+      const job = await insertPiiScanJob(client, {
+        tenantId: input.tenantId,
+        scanRunId: run.scanRunId,
+        subjectType: "artifact",
+        subjectId: input.artifactId,
+        sourceSessionId: input.sourceSessionId,
+        sourceUserId: input.sourceUserId,
+        mode: input.mode,
+        payload: input.payload
+      });
+      return { scanRunId: run.scanRunId, jobId: job.jobId };
     });
   }
 
@@ -168,16 +197,22 @@ export class PiiScanJobStore {
     return result.rows.map((row) => mapRow(row as Record<string, unknown>));
   }
 
-  async markCompleted(tenantId: string, jobId: string): Promise<void> {
-    await withTenantScope(this.db, tenantId, async (client) => {
-      await client.query(
+  /**
+   * Completes the job if `claim` still holds it. A stale attempt (its claim
+   * expired and the job was claimed again, or another attempt finished it)
+   * changes nothing and gets false.
+   */
+  async markCompleted(claim: PiiScanJobClaim): Promise<boolean> {
+    return withTenantScope(this.db, claim.tenantId, async (client) => {
+      const result = await client.query(
         `
           UPDATE pii_scan_jobs
           SET status = 'completed', completed_at = NOW(), updated_at = NOW(), error_message = NULL
-          WHERE tenant_id = $1 AND job_id = $2
+          WHERE tenant_id = $1 AND job_id = $2 AND status = 'claimed' AND attempts = $3
         `,
-        [tenantId, jobId]
+        [claim.tenantId, claim.jobId, claim.attempts]
       );
+      return (result.rowCount ?? 0) > 0;
     });
   }
 
@@ -187,16 +222,17 @@ export class PiiScanJobStore {
    * attempts so callers don't waste retries on errors that can't recover.
    * When false (the default — transient errors like provider timeouts),
    * the job is requeued with a backoff `run_after` until `max_attempts`.
+   * Only the attempt that `claim` names can record it; for a stale attempt
+   * this returns null and changes nothing.
    */
   async recordFailure(
-    tenantId: string,
-    jobId: string,
+    claim: PiiScanJobClaim,
     errorMessage: string,
     options: { backoffMs?: number; permanent?: boolean } = {}
   ): Promise<PiiScanJobRecord | null> {
     const backoffMs = options.backoffMs ?? 30_000;
     const permanent = options.permanent ?? false;
-    return withTenantScope(this.db, tenantId, async (client) => {
+    return withTenantScope(this.db, claim.tenantId, async (client) => {
       const result = await client.query(
         `
           UPDATE pii_scan_jobs
@@ -207,10 +243,10 @@ export class PiiScanJobStore {
             completed_at = CASE WHEN $5::boolean OR attempts >= max_attempts THEN NOW() ELSE NULL END,
             error_message = $4,
             updated_at = NOW()
-          WHERE tenant_id = $1 AND job_id = $2
+          WHERE tenant_id = $1 AND job_id = $2 AND status = 'claimed' AND attempts = $6
           RETURNING *
         `,
-        [tenantId, jobId, backoffMs, errorMessage, permanent]
+        [claim.tenantId, claim.jobId, backoffMs, errorMessage, permanent, claim.attempts]
       );
       if (result.rows.length === 0) return null;
       return mapRow(result.rows[0] as Record<string, unknown>);
@@ -295,6 +331,126 @@ export class PiiScanJobStore {
     return result.rows.map((row) => mapRow(row as Record<string, unknown>));
   }
 
+  /**
+   * Uploads whose scan state nothing will finish. A crash or a failed write
+   * between the upload commit and its scan state leaves one of these:
+   *
+   * - a `pending` upload with the `awaitingUploadScan` marker and no open
+   *   scan run;
+   * - an open scan run with no job (a synchronous scan stopped before or
+   *   after it recorded its decision, or a queued scan from before the
+   *   one-transaction enqueue).
+   *
+   * Each must be unchanged for `staleAfterMs`, longer than a synchronous scan
+   * can run. A subject with a queued or claimed job, or an open run that a
+   * failed job owns (`listUnfinishedFailures`), is left alone. Reads across
+   * tenants on `schedulerDb`; `recoverStalledUpload` closes each one in its
+   * tenant scope.
+   */
+  async listStalledUploads(staleAfterMs: number, limit: number): Promise<StalledUpload[]> {
+    const cutoff = staleCutoffSql("$1");
+    const result = await this.schedulerDb.query(
+      `WITH subjects AS (
+         SELECT a.tenant_id, a.artifact_id AS subject_id FROM artifacts a
+         WHERE a.status = 'pending' AND a.detail_json ? '${UPLOAD_SCAN_PENDING_KEY}' AND a.updated_at < ${cutoff}
+         UNION
+         SELECT r.tenant_id, r.subject_id FROM pii_scan_runs r
+         WHERE r.subject_type = 'artifact' AND r.status IN ('pending', 'processing') AND r.updated_at < ${cutoff}
+       )
+       SELECT s.tenant_id, s.subject_id FROM subjects s
+       WHERE ${unownedSubjectSql("s.tenant_id", "s.subject_id", cutoff)}
+       ORDER BY s.tenant_id, s.subject_id
+       LIMIT $2`,
+      [staleAfterMs, limit]
+    );
+    return result.rows.map((row) => ({ tenantId: String(row.tenant_id), artifactId: String(row.subject_id) }));
+  }
+
+  /**
+   * Closes one stalled upload in its tenant scope, after a check of the same
+   * conditions under lock:
+   *
+   * - An open scan run with a recorded decision gets a new queued job, so the
+   *   handler finishes that decision (a block deletes the bytes and ends
+   *   `blocked`; an allow makes the upload ready).
+   * - Without a decision, the open scan runs, the PII detail and a pending
+   *   upload become `failed`. The bytes stay, because nothing scanned them.
+   *   A rescan is not tried: the scan run does not store the import source,
+   *   so a rescan could apply the wrong scope.
+   *
+   * Lock order: scan runs, then the artifact, as `finishUndecidedFailure`
+   * takes the run before its subject write.
+   */
+  async recoverStalledUpload(
+    tenantId: string,
+    artifactId: string,
+    staleAfterMs: number
+  ): Promise<StalledUploadOutcome> {
+    const cutoff = staleCutoffSql("$3");
+    return withTenantScope(this.db, tenantId, async (client) => {
+      const runs = await client.query(
+        `SELECT scan_run_id, mode, source_session_id, source_user_id, created_at,
+                pending_decision IS NOT NULL AS decided
+         FROM pii_scan_runs
+         WHERE tenant_id = $1 AND subject_type = 'artifact' AND subject_id = $2
+           AND status IN ('pending', 'processing')
+         ORDER BY created_at DESC, scan_run_id DESC
+         FOR UPDATE`,
+        [tenantId, artifactId]
+      );
+      const artifact = await client.query(
+        `SELECT status = 'pending' AND detail_json ? '${UPLOAD_SCAN_PENDING_KEY}' AND updated_at < ${cutoff} AS stalled
+         FROM artifacts WHERE tenant_id = $1 AND artifact_id = $2
+         FOR UPDATE`,
+        [tenantId, artifactId, staleAfterMs]
+      );
+      const pendingUpload = artifact.rows[0]?.stalled === true;
+      if (runs.rows.length === 0 && !pendingUpload) return "skipped";
+      const unowned = await client.query(
+        `SELECT ${unownedSubjectSql("$1", "$2", cutoff)} AS unowned`,
+        [tenantId, artifactId, staleAfterMs]
+      );
+      if (unowned.rows[0]?.unowned !== true) return "skipped";
+
+      const decided = runs.rows.find((run) => run.decided === true);
+      if (decided) {
+        // The decision stands; the job handler applies it.
+        await insertPiiScanJob(client, {
+          tenantId,
+          scanRunId: String(decided.scan_run_id),
+          subjectType: "artifact",
+          subjectId: artifactId,
+          sourceSessionId: decided.source_session_id == null ? null : String(decided.source_session_id),
+          sourceUserId: decided.source_user_id == null ? null : String(decided.source_user_id),
+          mode: jobModeOf(decided.mode),
+          // The handler skips an audit event that this scan run wrote after
+          // the job's creation time. Use the run's start, so an event that the
+          // interrupted attempt wrote counts.
+          createdAt: decided.created_at as Date
+        });
+        return "requeued";
+      }
+
+      await client.query(
+        `UPDATE pii_scan_runs
+         SET status = 'failed', error_message = $3, completed_at = NOW(), updated_at = NOW()
+         WHERE tenant_id = $1 AND subject_type = 'artifact' AND subject_id = $2
+           AND status IN ('pending', 'processing')`,
+        [tenantId, artifactId, PII_SCAN_INTERRUPTED]
+      );
+      if (pendingUpload) {
+        const newest = runs.rows[0];
+        // The marker moves the pending upload to `failed` with this write.
+        await writeArtifactPiiDetail(client, tenantId, artifactId, {
+          status: "failed",
+          summaryText: PII_SCAN_INTERRUPTED,
+          ...(newest ? { modeApplied: newest.mode, scanRunId: String(newest.scan_run_id) } : {})
+        });
+      }
+      return "failed";
+    });
+  }
+
   async getById(tenantId: string, jobId: string): Promise<PiiScanJobRecord | null> {
     return withTenantScope(this.db, tenantId, async (client) => {
       const result = await client.query(
@@ -305,4 +461,74 @@ export class PiiScanJobStore {
       return mapRow(result.rows[0] as Record<string, unknown>);
     });
   }
+}
+
+function staleCutoffSql(staleAfterMs: string): string {
+  return `NOW() - (${staleAfterMs}::int * INTERVAL '1 millisecond')`;
+}
+
+// An artifact subject that no job owns: no queued or claimed job, and no open
+// scan run that changed since `cutoff` (a synchronous scan still running) or
+// that a failed job owns (`listUnfinishedFailures` finishes those).
+function unownedSubjectSql(tenantId: string, subjectId: string, cutoff: string): string {
+  return `NOT EXISTS (
+      SELECT 1 FROM pii_scan_jobs live
+      WHERE live.tenant_id = ${tenantId} AND live.subject_type = 'artifact'
+        AND live.subject_id = ${subjectId} AND live.status IN ('queued', 'claimed'))
+    AND NOT EXISTS (
+      SELECT 1 FROM pii_scan_runs busy
+      WHERE busy.tenant_id = ${tenantId} AND busy.subject_type = 'artifact'
+        AND busy.subject_id = ${subjectId} AND busy.status IN ('pending', 'processing')
+        AND (busy.updated_at >= ${cutoff} OR EXISTS (
+          SELECT 1 FROM pii_scan_jobs failed
+          WHERE failed.tenant_id = busy.tenant_id AND failed.scan_run_id = busy.scan_run_id
+            AND failed.status = 'failed')))`;
+}
+
+// A scan run stores the routed mode until it ends. `off` is not a job mode;
+// a recorded decision keeps its own applied mode.
+function jobModeOf(mode: unknown): PiiScanJobMode {
+  return mode === "detect" || mode === "transform" ? mode : "block";
+}
+
+/** Inserts a job in the caller's tenant transaction. */
+export async function insertPiiScanJob(
+  client: PoolClient,
+  input: CreatePiiScanJobInput & { createdAt?: Date }
+): Promise<PiiScanJobRecord> {
+  const result = await client.query(
+    `
+      INSERT INTO pii_scan_jobs (
+        tenant_id,
+        job_id,
+        scan_run_id,
+        subject_type,
+        subject_id,
+        source_session_id,
+        source_user_id,
+        mode,
+        payload_json,
+        max_attempts,
+        run_after,
+        created_at
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, COALESCE($11, NOW()), COALESCE($12, NOW()))
+      RETURNING *
+    `,
+    [
+      input.tenantId,
+      input.jobId ?? uuidv7(),
+      input.scanRunId,
+      input.subjectType,
+      input.subjectId,
+      input.sourceSessionId ?? null,
+      input.sourceUserId ?? null,
+      input.mode,
+      JSON.stringify(input.payload ?? {}),
+      input.maxAttempts ?? 3,
+      input.runAfter ?? null,
+      input.createdAt ?? null
+    ]
+  );
+  return mapRow(result.rows[0] as Record<string, unknown>);
 }

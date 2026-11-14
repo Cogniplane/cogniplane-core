@@ -18,7 +18,7 @@ import { PiiProtectionServiceError } from "./pii-protection-service.js";
 import type {
   PiiScanArtifactInput
 } from "./pii-provider.js";
-import type { PiiScanJobRecord } from "./pii-scan-job-store.js";
+import type { PiiScanJobClaim, PiiScanJobRecord } from "./pii-scan-job-store.js";
 import type { PiiScanMode, PiiScanRunDecision, PiiScanRunStore } from "./pii-scan-run-store.js";
 import { imageCoverageDetail, type ImageCoverageDetail } from "./scannable-text.js";
 
@@ -42,11 +42,11 @@ type PiiScanJobLogger = {
   warn(payload: unknown, message: string): void;
 };
 
+// Both writes are fenced by the claimed attempt: a stale attempt changes nothing.
 type PiiScanJobStoreCapability = {
-  markCompleted(tenantId: string, jobId: string): Promise<void>;
+  markCompleted(claim: PiiScanJobClaim): Promise<boolean>;
   recordFailure(
-    tenantId: string,
-    jobId: string,
+    claim: PiiScanJobClaim,
     error: string,
     options?: { backoffMs?: number; permanent?: boolean }
   ): Promise<{ status: PiiScanJobRecord["status"] } | null>;
@@ -101,7 +101,7 @@ export class PiiScanJobHandler {
             completedAt: new Date()
           });
           decisionApplied = true;
-          await this.deps.piiScanJobs.markCompleted(job.tenantId, job.jobId);
+          await this.acknowledge(job);
           return;
         }
         // A completed attempt can have cleared its decision before this
@@ -129,7 +129,7 @@ export class PiiScanJobHandler {
       }
       await this.applyDecision(job, next.decision, next.resumed);
       decisionApplied = true;
-      await this.deps.piiScanJobs.markCompleted(job.tenantId, job.jobId);
+      await this.acknowledge(job);
     } catch (error) {
       if (decisionApplied) {
         // Leave the applied decision intact. The worker's stale-job recovery
@@ -160,9 +160,10 @@ export class PiiScanJobHandler {
         "PiiScanJobHandler execution failed"
       );
 
+      // Null when this attempt no longer holds the job: another attempt
+      // finished it or claimed it again, and its outcome stands.
       const updated = await this.deps.piiScanJobs.recordFailure(
-        job.tenantId,
-        job.jobId,
+        job,
         `${errorCode}: ${message}`,
         { permanent }
       );
@@ -178,6 +179,15 @@ export class PiiScanJobHandler {
           );
         });
       }
+    }
+  }
+
+  private async acknowledge(job: PiiScanJobRecord): Promise<void> {
+    if (!(await this.deps.piiScanJobs.markCompleted(job))) {
+      this.deps.logger.warn(
+        { jobId: job.jobId, tenantId: job.tenantId, attempt: job.attempts },
+        "PII scan job not acknowledged: this attempt no longer holds the job"
+      );
     }
   }
 
@@ -227,21 +237,9 @@ export class PiiScanJobHandler {
     return decision ? { decision, resumed: true } : null;
   }
 
-  // The decision and the policy that it applied, as the scan run records them.
   private async decide(job: PiiScanJobRecord, subject: PiiSubject): Promise<PiiScanRunDecision> {
     const { decision, appliedPolicy, coverage } = await this.evaluate(job, subject);
-    const scanned = decision.action === "allow"
-      ? { findings: [], providerType: null, providerModel: null }
-      : { findings: decision.findings, providerType: decision.providerType, providerModel: decision.providerModel };
-    return {
-      action: decision.action,
-      mode: appliedPolicy.mode,
-      policyRevision: appliedPolicy.revision,
-      ...scanned,
-      ...(decision.action === "block" ? { blockReason: decision.blockReason } : {}),
-      // A scan that applied mode off read nothing, so no coverage applies.
-      ...(appliedPolicy.mode !== "off" ? coverage : {})
-    };
+    return scanRunDecision(decision, appliedPolicy, coverage);
   }
 
   // The job applies the policy in force now, not the policy at enqueue time.
@@ -502,6 +500,9 @@ export class PiiScanJobHandler {
       scanRunId: job.scanRunId
     };
     if (detail.policyRevision !== undefined) artifactPii.policyRevision = detail.policyRevision;
+    // As the synchronous scan writes it, so a block that recovery finishes
+    // shows the same reason.
+    if (detail.blockReason !== undefined) artifactPii.blockReason = detail.blockReason;
     if (detail.findingsCount !== undefined) {
       artifactPii.findingsCount = detail.findingsCount;
     }
@@ -513,8 +514,33 @@ export class PiiScanJobHandler {
   }
 }
 
-// A decision recorded before OCR coverage existed holds only `imagesNotScanned`.
-function coverageOf(decision: PiiScanRunDecision): ImageCoverageDetail {
+/**
+ * The decision and the policy that it applied, as the scan run records them
+ * (`pending_decision`). The queued and the synchronous scan both record it
+ * before they act on it.
+ */
+export function scanRunDecision(
+  decision: PiiDecision,
+  appliedPolicy: PiiAppliedPolicy,
+  coverage: ImageCoverageDetail
+): PiiScanRunDecision {
+  const scanned = decision.action === "allow"
+    ? { findings: [], providerType: null, providerModel: null }
+    : { findings: decision.findings, providerType: decision.providerType, providerModel: decision.providerModel };
+  return {
+    action: decision.action,
+    mode: appliedPolicy.mode,
+    policyRevision: appliedPolicy.revision,
+    ...scanned,
+    ...(decision.action === "block" ? { blockReason: decision.blockReason } : {}),
+    // A scan that applied mode off read nothing, so no coverage applies.
+    ...(appliedPolicy.mode !== "off" ? coverage : {})
+  };
+}
+
+// The page-image coverage that a recorded decision states. A decision
+// recorded before OCR coverage existed holds only `imagesNotScanned`.
+export function coverageOf(decision: PiiScanRunDecision): ImageCoverageDetail {
   return {
     ...(decision.imagesNotScanned ? { imagesNotScanned: true } : {}),
     ...(decision.imageScan !== undefined ? { imageScan: decision.imageScan } : {}),

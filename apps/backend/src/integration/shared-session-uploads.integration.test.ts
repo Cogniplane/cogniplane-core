@@ -196,7 +196,9 @@ describe.skipIf(!adminDatabaseUrl())("shared session uploads", () => {
       expect(await h.count()).toBe(0);
       expect(h.remove).toHaveBeenCalledOnce();
       await expect(h.storage.openReadStream(h.remove.mock.calls[0]![0])).rejects.toThrow();
-      expect(h.readPolicy).not.toHaveBeenCalled();
+      // The policy is read before the row exists, so an upload that needs no
+      // scan commits ready. Nothing is scanned.
+      expect(h.evaluateArtifact).not.toHaveBeenCalled();
       expect((await superuserPool().query(
         "SELECT id FROM audit_events WHERE tenant_id=$1 AND event_type='artifact_uploaded'", [h.tenantId])).rows).toEqual([]);
     },
@@ -333,7 +335,9 @@ describe.skipIf(!adminDatabaseUrl())("shared session uploads", () => {
       expect(h.remove).toHaveBeenCalledExactlyOnceWith(stored.storageKey);
       await expect(h.storage.openReadStream(stored.storageKey)).rejects.toThrow();
       expect(enqueue).not.toHaveBeenCalled();
-      expect(h.readPolicy).not.toHaveBeenCalled();
+      // The policy is read before the row exists, so an upload that needs no
+      // scan commits ready. Nothing is scanned.
+      expect(h.evaluateArtifact).not.toHaveBeenCalled();
       expect(await scanRows("pii_scan_runs")).toBe(0);
       expect(await scanRows("pii_scan_jobs")).toBe(0);
     } finally {
@@ -363,10 +367,14 @@ describe.skipIf(!adminDatabaseUrl())("shared session uploads", () => {
       [h.tenantId, artifact.artifactId])).rows[0].count).toBe("1");
   });
 
-  // No job exists after a failed enqueue, so no worker can finish the scan.
-  test("closes the pending scan state and keeps the bytes when the scan job insert fails", async () => {
+  // The scan run, the pending detail and the job commit in one transaction.
+  // A job insert that fails in it leaves no scan run; the upload fails.
+  test("rolls back the scan state and fails the upload, keeping the bytes, when the scan job insert fails", async () => {
     const h = await setup("detect");
-    const jobInsert = vi.spyOn(h.piiScanJobs, "create").mockRejectedValueOnce(new Error("job insert failed"));
+    const enqueueScan = h.piiScanJobs.enqueueArtifactScan.bind(h.piiScanJobs);
+    // `off` passes the scan run check and fails the job check, in the transaction.
+    const jobInsert = vi.spyOn(h.piiScanJobs, "enqueueArtifactScan")
+      .mockImplementationOnce(input => enqueueScan({ ...input, mode: "off" as never }));
 
     const response = await h.upload();
 
@@ -374,20 +382,15 @@ describe.skipIf(!adminDatabaseUrl())("shared session uploads", () => {
     expect(response.json().error).toBe("pii_enqueue_failed");
     expect(response.json().message).toBe("The file scan could not be queued. Try again later.");
     expect(jobInsert).toHaveBeenCalledOnce();
+    await expect(jobInsert.mock.results[0]!.value).rejects.toThrow(/pii_scan_jobs_mode_check/);
     const artifacts = (await superuserPool().query(
       "SELECT artifact_id, status, storage_key, detail_json FROM artifacts WHERE tenant_id=$1", [h.tenantId])).rows;
     expect(artifacts).toHaveLength(1);
     const [artifact] = artifacts;
-    const runs = (await superuserPool().query(
-      "SELECT scan_run_id, status, error_message, completed_at FROM pii_scan_runs WHERE tenant_id=$1 AND subject_id=$2",
-      [h.tenantId, artifact.artifact_id])).rows;
-    expect(runs).toEqual([{
-      scan_run_id: expect.any(String), status: "failed", error_message: "pii_enqueue_failed", completed_at: expect.any(Date)
-    }]);
+    expect((await superuserPool().query(
+      "SELECT count(*) FROM pii_scan_runs WHERE tenant_id=$1", [h.tenantId])).rows[0].count).toBe("0");
     expect(artifact.status).toBe("failed");
-    expect(artifact.detail_json.pii).toEqual({
-      status: "failed", modeApplied: "detect", scanRunId: runs[0].scan_run_id, summaryText: "pii_enqueue_failed"
-    });
+    expect(artifact.detail_json.pii).toEqual({ status: "failed", modeApplied: "detect", summaryText: "pii_enqueue_failed" });
     expect((await superuserPool().query(
       "SELECT count(*) FROM pii_scan_jobs WHERE tenant_id=$1", [h.tenantId])).rows[0].count).toBe("0");
     // The content was not scanned: the bytes stay and the file stays unpublished.
@@ -402,10 +405,10 @@ describe.skipIf(!adminDatabaseUrl())("shared session uploads", () => {
   test("keeps the file unpublished before enqueue and completes queued scans under the uploader's identity", async () => {
     const h = await setup("detect");
     const enqueue = h.enqueuer.enqueue.bind(h.enqueuer);
-    vi.spyOn(h.enqueuer, "enqueue").mockImplementationOnce(async input => {
+    vi.spyOn(h.enqueuer, "enqueue").mockImplementationOnce(async (input, plan) => {
       expect((await h.artifacts.get(h.tenantId, input.artifactId))?.status).toBe("pending");
       expect((await h.publish(input.artifactId)).statusCode).toBe(404);
-      return enqueue(input);
+      return enqueue(input, plan);
     });
     const response = await h.upload();
     expect(response.statusCode).toBe(201);

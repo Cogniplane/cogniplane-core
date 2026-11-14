@@ -40,6 +40,7 @@ import { PiiProtectionServiceError, type PiiProtectionService } from "./pii/pii-
 import { PERMANENT_PII_ERROR_CODES } from "./pii/pii-scan-job-handler.js";
 import { toScannableText, type PdfTextExtractor } from "./pii/scannable-text.js";
 import { isTextReadableArtifact, readStreamAsBoundedText } from "./artifacts/artifact-helpers.js";
+import { artifactPiiEligibleSql } from "./artifacts/artifact-store.js";
 
 export type ProjectFileActor = {
   tenantId: string;
@@ -1335,8 +1336,8 @@ export class ProjectFileStore {
         `SELECT a.* FROM artifacts a JOIN sessions s
           ON s.tenant_id=a.tenant_id AND s.session_id=a.session_id
           WHERE a.tenant_id=$1 AND s.project_id=$2 AND a.artifact_id=$3
-          AND s.status <> 'deleted' AND a.status='ready' AND a.artifact_type <> 'derived'
-          AND COALESCE(a.detail_json->'pii'->>'status', 'scanned') IN ('scanned','transformed') FOR SHARE OF a, s`,
+          AND s.status <> 'deleted' AND a.artifact_type <> 'derived'
+          AND ${artifactPiiEligibleSql("a")} FOR SHARE OF a, s`,
         [actor.tenantId, actor.projectId, input.artifactId],
       );
       const artifact = source.rows[0];

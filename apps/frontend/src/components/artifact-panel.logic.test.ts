@@ -131,6 +131,15 @@ describe("canDownloadArtifact", () => {
     expect(canDownloadArtifact(makeArtifact({ artifactType: "generated", status: "ready" }))).toBe(true);
   });
 
+  test("a ready file only with a PII verdict that the download token route accepts", () => {
+    for (const status of ["pending", "scanning", "blocked", "failed"] as const) {
+      expect(canDownloadArtifact(makeArtifact({ status: "ready", detail: { pii: { status } } })), status).toBe(false);
+    }
+    for (const status of ["scanned", "transformed"] as const) {
+      expect(canDownloadArtifact(makeArtifact({ status: "ready", detail: { pii: { status } } })), status).toBe(true);
+    }
+  });
+
   test("deleted artifacts can never download", () => {
     expect(canDownloadArtifact(makeArtifact({ status: "deleted" }))).toBe(false);
   });

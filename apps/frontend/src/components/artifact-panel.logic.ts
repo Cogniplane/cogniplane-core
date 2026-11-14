@@ -87,9 +87,10 @@ export function piiTone(pii: ArtifactPiiDetail): PiiTone {
 }
 
 export function canDownloadArtifact(artifact: Artifact): boolean {
-  // Uploads stay pending until their PII scan completes; the backend refuses
-  // a download token before then.
-  return artifact.status === "ready";
+  // The backend issues a download token only for an artifact that is ready
+  // and has an eligible PII verdict. A pending, blocked or failed scan holds
+  // the file.
+  return isArtifactEligibleForChatContext(artifact);
 }
 
 export function canSelectArtifact(artifact: Artifact): boolean {

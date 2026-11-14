@@ -116,7 +116,13 @@ async function setupQueued() {
   const queued = await h.enqueue();
   if (queued.kind !== "queued") throw new Error(`expected a queued scan, got ${queued.kind}`);
   expect(queued.mode).toBe("detect");
+  // Claims the job as claimDueJobs does, without the wait of a retry backoff.
+  // Only the claimed attempt can finish the job.
   const runQueuedJob = async () => {
+    await superuserPool().query(
+      "UPDATE pii_scan_jobs SET status = 'claimed', attempts = attempts + 1, claimed_at = NOW() WHERE job_id = $1",
+      [queued.jobId]
+    );
     const job = await h.piiScanJobs.getById(h.tenantId, queued.jobId);
     await h.handler.execute(job!);
   };

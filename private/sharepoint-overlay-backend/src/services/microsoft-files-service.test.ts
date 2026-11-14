@@ -38,7 +38,6 @@ function makeService(deps: MicrosoftFilesDeps) {
           await auditEvents.create(audit(record));
           return record;
         },
-        update: (...args) => artifacts.update(...args),
         getReadable: (...args) => artifacts.getReadable(...args)
       }
     })
@@ -70,22 +69,15 @@ function artifactsFrom(
 ): MicrosoftFilesDeps["artifacts"] {
   const records = new Map<string, ArtifactRecord>();
   return {
-    async createUpload({ expectedProjectId: _projectId, ...input }) {
+    async createUpload({ expectedProjectId: _projectId, awaitingScan = true, ...input }) {
       const record = await create({
         ...input,
         artifactType: "upload",
         createdByType: input.createdByType ?? "user",
-        status: "pending"
+        status: awaitingScan ? "pending" : "ready"
       });
       records.set(record.artifactId, record);
       return record;
-    },
-    async update(_tenantId, artifactId, patch) {
-      const record = records.get(artifactId);
-      if (!record) return null;
-      const updated = { ...record, ...patch };
-      records.set(artifactId, updated);
-      return updated;
     },
     async getReadable(_tenantId, artifactId) {
       return records.get(artifactId) ?? null;
@@ -790,6 +782,9 @@ test("importFileToSession: PII enqueuer 'allowed' result lets import succeed", a
     },
     auditEvents: stubAudit,
     piiScanEnqueuer: {
+      async plan() {
+        return { kind: "async", mode: "detect", entityTypes: [] };
+      },
       async enqueue(args) {
         enqueueArgs.push({ ...args });
         return { kind: "allowed", scanRunId: "run-1" };
@@ -843,6 +838,9 @@ test("importFileToSession: PII enqueuer 'blocked' raises MicrosoftImportBlockedE
     },
     auditEvents: stubAudit,
     piiScanEnqueuer: {
+      async plan() {
+        return { kind: "async", mode: "detect", entityTypes: [] };
+      },
       async enqueue() {
         return {
           kind: "blocked",
@@ -897,6 +895,9 @@ test("importFileToSession: PII enqueuer 'failed' raises MicrosoftImportPiiScanEr
     },
     auditEvents: stubAudit,
     piiScanEnqueuer: {
+      async plan() {
+        return { kind: "async", mode: "detect", entityTypes: [] };
+      },
       async enqueue() {
         return {
           kind: "failed",
@@ -1042,6 +1043,9 @@ test("importFileToSession: deletes stored bytes and starts no scan when the uplo
   const { calls, run } = importService({
     auditEvents: { async create() { throw failure; } },
     piiScanEnqueuer: {
+      async plan() {
+        return { kind: "async", mode: "detect", entityTypes: [] };
+      },
       async enqueue() {
         enqueued += 1;
         return { kind: "queued", scanRunId: "r", jobId: "j", mode: "detect" };
@@ -1056,6 +1060,9 @@ test("importFileToSession: deletes stored bytes and starts no scan when the uplo
 test("importFileToSession: a queued scan returns the artifact still pending", async () => {
   const { run } = importService({
     piiScanEnqueuer: {
+      async plan() {
+        return { kind: "async", mode: "detect", entityTypes: [] };
+      },
       async enqueue() { return { kind: "queued", scanRunId: "r", jobId: "j", mode: "detect" }; }
     }
   });
@@ -1064,11 +1071,24 @@ test("importFileToSession: a queued scan returns the artifact still pending", as
   expect(artifact.createdByType).toBe("tool");
 });
 
-test("importFileToSession: marks the artifact ready only after an allowed verdict", async () => {
-  const { run } = importService({
-    piiScanEnqueuer: { async enqueue() { return { kind: "allowed", scanRunId: "r" }; } }
+// The PII verdict write makes a scanned import ready (ArtifactStore.setPiiDetail);
+// admission creates the row ready only when no scan applies.
+test("importFileToSession: an import is created ready only when no scan applies", async () => {
+  const skipped = importService({
+    piiScanEnqueuer: {
+      async plan() { return { kind: "skip" }; },
+      async enqueue() { throw new Error("no scan applies"); }
+    }
   });
-  expect((await run()).status).toBe("ready");
+  expect((await skipped.run()).status).toBe("ready");
+
+  const scanned = importService({
+    piiScanEnqueuer: {
+      async plan() { return { kind: "async", mode: "detect", entityTypes: [] }; },
+      async enqueue() { return { kind: "queued", scanRunId: "r", jobId: "j", mode: "detect" }; }
+    }
+  });
+  expect((await scanned.run()).status).toBe("pending");
 });
 
 test("importFileToSession: rejects oversized metadata before downloading", async () => {

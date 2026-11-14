@@ -134,13 +134,14 @@ test("PiiScanJobStore.markCompleted updates the job status", async () => {
   db.updateReturn = sampleRow({ status: "completed", completed_at: new Date().toISOString() });
   const store = new PiiScanJobStore(db as unknown as Pool);
 
-  await store.markCompleted("tenant-1", "job-1");
+  await store.markCompleted({ tenantId: "tenant-1", jobId: "job-1", attempts: 2 });
 
   expect(db.lastQuery).toBeTruthy();
   expect(db.lastQuery!.text).toMatch(/UPDATE pii_scan_jobs/);
   expect(db.lastQuery!.text).toMatch(/status\s*=\s*'completed'/);
-  expect(db.lastQuery!.values).toContain("tenant-1");
-  expect(db.lastQuery!.values).toContain("job-1");
+  // Fenced by the claimed attempt (the integration suite runs the race).
+  expect(db.lastQuery!.text).toMatch(/status = 'claimed' AND attempts = \$3/);
+  expect(db.lastQuery!.values).toEqual(["tenant-1", "job-1", 2]);
 });
 
 test("PiiScanJobStore.recordFailure requeues and stores the error message", async () => {
@@ -148,12 +149,15 @@ test("PiiScanJobStore.recordFailure requeues and stores the error message", asyn
   db.updateReturn = sampleRow({ status: "queued", attempts: 1, error_message: "timeout" });
   const store = new PiiScanJobStore(db as unknown as Pool);
 
-  const updated = await store.recordFailure("tenant-1", "job-1", "timeout", { backoffMs: 15_000 });
+  const updated = await store.recordFailure({ tenantId: "tenant-1", jobId: "job-1", attempts: 1 }, "timeout", {
+    backoffMs: 15_000
+  });
 
   expect(db.lastQuery).toBeTruthy();
   // The retry guard (`attempts >= max_attempts`) is the load-bearing contract:
   // it decides requeue vs. terminal-failure. Assert its presence, not bind nums.
   expect(db.lastQuery!.text).toMatch(/attempts\s*>=\s*max_attempts/);
+  expect(db.lastQuery!.text).toMatch(/status = 'claimed' AND attempts = \$6/);
   // Scope, backoff, error, and the permanent flag all reach the query as
   // bound values. Transient default → permanent flag is false.
   expect(db.lastQuery!.values).toContain("tenant-1");
@@ -171,7 +175,7 @@ test("PiiScanJobStore.recordFailure with permanent=true forces status='failed' r
   db.updateReturn = sampleRow({ status: "failed", attempts: 1, error_message: "artifact_not_found" });
   const store = new PiiScanJobStore(db as unknown as Pool);
 
-  const updated = await store.recordFailure("tenant-1", "job-1", "artifact_not_found", {
+  const updated = await store.recordFailure({ tenantId: "tenant-1", jobId: "job-1", attempts: 1 }, "artifact_not_found", {
     permanent: true
   });
 

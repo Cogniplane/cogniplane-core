@@ -1,4 +1,5 @@
 import { test, expect } from "vitest";
+import { isArtifactPiiEligible as sharedIsArtifactPiiEligible } from "@cogniplane/shared-types";
 
 import type { Pool } from "../../lib/db.js";
 
@@ -226,39 +227,52 @@ function eligibilityInput(
   return { status, detail: pii ? { pii } : {} };
 }
 
-test("isArtifactPiiEligible denies pending, scanning, and blocked verdicts on a ready artifact", () => {
-  expect(isArtifactPiiEligible(eligibilityInput("ready", { status: "pending" }))).toBe(false);
-  expect(isArtifactPiiEligible(eligibilityInput("ready", { status: "scanning" }))).toBe(false);
-  expect(isArtifactPiiEligible(eligibilityInput("ready", { status: "blocked" }))).toBe(false);
+// Every pair of artifact status and PII verdict, with the one answer the rule
+// gives. Only a ready artifact with no verdict, or a scanned or transformed
+// verdict, is eligible. A failed scan and an unknown verdict fail closed.
+const ARTIFACT_STATUSES: ArtifactRecord["status"][] = ["pending", "processing", "ready", "failed", "deleted"];
+const ELIGIBLE_WHEN_READY = new Set<string | undefined>([undefined, "scanned", "transformed"]);
+
+test("isArtifactPiiEligible answers every (status, PII status) pair with the allow-list", () => {
+  for (const status of ARTIFACT_STATUSES) {
+    for (const pii of [undefined, ...PII_STATUSES]) {
+      const expected = status === "ready" && ELIGIBLE_WHEN_READY.has(pii);
+      expect(isArtifactPiiEligible(eligibilityInput(status, pii ? { status: pii } : undefined)), `${status} / ${pii}`)
+        .toBe(expected);
+    }
+  }
 });
 
-test("isArtifactPiiEligible keeps a detect-only verdict and an unscanned record downloadable", () => {
+test("isArtifactPiiEligible keeps a detect-only verdict and an unscanned record eligible", () => {
   // Findings alone are not a block: detect mode reports them and allows the file.
   expect(
     isArtifactPiiEligible(
       eligibilityInput("ready", { status: "scanned", modeApplied: "detect", findingsCount: 3 })
     )
   ).toBe(true);
-  expect(isArtifactPiiEligible(eligibilityInput("ready", { status: "transformed" }))).toBe(true);
-  expect(isArtifactPiiEligible(eligibilityInput("ready"))).toBe(true);
   expect(isArtifactPiiEligible({ status: "ready", detail: undefined as never })).toBe(true);
+  expect(isArtifactPiiEligible({ status: "ready", detail: { pii: {} } })).toBe(true);
 });
 
-test("isArtifactPiiEligible denies every artifact that is not ready, whatever its verdict", () => {
-  for (const status of ["pending", "processing", "failed", "deleted"] as const) {
-    expect(isArtifactPiiEligible(eligibilityInput(status))).toBe(false);
-    expect(isArtifactPiiEligible(eligibilityInput(status, { status: "scanned" }))).toBe(false);
-  }
+test("isArtifactPiiEligible refuses a failed scan and a verdict it does not know", () => {
+  expect(isArtifactPiiEligible(eligibilityInput("ready", { status: "failed" }))).toBe(false);
+  expect(isArtifactPiiEligible({ status: "ready", detail: { pii: { status: "quarantined" as never } } })).toBe(false);
+  expect(isArtifactPiiEligible({ status: "ready", detail: { pii: { status: 1 as never } } })).toBe(false);
 });
 
-test("the SQL eligibility predicate names exactly the verdicts the TS predicate denies", () => {
+test("the SQL eligibility predicate names exactly the verdicts the TS predicate allows", () => {
   // The SQL twin cannot run here (the integration suite compares them on a real
   // database). This guards the one thing a fake can: both are built from one list.
   const sql = artifactPiiEligibleSql("a");
   for (const status of PII_STATUSES) {
-    const denied = !isArtifactPiiEligible(eligibilityInput("ready", { status }));
-    expect(sql.includes(`'${status}'`), status).toBe(denied);
+    const allowed = isArtifactPiiEligible(eligibilityInput("ready", { status }));
+    expect(sql.includes(`'${status}'`), status).toBe(allowed);
   }
+});
+
+test("the backend rule is the shared rule that the frontend shows", () => {
+  // One function, so a frontend copy cannot drift and offer a file the backend refuses.
+  expect(isArtifactPiiEligible).toBe(sharedIsArtifactPiiEligible);
 });
 
 test("ArtifactStore.listForUser always scopes to tenant + user and excludes deleted/derived", async () => {

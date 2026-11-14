@@ -2,6 +2,8 @@
 import { z } from "zod";
 import { PiiEntityTypeSchema, PiiModeSchema } from "@cogniplane/shared-types";
 
+import type { PoolClient } from "pg";
+
 import { type Pool, withTenantScope } from "../../lib/db.js";
 import type { PiiFinding } from "./pii-provider.js";
 import { uuidv7 } from "../../lib/uuid.js";
@@ -180,72 +182,7 @@ export class PiiScanRunStore {
   constructor(private readonly db: Pool) {}
 
   async create(input: CreatePiiScanRunInput): Promise<PiiScanRunRecord> {
-    const scanRunId = input.scanRunId ?? uuidv7();
-    const findings = input.findings ?? [];
-    return withTenantScope(this.db, input.tenantId, async (client) => {
-      const result = await client.query(
-        `
-          INSERT INTO pii_scan_runs (
-            tenant_id,
-            scan_run_id,
-            subject_type,
-            instructions_revision,
-            subject_id,
-            source_session_id,
-            source_user_id,
-            mode,
-            policy_revision,
-            provider_type,
-            provider_model,
-            status,
-            findings_json,
-            summary_text,
-            action_taken,
-            error_message
-          )
-          VALUES ($1, $2, $3, $15, $4, $5, $6, $7, $16, $8, $9, $10, $11::jsonb, $12, $13, $14)
-          RETURNING
-            tenant_id,
-            scan_run_id,
-            subject_type,
-            instructions_revision,
-            subject_id,
-            source_session_id,
-            source_user_id,
-            mode,
-            policy_revision,
-            provider_type,
-            provider_model,
-            status,
-            findings_json,
-            summary_text,
-            action_taken,
-            error_message,
-            created_at,
-            updated_at,
-            completed_at
-        `,
-        [
-          input.tenantId,
-          scanRunId,
-          input.subjectType,
-          input.subjectId,
-          input.sourceSessionId ?? null,
-          input.sourceUserId ?? null,
-          input.mode,
-          input.providerType ?? null,
-          input.providerModel ?? null,
-          input.status ?? "pending",
-          JSON.stringify(findings),
-          input.summaryText ?? null,
-          input.actionTaken ?? null,
-          input.errorMessage ?? null,
-          input.instructionsRevision ?? null,
-          input.policyRevision ?? null
-        ]
-      );
-      return mapRow(result.rows[0] as Record<string, unknown>);
-    });
+    return withTenantScope(this.db, input.tenantId, (client) => insertPiiScanRun(client, input));
   }
 
   async update(
@@ -431,4 +368,75 @@ export class PiiScanRunStore {
       return mapRow(result.rows[0] as Record<string, unknown>);
     });
   }
+}
+
+/** Inserts a scan run in the caller's tenant transaction. */
+export async function insertPiiScanRun(
+  client: PoolClient,
+  input: CreatePiiScanRunInput
+): Promise<PiiScanRunRecord> {
+  const scanRunId = input.scanRunId ?? uuidv7();
+  const findings = input.findings ?? [];
+  const result = await client.query(
+    `
+      INSERT INTO pii_scan_runs (
+        tenant_id,
+        scan_run_id,
+        subject_type,
+        instructions_revision,
+        subject_id,
+        source_session_id,
+        source_user_id,
+        mode,
+        policy_revision,
+        provider_type,
+        provider_model,
+        status,
+        findings_json,
+        summary_text,
+        action_taken,
+        error_message
+      )
+      VALUES ($1, $2, $3, $15, $4, $5, $6, $7, $16, $8, $9, $10, $11::jsonb, $12, $13, $14)
+      RETURNING
+        tenant_id,
+        scan_run_id,
+        subject_type,
+        instructions_revision,
+        subject_id,
+        source_session_id,
+        source_user_id,
+        mode,
+        policy_revision,
+        provider_type,
+        provider_model,
+        status,
+        findings_json,
+        summary_text,
+        action_taken,
+        error_message,
+        created_at,
+        updated_at,
+        completed_at
+    `,
+    [
+      input.tenantId,
+      scanRunId,
+      input.subjectType,
+      input.subjectId,
+      input.sourceSessionId ?? null,
+      input.sourceUserId ?? null,
+      input.mode,
+      input.providerType ?? null,
+      input.providerModel ?? null,
+      input.status ?? "pending",
+      JSON.stringify(findings),
+      input.summaryText ?? null,
+      input.actionTaken ?? null,
+      input.errorMessage ?? null,
+      input.instructionsRevision ?? null,
+      input.policyRevision ?? null
+    ]
+  );
+  return mapRow(result.rows[0] as Record<string, unknown>);
 }

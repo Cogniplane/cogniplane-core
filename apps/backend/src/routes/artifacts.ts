@@ -98,7 +98,7 @@ export type ArtifactRouteStores = {
   auditEvents: Pick<AuditEventStore, "create">;
   storage: Pick<ArtifactStorage, "put" | "openReadStream" | "delete">;
   processor: Pick<ArtifactProcessor, "extractArtifactText">;
-  piiScanEnqueuer?: Pick<PiiArtifactScanEnqueuer, "enqueue">;
+  piiScanEnqueuer?: Pick<PiiArtifactScanEnqueuer, "plan" | "enqueue">;
   limits: Pick<RequestLimitsInterface, "consumeRateLimit">;
 };
 
