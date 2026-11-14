@@ -32,10 +32,12 @@ interrupt, one `approvals` row, one AG-UI event and one decision route.
 - Expiry: `APPROVAL_REQUEST_TTL_MS`. On expiry the row becomes `expired` and the
   audit event `approval.expired` is written in the same transaction
   (`ApprovalStore.expire`), a `runtime_notice` event
-  (`approval-expired:<approvalId>`) goes to the turn, and the graph resumes with
-  a reject. `stale-approval-sweeper.ts` expires rows after a process stops: each
-  batch and its audit events commit together, and a failed batch stays
-  `pending` for the next sweep.
+  (`approval-expired:<approvalId>`, `APPROVAL_EXPIRED_NOTICE_PREFIX` in
+  shared-types) goes to the turn, and the graph resumes with a reject. The
+  browser also reads the legacy prefix `policy-approval-expired:` in saved
+  notices; the current backend does not send it. `stale-approval-sweeper.ts`
+  expires rows after a process stops: each batch and its audit events commit
+  together, and a failed batch stays `pending` for the next sweep.
 - A declined, expired or refused call returns a `declined` tool result. When one
   call of a step is not approved, the other calls of that step do not run.
 

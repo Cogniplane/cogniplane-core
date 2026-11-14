@@ -1,5 +1,5 @@
 import type { FastifyBaseLogger } from "fastify";
-import type { CustomEventValue } from "@cogniplane/shared-types";
+import { approvalExpiredNoticeId, type CustomEventValue } from "@cogniplane/shared-types";
 
 import { uuidv7 } from "../../lib/uuid.js";
 import type { ApprovalKind, ApprovalRecord, ApprovalStatus, ApprovalStore } from "../auth/approval-store.js";
@@ -350,7 +350,7 @@ export class ApprovalCoordinator {
         this.expire(turn, approvalId, "ttl_expired");
         try {
           publish({ name: "runtime_notice", value: {
-            noticeId: `approval-expired:${approvalId}`, level: "warning", title: "Approval expired",
+            noticeId: approvalExpiredNoticeId(approvalId), level: "warning", title: "Approval expired",
             message: `The approval request for ${name} expired without an answer.`,
             createdAt: new Date().toISOString()
           } });

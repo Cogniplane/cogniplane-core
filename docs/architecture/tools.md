@@ -137,7 +137,17 @@ error, because SDK errors keep request headers and client objects there.
    `writeToolIds`) use `false`: they run only when the tenant enabled the
    integration and its `connectionProbe` reports a live connection
    (`app-dependencies.test.ts` checks this).
-4. Add new dependencies to the factory deps in `factory.ts`. Test the module in
+4. Decide the default of a tenant-configurable tool: add it to
+   `DEFAULT_TENANT_TOOL_IDS` (on for a new tenant) or to
+   `OFF_BY_DEFAULT_TENANT_TOOL_IDS` with the reason
+   (`services/tenant-settings-store.ts`). `services/tenant-tool-defaults.test.ts` fails
+   for a catalog tool in neither list. These lists apply only to new tenants:
+   an existing tenant keeps its stored `enabled_tool_ids`, and the gateway
+   leaves the tool out until an admin turns it on. To turn it on for existing
+   tenants, add a reviewed backfill migration that adds the id to stored lists
+   (examples: migrations `024`, `028`); do not change the stored list of a
+   tenant that turned a related tool off.
+5. Add new dependencies to the factory deps in `factory.ts`. Test the module in
    a sibling `*.test.ts` and the registration in `factory.test.ts`.
 
 ## Member credentials

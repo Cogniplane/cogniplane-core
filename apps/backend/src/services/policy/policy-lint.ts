@@ -3,7 +3,7 @@ import {
   type PolicyConditions,
   type PolicyLintWarning
 } from "@cogniplane/shared-types";
-import { compareRuleEvaluationOrder, normalizeToolName } from "./policy-engine.js";
+import { compareRuleEvaluationOrder, hasUnreadableConditions, normalizeToolName } from "./policy-engine.js";
 
 // A rule as the lint sees it: only the fields that affect reachability. It mirrors
 // the engine's EvaluableRule. It has no effect, because shadowing ignores the effect.
@@ -12,8 +12,15 @@ export type LintableRule = {
   name: string;
   priority: number;
   enabled: boolean;
+  /** The stored conditions, unknown keys included. */
   conditions: PolicyConditions;
+  conditionsInvalid?: boolean;
 };
+
+// What the engine matches: a rule with unreadable conditions matches every action.
+function matchedConditions(rule: LintableRule): PolicyConditions {
+  return hasUnreadableConditions(rule) ? {} : rule.conditions;
+}
 
 const KNOWN_KEYS = new Set<string>(POLICY_CONDITION_KEYS);
 
@@ -60,9 +67,9 @@ function arrayDimensionSubsumes(
  * cross-dimension interactions, so it never claims a shadow it can't prove. It
  * is sound (no false "shadowed") but incomplete (misses some real shadows).
  *
- * Unknown/passthrough condition keys are ignored here — they're dropped before
- * the engine ever sees them (toConditions), so they don't affect matching. A
- * separate `unknown_condition` warning flags them as a likely typo.
+ * Callers pass the conditions that the engine matches (matchedConditions): a
+ * rule with unreadable conditions matches every action, and a separate
+ * `unknown_condition` warning reports it.
  */
 export function conditionsSubsume(outer: PolicyConditions, inner: PolicyConditions): boolean {
   for (const dim of ARRAY_DIMENSIONS) {
@@ -100,9 +107,10 @@ function unknownConditionKeys(conditions: PolicyConditions): string[] {
  *   - duplicate: a higher-precedence enabled rule with an EQUIVALENT condition
  *     set — a clearer special case of shadowing (identical match space). The
  *     message notes the lower rule's effect can never apply.
- *   - unknown_condition: a condition key outside the known dimensions (a typo
- *     like `toolName` for `toolNames`), which `toConditions` silently drops —
- *     turning the rule into an unintended catch-all.
+ *   - unknown_condition: stored conditions that the engine cannot read (a key
+ *     outside the known dimensions, such as `toolName` for `toolNames`, or a
+ *     value of the wrong shape). The engine blocks every action while such a
+ *     rule is enabled.
  *
  * What it deliberately does NOT report: partial cross-dimension overlaps (two
  * rules that overlap on some actions but neither subsumes the other). Those are
@@ -111,7 +119,7 @@ function unknownConditionKeys(conditions: PolicyConditions): string[] {
  *
  * A DISABLED rule never shadows (the engine filters it out), so disabled rules
  * are skipped as potential shadowers but are still themselves checked for
- * unknown keys.
+ * unreadable conditions.
  */
 export function lintRules(rules: readonly LintableRule[]): PolicyLintWarning[] {
   const ordered = rules
@@ -120,21 +128,21 @@ export function lintRules(rules: readonly LintableRule[]): PolicyLintWarning[] {
 
   const warnings: PolicyLintWarning[] = [];
 
-  // Unknown-condition keys: independent of order/enablement.
+  // Unreadable conditions: independent of order/enablement.
   for (const rule of ordered) {
+    if (!hasUnreadableConditions(rule)) continue;
     const unknown = unknownConditionKeys(rule.conditions);
-    if (unknown.length > 0) {
-      warnings.push({
-        kind: "unknown_condition",
-        ruleId: rule.ruleId,
-        ruleName: rule.name,
-        conflictsWithRuleId: null,
-        conflictsWithRuleName: null,
-        message: `Rule "${rule.name}" has unrecognized condition ${
-          unknown.length === 1 ? "key" : "keys"
-        } ${unknown.map((k) => `"${k}"`).join(", ")} that the engine ignores — likely a typo (the dimension is dropped, so the rule matches more broadly than intended).`
-      });
-    }
+    const cause = unknown.length > 0
+      ? `unrecognized condition ${unknown.length === 1 ? "key" : "keys"} ${unknown.map((k) => `"${k}"`).join(", ")} (likely a typo)`
+      : "a condition value of the wrong shape";
+    warnings.push({
+      kind: "unknown_condition",
+      ruleId: rule.ruleId,
+      ruleName: rule.name,
+      conflictsWithRuleId: null,
+      conflictsWithRuleName: null,
+      message: `Rule "${rule.name}" has ${cause}, so its conditions cannot be read. While it is enabled, it blocks every action. Fix, disable or delete it.`
+    });
   }
 
   // Shadowing / duplicate: for each enabled rule, find the FIRST higher-precedence
@@ -146,9 +154,9 @@ export function lintRules(rules: readonly LintableRule[]): PolicyLintWarning[] {
     for (let j = 0; j < i; j += 1) {
       const earlier = ordered[j];
       if (!earlier.enabled) continue;
-      if (!conditionsSubsume(earlier.conditions, rule.conditions)) continue;
+      if (!conditionsSubsume(matchedConditions(earlier), matchedConditions(rule))) continue;
 
-      const duplicate = conditionsEquivalent(earlier.conditions, rule.conditions);
+      const duplicate = conditionsEquivalent(matchedConditions(earlier), matchedConditions(rule));
       warnings.push({
         kind: duplicate ? "duplicate" : "shadowed",
         ruleId: rule.ruleId,

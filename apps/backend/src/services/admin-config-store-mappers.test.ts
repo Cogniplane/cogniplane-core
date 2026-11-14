@@ -8,49 +8,83 @@ import {
   parseApprovalPolicy,
   parseApprovalReviewer,
   parseSkillActivationMetadata,
-  skillReferencesFromManifest
+  skillReferencesFromManifest,
+  UnreadableControlValueError
 } from "./admin-config-store-mappers.js";
 
+// Stored approval values fail closed (issue #121): before, an unreadable value
+// read as "never" (no approvals) or "user", and any object with a `granular`
+// key passed unchecked. Now each reader throws a classified error that names
+// the field and never the stored value.
 describe("parseApprovalPolicy", () => {
-  test("returns 'never' for the literal 'never'", () => {
-    expect(parseApprovalPolicy("never")).toBe("never");
+  test("reads the two modes", () => {
+    expect(parseApprovalPolicy("never", "tenant_settings")).toBe("never");
+    expect(parseApprovalPolicy("on-request", "tenant_settings")).toBe("on-request");
   });
 
-  test("returns 'on-request' for the literal 'on-request'", () => {
-    expect(parseApprovalPolicy("on-request")).toBe("on-request");
+  test("reads a granular policy stored as JSON text or as an object", () => {
+    const granular = { granular: { sandbox_approval: true, mcp_elicitations: false, rules: true, skill_approval: true } };
+    expect(parseApprovalPolicy(JSON.stringify(granular), "tenant_settings")).toEqual(granular);
+    expect(parseApprovalPolicy(granular, "runtime policy snapshot")).toEqual(granular);
+    const allSwitches = { granular: { ...granular.granular, request_permissions: false } };
+    expect(parseApprovalPolicy(JSON.stringify(allSwitches), "tenant_settings")).toEqual(allSwitches);
+    expect(parseApprovalPolicy(allSwitches, "runtime policy snapshot")).toEqual(allSwitches);
   });
 
-  test("parses a JSON-encoded granular policy", () => {
-    const granular = { granular: { writeFile: "on-request", runCommand: "never" } };
-    expect(parseApprovalPolicy(JSON.stringify(granular))).toEqual(granular);
+  // A request drops unknown keys, but a stored value is not a request. To drop
+  // a stored switch that this version does not know would change the control.
+  const known = { sandbox_approval: true, mcp_elicitations: true, rules: true, request_permissions: true, skill_approval: true };
+  const unknownInner = { granular: { ...known, future_switch: true } };
+  const unknownOuter = { granular: known, future_mode: "LEAKED-VALUE" };
+  test.each([
+    ["an unknown switch, as JSON text", "tenant_settings", JSON.stringify(unknownInner)],
+    ["an unknown switch, as an object", "runtime policy snapshot", unknownInner],
+    ["an unknown key beside granular, as JSON text", "tenant_settings", JSON.stringify(unknownOuter)],
+    ["an unknown key beside granular, as an object", "runtime policy snapshot", unknownOuter]
+  ])("refuses every known switch plus %s", (_label, source, value) => {
+    let error: unknown;
+    try {
+      parseApprovalPolicy(value, source);
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toBeInstanceOf(UnreadableControlValueError);
+    expect(error).toMatchObject({ source, field: "approvalPolicy" });
+    expect((error as Error).message).not.toMatch(/future|LEAKED/);
   });
 
-  test("falls back to 'never' for invalid JSON", () => {
-    expect(parseApprovalPolicy("{not-json")).toBe("never");
-  });
-
-  test("falls back to 'never' for JSON without a 'granular' key", () => {
-    expect(parseApprovalPolicy(JSON.stringify({ foo: "bar" }))).toBe("never");
-  });
-
-  test("falls back to 'never' for non-string, non-recognized values", () => {
-    expect(parseApprovalPolicy(null)).toBe("never");
-    expect(parseApprovalPolicy(undefined)).toBe("never");
-    expect(parseApprovalPolicy(42)).toBe("never");
-    expect(parseApprovalPolicy({})).toBe("never");
+  test.each([
+    ["invalid JSON", "{not-json"],
+    ["JSON without a granular key", JSON.stringify({ foo: "bar" })],
+    ["a granular policy with unknown switches only", JSON.stringify({ granular: { writeFile: "on-request" } })],
+    ["a required switch that is not a boolean", JSON.stringify({ granular: { sandbox_approval: "yes", mcp_elicitations: true, rules: true } })],
+    ["an unknown mode", "always"],
+    ["null", null],
+    ["undefined", undefined],
+    ["a number", 42],
+    ["an empty object", {}]
+  ])("throws for %s, without the stored value in the message", (_label, value) => {
+    let error: unknown;
+    try {
+      parseApprovalPolicy(value, "tenant_settings");
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toBeInstanceOf(UnreadableControlValueError);
+    expect(error).toMatchObject({ source: "tenant_settings", field: "approvalPolicy" });
+    expect((error as Error).message).not.toContain("writeFile");
+    expect((error as Error).message).not.toContain("always");
   });
 });
 
 describe("parseApprovalReviewer", () => {
-  test("returns 'guardian_subagent' when explicitly set", () => {
-    expect(parseApprovalReviewer("guardian_subagent")).toBe("guardian_subagent");
+  test("reads both reviewers", () => {
+    expect(parseApprovalReviewer("guardian_subagent", "tenant_settings")).toBe("guardian_subagent");
+    expect(parseApprovalReviewer("user", "tenant_settings")).toBe("user");
   });
 
-  test("defaults to 'user' for any other value", () => {
-    expect(parseApprovalReviewer("user")).toBe("user");
-    expect(parseApprovalReviewer(null)).toBe("user");
-    expect(parseApprovalReviewer(undefined)).toBe("user");
-    expect(parseApprovalReviewer("unknown")).toBe("user");
+  test.each([null, undefined, "unknown", ""])("throws for %s", (value) => {
+    expect(() => parseApprovalReviewer(value, "tenant_settings")).toThrow(UnreadableControlValueError);
   });
 });
 

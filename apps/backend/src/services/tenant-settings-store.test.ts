@@ -2,6 +2,7 @@ import { describe, expect, test } from "vitest";
 
 import { FakePool } from "../test-helpers/fake-pool.js";
 import { buildDefaultTenantSettingsInput, TenantSettingsStore } from "./tenant-settings-store.js";
+import { UnreadableControlValueError } from "./admin-config-store-mappers.js";
 
 // Unit tests for the approved sandbox hosts. The fake answers the statements of
 // the upsert from the values it binds. It reads the INSERT back by column name,
@@ -126,5 +127,49 @@ describe("approved sandbox hosts in the tenant settings store", () => {
     const { store } = makeStore(savedRow({ approved_sandbox_egress_domains: stored }));
 
     expect((await store.get("tenant-a"))!.approvedSandboxEgressDomains).toEqual([]);
+  });
+});
+
+// Stored closed-set controls fail closed (issue #121). Before, an unknown
+// approval policy read as "never", an unknown reviewer as "user", an unknown
+// enforcement mode as "monitor" and an unknown web search mode as "disabled".
+describe("stored control values in the tenant settings store", () => {
+  test("reads every valid explicit value, the weakest ones included", async () => {
+    const granular = { granular: { sandbox_approval: false, mcp_elicitations: false, rules: false } };
+    const { store } = makeStore(savedRow({
+      approval_policy: JSON.stringify(granular), approval_reviewer: "guardian_subagent",
+      policy_enforcement_mode: "monitor", web_search_mode: "live"
+    }));
+    expect(await store.get("tenant-a")).toMatchObject({
+      approvalPolicy: granular, approvalReviewer: "guardian_subagent", policyEnforcementMode: "monitor", webSearchMode: "live"
+    });
+    const never = makeStore(savedRow({ approval_policy: "never", policy_enforcement_mode: "enforce" }));
+    expect(await never.store.get("tenant-a")).toMatchObject({ approvalPolicy: "never", policyEnforcementMode: "enforce" });
+  });
+
+  test.each([
+    ["approvalPolicy", { approval_policy: "sometimes" }],
+    ["approvalPolicy", { approval_policy: JSON.stringify({ granular: { writeFile: true } }) }],
+    ["approvalPolicy", { approval_policy: JSON.stringify({ granular: { sandbox_approval: true, mcp_elicitations: true, rules: true, writeFile: true } }) }],
+    ["approvalPolicy", { approval_policy: "{broken" }],
+    ["approvalReviewer", { approval_reviewer: "anyone" }],
+    ["policyEnforcementMode", { policy_enforcement_mode: "strict" }],
+    ["webSearchMode", { web_search_mode: "unlimited" }],
+    ["enabledProviders", { enabled_providers: "anthropic" }],
+    ["enabledModelIds", { enabled_model_ids: { all: true } }]
+  ])("refuses an unreadable %s on read and on save, naming the field only", async (field, overrides) => {
+    const { store, inserts } = makeStore(savedRow(overrides));
+
+    await expect(store.get("tenant-a")).rejects.toMatchObject({ name: "UnreadableControlValueError", field, source: "tenant_settings" });
+    // A save merges onto the stored row, so it cannot keep an unreadable value.
+    await expect(store.upsert("tenant-a", { showEffortSelector: true })).rejects.toBeInstanceOf(UnreadableControlValueError);
+    expect(inserts).toEqual([]);
+    const error: unknown = await store.get("tenant-a").catch((caught: unknown) => caught);
+    expect((error as Error).message).not.toMatch(/sometimes|writeFile|anyone|strict|unlimited/);
+  });
+
+  test("a provider name that this version does not know is left out, not added", async () => {
+    const { store } = makeStore(savedRow({ enabled_providers: ["anthropic", "retired-provider"] }));
+    expect((await store.get("tenant-a"))!.enabledProviders).toEqual(["anthropic"]);
   });
 });

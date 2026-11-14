@@ -154,8 +154,8 @@ describe("lintRules — duplicate", () => {
 
 describe("lintRules — unknown_condition", () => {
   it("flags a typo'd condition key", () => {
-    // `toolName` (singular) is not a known dimension; toConditions would drop it,
-    // turning this into an unintended catch-all.
+    // `toolName` (singular) is not a known dimension, so the conditions cannot
+    // be read and the engine blocks every action while the rule is enabled.
     const r = rule({ ruleId: "pol_typo", conditions: { toolName: ["github_write"] } as unknown as PolicyConditions });
     const warnings = lintRules([r]);
     expect(warnings).toHaveLength(1);
@@ -171,6 +171,21 @@ describe("lintRules — unknown_condition", () => {
   it("ignores known keys", () => {
     const r = rule({ conditions: { toolNames: ["a"], turnContexts: ["scheduled"] } });
     expect(lintRules([r])).toEqual([]);
+  });
+
+  it("flags a known key with a value of the wrong shape", () => {
+    const r = rule({ ruleId: "pol_shape", conditions: { severities: ["root"] } as unknown as PolicyConditions });
+    const warnings = lintRules([r]);
+    expect(warnings).toEqual([expect.objectContaining({ kind: "unknown_condition", ruleId: "pol_shape" })]);
+    expect(warnings[0].message).toContain("wrong shape");
+    expect(warnings[0].message).toContain("blocks every action");
+  });
+
+  it("reports the rules below an enabled unreadable rule as unreachable, because it matches every action", () => {
+    const bad: LintableRule = { ...rule({ ruleId: "pol_bad", priority: 0 }), conditionsInvalid: true };
+    const below = rule({ ruleId: "pol_below", priority: 10, conditions: { toolNames: ["a"] } });
+    const warnings = lintRules([bad, below]);
+    expect(warnings.map((w) => [w.kind, w.ruleId])).toEqual([["unknown_condition", "pol_bad"], ["shadowed", "pol_below"]]);
   });
 });
 

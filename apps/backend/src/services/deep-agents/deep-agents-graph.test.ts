@@ -1,5 +1,6 @@
 import { createSilentLogger } from "../../test-helpers/silent-logger.js";
 import { describe, expect, it, vi } from "vitest";
+import { MODEL_PROVIDER_META, MODEL_PROVIDERS, type ModelProviderMeta } from "@cogniplane/shared-types";
 import { Command, MemorySaver } from "@langchain/langgraph";
 import { createDeepAgent } from "deepagents";
 import {
@@ -643,6 +644,30 @@ describe("buildOpenAiResponsesApiOptions", () => {
 });
 
 describe("applyReasoningEffort (bead i52g)", () => {
+  // Each provider names its mapping in MODEL_PROVIDER_META (a required field),
+  // and the switch has a never check, so no provider skips the mapping by a
+  // default branch.
+  it.each(MODEL_PROVIDERS)("maps an effort for %s through its declared mapping", (provider) => {
+    const mapping = MODEL_PROVIDER_META[provider].reasoningEffort;
+    const options = applyReasoningEffort(provider, "high");
+    if (mapping === "unsupported") expect(options).toEqual({});
+    else expect(Object.keys(options).length).toBeGreaterThan(0);
+  });
+
+  it("keeps the current mappings: Z.AI and OpenRouter use the OpenAI client shape", () => {
+    expect(applyReasoningEffort("zai", "high")).toEqual({ reasoning: { effort: "high" } });
+    expect(MODEL_PROVIDERS.map((provider) => MODEL_PROVIDER_META[provider].reasoningEffort))
+      .toEqual(["anthropic", "openai", "google", "openai", "openai"]);
+  });
+
+  it("a provider entry without a key pattern or a reasoning mapping does not compile", () => {
+    // @ts-expect-error keyPattern and reasoningEffort are required.
+    const incomplete: ModelProviderMeta = {
+      label: "New", initPrefix: "openai", baseUrl: null, envKey: "OPENAI_API_KEY", keyField: "openaiApiKey"
+    };
+    expect(incomplete.label).toBe("New");
+  });
+
   it("returns an empty object when no effort is selected", () => {
     expect(applyReasoningEffort("anthropic", null)).toEqual({});
     expect(applyReasoningEffort("openai", undefined)).toEqual({});

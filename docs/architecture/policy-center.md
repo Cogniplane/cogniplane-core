@@ -20,6 +20,19 @@ approval proof is in [approvals](approvals.md#policy-center-approval-proof).
 
   Conditions are AND; values in one condition are OR; an omitted or empty
   condition matches all.
+- Stored conditions are read with the strict input schema
+  (`PolicyConditionsInputSchema`). When they fail it (an unknown key such as
+  `toolName`, a value that is not a list of strings, an unknown severity or
+  turn context), the enabled rule blocks every action, whatever its effect
+  (`hasUnreadableConditions`, `services/policy/policy-engine.ts`). A typo'd
+  allow rule must not allow everything, and a damaged block rule must not
+  stop blocking. A disabled rule does nothing. The rule list shows it with
+  `conditionsInvalid: true` and empty conditions, and the lint reports
+  `unknown_condition`.
+- To repair such a rule, edit its conditions, disable it or delete it. The
+  weaker-change check reads it as "block everything", so each of these needs
+  step-up unless the result still blocks every action. A patch without
+  conditions keeps the stored JSON (`PolicyRuleStore.update`).
 - A proxy tool is `read_only` only when its upstream declares `readOnlyHint:
   true` (`deriveActionSeverity`, `services/mcp/policy-gate.ts`), so a severity
   rule trusts the upstream. For a proxy you do not trust, match on `toolNames`

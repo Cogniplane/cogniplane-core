@@ -267,55 +267,6 @@ describe("useAguiCustomEvents — approvals (R19)", () => {
   });
 });
 
-describe("useAguiCustomEvents — mcp_server_status (R79)", () => {
-  it("keeps only the latest status per server", () => {
-    const { agent, emit } = makeFakeAgent();
-    const { result } = renderHook(() => useAguiCustomEvents(agent));
-
-    emit("mcp_server_status", { serverName: "github", status: "starting" });
-    emit("mcp_server_status", { serverName: "notion", status: "starting" });
-    emit("mcp_server_status", { serverName: "github", status: "failed", error: "handshake timeout" });
-
-    expect(result.current.mcpStatuses).toEqual([
-      {
-        type: "mcp-server-status",
-        rowId: "mcp:notion",
-        serverName: "notion",
-        status: "starting",
-        error: null
-      },
-      {
-        type: "mcp-server-status",
-        rowId: "mcp:github",
-        serverName: "github",
-        status: "failed",
-        error: "handshake timeout"
-      }
-    ]);
-  });
-
-  it("does not surface a healthy `ready` transition", () => {
-    const { agent, emit } = makeFakeAgent();
-    const { result } = renderHook(() => useAguiCustomEvents(agent));
-
-    emit("mcp_server_status", { serverName: "github", status: "ready" });
-
-    expect(result.current.mcpStatuses).toEqual([]);
-  });
-
-  it("drops a server back off the list only when a newer status replaces it", () => {
-    const { agent, emit } = makeFakeAgent();
-    const { result } = renderHook(() => useAguiCustomEvents(agent));
-
-    emit("mcp_server_status", { serverName: "github", status: "starting" });
-    // "ready" is skipped entirely, so the "starting" row survives it.
-    emit("mcp_server_status", { serverName: "github", status: "ready" });
-
-    expect(result.current.mcpStatuses.map((s) => s.status)).toEqual(["starting"]);
-  });
-});
-
-
 describe("custom event validation", () => {
   it("ignores malformed known events before they can create broken cards", () => {
     const { agent, emit } = makeFakeAgent();
@@ -334,10 +285,11 @@ describe("custom event validation", () => {
     emit("third_party_event", { approvalId: "unrelated" });
     // Retired backend event; an older backend or replay can still send it.
     emit("tool_ui_resources", { toolCallId: "call-1", uiResources: [{ uri: "ui://card", mimeType: "text/html" }] });
+    // Retired: the current backend does not send it.
+    emit("mcp_server_status", { serverName: "github", status: "failed", error: "handshake timeout" });
     expect(result.current.approvals).toEqual([]);
     expect(result.current.notices).toEqual([]);
     expect(result.current.toolStatuses).toEqual([]);
-    expect(result.current.mcpStatuses).toEqual([]);
   });
 });
 

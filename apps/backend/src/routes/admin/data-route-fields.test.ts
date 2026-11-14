@@ -5,8 +5,11 @@ import {
   classifyIntegrationSave,
   classifyTenantSettingsSave,
   TENANT_SETTINGS_FIELDS,
+  tenantSettingsAuditValues,
   type TenantSettingsField
 } from "./data-route-fields.js";
+import { COMPARED_SETTINGS } from "../../services/admin-settings-comparison.js";
+import { TENANT_SETTINGS_FIELD_NAMES } from "@cogniplane/shared-types/tenant-settings-request";
 
 const STORED: Record<TenantSettingsField, unknown> = {
   showEffortSelector: false, webSearchMode: "disabled", approvalPolicy: "on-request", approvalReviewer: "user",
@@ -17,9 +20,24 @@ const STORED: Record<TenantSettingsField, unknown> = {
 };
 
 describe("tenant settings fields", () => {
+  const schemaFields = Object.keys(tenantSettingsBodySchema.shape).filter((key) => key !== "expectedVersion").sort();
+
   test("the list classifies every field of the request schema", () => {
-    const schemaFields = Object.keys(tenantSettingsBodySchema.shape).filter((key) => key !== "expectedVersion").sort();
     expect(Object.keys(TENANT_SETTINGS_FIELDS).sort()).toEqual(schemaFields);
+    expect([...TENANT_SETTINGS_FIELD_NAMES].sort()).toEqual(schemaFields);
+  });
+
+  // The record types make a missing setting fail to compile; these tests also
+  // catch a setting that a cast or an extra key hides.
+  test("the audit payload has every setting of the request schema and nothing else", () => {
+    const saved = { ...STORED, tenantId: "t1", version: 4, configHash: "h", updatedAt: "2026-11-14T00:00:00.000Z" };
+    const values = tenantSettingsAuditValues(saved);
+    expect(Object.keys(values).sort()).toEqual(schemaFields);
+    expect(values).toEqual(STORED);
+  });
+
+  test("Admin History compares every setting of the request schema", () => {
+    expect([...COMPARED_SETTINGS].sort()).toEqual(schemaFields);
   });
 
   test("the fields that route data or weaken a control are the protected ones", () => {

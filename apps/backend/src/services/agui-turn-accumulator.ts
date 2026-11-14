@@ -20,13 +20,60 @@
 //   CUSTOM tool_meta          → kind / server / command for a call
 //   CUSTOM tool_status        → failed|declined + durationMs for a call
 //   CUSTOM tool_mcp_app       → the linked MCP App call for a tool
-// The accumulator ignores other CUSTOM names.
+//
+// CUSTOM events go through the shared CogniplaneCustomEventSchema. A malformed
+// envelope or an unknown name is ignored. The switch in `applyCustom` names
+// each event and where it is saved, with a `never` check: a new event fails the
+// build until it is classified. See CUSTOM_EVENT_STORAGE.
 // ─────────────────────────────────────────────────────────────────────────────
 
 import { EventType, type BaseEvent } from "@ag-ui/client";
 
 import type { ToolResultRecord } from "./message-store.js";
-import type { McpAppCall } from "@cogniplane/shared-types";
+import {
+  CogniplaneCustomEventSchema,
+  type CogniplaneCustomEvent,
+  type McpAppCall
+} from "@cogniplane/shared-types";
+
+/**
+ * Where the backend saves each Cogniplane custom event:
+ * - `tool_result`: this accumulator folds it into the turn's tool results.
+ * - `turn_transcript`: TurnTranscript saves it on the assistant message
+ *   (runtime notices).
+ * - `approval_store`: the approval coordinator saved the approval row before
+ *   it sent the event; reload reads that row.
+ * - `message_store`: the event carries a user message row that the message
+ *   store saved before it sent the event.
+ * - `transport_only`: it describes the stream itself and has nothing to save.
+ */
+export type CustomEventStorage =
+  "tool_result" | "turn_transcript" | "approval_store" | "message_store" | "transport_only";
+
+export const CUSTOM_EVENT_STORAGE = {
+  turn_started: "transport_only",
+  approval_required: "approval_store",
+  runtime_notice: "turn_transcript",
+  tool_meta: "tool_result",
+  tool_status: "tool_result",
+  tool_mcp_app: "tool_result",
+  user_message_persisted: "message_store",
+  user_message_replaced: "message_store",
+  session_connection: "transport_only"
+} as const satisfies Record<CogniplaneCustomEvent["name"], CustomEventStorage>;
+
+/** The Cogniplane custom event in an AG-UI CUSTOM event, or null when it is malformed or unknown. */
+export function parseCogniplaneCustomEvent(event: BaseEvent): CogniplaneCustomEvent | null {
+  if (event.type !== EventType.CUSTOM) return null;
+  const { name, value } = event as { name?: unknown; value?: unknown };
+  const parsed = CogniplaneCustomEventSchema.safeParse({ name, value });
+  return parsed.success ? parsed.data : null;
+}
+
+// Only the name goes into the message: a value can carry tool output.
+function unclassifiedEvent(event: never): never {
+  throw new Error(`Unclassified custom event: ${String((event as { name?: unknown }).name)}`);
+}
 
 /** The subset of an UpsertToolResultInput this accumulator can derive from the
  *  wire — the writer fills in tenant/message/session/user before persisting. */
@@ -175,37 +222,51 @@ export class AguiTurnAccumulator {
       }
 
       case EventType.CUSTOM: {
-        const e = event as { name?: string; value?: Record<string, unknown> };
-        if (e.name === "tool_meta" && e.value) {
-          const call = this.calls.get(e.value.toolCallId as string);
-          if (call) {
-            if (e.value.kind === "mcp") call.kind = "mcp";
-            call.server = (e.value.server as string | null) ?? call.server;
-            call.command = (e.value.command as string | null) ?? call.command;
-          }
-          return;
-        }
-        if (e.name === "tool_status" && e.value) {
-          const call = this.calls.get(e.value.toolCallId as string);
-          if (call) {
-            const status = e.value.status;
-            if (status === "failed" || status === "declined") call.status = status;
-            call.durationMs = (e.value.durationMs as number | null) ?? call.durationMs;
-          }
-          return;
-        }
-        if (e.name === "tool_mcp_app" && e.value) {
-          const call = this.calls.get(e.value.toolCallId as string);
-          if (call && e.value.app && typeof e.value.app === "object") {
-            call.mcpApp = e.value.app as McpAppCall;
-          }
-          return;
-        }
+        const custom = parseCogniplaneCustomEvent(event);
+        if (custom) this.applyCustom(custom);
         return;
       }
 
       default:
         return;
+    }
+  }
+
+  /** Folds a parsed custom event into the turn. Each name is listed; see CUSTOM_EVENT_STORAGE. */
+  applyCustom(custom: CogniplaneCustomEvent): void {
+    switch (custom.name) {
+      case "tool_meta": {
+        const call = this.calls.get(custom.value.toolCallId);
+        if (call) {
+          if (custom.value.kind === "mcp") call.kind = "mcp";
+          call.server = custom.value.server ?? call.server;
+          call.command = custom.value.command ?? call.command;
+        }
+        return;
+      }
+      case "tool_status": {
+        const call = this.calls.get(custom.value.toolCallId);
+        if (call) {
+          call.status = custom.value.status;
+          call.durationMs = custom.value.durationMs ?? call.durationMs;
+        }
+        return;
+      }
+      case "tool_mcp_app": {
+        const call = this.calls.get(custom.value.toolCallId);
+        if (call) call.mcpApp = custom.value.app;
+        return;
+      }
+      // Saved elsewhere or nothing to save (CUSTOM_EVENT_STORAGE).
+      case "runtime_notice":
+      case "approval_required":
+      case "user_message_persisted":
+      case "user_message_replaced":
+      case "turn_started":
+      case "session_connection":
+        return;
+      default:
+        unclassifiedEvent(custom);
     }
   }
 

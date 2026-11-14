@@ -2,14 +2,8 @@ import { z } from "zod";
 import {
   AdminMcpServerCreateRequestSchema,
   AdminMcpServerUpdateRequestSchema,
-  AdminSkillReleaseSnapshotSchema,
-  EFFORT_LEVELS,
-  DEVELOPER_INSTRUCTIONS_MAX_LENGTH,
-  MODEL_PROVIDERS,
-  PolicyEnforcementModeSchema
+  AdminSkillReleaseSnapshotSchema
 } from "@cogniplane/shared-types";
-// Loads a public suffix list, so it is a separate entry point.
-import { SandboxEgressDomainsSchema } from "@cogniplane/shared-types/sandbox-egress";
 
 import { httpsUrlSchema, mcpUpstreamUrlSchema } from "../../lib/url-validation.js";
 
@@ -29,40 +23,9 @@ export const mcpUpdateBodySchema = AdminMcpServerUpdateRequestSchema.extend({
   message: "Managed MCP servers cannot configure an upstreamUrl"
 });
 
-const granularApprovalPolicySchema = z.object({
-  granular: z.object({
-    sandbox_approval: z.boolean(),
-    mcp_elicitations: z.boolean(),
-    rules: z.boolean(),
-    request_permissions: z.boolean().optional(),
-    skill_approval: z.boolean().optional()
-  })
-});
-
-export const tenantSettingsBodySchema = z.object({
-  expectedVersion: z.number().int().nonnegative().optional(),
-  showEffortSelector: z.boolean().optional(),
-  webSearchMode: z.enum(["disabled", "cached", "live"]).optional(),
-  approvalPolicy: z.union([z.enum(["never", "on-request"]), granularApprovalPolicySchema]).optional(),
-  approvalReviewer: z.enum(["user", "guardian_subagent"]).optional(),
-  allowCommandExecution: z.boolean().optional(),
-  autoApproveReadOnlyTools: z.boolean().optional(),
-  policyEnforcementMode: PolicyEnforcementModeSchema.optional(),
-  developerInstructions: z.string().trim().max(DEVELOPER_INSTRUCTIONS_MAX_LENGTH).nullable().optional(),
-  enabledToolIds: z.array(adminIdSchema).optional(),
-  enabledMcpServerIds: z.array(adminIdSchema).optional(),
-  // Model availability. Model ids are catalog-namespaced ("openrouter/z-ai/…"),
-  // so a plain bounded string — semantic validation against AVAILABLE_MODELS
-  // happens in the route, where the catalog is in scope.
-  enabledProviders: z.array(z.enum(MODEL_PROVIDERS)).optional(),
-  enabledModelIds: z.array(z.string().trim().min(1).max(200)).nullable().optional(),
-  defaultModelId: z.string().trim().min(1).max(200).nullable().optional(),
-  modelDefaultEfforts: z.record(z.string().trim().min(1).max(200), z.enum(EFFORT_LEVELS)).optional(),
-  // Hosts that agent-run code in the sandbox may reach. The provider
-  // checks nothing, so this is the check: exact host names, with `*.` only over
-  // a name that one party registers. An empty list means no network.
-  approvedSandboxEgressDomains: SandboxEgressDomainsSchema.optional()
-});
+// The request schema lives in shared-types, so the frontend sends the same
+// shape. This name stays for the route and its tests.
+export { TenantSettingsUpdateRequestSchema as tenantSettingsBodySchema } from "@cogniplane/shared-types/tenant-settings-request";
 
 export const githubImportBodySchema = z.object({
   githubUrl: httpsUrlSchema,

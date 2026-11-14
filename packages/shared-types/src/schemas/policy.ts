@@ -69,15 +69,24 @@ export type PolicyTurnContext = (typeof POLICY_TURN_CONTEXTS)[number];
 //                  never matches — see POLICY_SEVERITIES above)
 //   turnContexts — interactive vs scheduled/unattended
 //
-// One field map, two schemas. The STORED/read shape is `.passthrough()` so a
-// future dimension (connector, role, PII, team/group) already written by newer
-// code survives a round-trip through older readers. The admin INPUT shape is
-// `.strict()`: a typo'd key (`toolName` instead of `toolNames`) must 400 at
-// create/patch — stored, it would be dropped by the engine's condition reader
-// and silently turn the rule into a catch-all (a typo'd high-priority allow
-// short-circuits blocks; a typo'd block is a tenant-wide outage in enforce
-// mode). When a new dimension lands, add it to this map and to
-// POLICY_CONDITION_KEYS in the same change.
+// One field map, two schemas. The admin INPUT shape is `.strict()`: a typo'd
+// key (`toolName` instead of `toolNames`) must 400 at create/patch.
+//
+// The backend reads a STORED rule with the same strict schema
+// (`PolicyConditionsInputSchema`). A stored condition set that fails it (an
+// unknown key, a value that is not a list of strings, an unknown severity or
+// turn context) cannot be read. The engine then treats the rule, while it is
+// enabled, as a `block` rule that matches every action, whatever its stored
+// effect. Any other reading could make the policy less strict: a typo'd
+// allow rule read as a catch-all wins over every block below it, and a
+// block rule that is skipped stops blocking. A disabled rule with unreadable
+// conditions does nothing. Such a rule is listed with `conditions: {}` and
+// `conditionsInvalid: true`, and the lint reports it (`unknown_condition`).
+//
+// The read shape below stays `.passthrough()` for API compatibility. A new
+// dimension needs this map, POLICY_CONDITION_KEYS and a release in which every
+// replica reads it before any replica writes it: an older replica reads the
+// new key as unreadable and blocks.
 const policyConditionDimensions = {
   toolNames: z.array(z.string().min(1)).optional(),
   categories: z.array(z.string().min(1)).optional(),
@@ -91,10 +100,8 @@ export type PolicyConditions = z.infer<typeof PolicyConditionsSchema>;
 export const PolicyConditionsInputSchema = z.object(policyConditionDimensions).strict();
 export type PolicyConditionsInput = z.infer<typeof PolicyConditionsInputSchema>;
 
-// The dimension keys that the engine evaluates. `PolicyConditionsSchema` is
-// `.passthrough()`, so a rule can store a typo'd key (`toolName` for
-// `toolNames`). `toConditions` then drops the key, and the rule becomes a
-// catch-all. The conflict lint warns on any key outside this set.
+// The dimension keys that the engine evaluates. A stored key outside this set
+// makes the condition set unreadable (see above).
 export const POLICY_CONDITION_KEYS = [
   "toolNames",
   "categories",
@@ -118,6 +125,10 @@ export const PolicyRuleSchema = z
     enabled: z.boolean(),
     effect: PolicyEffectSchema,
     conditions: PolicyConditionsSchema,
+    // True when the stored conditions cannot be read. `conditions` is then
+    // `{}`, and the enabled rule blocks every action until an admin repairs,
+    // disables or deletes it (each of these needs step-up).
+    conditionsInvalid: z.literal(true).optional(),
     reason: z.string().nullable(),
     createdBy: z.string().nullable(),
     revision: PolicyRuleRevisionSchema,
@@ -385,7 +396,8 @@ export type PolicySimulateResponse = z.infer<typeof PolicySimulateResponseSchema
 //
 // GET /admin/policy/lint: a pure analysis of the active rule set for rules that
 // can never fire (shadowed by a higher-priority rule whose conditions subsume
-// theirs), exact duplicates, and unknown/typo'd condition keys. Conservative by
+// theirs), exact duplicates, and stored conditions that cannot be read
+// (`unknown_condition`: an unknown or typo'd key, or a value of the wrong shape). Conservative by
 // design — it reports only what is provable from the condition sets and the
 // engine's first-match-wins semantics, never a partial-overlap guess.
 

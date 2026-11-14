@@ -979,7 +979,7 @@ describe("SchedulerWorker", () => {
     // The narration quotes a 40-character token. The store saves the redacted
     // text, so the tool offset must point into "token is [REDACTED] ".
     const narration = "token is ghp_" + "A".repeat(36) + " ";
-    const notice = { noticeId: "n-1", level: "warning", title: "Skipped", message: "Tool gated" };
+    const notice = { noticeId: "n-1", level: "warning", title: "Skipped", message: "Tool gated", createdAt: "2026-11-14T00:00:00.000Z" };
     const { deps, jobRunsCompleted, messagesUpdated, streamingUpdates, toolResultsSaved, noticesSaved } =
       createFakeDeps({
         dueJobs: [job],

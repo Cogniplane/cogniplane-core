@@ -1,15 +1,16 @@
-import type { z } from "zod";
+import {
+  TENANT_SETTINGS_FIELD_NAMES,
+  type TenantSettingsField
+} from "@cogniplane/shared-types/tenant-settings-request";
 
 import type { IntegrationDescriptor } from "../../services/integrations/integration-registry.js";
-import type { tenantSettingsBodySchema } from "./admin-route-schemas.js";
 
 // Which changes of a data route need step-up and an owner notice
 // (docs/architecture/sensitive-changes.md, "Data routes"). A save that
 // changes none of them needs neither: a small change (the effort selector,
 // an integration turned off) must not ask for a password or send email.
 
-type TenantSettingsBody = z.infer<typeof tenantSettingsBodySchema>;
-export type TenantSettingsField = Exclude<keyof TenantSettingsBody, "expectedVersion">;
+export type { TenantSettingsField };
 
 /**
  * Why a field matters:
@@ -75,6 +76,17 @@ export function classifyTenantSettingsSave<T extends Partial<Record<TenantSettin
     else changed.push(field);
   }
   return { changed, write };
+}
+
+/**
+ * The settings part of the `admin.tenant_settings.updated` audit payload: each
+ * setting of the request schema, read from the saved record. The parameter
+ * type makes a setting that the record does not have fail to compile, and the
+ * key list comes from the schema, so a new setting is in the payload with no
+ * other edit.
+ */
+export function tenantSettingsAuditValues(saved: Record<TenantSettingsField, unknown>): Record<TenantSettingsField, unknown> {
+  return Object.fromEntries(TENANT_SETTINGS_FIELD_NAMES.map((field) => [field, saved[field]])) as Record<TenantSettingsField, unknown>;
 }
 
 export function tenantSettingsLabels(fields: readonly TenantSettingsField[]): string[] {

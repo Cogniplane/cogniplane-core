@@ -2203,6 +2203,35 @@ function policyApprovalRecord(input: {
   };
 }
 
+// Issue #121: an unknown enforcement mode in the snapshot read as "monitor",
+// so no rule gated. Now the gateway refuses the call with its generic error,
+// forwards nothing, and does not echo the stored value.
+test.each([
+  ["an unknown enforcement mode", { policyEnforcementMode: "strict-LEAKED-VALUE" }],
+  ["a missing enforcement mode", { policyEnforcementMode: undefined }],
+  ["an unknown approval policy", { approvalPolicy: "LEAKED-VALUE" }],
+  ["an unknown granular approval switch", {
+    approvalPolicy: { granular: { sandbox_approval: true, mcp_elicitations: true, rules: true, LEAKED_VALUE: true } }
+  }],
+  ["an unknown key beside granular", {
+    approvalPolicy: { granular: { sandbox_approval: true, mcp_elicitations: true, rules: true }, mode: "LEAKED-VALUE" }
+  }]
+])("a runtime policy snapshot with %s refuses the proxy call", async (_label, override) => {
+  const { service } = makePolicyService([]);
+  const { app, upstream, upstreamRequests } = await buildProxyApp(service, {
+    extraMetadata: { runtimePolicy: { ...seedRuntimePolicySnapshot(), ...override } }
+  });
+  onTestFinished(async () => {
+    await Promise.all([app.close(), upstream.close()]);
+  });
+
+  const response = await callProxyTool(app, { query: "hello" });
+
+  expect(response.json().error).toEqual({ code: -32000, message: "Tool call failed." });
+  expect(response.body).not.toContain("LEAKED-VALUE");
+  expect(toolCallRequests(upstreamRequests)).toHaveLength(0);
+});
+
 test("enforce-mode require_approval → APPROVE forwards the call", async () => {
   const { service } = makePolicyService([
     makePolicyRule({ effect: "require_approval" })

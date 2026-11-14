@@ -1,6 +1,7 @@
 import Fastify from "fastify";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { MODEL_PROVIDERS, type ModelProvider } from "@cogniplane/shared-types";
+import { TENANT_SETTINGS_FIELD_NAMES } from "@cogniplane/shared-types/tenant-settings-request";
 
 import { AdminConfigError } from "../../services/admin-config-error.js";
 import type { ManagedToolCatalogEntry } from "../../services/managed-tools/catalog.js";
@@ -273,6 +274,11 @@ describe("PUT /admin/tenant-settings approved sandbox hosts", () => {
     const event = audit!(settingsWith({ version: 5, approvedSandboxEgressDomains: ["*.example.com", "pypi.org"] }));
     expect(event.type).toBe("admin.tenant_settings.updated");
     expect(event.payload.approvedSandboxEgressDomains).toEqual(["*.example.com", "pypi.org"]);
+    // Every setting of the request schema, plus the save metadata. A new
+    // setting is in the payload with no edit (tenantSettingsAuditValues).
+    expect(Object.keys(event.payload).sort()).toEqual(
+      [...TENANT_SETTINGS_FIELD_NAMES, "runtimeRefresh", "version", "configHash"].sort()
+    );
   });
 
   test("GET returns the saved list", async () => {

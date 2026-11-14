@@ -14,7 +14,7 @@ import type { DynamicConfigService } from "../../services/dynamic-config-service
 import { TenantSettingsConflictError } from "../../services/tenant-settings-store.js";
 import type { ManagedToolCatalog } from "../../services/managed-tools/catalog.js";
 import { tenantSettingsBodySchema } from "./admin-route-schemas.js";
-import { classifyTenantSettingsSave, tenantSettingsLabels } from "./data-route-fields.js";
+import { classifyTenantSettingsSave, tenantSettingsAuditValues, tenantSettingsLabels } from "./data-route-fields.js";
 import {
   respondAdminMutationError,
   withAdmin
@@ -196,21 +196,7 @@ export async function registerAdminTenantSettingsRoutes(
           userId: request.auth.userId,
           type: "admin.tenant_settings.updated",
           payload: {
-            showEffortSelector: saved.showEffortSelector,
-            webSearchMode: saved.webSearchMode,
-            approvalPolicy: saved.approvalPolicy,
-            approvalReviewer: saved.approvalReviewer,
-            allowCommandExecution: saved.allowCommandExecution,
-            autoApproveReadOnlyTools: saved.autoApproveReadOnlyTools,
-            policyEnforcementMode: saved.policyEnforcementMode,
-            developerInstructions: saved.developerInstructions,
-            enabledToolIds: saved.enabledToolIds,
-            enabledMcpServerIds: saved.enabledMcpServerIds,
-            enabledProviders: saved.enabledProviders,
-            enabledModelIds: saved.enabledModelIds,
-            defaultModelId: saved.defaultModelId,
-            modelDefaultEfforts: saved.modelDefaultEfforts,
-            approvedSandboxEgressDomains: saved.approvedSandboxEgressDomains,
+            ...tenantSettingsAuditValues(saved),
             // Cached sessions compare the bundle hash and refresh capabilities
             // in place before their next turn. Do not dispose their E2B sandbox:
             // that would erase agent-created workspace files for a settings save.

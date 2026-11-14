@@ -2,32 +2,15 @@
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
-import { getTenantSettings, updateTenantAgentSettings } from "../lib/admin-api";
-import type {
-  ApprovalPolicy,
-  PolicyEnforcementMode,
-  TenantSettings,
-  WebSearchMode
-} from "@cogniplane/shared-types";
+import { getTenantSettings, updateTenantAgentSettings, type TenantAgentSettingsUpdate } from "../lib/admin-api";
+import type { TenantSettings } from "@cogniplane/shared-types";
 import { ApiError } from "../lib/api-client";
 import { toErrorMessage } from "../lib/error-utils";
 import { queryKeys } from "../lib/query-keys";
 
-export type TenantSettingsInput = {
-  expectedVersion: number;
-} & Partial<{
-  showEffortSelector: boolean;
-  webSearchMode: WebSearchMode;
-  approvalPolicy: ApprovalPolicy;
-  approvalReviewer: "user" | "guardian_subagent";
-  allowCommandExecution: boolean;
-  autoApproveReadOnlyTools: boolean;
-  policyEnforcementMode: PolicyEnforcementMode;
-  developerInstructions: string | null;
-  enabledToolIds: string[];
-  enabledMcpServerIds: string[];
-  approvedSandboxEgressDomains: string[];
-}>;
+// The Agent behavior fields of the shared request schema, with the loaded
+// version (lib/admin-api.ts).
+export type TenantSettingsInput = TenantAgentSettingsUpdate;
 
 export type SaveResult = { ok: true } | { ok: false; status: number | null };
 

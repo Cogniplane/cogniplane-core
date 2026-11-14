@@ -1,8 +1,9 @@
-import type {
-  PolicyConditions,
-  PolicyEffect,
-  PolicySeverity,
-  PolicyTurnContext
+import {
+  PolicyConditionsInputSchema,
+  type PolicyConditions,
+  type PolicyEffect,
+  type PolicySeverity,
+  type PolicyTurnContext
 } from "@cogniplane/shared-types";
 
 // The action being evaluated. Keys off tool name, MCP server category, read/write
@@ -26,6 +27,8 @@ export type EvaluableRule = {
   enabled: boolean;
   effect: PolicyEffect;
   conditions: PolicyConditions;
+  /** The store could not read the stored conditions (see hasUnreadableConditions). */
+  conditionsInvalid?: boolean;
   reason: string | null;
 };
 
@@ -44,14 +47,37 @@ export type PolicyEvaluation = {
 // No rule matches: allow. The runtime's own approval policy still applies on its own.
 const DEFAULT_OUTCOME: PolicyEffect = "allow";
 
+// The engine reads conditions with the shared strict schema, once per
+// conditions object (rule sets are cached and evaluated many times).
+const readableConditions = new WeakMap<object, boolean>();
+
+/**
+ * True when the rule's conditions cannot be read: the store marked them, or
+ * they fail the shared strict schema (an unknown key, a value that is not a
+ * list of strings, an unknown severity or turn context). An enabled rule like
+ * this matches every action and blocks it, whatever its stored effect, so a
+ * damaged rule never makes the outcome less strict. See the comment on
+ * PolicyConditionsInputSchema in shared-types.
+ */
+export function hasUnreadableConditions(rule: Pick<EvaluableRule, "conditions" | "conditionsInvalid">): boolean {
+  if (rule.conditionsInvalid === true) return true;
+  const conditions: unknown = rule.conditions;
+  if (conditions === null || typeof conditions !== "object") return true;
+  let readable = readableConditions.get(conditions);
+  if (readable === undefined) {
+    readable = PolicyConditionsInputSchema.safeParse(conditions).success;
+    readableConditions.set(conditions, readable);
+  }
+  return !readable;
+}
+
+// An omitted or empty dimension matches anything. The values are readable
+// (hasUnreadableConditions runs first).
 function arrayMatches(
   values: readonly string[] | undefined,
   candidate: string | null
 ): boolean {
-  // An omitted or empty dimension matches anything. Conditions come from JSONB
-  // (see toConditions) and can be malformed. A throw here would block every tool
-  // call for the tenant, so a bad value counts as "no constraint" and never throws.
-  if (!Array.isArray(values) || values.length === 0) return true;
+  if (values === undefined || values.length === 0) return true;
   if (candidate === null) return false;
   return values.includes(candidate);
 }
@@ -62,11 +88,9 @@ export function normalizeToolName(value: string): string {
 }
 
 function toolNameMatches(values: readonly string[] | undefined, candidate: string): boolean {
-  if (!Array.isArray(values) || values.length === 0) return true;
+  if (values === undefined || values.length === 0) return true;
   const normalizedCandidate = normalizeToolName(candidate);
-  return values.some(
-    (value) => typeof value === "string" && normalizeToolName(value) === normalizedCandidate
-  );
+  return values.some((value) => normalizeToolName(value) === normalizedCandidate);
 }
 
 function ruleMatches(rule: EvaluableRule, action: PolicyActionContext): boolean {
@@ -101,7 +125,9 @@ export function compareRuleEvaluationOrder(
 
 /**
  * The first enabled rule (ascending priority, then ruleId for ties) whose
- * conditions all match decides the outcome. No match means default allow.
+ * conditions all match decides the outcome. No match means default allow. An
+ * enabled rule with unreadable conditions matches every action and blocks it
+ * (hasUnreadableConditions).
  *
  * Pure. The engine sorts its input, so a mis-ordered list cannot change the decision.
  * The caller uses tenant enforcement mode to decide whether to enforce a gating outcome.
@@ -116,6 +142,15 @@ export function evaluatePolicy(
     .sort(compareRuleEvaluationOrder);
 
   for (const rule of candidates) {
+    if (hasUnreadableConditions(rule)) {
+      return {
+        outcome: "block",
+        matchedRuleId: rule.ruleId,
+        matchedRuleName: rule.name,
+        gating: true,
+        explanation: `Action blocked: the conditions of policy rule "${rule.name}" cannot be read. An admin must fix, disable or delete the rule.`
+      };
+    }
     if (!ruleMatches(rule, action)) continue;
     return {
       outcome: rule.effect,

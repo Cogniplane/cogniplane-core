@@ -96,8 +96,9 @@ redirect and hide. Every rule is enforced in the backend.
   [rotation](operations.md#rotate-secrets).
 - Startup rules for secrets: [configuration](configuration.md#startup-rules).
 - `redactSecrets()` (`services/redact-secrets.ts`) removes bearer headers, known
-  token formats (the patterns in that file, for example `sk-ant-` keys and JWTs)
-  and credential query parameters in any string. It blanks string and array
+  token formats (the patterns in that file, for example JWTs, and the
+  `keyPattern` of each model provider in `MODEL_PROVIDER_META`, for example
+  `sk-ant-` keys) and credential query parameters in any string. It blanks string and array
   values of fields whose name matches its `SECRET_KEY_PATTERN`. Exceptions:
   numbers and booleans under those names stay; a nested object is walked, not
   blanked; paging fields (`pageToken`, `nextPageToken`, ...) stay.

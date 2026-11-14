@@ -21,6 +21,10 @@
     "./sandbox-egress": {
       "types": "./dist/sandbox-egress.d.ts",
       "default": "./dist/sandbox-egress.js"
+    },
+    "./tenant-settings-request": {
+      "types": "./dist/tenant-settings-request.d.ts",
+      "default": "./dist/tenant-settings-request.js"
     }
   },
   "files": [

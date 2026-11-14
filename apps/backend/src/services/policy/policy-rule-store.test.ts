@@ -4,7 +4,12 @@ import type { Pool } from "../../lib/db.js";
 
 import { PolicyRuleConflictError, PolicyRuleStore, PolicyReorderMismatchError, type PolicyRuleWriteOptions } from "./policy-rule-store.js";
 import { WeakerChangeError } from "../weaker-change-error.js";
+import { UnreadableControlValueError } from "../admin-config-store-mappers.js";
+import { enforcePolicyCenter, type PolicyGate } from "../mcp/policy-gate.js";
+import { PolicyBlockedError, PolicyService } from "./policy-service.js";
 import type { AuditEventInput } from "../audit-event-store.js";
+import type { PolicyDecisionInput } from "./policy-decision-store.js";
+import type { ToolExecutionContext } from "../auth/tool-execution-context-store.js";
 
 const AUDIT: AuditEventInput = {
   tenantId: "t1", sessionId: null, userId: "admin-1", type: "admin.policy_rule.updated", payload: {}
@@ -124,7 +129,8 @@ class InMemoryRuleDatabase {
       row.priority = Number(params[4]);
       row.enabled = Boolean(params[5]);
       row.effect = params[6];
-      row.conditions_json = JSON.parse(String(params[7]));
+      // COALESCE($8::jsonb, conditions_json): no conditions in the patch keeps the stored JSON.
+      if (params[7] !== null) row.conditions_json = JSON.parse(String(params[7]));
       row.reason = params[8];
       row.updated_at = this.nextTimestamp();
       return { rows: [row], rowCount: 1 };
@@ -246,27 +252,169 @@ test("reorder rejects a set that does not match the tenant's current rules", asy
   );
 });
 
-test("mapRow normalizes malformed condition dimensions to a clean shape", async () => {
-  const { db, store } = makeStore();
-  // Seed a row directly with messy JSONB: non-string entries and an empty array.
-  db.rows.push({
-    rule_id: "pol_seed",
-    tenant_id: "t1",
-    name: "seeded",
-    description: null,
-    priority: 0,
-    enabled: true,
-    effect: "block",
-    conditions_json: { toolNames: ["ok", 5, null], categories: [], unknownKey: ["dropped"] },
-    reason: null,
-    created_by: null,
-    created_at: "2026-05-31T00:00:00.000Z",
-    updated_at: "2026-05-31T00:00:00.000Z"
+// Stored conditions that the shared strict schema cannot read (issue #121).
+// Before, the store dropped unknown keys and bad entries, so `{ toolName:
+// ["typo"] }` on an allow rule became "allow every tool".
+describe("a stored rule whose conditions cannot be read", () => {
+  function seedRow(db: InMemoryRuleDatabase, row: Partial<Record<string, unknown>> & { rule_id: string }) {
+    db.rows.push({
+      tenant_id: "t1", name: row.rule_id, description: null, priority: 0, enabled: true, effect: "allow",
+      conditions_json: {}, reason: null, created_by: null, revision: 1,
+      created_at: "2026-05-31T00:00:00.000Z", updated_at: "2026-05-31T00:00:00.000Z", ...row
+    });
+  }
+
+  function gateService(store: PolicyRuleStore) {
+    const decisions: PolicyDecisionInput[] = [];
+    const service = new PolicyService({
+      rules: store,
+      decisions: { record: async (tenantId, input, audit) => {
+        decisions.push(input);
+        const decision = { ...input, decisionId: "pdc_1", tenantId, createdAt: new Date(0).toISOString() };
+        audit(decision);
+        return decision;
+      } },
+      logger: { warn() {} },
+      ruleCacheTtlMs: 0
+    });
+    return { service, decisions };
+  }
+
+  function gateInput(toolName: string, enforcementMode: "monitor" | "enforce") {
+    return {
+      tenantId: "t1", sessionId: "s1", userId: "u1", runtimeId: "r1", toolName, category: "github",
+      severity: "read_only" as const, serverId: "github", turnContext: "interactive" as const, enforcementMode
+    };
+  }
+
+  test.each([
+    ["an unknown key", { toolName: ["typo"] }],
+    ["a list with a non-string entry", { toolNames: ["ok", 5] }],
+    ["a dimension that is not a list", { categories: "github" }],
+    ["an unknown severity", { severities: ["root"] }],
+    ["an unknown turn context", { turnContexts: ["batch"] }],
+    ["an empty tool name", { toolNames: [""] }],
+    ["a list instead of an object", ["toolNames"]],
+    ["null", null]
+  ])("%s marks the rule unreadable instead of dropping the value", async (_label, conditions) => {
+    const { db, store } = makeStore();
+    seedRow(db, { rule_id: "pol_bad", conditions_json: conditions });
+
+    const rule = await store.get("t1", "pol_bad");
+
+    expect(rule).toMatchObject({ conditions: {}, conditionsInvalid: true, effect: "allow" });
   });
 
-  const rule = await store.get("t1", "pol_seed");
-  // Non-strings filtered out, empty dimension dropped, unknown key not surfaced.
-  expect(rule!.conditions).toEqual({ toolNames: ["ok"] });
+  test("valid empty conditions stay a catch-all with no marker", async () => {
+    const { db, store } = makeStore();
+    seedRow(db, { rule_id: "pol_all", conditions_json: {} });
+    const rule = await store.get("t1", "pol_all");
+    expect(rule).not.toHaveProperty("conditionsInvalid");
+    expect(rule?.conditions).toEqual({});
+  });
+
+  test("an unknown stored effect fails the read instead of passing a cast", async () => {
+    const { db, store } = makeStore();
+    seedRow(db, { rule_id: "pol_effect", effect: "permit" });
+    await expect(store.list("t1")).rejects.toThrow(UnreadableControlValueError);
+  });
+
+  test("a typo'd high-priority allow rule blocks at the gateway instead of allowing every tool", async () => {
+    const { db, store } = makeStore();
+    seedRow(db, { rule_id: "pol_allow_typo", priority: 0, effect: "allow", conditions_json: { toolName: ["typo"] } });
+    seedRow(db, { rule_id: "pol_block_export", priority: 10, effect: "block", conditions_json: { toolNames: ["export"] } });
+    const { service, decisions } = gateService(store);
+
+    await expect(service.gateAction(gateInput("export", "enforce"))).rejects.toBeInstanceOf(PolicyBlockedError);
+    await expect(service.gateAction(gateInput("search", "enforce"))).rejects.toMatchObject({
+      matchedRuleId: "pol_allow_typo",
+      explanation: expect.stringContaining("cannot be read")
+    });
+    // Monitor mode records what Enforce would block and lets the call through.
+    const monitored = await service.gateAction(gateInput("search", "monitor"));
+    expect(monitored).toMatchObject({ enforced: false, evaluation: { outcome: "block", matchedRuleId: "pol_allow_typo" } });
+    expect(decisions.map((decision) => decision.outcome)).toEqual(["block", "block", "block"]);
+  });
+
+  test("an unreadable block rule still blocks, and blocks every action", async () => {
+    const { db, store } = makeStore();
+    seedRow(db, { rule_id: "pol_block_bad", priority: 0, effect: "block", conditions_json: { toolNames: ["export", 7] } });
+    seedRow(db, { rule_id: "pol_allow", priority: 10, effect: "allow", conditions_json: {} });
+    const { service } = gateService(store);
+
+    for (const tool of ["export", "search"]) {
+      await expect(service.gateAction(gateInput(tool, "enforce"))).rejects.toMatchObject({ matchedRuleId: "pol_block_bad" });
+    }
+  });
+
+  test("the gateway hook refuses the call through the real store, service and Policy Center gate", async () => {
+    const { db, store } = makeStore();
+    seedRow(db, { rule_id: "pol_allow_typo", effect: "allow", conditions_json: { toolName: ["typo"] } });
+    const { service } = gateService(store);
+    const context: ToolExecutionContext = {
+      toolContextId: "ctx-1", tenantId: "t1", sessionId: "s1", userId: "u1", runtimeId: "r1",
+      runtimePolicyId: "p", messageId: null, credentialEnvelope: {},
+      metadata: { turnContext: "interactive", runtimePolicy: {
+        id: "p", policyEnforcementMode: "enforce", webSearchMode: "disabled", approvalPolicy: "on-request",
+        approvalReviewer: "user", enabledToolIds: ["search"], enabledMcpServers: ["github"]
+      } },
+      createdAt: "2026-11-14T00:00:00.000Z", expiresAt: "2026-11-14T01:00:00.000Z"
+    };
+    const gate: PolicyGate = {
+      policyService: service, approvals: { get: async () => null, consume: async () => false }, logger: { warn() {} }
+    };
+
+    await expect(enforcePolicyCenter(gate, context, "search", "github", { readOnly: true }, {}, null))
+      .rejects.toBeInstanceOf(PolicyBlockedError);
+  });
+
+  test("a disabled unreadable rule does nothing", async () => {
+    const { db, store } = makeStore();
+    seedRow(db, { rule_id: "pol_off", enabled: false, effect: "block", conditions_json: { toolName: ["typo"] } });
+    const { service } = gateService(store);
+    await expect(service.gateAction(gateInput("search", "enforce"))).resolves.toMatchObject({
+      enforced: false, evaluation: { outcome: "allow", matchedRuleId: null }
+    });
+  });
+
+  describe("changes keep the weaker-change protection", () => {
+    async function seededInvalid() {
+      const { db, store } = makeStore();
+      seedRow(db, { rule_id: "pol_bad", priority: 0, effect: "allow", conditions_json: { toolName: ["typo"] } });
+      seedRow(db, { rule_id: "pol_allow", priority: 10, effect: "allow", conditions_json: { toolNames: ["search"] } });
+      return { db, store };
+    }
+
+    const weaker: Array<[string, (store: PolicyRuleStore) => Promise<unknown>]> = [
+      ["disable it", (store) => store.update("t1", "pol_bad", { expectedRevision: 1, enabled: false }, { allowWeaker: false })],
+      ["delete it", (store) => store.delete("t1", "pol_bad", { allowWeaker: false })],
+      ["repair it to the conditions it was meant to have",
+        (store) => store.update("t1", "pol_bad", { expectedRevision: 1, conditions: { toolNames: ["typo"] } }, { allowWeaker: false })],
+      ["move it below an allow rule", (store) => store.reorder("t1", ["pol_allow", "pol_bad"], { allowWeaker: false })]
+    ];
+
+    test.each(weaker)("%s needs step-up (WeakerChangeError without it)", async (_label, change) => {
+      const { store } = await seededInvalid();
+      await expect(change(store)).rejects.toBeInstanceOf(WeakerChangeError);
+    });
+
+    test("a patch without conditions keeps the stored JSON, so the rule stays unreadable and blocking", async () => {
+      const { db, store } = await seededInvalid();
+
+      const renamed = await store.update("t1", "pol_bad", { expectedRevision: 1, name: "renamed" }, { allowWeaker: false });
+
+      expect(renamed).toMatchObject({ name: "renamed", conditions: {}, conditionsInvalid: true });
+      expect(db.rows.find((row) => row.rule_id === "pol_bad")?.conditions_json).toEqual({ toolName: ["typo"] });
+    });
+
+    test("a repair that still blocks every action needs no step-up", async () => {
+      const { store } = await seededInvalid();
+      const repaired = await store.update("t1", "pol_bad",
+        { expectedRevision: 1, effect: "block", conditions: {} }, { allowWeaker: false });
+      expect(repaired).toMatchObject({ effect: "block", conditions: {} });
+      expect(repaired).not.toHaveProperty("conditionsInvalid");
+    });
+  });
 });
 
 test("listForLint surfaces the raw conditions including unknown keys", async () => {

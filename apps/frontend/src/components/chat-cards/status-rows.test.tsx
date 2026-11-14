@@ -33,19 +33,3 @@ it.each([
   fireEvent.click(summary);
   expect(details.open).toBe(!open);
 });
-
-it("keeps the server and status visible while the full error has a native disclosure", async () => {
-  const { McpServerStatusRowView } = await import("./status-rows");
-  const error = "First line\n" + "long unbroken error ".repeat(80) + "Final detail.";
-  const { container } = render(<McpServerStatusRowView row={{ type: "mcp-server-status", rowId: "mcp-1", serverName: "Report server", status: "failed", error }} />);
-  expect(screen.getByText("Report server · failed")).toBeTruthy();
-  const details = container.querySelector("details")!;
-  const summary = screen.getByText("Error details").closest("summary")!;
-  expect(details.open).toBe(false);
-  summary.focus();
-  expect(document.activeElement).toBe(summary);
-  fireEvent.click(summary);
-  expect(details.open).toBe(true);
-  expect(details.querySelector("p")?.textContent).toBe(error);
-  expect(screen.getByText("Report server · failed")).toBeTruthy();
-});

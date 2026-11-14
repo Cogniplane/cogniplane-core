@@ -7,32 +7,52 @@ import { PolicyEnforcementModeSchema } from "./policy.js";
 
 import { EFFORT_LEVELS, MODEL_PROVIDERS, WEB_SEARCH_MODES } from "../primitives.js";
 
-// Granular approval policy + literal forms must mirror @cogniplane/shared-types primitive types.
-const GranularApprovalPolicySchema = z.object({
-  granular: z.object({
-    sandbox_approval: z.boolean(),
-    mcp_elicitations: z.boolean(),
-    rules: z.boolean(),
-    request_permissions: z.boolean().optional(),
-    skill_approval: z.boolean().optional()
-  }).passthrough()
-}).passthrough();
+// The granular approval switches. Three are required; the other two are
+// optional because older saved policies do not have them.
+const granularApprovalFields = {
+  sandbox_approval: z.boolean(),
+  mcp_elicitations: z.boolean(),
+  rules: z.boolean(),
+  request_permissions: z.boolean().optional(),
+  skill_approval: z.boolean().optional()
+} as const;
 
-const ApprovalPolicySchema = z.union([
-  z.literal("never"),
-  z.literal("on-request"),
-  GranularApprovalPolicySchema
+// Reads a request body. Unknown keys are removed; a missing or non-boolean
+// required switch fails the parse.
+export const GranularApprovalPolicySchema = z.object({
+  granular: z.object(granularApprovalFields)
+});
+
+export const APPROVAL_POLICY_MODES = ["never", "on-request"] as const;
+
+// The request form of an approval policy.
+export const ApprovalPolicySchema = z.union([z.enum(APPROVAL_POLICY_MODES), GranularApprovalPolicySchema]);
+
+// The stored form (tenant setting and runtime policy snapshot). An unknown key
+// fails the parse: to remove it would silently drop a switch that this
+// version cannot apply.
+export const StoredApprovalPolicySchema = z.union([
+  z.enum(APPROVAL_POLICY_MODES),
+  z.object({ granular: z.object(granularApprovalFields).strict() }).strict()
 ]);
 
-const ApprovalReviewerSchema = z.enum(["user", "guardian_subagent"]);
+// The response form keeps unknown keys, so an older client does not drop a
+// newer switch.
+const ApprovalPolicyResponseSchema = z.union([
+  z.enum(APPROVAL_POLICY_MODES),
+  z.object({ granular: z.object(granularApprovalFields).passthrough() }).passthrough()
+]);
 
-const WebSearchModeSchema = z.enum(WEB_SEARCH_MODES);
+export const APPROVAL_REVIEWERS = ["user", "guardian_subagent"] as const;
+export const ApprovalReviewerSchema = z.enum(APPROVAL_REVIEWERS);
+
+export const WebSearchModeSchema = z.enum(WEB_SEARCH_MODES);
 
 export const TenantSettingsSchema = z.object({
   tenantId: z.string(),
   showEffortSelector: z.boolean(),
   webSearchMode: WebSearchModeSchema,
-  approvalPolicy: ApprovalPolicySchema,
+  approvalPolicy: ApprovalPolicyResponseSchema,
   // Reviewer for runtime-native approvals only. Policy Center
   // require_approval is actor confirmation by the initiating user.
   approvalReviewer: ApprovalReviewerSchema,

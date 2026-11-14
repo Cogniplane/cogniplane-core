@@ -76,21 +76,26 @@ test("values within a dimension are OR-ed", () => {
   expect(result.matchedRuleId).toBe("pol_1");
 });
 
-test("malformed conditions (non-array dimension) degrade to a catch-all, never throw", () => {
-  // A corrupt JSONB dimension (an object or a string) must not crash the engine.
-  const badObject = evaluatePolicy(
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    [rule({ conditions: { toolNames: { x: 1 } } as any })],
-    action
-  );
-  expect(badObject.matchedRuleId).toBe("pol_1");
+// Before issue #121 a malformed dimension read as "no constraint", so a
+// malformed allow rule allowed every action. Now an enabled rule whose
+// conditions fail the shared strict schema blocks every action, whatever its
+// effect, and evaluation still never throws.
+test.each([
+  ["a dimension that is an object", { toolNames: { x: 1 } }],
+  ["a dimension that is a string", { categories: "github" }],
+  ["an unknown key", { toolName: ["x"] }],
+  ["an unknown severity", { severities: ["root"] }]
+])("unreadable conditions (%s) block every action, never throw", (_label, conditions) => {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const result = evaluatePolicy([rule({ effect: "allow", conditions: conditions as any })], action);
+  expect(result).toMatchObject({ outcome: "block", matchedRuleId: "pol_1", gating: true });
+});
 
-  const badString = evaluatePolicy(
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    [rule({ conditions: { categories: "github" } as any })],
-    action
-  );
-  expect(badString.matchedRuleId).toBe("pol_1");
+test("the store's marker blocks every action, and a disabled unreadable rule is skipped", () => {
+  expect(evaluatePolicy([rule({ effect: "allow", conditions: {}, conditionsInvalid: true })], action))
+    .toMatchObject({ outcome: "block", matchedRuleId: "pol_1" });
+  expect(evaluatePolicy([rule({ enabled: false, conditions: {}, conditionsInvalid: true })], action))
+    .toMatchObject({ outcome: "allow", matchedRuleId: null });
 });
 
 test("a null action dimension never matches a constrained condition", () => {
