@@ -22,6 +22,7 @@ import { PiiScanJobStore } from "../services/pii/pii-scan-job-store.js";
 import { PiiScanRunStore } from "../services/pii/pii-scan-run-store.js";
 import { DatabasePiiScanSubjectReader } from "../services/pii/pii-scan-subject-reader.js";
 import { RuleBasedPiiDetector } from "../services/pii/rule-based-pii-detector.js";
+import { StorageGc } from "../services/storage/storage-gc.js";
 import { TenantOrgSettingsStore } from "../services/tenant-org-settings-store.js";
 import { PII_SAVE_ALLOWED } from "../test-helpers/data-routes.js";
 import { adminDatabaseUrl, appPool, maintenancePool, superuserPool } from "./support/database.js";
@@ -131,6 +132,11 @@ async function setup(options: { evaluationTimeoutMs: number; limits: BucketReque
     piiScanJobs,
     artifacts,
     storage,
+    storageGc: new StorageGc({
+      maintenanceDb: maintenancePool(),
+      artifactStorage: storage,
+      skillBundleStorage: { deleteBundle: async () => { throw new Error("no bundle in this test"); } }
+    }),
     subjectReader: new DatabasePiiScanSubjectReader({ db: appPool(), artifacts, storage }),
     auditEvents: new AuditEventStore(appPool()),
     logger: { error() {}, warn() {} }

@@ -71,6 +71,10 @@ describe.skipIf(!adminDatabaseUrl())("session execution authority", () => {
   });
 
   test("a stopping lease whose owner is gone frees the session at its expiry and keeps its stop reason", async () => {
+    const sweeper = new SessionExecutionStore(maintenancePool());
+    // Clear earlier fixtures first. A sweep takes at most 500 expired leases,
+    // so this test's lease need not be in its first batch on a shared database.
+    while (await sweeper.sweepExpired() > 0) { /* Drain the earlier batches. */ }
     const h = await personalSession();
     const dead = new SessionExecutionStore(appPool(), "dead-replica");
     const other = new SessionExecutionStore(appPool(), "replica-b");
@@ -82,7 +86,7 @@ describe.skipIf(!adminDatabaseUrl())("session execution authority", () => {
     await superuserPool().query(
       "UPDATE session_executions SET expires_at=clock_timestamp()-INTERVAL '1 second' WHERE execution_id=$1",
       [turn.executionId]);
-    expect(await new SessionExecutionStore(maintenancePool()).sweepExpired()).toBeGreaterThanOrEqual(1);
+    expect(await sweeper.sweepExpired()).toBeGreaterThanOrEqual(1);
     expect(await lease(turn.executionId)).toEqual({ status: "stopped", stop_reason: "cancelled" });
     expect(await messageStatus(reply)).toBe("interrupted");
     await other.acquire(h.actor, 30_000);
