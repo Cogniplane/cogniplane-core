@@ -13,7 +13,7 @@ export const HISTORY_EVENTS = {
   "admin.policy_rule.deleted": entry("policies", "Policy rule deleted", ["ruleId"]),
   "admin.policy_rule.reordered": entry("policies", "Policy rule order changed", ["ruleIds"]),
   "tenant.member.role_changed": entry("people", "Member role changed", ["targetUserId", "previousRole", "role"]),
-  "tenant.member.removed": entry("people", "Member removed", ["targetUserId", "previousRole"]),
+  "tenant.member.removed": entry("people", "Member removed", ["targetUserId", "previousRole", "projectRolesRemoved"]),
   "admin.user.beta_tester_updated": entry("people", "Test access changed", ["targetUserId", "isBetaTester"]),
   "tenant.renamed": entry("settings", "Organization renamed", ["previousName", "tenantName"]),
   "tenant.provider_key.updated": entry("models", "Provider credentials changed", ["provider"]),

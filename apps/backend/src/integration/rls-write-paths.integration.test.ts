@@ -77,6 +77,7 @@ import { PersonalSkillStore } from "../services/skills/personal-skill-store.js";
 import { ProjectSkillStore } from "../services/skills/project-skill-store.js";
 import { TenantOrgSettingsStore } from "../services/tenant-org-settings-store.js";
 import { TenantSettingsStore } from "../services/tenant-settings-store.js";
+import { endTenantMembership } from "../services/tenant-member-removal.js";
 import { ToolEventStore } from "../services/tool-event-store.js";
 import { UserSettingsStore } from "../services/user-settings-store.js";
 import { createSilentLogger } from "../test-helpers/silent-logger.js";
@@ -171,6 +172,11 @@ const people = once(async () => {
   const peer = await signIn(unique("org-peer"));
   return { owner, member, peer };
 });
+
+// A removal ends a membership, so it gets a WorkOS tenant of its own: the
+// cases that use people() keep their members.
+const removalOrganization = unique("org-removal");
+const removalOwner = once(async () => signIn(removalOrganization));
 
 // Local accounts live in a local tenant. The operator command creates the
 // tenant (on the migration pool, as in production); the app pool writes the
@@ -584,6 +590,18 @@ const WRITE_PATHS: Record<string, WritePath> = {
     writer: "maintenance",
     reason: "Written in the same sign-in transaction as the tenant row.",
     write: async () => ({ user_id: (await people()).member.userId })
+  },
+  tenant_member_removals: {
+    path: "endTenantMembership (DELETE /tenant/members/:userId)",
+    writer: "app",
+    owner: removalOwner,
+    write: async () => {
+      const owner = await removalOwner();
+      const removed = await signIn(removalOrganization);
+      await withTenantScope(appPool(), owner.tenantId, (client) =>
+        endTenantMembership(client, { tenantId: owner.tenantId, userId: removed.userId, removedBy: owner.userId }));
+      return { user_id: removed.userId };
+    }
   },
   local_identities: {
     path: "LocalAccountService.createMember",

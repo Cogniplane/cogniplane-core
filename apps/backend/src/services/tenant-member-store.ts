@@ -23,6 +23,13 @@ export type TenantAuthState = {
   localStatus: LocalAccountStatus | null;
   /** Local accounts only; every token of a session must carry this value. */
   securityVersion: number | null;
+  /**
+   * The latest removal of this user by the tenant, in seconds since the
+   * epoch (tenant_member_removals). A session that started at or before it is
+   * refused (lib/auth-admission.ts). Unset when the tenant never removed the
+   * user.
+   */
+  removedAt?: number;
 };
 
 function isLocalStatus(value: unknown): value is LocalAccountStatus {
@@ -30,11 +37,13 @@ function isLocalStatus(value: unknown): value is LocalAccountStatus {
 }
 
 const AUTH_STATE_SQL = `
-  SELECT tm.role, t.login_type, u.auth_source, li.status AS local_status, li.security_version
+  SELECT tm.role, t.login_type, u.auth_source, li.status AS local_status, li.security_version,
+    EXTRACT(EPOCH FROM r.removed_at)::float8 AS removed_at
   FROM tenant_memberships tm
   JOIN tenants t ON t.tenant_id = tm.tenant_id
   JOIN users u ON u.user_id = tm.user_id
   LEFT JOIN local_identities li ON li.tenant_id = tm.tenant_id AND li.user_id = tm.user_id
+  LEFT JOIN tenant_member_removals r ON r.tenant_id = tm.tenant_id AND r.user_id = tm.user_id
   WHERE tm.tenant_id = $1
     AND tm.user_id = $2
   LIMIT 1
@@ -46,6 +55,7 @@ type AuthStateRow = {
   auth_source: string;
   local_status: string | null;
   security_version: number | null;
+  removed_at: number | null;
 };
 
 function mapAuthState(row: AuthStateRow | undefined): TenantAuthState | null {
@@ -54,12 +64,13 @@ function mapAuthState(row: AuthStateRow | undefined): TenantAuthState | null {
   if (role !== "owner" && role !== "admin" && role !== "member") return null;
   // An unknown value means a schema this code does not know. Refuse.
   if (!isLoginType(loginType) || !isLoginType(authSource)) return null;
+  const removal = row.removed_at === null || row.removed_at === undefined ? {} : { removedAt: Number(row.removed_at) };
   if (authSource === "local") {
     // A local member without a local identity is a data error: refuse.
     if (!isLocalStatus(row.local_status) || typeof row.security_version !== "number") return null;
-    return { role, loginType, authSource, localStatus: row.local_status, securityVersion: row.security_version };
+    return { role, loginType, authSource, localStatus: row.local_status, securityVersion: row.security_version, ...removal };
   }
-  return { role, loginType, authSource, localStatus: null, securityVersion: null };
+  return { role, loginType, authSource, localStatus: null, securityVersion: null, ...removal };
 }
 
 /**

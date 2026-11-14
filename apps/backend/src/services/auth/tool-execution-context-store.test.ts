@@ -330,3 +330,33 @@ test("extend does not cross tenants", async () => {
 
   expect(await store.extend("other-tenant", created.toolContextId, ttlMs)).toBeNull();
 });
+
+// Every lookup of a context requires that its owner is still a member of the
+// tenant, for interactive and scheduled contexts and for both login types. A
+// member removal then stops the owner's turns on every replica. Real SQL:
+// integration/tool-execution-context-store.integration.test.ts.
+test("get, liveness, extend and findLatestActiveBySession all require the owner's current membership", async () => {
+  const texts: string[] = [];
+  const client = {
+    async query(text: string) {
+      texts.push(text);
+      if (text.includes("AS owner_current")) return { rows: [{ owner_current: false, usable: true }], rowCount: 1 };
+      return { rows: [], rowCount: 0 };
+    },
+    release() {}
+  };
+  const store = new ToolExecutionContextStore({ connect: async () => client } as unknown as Pool);
+
+  expect(await store.get("tenant-1", "ctx-1")).toBeNull();
+  expect(await store.findLatestActiveBySession("tenant-1", "session-1")).toBeNull();
+  expect(await store.extend("tenant-1", "ctx-1", 1_000)).toBeNull();
+  // A context whose owner left the tenant gives the same reason as a
+  // security change, so the user sees why the turn stopped.
+  expect(await store.liveness("tenant-1", "ctx-1")).toBe("security_change");
+
+  const lookups = texts.filter((text) => text.includes("tool_execution_contexts"));
+  expect(lookups).toHaveLength(4);
+  for (const text of lookups) {
+    expect(text).toMatch(/EXISTS \(SELECT 1 FROM tenant_memberships owner_membership\s+WHERE owner_membership\.tenant_id=tool_execution_contexts\.tenant_id AND owner_membership\.user_id=tool_execution_contexts\.user_id\)/);
+  }
+});

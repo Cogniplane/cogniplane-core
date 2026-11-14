@@ -27,6 +27,7 @@ import type { StepUpRoute } from "../services/auth/step-up-routes.js";
 import { LocalMfaService } from "../services/auth/local-mfa-service.js";
 import type { DataRouteControl } from "../services/data-route-control.js";
 import { currentRole, isManager, lockTenantMembership, mayAssignRole, ownerRoleRefusal } from "../services/member-authority.js";
+import { endTenantMembership } from "../services/tenant-member-removal.js";
 import type { GithubConnectionService } from "../services/integrations/github/github-connection-service.js";
 import { IntegrationRegistry } from "../services/integrations/integration-registry.js";
 import { PiiImportScopeRegistry } from "../services/pii/pii-import-scopes.js";
@@ -585,7 +586,7 @@ export async function registerTenantRoutes(
       // tokens — the membership row is not consulted anywhere on the scheduler
       // path. `next_run_at = NULL` also drops them out of the due-job query.
       // The pause reason makes the owner review each job before it runs
-      // again, if the member comes back.
+      // again, if a future re-admission brings the member back.
       await client.query(
         `UPDATE scheduled_jobs
          SET enabled = FALSE, next_run_at = NULL, paused_reason = 'security_change', updated_at = NOW()
@@ -601,13 +602,17 @@ export async function registerTenantRoutes(
       // A WorkOS member has no security version; its work stops all the same.
       change.endActiveWork(targetUserId);
 
-      await client.query(
-        `DELETE FROM tenant_memberships WHERE tenant_id = $1 AND user_id = $2`,
-        [tenantId, targetUserId]
-      );
+      // The removal lasts (services/tenant-member-removal.ts): it deletes the
+      // member's project roles and the membership, and records the removal.
+      // WorkOS sign-in then refuses the user, and no session that started
+      // before now is admitted again.
+      const { projectRolesRemoved } = await endTenantMembership(client, {
+        tenantId, userId: targetUserId, removedBy: request.auth.userId
+      });
       await AuditEventStore.createInTransaction(client, tenantAudit(request, "tenant.member.removed", {
         targetUserId,
-        previousRole: target.rows[0].role
+        previousRole: target.rows[0].role,
+        projectRolesRemoved
       }));
 
       return { kind: "deleted" as const };
@@ -633,9 +638,8 @@ export async function registerTenantRoutes(
     // membership transaction, not inside it: each connection service opens its
     // own `withTenantScope` and writes an audit event, so it cannot join the
     // client above. A crash in the gap leaves connection rows for a user who is
-    // no longer a member — they are unreachable while the membership is gone,
-    // but note that a later re-add through WorkOS provisioning recreates the
-    // membership and would restore access to them.
+    // no longer a member. They are unreachable: the membership is gone, and
+    // WorkOS sign-in refuses the removed user.
     //
     // Driven off the integration registry rather than a hardcoded table list so
     // a private overlay's integrations are covered too.

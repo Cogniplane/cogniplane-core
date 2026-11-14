@@ -166,7 +166,8 @@ describe("auth callback page", () => {
 
   it.each([
     ["no_organization", "Ask your administrator to invite you."],
-    ["wrong_login_type", "sign in with your password"]
+    ["wrong_login_type", "sign in with your password"],
+    ["membership_removed", "removed you from this organization"]
   ])("explains a %s failure that a new sign-in does not fix", async (code, text) => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({ error: code }), { status: 403 })));
     render(<AuthCallbackPage />);

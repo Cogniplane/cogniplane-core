@@ -10,11 +10,12 @@ export const MAINTENANCE_GRANTS = {
   "SELECT, INSERT, UPDATE": ["tenants", "users", "tenant_memberships"],
   // local_identities, auth_action_tokens, user_passkeys: sign-in looks an
   // account up by email, by link, or by passkey credential id before the
-  // tenant is known. Read only; every write goes through app_user in the
-  // tenant's scope.
+  // tenant is known. tenant_member_removals: WorkOS sign-in and request
+  // admission read a removal before the tenant scope exists. Read only;
+  // every write goes through app_user in the tenant's scope.
   "SELECT": [
     "tenant_org_settings", "artifacts", "pii_scan_runs", "projects", "project_memberships",
-    "local_identities", "auth_action_tokens", "user_passkeys"
+    "local_identities", "auth_action_tokens", "user_passkeys", "tenant_member_removals"
   ],
   "SELECT, UPDATE": [
     "scheduled_jobs", "scheduled_job_runs", "pii_scan_jobs", "approvals",

@@ -18,6 +18,7 @@ import {
   WrongLoginTypeError
 } from "../services/auth/workos-tenant-provisioning.js";
 import { IntegrationRegistry } from "../services/integrations/integration-registry.js";
+import { MemberRemovedError } from "../services/tenant-member-removal.js";
 import { clientIpKey, enforceRateLimit } from "../services/rate-limit-reply.js";
 import type { LocalAuth } from "../services/auth/local-auth.js";
 import type { RequestLimitsInterface } from "../services/request-limits.js";
@@ -37,6 +38,8 @@ const PKCE_VERIFIER_PATTERN = /^[A-Za-z0-9._~-]{43,128}$/;
 // The WorkOS examples show codes of 25 and 26 characters. The bound keeps
 // larger input out of the token request.
 const OAUTH_CODE_MAX_LENGTH = 512;
+const MEMBERSHIP_REMOVED_MESSAGE =
+  "An owner or admin removed you from this organization. Ask them if you need access again.";
 
 // The schema checks only the field types and the code size. The checks in the
 // route give the specific errors, and OAUTH_PARAM_PATTERN bounds the state.
@@ -264,6 +267,15 @@ function registerWorkosAuthRoutes(
         workosRoleSlug: organization.roleSlug
       });
     } catch (error) {
+      // The tenant removed this user. The removal lasts whatever WorkOS says
+      // (services/tenant-member-removal.ts); nothing was written.
+      if (error instanceof MemberRemovedError) {
+        request.log.warn(
+          { tenantId: error.tenantId, workosUserId: workosUser.id },
+          "auth callback 403: the tenant removed this member"
+        );
+        return reply.code(403).send(apiError("membership_removed", MEMBERSHIP_REMOVED_MESSAGE));
+      }
       if (error instanceof WrongLoginTypeError) {
         request.log.warn(
           { organizationId: organization.organizationId },

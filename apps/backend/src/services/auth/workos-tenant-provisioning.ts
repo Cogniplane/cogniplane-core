@@ -3,6 +3,8 @@ import type { WorkOS } from "@workos-inc/node";
 import type { Pool } from "../../lib/db.js";
 import { withTransaction } from "../../lib/db.js";
 import { uuidv7 } from "../../lib/uuid.js";
+import { lockTenantMembership } from "../member-authority.js";
+import { assertMemberNotRemoved } from "../tenant-member-removal.js";
 
 /**
  * Raised when the email on an incoming WorkOS login already belongs to a
@@ -119,8 +121,9 @@ export interface ProvisionedTenantIdentity {
 
 /**
  * Upserts the tenant, user, and membership rows for a WorkOS login. The whole
- * upsert runs in a single transaction to prevent race conditions in
- * first-member owner promotion.
+ * upsert runs in a single transaction, under the tenant's membership lock, to
+ * prevent race conditions in first-member owner promotion and with member
+ * removal. Throws MemberRemovedError for a user that the tenant removed.
  */
 export async function provisionTenantIdentity(
   db: Pool,
@@ -134,24 +137,43 @@ export async function provisionTenantIdentity(
   }
 ): Promise<ProvisionedTenantIdentity> {
   return withTransaction(db, async (client) => {
-    const tenantResult = await client.query(
-      // tenant_name is deliberately NOT in the DO UPDATE list. The owner renames
-      // the tenant through PUT /tenant; re-applying the WorkOS org name on every
-      // member's login would revert that rename at the next sign-in. The name is
-      // seeded once, on INSERT. A later rename in WorkOS therefore does not sync.
+    // tenant_name is set on INSERT only. The owner renames the tenant through
+    // PUT /tenant; re-applying the WorkOS org name at each sign-in would revert
+    // that rename. A later rename in WorkOS therefore does not sync.
+    //
+    // DO NOTHING, not DO UPDATE: the sign-in takes no lock on an existing
+    // tenant row. Manager changes take the tenant's membership lock first and
+    // can then lock the tenant row (FOR SHARE in
+    // LocalAccountService.createMemberInTransaction, UPDATE in the MFA policy
+    // change), so a row lock here, before the membership lock below, could
+    // deadlock with them. Two first sign-ins of a new organization still
+    // meet: the second INSERT waits until the first commits, then reads its
+    // row.
+    await client.query(
       `INSERT INTO tenants (tenant_id, tenant_name, slug, workos_org_id)
        VALUES ($1, $2, $3, $4)
-       ON CONFLICT (workos_org_id) DO UPDATE SET
-         updated_at = NOW()
-       RETURNING tenant_id, login_type`,
+       ON CONFLICT (workos_org_id) DO NOTHING`,
       [uuidv7(), input.organizationName, input.organizationId.toLowerCase(), input.organizationId]
     );
+    const tenantResult = await client.query(
+      `SELECT tenant_id, login_type FROM tenants WHERE workos_org_id = $1`,
+      [input.organizationId]
+    );
+    // Only the tenant deletion command deletes a tenant, so the row is there
+    // unless that command ran in between.
+    if (!tenantResult.rows[0]) throw new Error("The tenant of this WorkOS organization was deleted during sign-in.");
     const tenantId = tenantResult.rows[0].tenant_id as string;
-    // Checked inside the transaction, after the upsert has locked the tenant
-    // row: a throw here rolls back every write of this login.
+    // A throw here rolls back every write of this login.
     if (tenantResult.rows[0].login_type !== "workos") {
       throw new WrongLoginTypeError(input.organizationId);
     }
+
+    // The tenant's membership lock, which every manager change takes first
+    // (services/member-authority.ts). Under it, a sign-in and a member removal
+    // or role change run one at a time, and concurrent first sign-ins count
+    // the members one at a time. Taken before the email lock below, in the
+    // same order as local member creation.
+    await lockTenantMembership(client, tenantId);
 
     // `users` is unique on BOTH workos_user_id and email, but the upsert below
     // can only name one conflict target. A WorkOS user that was deleted and
@@ -218,9 +240,15 @@ export async function provisionTenantIdentity(
           )
         ).rows[0].user_id as string);
 
+    // A removal by the tenant lasts: WorkOS does not admit the user again
+    // (services/tenant-member-removal.ts). Checked under the membership lock,
+    // so a removal that commits first is seen, and one that starts later waits
+    // for this sign-in and then deletes its membership.
+    await assertMemberNotRemoved(client, tenantId, userId);
+
     // Count members before the membership upsert. Concurrent first logins
-    // to one tenant wait for each other on the tenant row that the upsert
-    // above locked, so only one of them sees zero.
+    // to one tenant wait for each other on the membership lock above, so only
+    // one of them sees zero.
     const memberCount = await client.query(
       `SELECT COUNT(*) AS cnt FROM tenant_memberships WHERE tenant_id = $1`,
       [tenantId]
@@ -232,9 +260,8 @@ export async function provisionTenantIdentity(
     // conflict: it returns the role as committed now. Reading the role first
     // and writing it back would undo a role change that commits in between:
     // ON CONFLICT DO UPDATE waits for the row and acts on its latest version,
-    // a separate read does not. A removal that commits in between leaves no
-    // row, so the login inserts a new membership with this role, as a login
-    // just after the removal would.
+    // a separate read does not. A removal cannot commit in between: it takes
+    // the membership lock that this transaction holds.
     const newMemberRole = resolveTenantMembershipRole({
       existingRole: null,
       isFirstMember,

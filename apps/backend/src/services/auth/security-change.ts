@@ -48,9 +48,11 @@ import { lockAccountChats, type ReleasedAccountSandbox, releaseAccountSandboxes 
 // recorded accounts. security-change-sites.test.ts lists every increment in
 // the source, so a new one fails until it is listed and tested.
 //
-// WorkOS accounts have no security version in this database. Nothing here
-// changes for them: their contexts are not compared, and only a member
-// removal stops their runtimes.
+// WorkOS accounts have no security version in this database. Only a member
+// removal stops their work. Layer 1 applies to them, and layer 2 through the
+// membership: every context lookup also requires that its owner is still a
+// member of the tenant (tool-execution-context-store.ts), so a removal stops
+// the member's interactive and scheduled turns on every replica.
 
 /**
  * The accounts of one tenant whose active work must stop, and the sandboxes that the

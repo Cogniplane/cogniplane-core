@@ -35,7 +35,11 @@ export async function withStagedDatabase(work: (staged: StagedDatabase) => Promi
   await admin.end();
   const url = new URL(adminDatabaseUrl()!);
   url.pathname = `/${database}`;
-  const db = new pg.Pool({ connectionString: url.toString(), max: 2 });
+  // Four connections: a race test holds one open transaction, runs two
+  // statements that wait for locks, and reads the result on a fourth. With
+  // fewer, a statement could wait for a connection that a waiting statement
+  // holds, and the test would hang.
+  const db = new pg.Pool({ connectionString: url.toString(), max: 4 });
   const dir = await mkdtemp(path.join(tmpdir(), "staged-migrations-"));
   const linked = new Set<string>();
   try {

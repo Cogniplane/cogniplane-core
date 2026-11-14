@@ -133,7 +133,7 @@ export function jwtAuth(
       return;
     }
 
-    const admission = checkAuthAdmission(config, authState, { sv: payload.sv });
+    const admission = checkAuthAdmission(config, authState, { sv: payload.sv, authTime: payload.auth_time });
     if (!admission.ok) {
       request.log.warn(
         { url: sanitizeUrl(request.url), method: request.method, userId: payload.sub, tenantId: payload.tid, reason: admission.error },

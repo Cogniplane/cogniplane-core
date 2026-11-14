@@ -65,7 +65,8 @@ other people in Admin > People (`routes/tenant-local-members.ts`).
   does the same for a WorkOS member. Details and limits:
   [sandbox](sandbox.md#e2b-sandbox).
 - WorkOS accounts have no security version in this database, so objects that a
-  revoked WorkOS session created stay active.
+  revoked WorkOS session created stay active. A member removal still stops
+  their tool contexts, through the membership ([roles](auth.md#roles)).
 
 ## Serialization of account changes
 

@@ -29,6 +29,41 @@ are not tested against a newer schema. If the new backends fail `/ready`, fix
 forward, or stop the backends, restore the backup from step 1 and redeploy the
 previous images.
 
+### Upgrade to removal records
+
+Migration `091` adds `tenant_member_removals` ([roles](architecture/auth.md#roles)).
+It also records the removals from before the upgrade. Each user with a
+`tenant.member.removed` audit event and no membership in that tenant gets a
+record, at the time of the latest event. WorkOS sign-in then refuses the user.
+A user with a membership gets no record: the data does not show whether the
+tenant wanted the user back. Limits:
+
+- A removal with no audit event gets no record, so the next WorkOS sign-in adds
+  the user again. Older builds wrote no event, and
+  [audit retention](#audit-retention) can have deleted it. Remove such a user
+  again after the upgrade.
+- During the rollout, a backend of the earlier release removes a member
+  without a record, and its WorkOS sign-in adds a removed user back.
+
+After every backend runs the new release, run
+`apps/backend/db/deferred/record-member-removals.sql` once with `psql` and the
+migration credential. It records the removals again, and lists each member
+whose membership started after their latest removal. For each listed member, an
+owner or admin of that tenant decides; when the return was not wanted, they
+remove the member again in Admin > People.
+
+The file takes the membership lock of every tenant before it reads, in
+`tenant_id` order, and keeps the locks until it commits. A WorkOS sign-in that
+holds a lock when the file starts finishes first: its membership stays, and the
+file lists it. A sign-in or member change that starts later waits for the
+commit, so the sign-in of a removed user is then refused. While the file runs,
+sign-ins and member changes of every tenant wait; a wait longer than the
+30-second statement timeout of the backends fails that request. Run the file
+when traffic is low. A lock wait of more than 5 seconds (`lock_timeout`), or a
+deadlock with a tenant deletion that runs at the same time, rolls the file back
+with no change; run it again. Do not run it while a backend of the earlier
+release still runs: those backends take no lock and do not check the records.
+
 ### Migration limits
 
 The migration job runs the migrations, the role setup and the grants on one
