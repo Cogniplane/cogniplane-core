@@ -217,7 +217,9 @@ transaction, then removes storage objects and checkpoint threads, which are
 queued in `tenant_deletion_cleanup`. It does not change Redis unless you add
 `--flush-redis` ([Redis](#redis-and-tenant-deletion)). It kills no E2B
 sandbox: a sandbox of the tenant runs until E2B expires it
-(`E2B_SANDBOX_TIMEOUT_MS` after its last turn start).
+(`E2B_SANDBOX_TIMEOUT_MS` after its last turn start). It calls no other
+provider either; the receipt only counts what stays there
+([resources outside the database](#resources-outside-the-database)).
 
 User rows: the transaction finds each user that a row of the tenant names,
 also a former member with no membership left, and locks these `users` rows.
@@ -245,6 +247,54 @@ removes them. Any other status exits 1 and means some objects or threads are
 still queued: run the command again with the same `--request-id`. A new request
 id fails after the rows are gone, because the tenant no longer exists. A run
 for a completed request does nothing and prints the same receipt.
+
+`completed` says nothing about other providers. Sandboxes, Pipedream accounts,
+OAuth grants and member credentials at other services are not revoked or
+deleted.
+
+### Resources outside the database
+
+The transaction counts the tenant's resources at other providers before the
+cascade deletes their rows, and stores the counts in the receipt's
+`externalResources`. The value holds numbers only: no id, account label, token
+or secret. A replay prints the stored counts. A receipt from a version before
+the counts has `externalResources: null`: nothing was recorded, and a replay
+cannot count, because the rows are gone. When a count is not zero, or the value
+is null, the command writes a note to stderr.
+
+| Field | What it counts | What stays at the provider |
+|---|---|---|
+| `e2bSandboxes` | Distinct `sessions.sandbox_id` values. | Each sandbox runs until E2B expires it. Some can be gone already. Project chats save no sandbox id ([sandbox](architecture/sandbox.md#e2b-sandbox)), so a project chat sandbox that a replica left running is not counted. |
+| `jira.externalUserIds` | Distinct Pipedream Connect external user ids over the two groups below. | Jira accounts in Pipedream under each id, with the Atlassian tokens that Pipedream holds. |
+| `jira.activeExternalUserIds` | Current ids (`user_jira_identities`, `user_jira_connections`). | As above. |
+| `jira.activeExternalUserIdsWithoutSelectedAccount` | Current ids that no connection row names: an authorization started, and accounts can exist that no row lists. | As above. |
+| `jira.selectedAccounts` | Distinct selected Pipedream account ids. Part of the current ids, not more resources. | As above. |
+| `jira.retiredExternalUserIdsPendingCleanup` | Distinct retired ids whose remote delete did not finish (`user_jira_cleanups`). | No worker retries them: the cleanup rows are gone. |
+| `jira.pendingCleanups` | `user_jira_cleanups` rows. One id can have more than one row. | As above. |
+| `oauthConnections.github`, `.notion`, `.microsoft` | Connection rows. Each held an encrypted OAuth token. | The grant at the provider, until a member or a provider admin revokes it or the token expires. |
+| `personalMcpCredentials` | `member_mcp_credentials` rows with a secret. | The member's credential at the upstream MCP server. Only its owner can revoke it. |
+
+Organization credentials are not counted: model provider keys
+(`tenant_org_settings`) and organization MCP server secrets
+(`admin_mcp_servers`).
+
+The receipt does not hold the Pipedream external user ids, and you cannot
+compute them after the deletion. Each one is an HMAC of the tenant id, a user
+id and a generation, and the user ids and generations were in the deleted
+rows. To delete Pipedream accounts, read the ids before the run.
+
+Order for `--third-party-disposition`:
+
+1. Before the run, read the tables in the table above for the tenant as the
+   migration role. Deal with what you can at each provider (for example,
+   delete Pipedream accounts by external user id, or ask members to revoke
+   the OAuth grant at GitHub, Notion or Microsoft).
+2. Write what you did and what you leave in place in
+   `--third-party-disposition`. The text is your statement; the command does
+   not check it.
+3. After the run, compare `externalResources` with that text. The receipt
+   keeps the text of the first run, so record a difference and its follow-up in
+   the deletion ticket.
 
 ### Redis and tenant deletion
 

@@ -301,6 +301,239 @@ describe.skipIf(!adminDatabaseUrl())("tenant offboarding", () => {
     expect((await superuserPool().query(`SELECT 1 FROM users WHERE user_id = ANY($1)`, [[boot.userId, removed.userId]])).rowCount).toBe(0);
   });
 
+  // The counts in `externalResources` come from rows that the tenant delete
+  // cascades away, so they must be read first. Every id, label and secret below
+  // has a marker that the receipt must not contain.
+  describe("external resource counts", () => {
+    const marker = `SECRET-${randomUUID()}`;
+
+    function deletionService() {
+      return new TenantDeletionService({
+        db: superuserPool(),
+        artifactStorage: { delete: vi.fn(async () => undefined) },
+        skillBundleStorage: { deleteBundle: vi.fn(async () => undefined) },
+        purgeRuntimeThread: (threadId) => checkpointer!.deleteThread(threadId)
+      });
+    }
+
+    const deletion = (tenantId: string) => ({
+      requestId: `NONPROD-OFFBOARD-${randomUUID()}`,
+      tenantId,
+      redisDisposition: "No Redis in this test.",
+      thirdPartyDisposition: "Operator checked Pipedream, GitHub and Microsoft.",
+      backupDisposition: "None."
+    });
+
+    async function setSandbox(sessionId: string, sandboxId: string): Promise<void> {
+      await superuserPool().query(`UPDATE sessions SET sandbox_id = $2 WHERE session_id = $1`, [sessionId, sandboxId]);
+    }
+
+    async function seedJiraIdentity(tenantId: string, userId: string, externalId: string | null, generation = 0) {
+      await superuserPool().query(
+        `INSERT INTO user_jira_identities (tenant_id, user_id, generation, pipedream_external_user_id)
+         VALUES ($1, $2, $3, $4)`,
+        [tenantId, userId, generation, externalId]
+      );
+    }
+
+    async function seedJiraConnection(tenantId: string, userId: string, externalId: string, accountId: string) {
+      await superuserPool().query(
+        `INSERT INTO user_jira_connections (tenant_id, user_id, pipedream_external_user_id, pipedream_account_id,
+           account_name, jira_cloud_id, jira_site_name, jira_site_url)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+        [tenantId, userId, externalId, accountId, `${marker} account`, randomUUID(), `${marker} site`,
+          `https://${marker.toLowerCase()}.atlassian.net`]
+      );
+    }
+
+    async function seedJiraCleanup(tenantId: string, userId: string, externalId: string, reason: string) {
+      await superuserPool().query(
+        `INSERT INTO user_jira_cleanups (tenant_id, user_id, pipedream_external_user_id, reason)
+         VALUES ($1, $2, $3, $4)`,
+        [tenantId, userId, externalId, reason]
+      );
+    }
+
+    async function seedOauth(provider: "github" | "notion" | "microsoft", tenantId: string, userId: string) {
+      const token = `${marker}-${provider}-token`;
+      if (provider === "github") {
+        await superuserPool().query(
+          `INSERT INTO user_github_connections (tenant_id, user_id, github_user_id, github_login, access_token_encrypted)
+           VALUES ($1, $2, $3, $4, $5)`,
+          [tenantId, userId, `${marker}-gh-id`, `${marker}-login`, token]
+        );
+      } else if (provider === "notion") {
+        await superuserPool().query(
+          `INSERT INTO user_notion_connections (tenant_id, user_id, notion_user_id, access_token_encrypted)
+           VALUES ($1, $2, $3, $4)`,
+          [tenantId, userId, `${marker}-notion-id`, token]
+        );
+      } else {
+        await superuserPool().query(
+          `INSERT INTO user_microsoft_connections (tenant_id, user_id, microsoft_user_id, access_token_encrypted)
+           VALUES ($1, $2, $3, $4)`,
+          [tenantId, userId, `${marker}-ms-id`, token]
+        );
+      }
+    }
+
+    async function seedMcpCredential(tenantId: string, userId: string, secret: string | null) {
+      await superuserPool().query(
+        `INSERT INTO member_mcp_credentials (tenant_id, user_id, server_id, credential_binding_id, secret_encrypted, account_label)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [tenantId, userId, `server-${randomUUID()}`, randomUUID(), secret, `${marker} label`]
+      );
+    }
+
+    test("records the counts read before the cascade, for this tenant only, without ids or secrets", async () => {
+      const target = await seedTenant();
+      const other = await seedTenant();
+      const connected = await seedUser();
+      const started = await seedUser();
+      const disconnected = await seedUser();
+      const departed = await seedUser();
+      await seedMembership(target, connected, "owner");
+      await seedMembership(target, started);
+      await seedMembership(target, disconnected);
+      // `departed` was removed earlier: only its retired identity and cleanup stay.
+
+      // Two sessions saved the same sandbox id: one sandbox.
+      for (const sandboxId of [`${marker}-sbx-a`, `${marker}-sbx-a`, `${marker}-sbx-b`]) {
+        await setSandbox(await seedSession(target, connected), sandboxId);
+      }
+      await seedSession(target, started);
+
+      // Current ids: one with a selected account, one from an authorization
+      // that selected no account. Retired ids: one disconnect with two cleanup
+      // rows, and one member removal.
+      await seedJiraIdentity(target, connected, `${marker}-ext-connected`);
+      await seedJiraConnection(target, connected, `${marker}-ext-connected`, "apn_target1");
+      await seedJiraIdentity(target, started, `${marker}-ext-started`);
+      await seedJiraIdentity(target, disconnected, null, 1);
+      await seedJiraCleanup(target, disconnected, `${marker}-ext-disconnected`, "user_disconnect");
+      await seedJiraCleanup(target, disconnected, `${marker}-ext-disconnected`, "project_changed");
+      await seedJiraIdentity(target, departed, null, 1);
+      await seedJiraCleanup(target, departed, `${marker}-ext-departed`, "member_removed");
+
+      await seedOauth("github", target, connected);
+      await seedOauth("github", target, started);
+      await seedOauth("microsoft", target, disconnected);
+      await seedMcpCredential(target, connected, `${marker}-mcp-secret`);
+      // A removed credential keeps its row without a secret.
+      await seedMcpCredential(target, started, null);
+
+      // The other tenant has one of each, so a count without the tenant
+      // predicate gives other numbers.
+      const otherUser = await seedUser();
+      await seedMembership(other, otherUser, "owner");
+      await setSandbox(await seedSession(other, otherUser), `${marker}-sbx-other`);
+      await seedJiraIdentity(other, otherUser, `${marker}-ext-other`);
+      await seedJiraConnection(other, otherUser, `${marker}-ext-other`, "apn_other1");
+      await seedJiraCleanup(other, otherUser, `${marker}-ext-other-old`, "user_disconnect");
+      for (const provider of ["github", "notion", "microsoft"] as const) await seedOauth(provider, other, otherUser);
+      await seedMcpCredential(other, otherUser, `${marker}-mcp-other`);
+
+      const service = deletionService();
+      const input = deletion(target);
+      const receipt = await service.execute(input);
+
+      const expected = {
+        e2bSandboxes: 2,
+        jira: {
+          externalUserIds: 4,
+          activeExternalUserIds: 2,
+          activeExternalUserIdsWithoutSelectedAccount: 1,
+          selectedAccounts: 1,
+          retiredExternalUserIdsPendingCleanup: 2,
+          pendingCleanups: 3
+        },
+        oauthConnections: { github: 2, notion: 0, microsoft: 1 },
+        personalMcpCredentials: 1
+      };
+      expect(receipt.status).toBe("completed");
+      expect(receipt.externalResources).toEqual(expected);
+      expect(receipt.thirdPartyDisposition).toBe(input.thirdPartyDisposition);
+      // The rows that the counts came from are gone.
+      for (const table of [
+        "user_jira_identities", "user_jira_connections", "user_jira_cleanups", "user_github_connections",
+        "user_microsoft_connections", "member_mcp_credentials", "sessions"
+      ]) {
+        expect((await superuserPool().query(`SELECT 1 FROM ${table} WHERE tenant_id = $1`, [target])).rowCount, table).toBe(0);
+      }
+
+      const stored = await superuserPool().query(
+        `SELECT external_resources FROM tenant_deletion_receipts WHERE request_id = $1`,
+        [input.requestId]
+      );
+      expect(stored.rows[0].external_resources).toEqual(expected);
+      expect(JSON.stringify(receipt)).not.toContain(marker);
+      expect(JSON.stringify(receipt)).not.toContain("apn_");
+      expect(JSON.stringify(receipt)).not.toContain(target);
+
+      // A replay finds no row to count and returns the stored counts.
+      expect(await service.execute(input)).toEqual(receipt);
+
+      // The other tenant keeps its rows, and its own deletion counts only them.
+      const otherReceipt = await service.execute(deletion(other));
+      expect(otherReceipt.externalResources).toEqual({
+        e2bSandboxes: 1,
+        jira: {
+          externalUserIds: 2,
+          activeExternalUserIds: 1,
+          activeExternalUserIdsWithoutSelectedAccount: 0,
+          selectedAccounts: 1,
+          retiredExternalUserIdsPendingCleanup: 1,
+          pendingCleanups: 1
+        },
+        oauthConnections: { github: 1, notion: 1, microsoft: 1 },
+        personalMcpCredentials: 1
+      });
+    });
+
+    test("a tenant without such resources records zeros, not null", async () => {
+      const tenantId = await seedTenant();
+      await seedMembership(tenantId, await seedUser(), "owner");
+
+      const receipt = await deletionService().execute(deletion(tenantId));
+
+      expect(receipt.externalResources).toEqual({
+        e2bSandboxes: 0,
+        jira: {
+          externalUserIds: 0,
+          activeExternalUserIds: 0,
+          activeExternalUserIdsWithoutSelectedAccount: 0,
+          selectedAccounts: 0,
+          retiredExternalUserIdsPendingCleanup: 0,
+          pendingCleanups: 0
+        },
+        oauthConnections: { github: 0, notion: 0, microsoft: 0 },
+        personalMcpCredentials: 0
+      });
+    });
+
+    // A receipt from before migration 093 has no counts. A replay must not
+    // write counts for it: the rows are gone, so they would all be zero.
+    test("a receipt written before the counts existed keeps null on replay", async () => {
+      const tenantId = `tenant-gone-${randomUUID()}`;
+      const requestId = `NONPROD-OFFBOARD-${randomUUID()}`;
+      await superuserPool().query(
+        `INSERT INTO tenant_deletion_receipts (request_id, tenant_id_hash, status, redis_disposition,
+           third_party_disposition, backup_disposition, database_deleted_at, completed_at)
+         VALUES ($1, encode(sha256(convert_to($2, 'UTF8')), 'hex'), 'completed', 'r', 'Old attestation.', 'b', NOW(), NOW())`,
+        [requestId, tenantId]
+      );
+
+      const receipt = await deletionService().execute({ ...deletion(tenantId), requestId });
+
+      expect(receipt).toMatchObject({ status: "completed", externalResources: null, thirdPartyDisposition: "Old attestation." });
+      const stored = await superuserPool().query(
+        `SELECT external_resources FROM tenant_deletion_receipts WHERE request_id = $1`,
+        [requestId]
+      );
+      expect(stored.rows[0].external_resources).toBeNull();
+    });
+  });
+
   // Member removal (routes/tenant.ts) deletes only the membership row. The
   // removed member's sessions, jobs, settings and audit events stay in that
   // tenant, so a user without a membership can still belong to another tenant.

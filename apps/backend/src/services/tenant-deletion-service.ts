@@ -34,8 +34,39 @@ export type TenantDeletionInput = {
   tenantId: string;
   /** Recorded when this request deletes the rows; a replay keeps the stored text. */
   redisDisposition: string;
+  /** The operator's statement. The service does not check it against `externalResources`. */
   thirdPartyDisposition: string;
   backupDisposition: string;
+};
+
+/**
+ * Counts of the tenant's resources outside this database, read before the
+ * cascade deletes their rows. Tenant deletion deletes only the local rows: it
+ * kills no sandbox and revokes no token or account. The counts tell the
+ * operator what to check at each provider; they hold no id, label or secret.
+ */
+export type ExternalResourceInventory = {
+  /** Distinct `sessions.sandbox_id` values. E2B can have expired some already. */
+  e2bSandboxes: number;
+  /** Pipedream Connect external user ids. Each one can own Jira accounts in Pipedream. */
+  jira: {
+    /** Distinct ids, current and retired together: the number of ids to check in Pipedream. */
+    externalUserIds: number;
+    /** Current ids, from `user_jira_identities` and `user_jira_connections`. */
+    activeExternalUserIds: number;
+    /** Current ids without a selected account: an authorization started, and accounts can exist that no row names. */
+    activeExternalUserIdsWithoutSelectedAccount: number;
+    /** Distinct selected Pipedream account ids (`user_jira_connections`). */
+    selectedAccounts: number;
+    /** Distinct retired ids whose remote delete did not finish (`user_jira_cleanups`). */
+    retiredExternalUserIdsPendingCleanup: number;
+    /** `user_jira_cleanups` rows. More than the ids above when one id has more than one row. */
+    pendingCleanups: number;
+  };
+  /** Connection rows, each with a stored OAuth token. The grant at the provider stays until it is revoked or expires. */
+  oauthConnections: { github: number; notion: number; microsoft: number };
+  /** `member_mcp_credentials` rows that hold a secret. */
+  personalMcpCredentials: number;
 };
 
 export type TenantDeletionReceipt = {
@@ -43,6 +74,8 @@ export type TenantDeletionReceipt = {
   tenantIdHash: string;
   status: "cleanup_pending" | "cleanup_failed" | "completed";
   rowCounts: Record<string, number>;
+  /** Null for a receipt written before the inventory existed: the counts were not recorded. */
+  externalResources: ExternalResourceInventory | null;
   objectCount: number;
   runtimeThreadCount: number;
   deletedObjectCount: number;
@@ -138,6 +171,7 @@ function receiptFromRow(row: Record<string, unknown>): TenantDeletionReceipt {
     tenantIdHash: String(row.tenant_id_hash),
     status: row.status as TenantDeletionReceipt["status"],
     rowCounts: (row.row_counts as Record<string, number>) ?? {},
+    externalResources: (row.external_resources as ExternalResourceInventory | null | undefined) ?? null,
     objectCount: Number(row.object_count),
     runtimeThreadCount: Number(row.runtime_thread_count),
     deletedObjectCount: Number(row.deleted_object_count),
@@ -183,6 +217,68 @@ async function countTenantRows(client: PoolClient, tenantId: string): Promise<Re
     counts[tableName] = Number(result.rows[0]?.count ?? 0);
   }
   return counts;
+}
+
+// Call this in the deletion transaction, before the tenant delete: the
+// cascade removes every row that it counts. A retirement gives the member a new Jira
+// external id, so a retired id is normally not also current; the union counts
+// an id in both groups once.
+async function countExternalResources(client: PoolClient, tenantId: string): Promise<ExternalResourceInventory> {
+  const result = await client.query<Record<string, number>>(
+    `
+      WITH active_jira AS (
+        SELECT pipedream_external_user_id AS id
+          FROM user_jira_identities
+         WHERE tenant_id = $1 AND pipedream_external_user_id IS NOT NULL
+        UNION
+        SELECT pipedream_external_user_id FROM user_jira_connections WHERE tenant_id = $1
+      ),
+      retired_jira AS (
+        SELECT DISTINCT pipedream_external_user_id AS id FROM user_jira_cleanups WHERE tenant_id = $1
+      )
+      SELECT
+        (SELECT COUNT(DISTINCT sandbox_id) FROM sessions
+          WHERE tenant_id = $1 AND sandbox_id IS NOT NULL)::int AS e2b_sandboxes,
+        (SELECT COUNT(*) FROM (SELECT id FROM active_jira UNION SELECT id FROM retired_jira) ids)::int
+          AS jira_external_user_ids,
+        (SELECT COUNT(*) FROM active_jira)::int AS jira_active_external_user_ids,
+        (SELECT COUNT(*) FROM active_jira a
+          WHERE NOT EXISTS (
+            SELECT 1 FROM user_jira_connections c
+             WHERE c.tenant_id = $1 AND c.pipedream_external_user_id = a.id
+          ))::int AS jira_active_without_selected_account,
+        (SELECT COUNT(DISTINCT pipedream_account_id) FROM user_jira_connections
+          WHERE tenant_id = $1)::int AS jira_selected_accounts,
+        (SELECT COUNT(*) FROM retired_jira)::int AS jira_retired_pending_cleanup,
+        (SELECT COUNT(*) FROM user_jira_cleanups WHERE tenant_id = $1)::int AS jira_pending_cleanups,
+        (SELECT COUNT(*) FROM user_github_connections WHERE tenant_id = $1)::int AS github_connections,
+        (SELECT COUNT(*) FROM user_notion_connections WHERE tenant_id = $1)::int AS notion_connections,
+        (SELECT COUNT(*) FROM user_microsoft_connections WHERE tenant_id = $1)::int AS microsoft_connections,
+        (SELECT COUNT(*) FROM member_mcp_credentials
+          WHERE tenant_id = $1 AND secret_encrypted IS NOT NULL)::int AS personal_mcp_credentials
+    `,
+    [tenantId]
+  );
+  const row = result.rows[0];
+  if (!row) throw new Error("External resource count returned no row.");
+  const count = (column: string) => Number(row[column] ?? 0);
+  return {
+    e2bSandboxes: count("e2b_sandboxes"),
+    jira: {
+      externalUserIds: count("jira_external_user_ids"),
+      activeExternalUserIds: count("jira_active_external_user_ids"),
+      activeExternalUserIdsWithoutSelectedAccount: count("jira_active_without_selected_account"),
+      selectedAccounts: count("jira_selected_accounts"),
+      retiredExternalUserIdsPendingCleanup: count("jira_retired_pending_cleanup"),
+      pendingCleanups: count("jira_pending_cleanups")
+    },
+    oauthConnections: {
+      github: count("github_connections"),
+      notion: count("notion_connections"),
+      microsoft: count("microsoft_connections")
+    },
+    personalMcpCredentials: count("personal_mcp_credentials")
+  };
 }
 
 // Every column that can store a user id: each foreign key to users from the
@@ -335,6 +431,7 @@ export class TenantDeletionService {
       }
 
       const rowCounts = await countTenantRows(client, input.tenantId);
+      const externalResources = await countExternalResources(client, input.tenantId);
       const userReferences = await loadUserReferences(client);
       // Member removal deletes only the membership, so a former member is
       // found through the tenant's other rows. Lock the users rows before the
@@ -354,15 +451,16 @@ export class TenantDeletionService {
       await client.query(
         `
           INSERT INTO tenant_deletion_receipts (
-            request_id, tenant_id_hash, status, row_counts,
+            request_id, tenant_id_hash, status, row_counts, external_resources,
             redis_disposition, third_party_disposition, backup_disposition,
             database_deleted_at
-          ) VALUES ($1, $2, 'cleanup_pending', $3::jsonb, $4, $5, $6, NOW())
+          ) VALUES ($1, $2, 'cleanup_pending', $3::jsonb, $4::jsonb, $5, $6, $7, NOW())
         `,
         [
           input.requestId,
           tenantHash(input.tenantId),
           JSON.stringify(rowCounts),
+          JSON.stringify(externalResources),
           input.redisDisposition,
           input.thirdPartyDisposition,
           input.backupDisposition
