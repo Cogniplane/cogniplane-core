@@ -21,6 +21,10 @@ export function clearIdleTimer(host: IdleTimerHost): void {
  * delete, purge or a security change of the account kills it.
  * Skipped while the session is busy or already torn down — onIdle must never
  * fire mid-turn.
+ *
+ * Both checks run again when the timer fires. A turn that is still being
+ * prepared (`deferWhile`) arms the timer again instead: the turn clears it when
+ * it starts, and a turn that never starts lets it fire later.
  */
 export function scheduleIdleTeardown(
   host: IdleTimerHost,
@@ -28,6 +32,8 @@ export function scheduleIdleTeardown(
     timeoutMs: number;
     /** Busy or already-closed sessions must not arm the timer. */
     isBusy: () => boolean;
+    /** A next turn that prepares to use the runtime. Read when the timer fires. */
+    deferWhile?: () => boolean;
     /** Teardown action (deep-agents: abortSession). */
     onIdle: () => Promise<void>;
     logger: Pick<FastifyBaseLogger, "error">;
@@ -38,6 +44,11 @@ export function scheduleIdleTeardown(
   if (opts.isBusy()) return;
   host.idleTimer = setTimeout(() => {
     host.idleTimer = null;
+    if (opts.isBusy()) return;
+    if (opts.deferWhile?.()) {
+      scheduleIdleTeardown(host, opts);
+      return;
+    }
     void opts.onIdle().catch((err: unknown) => {
       opts.logger.error({ err, ...opts.logContext }, "idle teardown failed");
     });

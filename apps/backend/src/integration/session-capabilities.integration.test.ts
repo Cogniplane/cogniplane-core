@@ -225,7 +225,7 @@ describe.skipIf(!adminDatabaseUrl())("session capability persistence", () => {
     await expect(store.getCapabilitySelection(tenant, id, outsider)).rejects.toThrow("Session not found");
   });
 
-  test("pending approvals and streaming turns lock changes", async () => {
+  test("pending approvals lock changes; a reply left streaming without a lease does not", async () => {
     const tenant = await seedTenant(), user = await seedUser();
     const id = await seedSession(tenant, user), runtimeId = await seedRuntimeSession(tenant, user, id);
     const store = new SessionStore(appPool());
@@ -234,10 +234,9 @@ describe.skipIf(!adminDatabaseUrl())("session capability persistence", () => {
     expect((await store.getCapabilities(tenant, id, user)).canEdit).toBe(false);
     expect(await store.setCapabilities(tenant, id, user, update)).toBe(false);
     await superuserPool().query("UPDATE approvals SET status = 'approved' WHERE approval_id = $1", [approval]);
-    const message = await seedStreamingMessage(tenant, user, id);
-    expect((await store.getCapabilities(tenant, id, user)).canEdit).toBe(false);
-    expect(await store.setCapabilities(tenant, id, user, update)).toBe(false);
-    await superuserPool().query("UPDATE messages SET status = 'completed' WHERE message_id = $1", [message]);
+    // The lease is the only rule for a running turn (sessionBusySql); the sweep closes such a reply.
+    await seedStreamingMessage(tenant, user, id);
+    expect((await store.getCapabilities(tenant, id, user)).canEdit).toBe(true);
     expect(await store.setCapabilities(tenant, id, user, update)).toBe(true);
   });
 

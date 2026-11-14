@@ -6,6 +6,8 @@ import type { ProjectInstructionsSnapshot } from "@cogniplane/shared-types";
 import type { BaseEvent } from "@ag-ui/client";
 
 import type { RuntimeReasoningEffort } from "../../runtime-contracts.js";
+import type { CheckpointWriteFence } from "../session-execution-store.js";
+import { CHECKPOINT_FENCE_KEY } from "./deep-agents-checkpointer.js";
 import { ToolCallIdTracker } from "./tool-call-id-tracker.js";
 import type {
   DeepAgentsGraph,
@@ -72,6 +74,12 @@ export interface SessionAGUITurnBackendParams {
   generativeUiContext?: string | null;
   generativeUiTransport?: "tool";
   signal?: AbortSignal;
+  /**
+   * The execution of this turn, copied when the turn starts. Every stream pass,
+   * also a resume after an approval, writes checkpoints under it, even when the
+   * runtime serves a newer execution later.
+   */
+  checkpointFence?: CheckpointWriteFence;
   /** Records availability after the graph and its tools have loaded. */
   onGraphReady?: () => Promise<void>;
   /** Bridges to the shared approval plane (adapter-supplied in production). */
@@ -90,6 +98,7 @@ export function createSessionAGUITurnBackend(
   params: SessionAGUITurnBackendParams
 ): AGUITurnBackend {
   const { threadId, runtime, toolContextRef, modelId, effort, promptText, signal } = params;
+  const fence = params.checkpointFence ? Object.freeze({ ...params.checkpointFence }) : undefined;
   let graph: DeepAgentsGraph | null = null;
   // Child runs inherit the turn's callbacks, so delegated tools report too.
   const callIds = new ToolCallIdTracker();
@@ -125,7 +134,7 @@ export function createSessionAGUITurnBackend(
       yield* g.streamEvents(input, {
         version: "v2",
         callbacks,
-        configurable: { thread_id: threadId },
+        configurable: { thread_id: threadId, ...(fence ? { [CHECKPOINT_FENCE_KEY]: fence } : {}) },
         context: {
           projectInstructions: params.projectInstructions ?? null,
           memoryContext: params.memoryContext ?? null,

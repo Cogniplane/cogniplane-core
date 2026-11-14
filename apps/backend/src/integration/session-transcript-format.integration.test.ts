@@ -10,7 +10,7 @@ import { registerAdminSessionDetailRoute } from "../routes/admin/admin-session-d
 import { createDeepAgentsCheckpointer } from "../services/deep-agents/deep-agents-checkpointer.js";
 import { ProjectStore } from "../services/project-store.js";
 import { CURRENT_TRANSCRIPT_FORMAT, SessionStore } from "../services/session-store.js";
-import { adminDatabaseUrl, appPool, runAppUserUrl, superuserPool } from "./support/database.js";
+import { adminDatabaseUrl, appPool, runAppUserUrl, superuserPool, unfencedCheckpointWriter } from "./support/database.js";
 import { seedMembership, seedMessage, seedSession, seedTenant, seedUser } from "./support/fixtures.js";
 import { buildMessageApp } from "./support/message-app.js";
 import { withStagedDatabase } from "./support/staged-migrations.js";
@@ -157,7 +157,7 @@ describe.skipIf(!adminDatabaseUrl())("session history format", () => {
     await setFormat(unsupported, CURRENT_TRANSCRIPT_FORMAT + 1);
     for (const sessionId of [legacy, unsupported]) {
       await seedMessage(tenantId, userId, sessionId);
-      await checkpointer.put({ configurable: { thread_id: sessionId, checkpoint_ns: "" } }, {
+      await unfencedCheckpointWriter().put({ configurable: { thread_id: sessionId, checkpoint_ns: "" } }, {
         v: 4, id: `cp-${sessionId}`, ts: new Date().toISOString(),
         channel_values: { messages: ["old context"] }, channel_versions: { messages: 1 }, versions_seen: {}
       }, { source: "input", step: 1, parents: {} }, { messages: 1 });

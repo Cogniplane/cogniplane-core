@@ -266,7 +266,9 @@ describe.skipIf(!adminDatabaseUrl())("durable session execution", () => {
       })]);
     } finally { await app.close(); }
 
-    // The release of a stopped lease changes nothing, and the session is free.
+    // The stopped lease holds the session until its owner releases it.
+    await expect(other.acquire({ tenantId, sessionId: scheduledSession, userId }, 30_000, caps))
+      .rejects.toMatchObject({ code: "session_busy" });
     await worker.release(scheduled);
     expect(await listed()).toMatchObject({ isRunning: false });
     const next = await other.acquire({ tenantId, sessionId: scheduledSession, userId }, 30_000, caps);
@@ -472,6 +474,9 @@ describe.skipIf(!adminDatabaseUrl())("durable session execution", () => {
     expect(await h.executions.isCurrent(execution)).toBe(true);
     expect((await superuserPool().query("SELECT status FROM approvals WHERE approval_id=$1", [approvalId])).rows[0].status).toBe("pending");
     await h.executions.stop({ ...h.actor, userId: h.userId });
+    await expect(h.projects.setArchived(h.tenantId, h.userId, h.owner.projectId, true))
+      .rejects.toMatchObject({ code: "project_busy", status: 409 });
+    await h.executions.release(execution);
     expect(await h.projects.setArchived(h.tenantId, h.userId, h.owner.projectId, true)).toBe(true);
     await expect(h.executions.acquire(h.actor, 60_000)).rejects.toMatchObject({ code: "project_archived" });
   });
@@ -586,6 +591,9 @@ describe.skipIf(!adminDatabaseUrl())("durable session execution", () => {
     await expect(mutate()).rejects.toMatchObject({ code: "session_busy", statusCode: 409 });
     expect(await h.executions.isCurrent(execution)).toBe(true);
     await h.executions.stop(h.actor);
+    // The stopped turn still unwinds on its owner until the owner releases the lease.
+    await expect(mutate()).rejects.toMatchObject({ code: "session_busy", statusCode: 409 });
+    await h.executions.release(execution);
     expect(await mutate()).toBeTruthy();
   });
 

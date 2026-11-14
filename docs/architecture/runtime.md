@@ -76,6 +76,39 @@ at the next turn:
   `sessions` table and check access.
 - Idle teardown keeps the thread. Permanent session deletion purges it.
 
+### Write fence
+
+A turn writes checkpoints only while its execution holds the session lease.
+
+- When a turn starts, the adapter copies its execution: tenant, session, user,
+  execution id, owner and runtime id (`CheckpointWriteFence`). It passes the
+  copy in the LangGraph `configurable` of every stream pass of the turn,
+  including the resume after an approval (`CHECKPOINT_FENCE_KEY`,
+  `deep-agents-agui-backend.ts`). LangGraph copies it into the config of every
+  `put` and `putWrites`, also in subgraphs and subagents. A later turn on the
+  same warm runtime has its own copy, so late work of an earlier turn keeps
+  the earlier execution.
+- `ExecutionFencedCheckpointSaver` runs each `put` and `putWrites` in one
+  transaction. The first statement after `BEGIN` is
+  `lockExecutionForCheckpointWrite` (`session-execution-store.ts`). It locks
+  the lease row `FOR SHARE` and continues only if that execution is `active`,
+  not expired, with the same owner, user and runtime. Otherwise the write rolls
+  back with `execution_stopped`. A write with no fence, or for another thread
+  than the session of its fence, fails before it connects.
+- Guarantee: every change of the lease updates that row. A stop, a release, an
+  expiry, the replacement in `acquire`, a security change and the revocation
+  triggers all wait for a write in progress. A write that comes after the change
+  waits for it, then fails. A write that passed the check before a change
+  commits before it. After the change, no write of the earlier execution
+  commits. A `stopping` lease writes nothing.
+- Reads and `deleteThread` take no fence. Deletion runs after the session row is
+  gone; deleting it also deletes the lease row, so a later write fails.
+- Project sessions use an in-memory saver per runtime and are not fenced. Their
+  history comes from the saved transcript.
+- Rolling upgrade: a backend of a release before migration `093` writes
+  checkpoints with no fence. Its late writes are refused only after every
+  backend runs this release ([operations](../operations.md#upgrade-to-execution-stopping-and-the-checkpoint-fence)).
+
 ## Sessions and turns
 
 - Session routes (`routes/sessions.ts`): list, create, rename, `archive`,
@@ -89,9 +122,30 @@ at the next turn:
   `MAX_RUNNING_TURNS_PER_TENANT` cap running turns (429 `running_turn_limit`).
   Interactive and [scheduled](#scheduler) turns take the same lease and count
   toward the same caps. The session list shows a session as running while its
-  lease is active.
+  lease is active or stopping.
+- The lease is the only rule for "a turn runs in this session". The local
+  registries (`ActiveTurnsRegistry`, the adapter's turn set) only answer
+  first on the replica that runs the turn. A session is busy
+  (`sessionBusySql`, `session-execution-store.ts`) while its lease is `active`
+  or `stopping` and not expired, or while it has a pending approval that has not
+  expired. Turn admission, archive (also of a personal chat), capability edits,
+  project skill changes, project archive and attaching a chat to a project read
+  this rule. Delete of a personal chat does not wait: it stops the turn.
+- A `stopping` lease has no authority (every authority check requires
+  `active`), but it keeps the session busy until the owner releases it
+  (`stopped`) or it expires.
+- When an interactive turn loses its lease, its replica calls `abortSession`
+  for that execution. This only asks the runtime to stop: it resolves when the
+  runtime is disposed, and the turn's stream can still run then. The replica
+  releases the lease when the request has ended: the stream and the final
+  writes of the reply, or the setup, which stops at its next step. If the
+  request does not end in `SESSION_EXECUTION_LEASE_MS`, the replica releases
+  anyway. Then a newer turn can start while the old one still runs. The old
+  turn cannot dispatch model or tool calls, and its checkpoint writes fail
+  ([write fence](#write-fence)).
 - `RUNTIME_IDLE_TIMEOUT_MS` (`idle-teardown.ts`) tears down an idle session
-  runtime. It kills the sandbox only when no binding is saved (project chats); a
+  runtime. When the timer fires during a pending `createSession` or an admitted
+  turn, it arms again and does not tear down. It kills the sandbox only when no binding is saved (project chats); a
   bound sandbox stays until E2B expires it, and the next turn reconnects. The
   conversation resumes as in [Session types](#session-types).
 - `RUNTIME_TURN_TIMEOUT_MS` aborts a stuck turn and is paused while an approval
@@ -146,12 +200,13 @@ scheduled turns:
   private-key blocks with `[REDACTED PRIVATE KEY]`. Text without whitespace,
   such as Chinese or Japanese, is released in parts, cut where no secret rule
   can match across the cut. Keep this when you change the replay path.
-- `POST /sessions/:sessionId/interrupt` fences the execution in the database.
-  The replica that runs the turn sees the fence through dispatch authorization
-  and its heartbeat, and dispatches no further model or tool call; a sandbox
+- `POST /sessions/:sessionId/interrupt` sets the lease to `stopping`. The
+  replica that runs the turn sees the stop through dispatch authorization and
+  its heartbeat, and dispatches no further model or tool call; a sandbox
   command already running continues ([sandbox](sandbox.md#sandbox-network)). A
-  Redis stop channel makes this faster. The interrupt names the fenced
-  execution, so a late stop does not stop a newer turn of the session.
+  Redis stop channel makes this faster. The interrupt names the stopped
+  execution, so a late stop does not stop a newer turn of the session. A new
+  message gets `session_busy` until the old turn released the lease.
 - Only a user who can edit the session stops its turn
   (`sessionExecutionAccessSql`). An organization admin gets 404 for another
   member's chat, also for a scheduled turn. To stop the model calls of such a
@@ -298,7 +353,8 @@ teardown.
 |---|---|---|
 | Scheduler: jobs, PII scan jobs, session trash, scheduled session and project file retention | `services/scheduler-worker.ts`, `build-scheduler-worker.ts` | Every `SCHEDULER_POLL_INTERVAL_MS` |
 | Mail outbox | `services/mail/mail-outbox-worker.ts` | Every `MAIL_POLL_INTERVAL_MS` (`MAIL_CLEANUP_INTERVAL_MS` with email off; code constants) |
-| Expired session execution leases | `app-bootstrap.ts` | At start, then every `SESSION_EXECUTION_HEARTBEAT_MS` |
+| Expired session execution leases, then replies left `pending` or `streaming` in a session that is not busy, with no write for `SESSION_EXECUTION_LEASE_MS` (`SessionExecutionStore.sweepOrphanedReplies`) | `app-bootstrap.ts` | At start, then every `SESSION_EXECUTION_HEARTBEAT_MS` |
+| `runtime_sessions` rows of a process that is gone: the process renews the owner stamp of its rows, and the sweep terminates rows not renewed for `RUNTIME_OWNER_STALE_MS`, or rows with no owner (older versions) not updated for `UNOWNED_RUNTIME_STALE_MS`. A row whose runtime holds a lease stays. | `app-bootstrap.ts`, `runtime-session-store.ts` | At start, then every `RUNTIME_OWNER_HEARTBEAT_MS` |
 | Stale approvals | `services/runtime/stale-approval-sweeper.ts` | At start, then every `APPROVAL_REQUEST_TTL_MS` |
 | Stale assistant messages | `services/runtime/stale-message-sweeper.ts` | At start, then at its stale deadline |
 | Idle session runtimes | `services/runtime/idle-teardown.ts` | Per session, after `RUNTIME_IDLE_TIMEOUT_MS` |

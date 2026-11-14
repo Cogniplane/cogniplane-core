@@ -1,9 +1,10 @@
 // Archive, delete and purge of a normal chat take its saved sandbox, so that the
 // caller can kill it. The store reads `sessions.sandbox_id` under the session row
-// lock and clears it in the transaction that changes the status, and the status
-// change stops the turn that holds the lease. Only real PostgreSQL shows that the
-// record is cleared in that transaction, that a stopped lease cannot write it
-// back, and that a record write that holds the lock first is the one taken.
+// lock and clears it in the transaction that changes the status. Delete stops the
+// turn that holds the lease; archive waits until no turn holds it. Only real
+// PostgreSQL shows that the record is cleared in that transaction, that a lease
+// that is no longer active cannot write it back, and that a record write that
+// holds the lock first is the one taken.
 
 import { describe, expect, test, vi } from "vitest";
 
@@ -34,19 +35,27 @@ const saved = (sandboxId: string, hash: string) => ({ sandbox_id: sandboxId, san
 const cleared = { sandbox_id: null, sandbox_network_policy: null };
 
 describe.skipIf(!adminDatabaseUrl())("sandbox of a disposed session", () => {
-  test("archive takes the saved sandbox once, and the stopped turn cannot write a record back", async () => {
+  test("archive waits for the turn, takes the saved sandbox once, and the old turn cannot write a record back", async () => {
     const c = await chatWithSandbox();
     const foreignTenant = await seedTenant(), foreignUser = await seedUser();
     expect(await c.sessions.setArchived(foreignTenant, c.sessionId, c.userId, true)).toBeNull();
     expect(await c.sessions.setArchived(c.tenantId, c.sessionId, foreignUser, true)).toBeNull();
     expect(await record(c.tenantId, c.sessionId)).toEqual(saved("sandbox-one", "policy-a"));
 
+    // A turn holds the lease, also after a stop, until its owner releases it.
+    await expect(c.sessions.setArchived(c.tenantId, c.sessionId, c.userId, true))
+      .rejects.toMatchObject({ code: "session_busy" });
+    await c.executions.stop(c.actor);
+    await expect(c.sessions.setArchived(c.tenantId, c.sessionId, c.userId, true))
+      .rejects.toMatchObject({ code: "session_busy" });
+    expect(await record(c.tenantId, c.sessionId)).toEqual(saved("sandbox-one", "policy-a"));
+    await c.executions.release(c.execution);
+
     const archived = await c.sessions.setArchived(c.tenantId, c.sessionId, c.userId, true);
     expect(archived).toMatchObject({ session: { sessionId: c.sessionId, status: "archived" }, releasedSandboxId: "sandbox-one" });
     expect(await record(c.tenantId, c.sessionId)).toEqual(cleared);
 
-    // The same transaction stopped the execution. Its runtime can neither save a new
-    // sandbox, nor release the old one, nor load a record.
+    // The old execution can neither save a new sandbox, nor release the old one, nor load a record.
     expect(await c.executions.isCurrent(c.execution)).toBe(false);
     await expect(c.executions.bindSandboxId(c.execution, null, "sandbox-late", "policy-a"))
       .rejects.toMatchObject({ code: "execution_stopped" });
@@ -82,6 +91,7 @@ describe.skipIf(!adminDatabaseUrl())("sandbox of a disposed session", () => {
     expect(await record(c.tenantId, c.sessionId)).toEqual(cleared);
 
     const archivedFirst = await chatWithSandbox();
+    await archivedFirst.executions.release(archivedFirst.execution);
     expect((await archivedFirst.sessions.setArchived(archivedFirst.tenantId, archivedFirst.sessionId, archivedFirst.userId, true))
       ?.releasedSandboxId).toBe("sandbox-one");
     expect(await archivedFirst.sessions.remove(archivedFirst.tenantId, archivedFirst.sessionId, archivedFirst.userId))
@@ -99,6 +109,7 @@ describe.skipIf(!adminDatabaseUrl())("sandbox of a disposed session", () => {
     const retired = await chatWithSandbox();
     await retired.executions.releaseSandboxId(retired.execution, "sandbox-one");
     await retired.executions.bindSandboxId(retired.execution, null, "sandbox-two", "policy-b");
+    await retired.executions.release(retired.execution);
     expect(await retired.sessions.setArchived(retired.tenantId, retired.sessionId, retired.userId, true))
       .toMatchObject({ releasedSandboxId: "sandbox-two" });
   });

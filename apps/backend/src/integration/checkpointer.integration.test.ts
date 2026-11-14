@@ -10,15 +10,34 @@
 // It asserts no tenancy boundary, deliberately. The checkpointer tables have no
 // tenant column and no RLS; isolation is app-layer, because thread_id IS the
 // session id and every route resolves the session through the RLS-scoped
-// `sessions` table first.
+// `sessions` table first. Each write holds a session lease, as a turn does: the
+// fence (checkpoint-write-fence.integration.test.ts) reads session_executions
+// as app_user in the same transaction.
 
 import { afterAll, describe, expect, test } from "vitest";
 import type { Checkpoint, CheckpointMetadata } from "@langchain/langgraph";
 import type pg from "pg";
 
-import { createDeepAgentsCheckpointer } from "../services/deep-agents/deep-agents-checkpointer.js";
+import { CHECKPOINT_FENCE_KEY, createDeepAgentsCheckpointer } from "../services/deep-agents/deep-agents-checkpointer.js";
+import { SessionExecutionStore } from "../services/session-execution-store.js";
 
-import { adminDatabaseUrl, runAppUserUrl, runRoleName } from "./support/database.js";
+import { adminDatabaseUrl, appPool, runAppUserUrl, runRoleName } from "./support/database.js";
+import { seedMembership, seedSession, seedTenant, seedUser } from "./support/fixtures.js";
+
+/** A session whose turn holds the lease, and the config that its writes carry. */
+async function leasedThread() {
+  const tenantId = await seedTenant(), userId = await seedUser();
+  await seedMembership(tenantId, userId);
+  const sessionId = await seedSession(tenantId, userId);
+  const executions = new SessionExecutionStore(appPool(), "checkpointer-test");
+  const execution = await executions.acquire({ tenantId, sessionId, userId }, 30_000);
+  await executions.bindRuntime(execution, "runtime-1");
+  const fence = { tenantId, sessionId, userId, executionId: execution.executionId, ownerId: execution.ownerId, runtimeId: "runtime-1" };
+  return {
+    threadId: sessionId,
+    config: { configurable: { thread_id: sessionId, checkpoint_ns: "", [CHECKPOINT_FENCE_KEY]: fence } }
+  };
+}
 
 describe.skipIf(!adminDatabaseUrl())("Deep Agents checkpointer", () => {
   // The saver owns its own pool (PostgresSaver constructs one), so it is not
@@ -67,10 +86,7 @@ describe.skipIf(!adminDatabaseUrl())("Deep Agents checkpointer", () => {
   });
 
   test("a checkpoint written as app_user reads back", async () => {
-    const threadId = `it-thread-${Date.now()}`;
-    const config = {
-      configurable: { thread_id: threadId, checkpoint_ns: "" }
-    };
+    const { threadId, config } = await leasedThread();
 
     const written = await saver!.put(
       config,
@@ -91,14 +107,14 @@ describe.skipIf(!adminDatabaseUrl())("Deep Agents checkpointer", () => {
     // Session deletion purges the thread this way (purgeSessionData). If the
     // grants were read-only, the write above would have failed but this would
     // be the first thing to notice a missing DELETE grant.
-    const threadId = `it-thread-del-${Date.now()}`;
-    const config = { configurable: { thread_id: threadId, checkpoint_ns: "" } };
+    const { threadId, config } = await leasedThread();
+    const read = { configurable: { thread_id: threadId, checkpoint_ns: "" } };
 
     await saver!.put(config, checkpoint("cp-1"), CHECKPOINT_METADATA, NEW_VERSIONS);
-    expect(await saver!.getTuple(config)).toBeDefined();
+    expect(await saver!.getTuple(read)).toBeDefined();
 
     await saver!.deleteThread(threadId);
-    expect(await saver!.getTuple(config)).toBeUndefined();
+    expect(await saver!.getTuple(read)).toBeUndefined();
   });
 
   test("threads are independent", async () => {
@@ -107,17 +123,19 @@ describe.skipIf(!adminDatabaseUrl())("Deep Agents checkpointer", () => {
     //
     // The test writes distinct data to both threads and reads both back. Reading
     // a thread that was never written would pass even if `put` failed silently.
-    const first = `it-thread-a-${Date.now()}`;
-    const second = `it-thread-b-${Date.now()}`;
+    const firstThread = await leasedThread();
+    const secondThread = await leasedThread();
+    const first = firstThread.threadId;
+    const second = secondThread.threadId;
 
     await saver!.put(
-      { configurable: { thread_id: first, checkpoint_ns: "" } },
+      firstThread.config,
       { ...checkpoint("cp-a"), channel_values: { messages: ["thread A value"] } },
       CHECKPOINT_METADATA,
       NEW_VERSIONS
     );
     await saver!.put(
-      { configurable: { thread_id: second, checkpoint_ns: "" } },
+      secondThread.config,
       { ...checkpoint("cp-b"), channel_values: { messages: ["thread B value"] } },
       CHECKPOINT_METADATA,
       NEW_VERSIONS

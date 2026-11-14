@@ -66,3 +66,21 @@ export async function stopLostExecution(input: {
     ...(bySecurityChange ? { reason: "security_change" as const } : {})
   });
 }
+
+/**
+ * Waits for `work`, but not longer than `ms`. Resolves in both cases; `work`
+ * handles its own errors. The caller holds a lease that ends at its expiry
+ * anyway, so it waits at most one lease period before it releases.
+ */
+export async function waitAtMost(work: Promise<unknown>, ms: number): Promise<void> {
+  let timer: NodeJS.Timeout | undefined;
+  const limit = new Promise<void>(resolve => {
+    timer = setTimeout(resolve, ms);
+    timer.unref?.();
+  });
+  try {
+    await Promise.race([work.then(() => undefined, () => undefined), limit]);
+  } finally {
+    clearTimeout(timer);
+  }
+}

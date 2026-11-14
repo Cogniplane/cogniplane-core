@@ -31,6 +31,7 @@ import { buildSettingsRouteStores, registerSettingsRoutes } from "./routes/setti
 import type { RuntimeAdapter } from "./runtime-contracts.js";
 import type { AppDependencies } from "./app-dependencies.js";
 import type { SessionExecutionStore } from "./services/session-execution-store.js";
+import { RUNTIME_OWNER_HEARTBEAT_MS, type RuntimeSessionStore } from "./services/runtime/runtime-session-store.js";
 import type { StopSignal } from "./services/turn-coordination-bus.js";
 import { buildApiKeyPresenceCheckers } from "./services/runtime/api-key-presence.js";
 import type { SchedulerWorker } from "./services/scheduler-worker.js";
@@ -182,7 +183,16 @@ export function registerAppLifecycle(input: {
    * can omit it; production always wires it.
    */
   staleMessageSweeper?: StaleMessageSweeperDeps | null;
-  expiredExecutions?: Pick<SessionExecutionStore, "sweepExpired">;
+  /**
+   * Cross-tenant lease recovery on the privileged pool: expired leases, and
+   * replies left active in a session with no work.
+   */
+  expiredExecutions?: Pick<SessionExecutionStore, "sweepExpired" | "sweepOrphanedReplies">;
+  /**
+   * Runtime rows on the privileged pool, with the owner id of this process:
+   * renews this process's stamp and terminates the rows of a gone process.
+   */
+  runtimeOwners?: Pick<RuntimeSessionStore, "heartbeatOwner" | "sweepOrphaned"> | null;
 }) {
   const {
     app,
@@ -199,7 +209,8 @@ export function registerAppLifecycle(input: {
     mailWorker,
     staleApprovalSweeper,
     staleMessageSweeper,
-    expiredExecutions
+    expiredExecutions,
+    runtimeOwners
   } = input;
 
   schedulerWorker?.start(config.SCHEDULER_POLL_INTERVAL_MS);
@@ -208,11 +219,24 @@ export function registerAppLifecycle(input: {
   const sweepInterval = setInterval(() => limits.sweepExpired(), RATE_LIMIT_SWEEP_INTERVAL_MS);
   sweepInterval.unref();
   const sweepExecutions = () => {
-    void expiredExecutions?.sweepExpired().catch(err => app.log.error({ err }, "Expired execution sweep failed"));
+    if (!expiredExecutions) return;
+    // Then a reply of a turn that ended without closing it, also with the turn watchdog off.
+    void expiredExecutions.sweepExpired()
+      .then(() => expiredExecutions.sweepOrphanedReplies(config.SESSION_EXECUTION_LEASE_MS))
+      .catch(err => app.log.error({ err }, "Expired execution sweep failed"));
   };
   sweepExecutions();
   const executionSweepInterval = setInterval(sweepExecutions, config.SESSION_EXECUTION_HEARTBEAT_MS);
   executionSweepInterval.unref();
+  const sweepRuntimeOwners = () => {
+    if (!runtimeOwners) return;
+    void runtimeOwners.heartbeatOwner()
+      .then(() => runtimeOwners.sweepOrphaned())
+      .catch(err => app.log.error({ err }, "Runtime owner sweep failed"));
+  };
+  sweepRuntimeOwners();
+  const runtimeOwnerInterval = setInterval(sweepRuntimeOwners, RUNTIME_OWNER_HEARTBEAT_MS);
+  runtimeOwnerInterval.unref();
 
   // Recover approvals orphaned by a prior crash/restart immediately at boot,
   // then keep sweeping for ones whose in-process TTL timer dies mid-run. The
@@ -253,6 +277,7 @@ export function registerAppLifecycle(input: {
     mailWorker?.stop();
     clearInterval(sweepInterval);
     clearInterval(executionSweepInterval);
+    clearInterval(runtimeOwnerInterval);
     if (approvalSweepInterval) clearInterval(approvalSweepInterval);
     if (messageSweepInterval) clearInterval(messageSweepInterval);
     const waitForTurns = async (budgetMs: number) => {

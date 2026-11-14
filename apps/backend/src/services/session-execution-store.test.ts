@@ -51,7 +51,7 @@ function admissionPool(world: World) {
       tenant_count: world.activeCounts?.tenant ?? 0,
       user_count: world.activeCounts?.user ?? 0
     }))
-    .onQuery("SELECT execution_id FROM session_executions", () => (world.busy ? one({ execution_id: "running" }) : none))
+    .onQuery("FROM session_executions busy_execution", () => (world.busy ? one({ "?column?": 1 }) : none))
     .onQuery("WITH expired AS", () => one({ count: 0 }))
     .onQuery("INSERT INTO session_executions", () => one({ expires_at: "2026-10-01T12:00:30.000Z" }));
 }
@@ -254,7 +254,7 @@ function leasePool(live: LiveExecution) {
     })
     .onQuery("SET expires_at=clock_timestamp()", (_sql, [, , userId, executionId, , ownerId]) =>
       owns(executionId, userId, ownerId) ? one({ execution_id: executionId }) : none)
-    .onQuery("SET status='finished'", (_sql, [, executionId, userId, ownerId]) =>
+    .onQuery("THEN 'stopped' ELSE 'finished' END", (_sql, [, executionId, userId, ownerId]) =>
       owns(executionId, userId, ownerId) ? one({}) : none)
     .onQuery("SELECT e.execution_id FROM session_executions e", (_sql, [, , userId, executionId, runtimeId]) =>
       owns(executionId, userId) && (runtimeId === null || runtimeId === live.runtimeId) ? one({ execution_id: executionId }) : none);
@@ -334,7 +334,7 @@ describe("SessionExecutionStore fencing", () => {
     expect(await store.isCurrent(execution, "runtime-2")).toBe(false);
     await store.release(stale);
     await store.release(execution);
-    const releases = pool.queries.filter(query => query.text.includes("SET status='finished'"));
+    const releases = pool.queries.filter(query => query.text.includes("ELSE 'finished' END"));
     expect(releases.map(query => query.values[3])).toEqual(["owner-b", "owner-a"]);
   });
 });
@@ -342,7 +342,7 @@ describe("SessionExecutionStore fencing", () => {
 describe("SessionExecutionStore cancellation", () => {
   function cancelPool(stopped: Record<string, unknown> | null, auditError?: Error) {
     return new FakePool()
-      .onQuery("SET status='stopped', stop_reason='cancelled'", () => (stopped ? one(stopped) : none))
+      .onQuery("SET status='stopping', stop_reason='cancelled'", () => (stopped ? one(stopped) : none))
       .onQuery("INSERT INTO audit_events", () => {
         if (auditError) throw auditError;
         return one({});

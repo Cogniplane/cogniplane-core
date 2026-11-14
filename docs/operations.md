@@ -66,6 +66,24 @@ deadlock with a tenant deletion that runs at the same time, rolls the file back
 with no change; run it again. Do not run it while a backend of the earlier
 release still runs: those backends take no lock and do not check the records.
 
+### Upgrade to execution stopping and the checkpoint fence
+
+Migration `093` adds the lease state `stopping`, the owner columns of
+`runtime_sessions`, and their indexes. The new release also fences checkpoint
+writes ([runtime](architecture/runtime.md#write-fence)). While backends of the
+earlier release still run:
+
+- Their admission treats a `stopping` lease as free and replaces it, and their
+  release does not end a `stopping` lease. A turn that a new backend stops on an
+  old backend keeps the session busy until the lease expires
+  (`SESSION_EXECUTION_LEASE_MS`).
+- They write checkpoints with no fence, so their late writes are not refused.
+- Their runtime rows have no owner. The new sweep ends such a row only after
+  24 hours without an update.
+
+A turn of a new backend is fenced also when an old backend replaces its lease.
+After every backend runs the new release, every checkpoint write is fenced.
+
 ### Migration limits
 
 The migration job runs the migrations, the role setup and the grants on one

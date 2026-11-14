@@ -67,7 +67,9 @@ export function buildStores(
   const piiScanRuns = new PiiScanRunStore(db);
   const piiScanJobs = new PiiScanJobStore(db, schedulerDb);
   const piiAnalytics = new PiiAnalyticsStore(db);
-  const runtimeSessions = new RuntimeSessionStore(db);
+  // One id names this process as the owner of its leases and its runtime rows.
+  const executions = new SessionExecutionStore(db);
+  const runtimeSessions = new RuntimeSessionStore(db, executions.ownerId);
   const skills = new SkillConfigStore(db);
   const skillRevisions = new SkillRevisionStore(db, skills);
   if (!timers?.DATA_ENCRYPTION_SECRET) {
@@ -93,7 +95,7 @@ export function buildStores(
       monthlyLimitUsd: timers?.MODEL_SPENDING_MONTHLY_LIMIT_USD ?? null,
       turnReservationUsd: timers?.MODEL_SPENDING_TURN_RESERVATION_USD ?? envSchema.shape.MODEL_SPENDING_TURN_RESERVATION_USD.parse(undefined)
     }),
-    executions: new SessionExecutionStore(db),
+    executions,
     projects: new ProjectStore(db),
     personalCapabilities: new PersonalCapabilityStore(db),
     personalSkills: new PersonalSkillStore(db),

@@ -7,7 +7,7 @@ import type { RuntimeReasoningEffort } from "../../runtime-contracts.js";
 import type { SkillsLibraryFiles } from "./deep-agents-skills-library.js";
 import type { PolicyService } from "../policy/policy-service.js";
 import type { PolicyApprovalProof } from "../policy/policy-approval-proof.js";
-import type { SessionExecution } from "../session-execution-store.js";
+import type { CheckpointWriteFence, SessionExecution } from "../session-execution-store.js";
 import type { SandboxNetworkPolicy } from "../runtime/sandbox-network-policy.js";
 
 /**
@@ -55,7 +55,8 @@ export type DeepAgentsGraph = {
     config: {
       version: "v2";
       callbacks?: BaseCallbackHandler[];
-      configurable: { thread_id: string };
+      /** `cogniplane_checkpoint_fence`: the execution of this run (CHECKPOINT_FENCE_KEY). */
+      configurable: { thread_id: string; cogniplane_checkpoint_fence?: CheckpointWriteFence };
       context?: {
         projectInstructions: ProjectInstructionsSnapshot | null;
         /** Labelled data message of recalled memories. Model input only, never the system prompt. */

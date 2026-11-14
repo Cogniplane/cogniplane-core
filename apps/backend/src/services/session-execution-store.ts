@@ -35,6 +35,41 @@ export function sessionExecutionAccessSql(session: string, user: string): string
   return `(${session}.purpose <> 'project_reference' AND ${sessionUploadAccessSql(session, user)})`;
 }
 
+/**
+ * A turn holds the session: its lease is `active`, or `stopping` while a
+ * stopped turn unwinds on its owner, and it has not expired. Every rule of the
+ * form "a turn runs in this session" reads this, on any replica. The local
+ * registries are only a fast path in front of it.
+ */
+export function sessionExecutionBusySql(tenant: string, session: string): string {
+  return `EXISTS (SELECT 1 FROM session_executions busy_execution
+    WHERE busy_execution.tenant_id=${tenant} AND busy_execution.session_id=${session}
+      AND busy_execution.status IN ('active','stopping') AND busy_execution.expires_at>clock_timestamp())`;
+}
+
+/**
+ * The session has work that a change of the session must wait for: a turn
+ * holds it (sessionExecutionBusySql), or a pending approval that has not
+ * expired. An approval belongs to a turn with a lease; the expiry check keeps
+ * an approval that the sweep has not reached yet from blocking the session.
+ */
+export function sessionBusySql(tenant: string, session: string): string {
+  return `(${sessionExecutionBusySql(tenant, session)} OR EXISTS (SELECT 1 FROM approvals busy_approval
+    WHERE busy_approval.tenant_id=${tenant} AND busy_approval.session_id=${session}
+      AND busy_approval.status='pending' AND busy_approval.expires_at>clock_timestamp()))`;
+}
+
+/** sessionBusySql for each session of a project. Uses the project index of the lease. */
+export function projectBusySql(tenant: string, project: string): string {
+  return `(EXISTS (SELECT 1 FROM session_executions busy_execution
+    WHERE busy_execution.tenant_id=${tenant} AND busy_execution.project_id=${project}
+      AND busy_execution.status IN ('active','stopping') AND busy_execution.expires_at>clock_timestamp())
+    OR EXISTS (SELECT 1 FROM approvals busy_approval JOIN sessions busy_session
+      ON busy_session.tenant_id=busy_approval.tenant_id AND busy_session.session_id=busy_approval.session_id
+    WHERE busy_session.tenant_id=${tenant} AND busy_session.project_id=${project}
+      AND busy_approval.status='pending' AND busy_approval.expires_at>clock_timestamp()))`;
+}
+
 // A context of a project session, an interactive context, and each context
 // that names an execution (interactive and scheduled turns write
 // `executionId`) is live only while that exact execution holds an active
@@ -70,6 +105,37 @@ export function toolContextExecutionSql(context: string): string {
 async function lockSessionRow(db: Pick<PoolClient, "query">, execution: ExecutionActor): Promise<void> {
   await db.query("SELECT session_id FROM sessions WHERE tenant_id=$1 AND session_id=$2 FOR UPDATE",
     [execution.tenantId, execution.sessionId]);
+}
+
+/**
+ * The execution that a checkpoint write belongs to. The turn copies it when it
+ * starts, so a write keeps the identity of its own turn after the runtime has
+ * moved on to a newer execution.
+ */
+export type CheckpointWriteFence = Pick<SessionExecution, "tenantId" | "sessionId" | "userId" | "executionId" | "ownerId"> & {
+  runtimeId: string;
+};
+
+/**
+ * Run first in the transaction of a checkpoint write (deep-agents-checkpointer.ts).
+ * The write may continue only while its execution holds the active lease of the
+ * session, with the same owner, user and runtime.
+ *
+ * `FOR SHARE` keeps the lease row locked until the write commits or rolls back.
+ * Every change of the lease (stop, release, expiry, the replacement in
+ * `acquire`, a security change, the revocation triggers) updates that row, so it
+ * waits for the write. A write that comes after such a change waits for it, then
+ * reads the new row and fails. So no write of an old execution commits after a
+ * new execution holds the session.
+ */
+export async function lockExecutionForCheckpointWrite(db: Pick<PoolClient, "query">, fence: CheckpointWriteFence): Promise<void> {
+  await db.query("SELECT set_config('app.current_tenant_id', $1, true)", [fence.tenantId]);
+  const result = await db.query(`SELECT 1 FROM session_executions
+    WHERE tenant_id=$1 AND session_id=$2 AND execution_id=$3 AND owner_id=$4 AND user_id=$5
+      AND runtime_id=$6 AND status='active' AND expires_at>clock_timestamp()
+    FOR SHARE`,
+  [fence.tenantId, fence.sessionId, fence.executionId, fence.ownerId, fence.userId, fence.runtimeId]);
+  if (!result.rows[0]) throw new SessionExecutionError("execution_stopped", 403);
 }
 
 /** A sandbox that a security change took from a chat of the account. The account is for the log. */
@@ -200,15 +266,20 @@ export class SessionExecutionStore {
     });
   }
 
-  /** Run only with the privileged pool. Expired leases cannot belong to a live turn. */
+  /**
+   * Run only with the privileged pool. Expired leases cannot belong to a live
+   * turn. A `stopping` lease keeps its stop reason; an `active` one ends with
+   * `lease_expired`.
+   */
   async sweepExpired(limit = 500): Promise<number> {
     const result = await this.pool.query(`WITH expired AS (
-      UPDATE session_executions SET status='stopped', stop_reason='lease_expired', updated_at=NOW()
+      UPDATE session_executions SET status='stopped', updated_at=NOW(),
+        stop_reason=CASE WHEN status='stopping' THEN stop_reason ELSE 'lease_expired' END
       WHERE (tenant_id, session_id) IN (
         SELECT tenant_id, session_id FROM session_executions
-        WHERE status='active' AND expires_at<=clock_timestamp()
+        WHERE status IN ('active','stopping') AND expires_at<=clock_timestamp()
         LIMIT $1 FOR UPDATE SKIP LOCKED
-      ) AND status='active' AND expires_at<=clock_timestamp()
+      ) AND status IN ('active','stopping') AND expires_at<=clock_timestamp()
       RETURNING tenant_id, session_id, expires_at
     ), interrupted AS (
       UPDATE messages m SET status='interrupted', updated_at=NOW()
@@ -217,6 +288,30 @@ export class SessionExecutionStore {
         AND m.created_at<=e.expires_at
       RETURNING m.tenant_id, m.message_id
     ) SELECT count(*)::integer AS count FROM expired`, [limit]);
+    return result.rows[0]?.count ?? 0;
+  }
+
+  /**
+   * Run only with the privileged pool. Closes assistant replies that stay
+   * `pending` or `streaming` in a session with no work (sessionBusySql) and
+   * had no write for `olderThanMs`. A turn finalizes its reply before it
+   * releases its lease, so such a reply has no live turn. A late write of its
+   * turn cannot make it active again: `updateContent` saves an active status
+   * only on an active row, and a final status replaces `interrupted`.
+   * Independent of the turn watchdog (stale-message-sweeper.ts), which can be off.
+   */
+  async sweepOrphanedReplies(olderThanMs: number, limit = 500): Promise<number> {
+    const result = await this.pool.query(`WITH orphaned AS (
+      UPDATE messages SET status='interrupted', updated_at=NOW()
+      WHERE message_id IN (
+        SELECT m.message_id FROM messages m
+        WHERE m.role='assistant' AND m.status IN ('pending','streaming')
+          AND m.updated_at < NOW() - ($1::bigint * INTERVAL '1 millisecond')
+          AND NOT ${sessionBusySql("m.tenant_id", "m.session_id")}
+        ORDER BY m.updated_at LIMIT $2 FOR UPDATE OF m SKIP LOCKED
+      ) AND status IN ('pending','streaming')
+      RETURNING message_id
+    ) SELECT count(*)::integer AS count FROM orphaned`, [Math.max(0, Math.floor(olderThanMs)), limit]);
     return result.rows[0]?.count ?? 0;
   }
 
@@ -248,14 +343,15 @@ export class SessionExecutionStore {
       const allowed = await db.query(`SELECT session_id FROM sessions s WHERE tenant_id=$1 AND session_id=$2
         AND ${sessionExecutionAccessSql("s", "$3")}`, [actor.tenantId, actor.sessionId, actor.userId]);
       if (!allowed.rows[0]) throw new SessionExecutionError("session_unavailable", 404);
-      const current = await db.query(`SELECT execution_id FROM session_executions
-        WHERE tenant_id=$1 AND session_id=$2 AND status='active' AND expires_at>clock_timestamp()`,
-      [actor.tenantId, actor.sessionId]);
+      // A `stopping` lease is busy too: its turn still unwinds on its owner.
+      const current = await db.query(`SELECT 1 WHERE ${sessionExecutionBusySql("$1", "$2")}`,
+        [actor.tenantId, actor.sessionId]);
       if (current.rows[0]) throw new SessionExecutionError("session_busy", 409);
       if (caps) {
         const counts = await db.query(`SELECT count(*)::integer AS tenant_count,
           count(*) FILTER (WHERE user_id=$2)::integer AS user_count
-          FROM session_executions WHERE tenant_id=$1 AND status='active' AND expires_at>clock_timestamp()`,
+          FROM session_executions WHERE tenant_id=$1 AND status IN ('active','stopping')
+            AND expires_at>clock_timestamp()`,
         [actor.tenantId, actor.userId]);
         if (counts.rows[0].tenant_count >= caps.perTenant || counts.rows[0].user_count >= caps.perUser)
           throw new SessionExecutionError("running_turn_limit", 429);
@@ -263,8 +359,10 @@ export class SessionExecutionStore {
       // Finish the old generation before its only execution row is replaced.
       // The status update also fires approval expiry.
       await db.query(`WITH expired AS (
-        UPDATE session_executions SET status='stopped', stop_reason='lease_expired', updated_at=NOW()
-        WHERE tenant_id=$1 AND session_id=$2 AND status='active' AND expires_at<=clock_timestamp()
+        UPDATE session_executions SET status='stopped', updated_at=NOW(),
+          stop_reason=CASE WHEN status='stopping' THEN stop_reason ELSE 'lease_expired' END
+        WHERE tenant_id=$1 AND session_id=$2 AND status IN ('active','stopping')
+          AND expires_at<=clock_timestamp()
         RETURNING expires_at
       ), interrupted AS (
         UPDATE messages m SET status='interrupted', updated_at=NOW()
@@ -328,10 +426,17 @@ export class SessionExecutionStore {
     });
   }
 
+  /**
+   * The owner ends its lease when its turn has settled: `active` becomes
+   * `finished`, and a `stopping` lease (a stop that this turn has now obeyed)
+   * becomes `stopped`. The session is free for a new turn after this.
+   */
   async release(execution: SessionExecution): Promise<void> {
     await withTenantScope(this.pool, execution.tenantId, (db) => db.query(
-      `UPDATE session_executions SET status='finished', updated_at=NOW()
-        WHERE tenant_id=$1 AND execution_id=$2 AND user_id=$3 AND owner_id=$4 AND status='active'`,
+      `UPDATE session_executions
+        SET status=CASE WHEN status='stopping' THEN 'stopped' ELSE 'finished' END, updated_at=NOW()
+        WHERE tenant_id=$1 AND execution_id=$2 AND user_id=$3 AND owner_id=$4
+          AND status IN ('active','stopping')`,
       [execution.tenantId, execution.executionId, execution.userId, execution.ownerId]));
   }
 
@@ -339,10 +444,11 @@ export class SessionExecutionStore {
     return Boolean(await this.stopAndGetOwner(actor));
   }
 
+  /** The turn that holds the session, also while a stopped turn unwinds and sends its last events. */
   async currentOwner(tenantId: string, sessionId: string): Promise<TurnOwner | null> {
     return withTenantScope(this.pool, tenantId, async db => {
       const result = await db.query(`SELECT execution_id, owner_id FROM session_executions
-        WHERE tenant_id=$1 AND session_id=$2 AND status='active' AND expires_at>clock_timestamp()`,
+        WHERE tenant_id=$1 AND session_id=$2 AND status IN ('active','stopping') AND expires_at>clock_timestamp()`,
       [tenantId, sessionId]);
       const row = result.rows[0];
       return row ? { executionId: row.execution_id, ownerId: row.owner_id } : null;
@@ -363,19 +469,31 @@ export class SessionExecutionStore {
     });
   }
 
+  /**
+   * True when this execution was stopped. A stop keeps the row and its
+   * execution id (`stopping`) until the owner releases it, so the owner always
+   * finds its own stop here and acts on the stop signal at once.
+   */
   async isStopped(turn: { tenantId: string; sessionId: string; executionId: string; ownerId: string }): Promise<boolean> {
     return withTenantScope(this.pool, turn.tenantId, async db => {
       const result = await db.query(`SELECT 1 FROM session_executions
-        WHERE tenant_id=$1 AND session_id=$2 AND execution_id=$3 AND owner_id=$4 AND status='stopped'`,
+        WHERE tenant_id=$1 AND session_id=$2 AND execution_id=$3 AND owner_id=$4 AND status IN ('stopping','stopped')`,
       [turn.tenantId, turn.sessionId, turn.executionId, turn.ownerId]);
       return Boolean(result.rows[0]);
     });
   }
 
+  /**
+   * Stops the turn: the lease becomes `stopping`. It loses its authority at
+   * once (every check requires `active`), but the session stays busy until
+   * the owner releases the lease after its turn settled, or until the lease
+   * expires. So a new turn cannot start on another replica while the old one
+   * still writes to the same checkpoint thread and sandbox.
+   */
   async stopAndGetOwner(actor: ExecutionActor): Promise<TurnOwner | null> {
     return withTenantScope(this.pool, actor.tenantId, async (db) => {
       const result = await db.query(`UPDATE session_executions e
-        SET status='stopped', stop_reason='cancelled', updated_at=NOW()
+        SET status='stopping', stop_reason='cancelled', updated_at=NOW()
         FROM sessions s WHERE s.tenant_id=e.tenant_id AND s.session_id=e.session_id
           AND e.tenant_id=$1 AND e.session_id=$2 AND e.status='active'
           AND e.expires_at>clock_timestamp()
