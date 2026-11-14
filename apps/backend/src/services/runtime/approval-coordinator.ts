@@ -63,6 +63,15 @@ const STORED_OUTCOME: Partial<Record<ApprovalStatus, ApprovalOutcome>> = {
   approved: "approve", rejected: "reject", expired: "expired"
 };
 
+/**
+ * Whether a decision allows later calls of the tool in its turn. A rejection or
+ * an approval without turn scope ignores the remember flag, so the flag does
+ * not make two such decisions different.
+ */
+function remembersForTurn(approval: ApprovalRecord, decision: "approve" | "reject", remember?: boolean): boolean {
+  return decision === "approve" && remember === true && approvalAllowsTurnScope(approval);
+}
+
 export class ApprovalCoordinator {
   /** Two open turns can wait on the same persisted policy approval. */
   private readonly pending = new Map<string, Set<PendingApproval>>();
@@ -70,7 +79,7 @@ export class ApprovalCoordinator {
   private closed = false;
 
   constructor(private readonly deps: {
-    approvals: Pick<ApprovalStore, "get" | "create" | "resolve" | "listPending" | "expire">;
+    approvals: Pick<ApprovalStore, "get" | "getDecided" | "create" | "resolve" | "listPending" | "expire">;
     auditEvents: Pick<AuditEventStore, "create">;
     logger: Pick<FastifyBaseLogger, "debug" | "warn" | "error">;
     ttlMs: number;
@@ -90,19 +99,27 @@ export class ApprovalCoordinator {
 
   async decide(input: ApprovalActor & {
     approvalId: string; decision: "approve" | "reject"; rememberForTurn?: boolean;
-  }): Promise<"resolved" | "missing"> {
+  }): Promise<"resolved" | "missing" | "conflict"> {
     const { tenantId, approvalId, userId, decision, rememberForTurn } = input;
     const actor = { tenantId, userId };
     const waits = [...(this.pending.get(approvalId) ?? [])];
     const eligible: PendingApproval[] = [];
+    let ownerAsked = false;
     for (const entry of waits) {
       const { turn } = entry;
-      if (turn.identity.tenantId !== tenantId || turn.identity.userId !== userId ||
-          !turn.hasLocalActor(actor)) continue;
+      if (turn.identity.tenantId !== tenantId || turn.identity.userId !== userId) continue;
+      ownerAsked = true;
+      if (!turn.hasLocalActor(actor)) continue;
       try { await turn.validateLocalDecision(actor); } catch { continue; }
       eligible.push(entry);
     }
-    if (waits.length > 0 && eligible.length === 0) return "missing";
+    // A local wait refuses the caller, so this replica does not write a decision.
+    // When the approval owner asks, another replica can have saved a decision
+    // before this wait polled it: read that decision as a remote replica does.
+    // The read does not resume a wait or write an audit event.
+    if (waits.length > 0 && eligible.length === 0) {
+      return ownerAsked ? this.compareSavedDecision(input) : "missing";
+    }
     const settleEligible = () => {
       for (const entry of eligible) {
         if (!entry.turn.hasLocalActor(actor)) continue;
@@ -111,7 +128,7 @@ export class ApprovalCoordinator {
       }
     };
     if (eligible.length > 0 && eligible.every((entry) => !entry.requiresDurableProof)) {
-      if (!eligible.some((entry) => entry.turn.hasLocalActor(actor))) return "missing";
+      if (!eligible.some((entry) => entry.turn.hasLocalActor(actor))) return this.compareSavedDecision(input);
       settleEligible();
       try {
         const approval = await this.deps.approvals.resolve(tenantId, approvalId, userId, decision,
@@ -132,7 +149,7 @@ export class ApprovalCoordinator {
       this.deps.logger.error({ err, approvalId, tenantId }, "failed to persist approval decision");
       throw err;
     }
-    if (!approval) return "missing";
+    if (!approval) return this.compareSavedDecision(input);
     settleEligible();
     try {
       await this.auditDecision(tenantId, approval, decision);
@@ -140,6 +157,31 @@ export class ApprovalCoordinator {
       this.deps.logger.warn({ err, approvalId }, "failed to write approval decision audit event");
     }
     return "resolved";
+  }
+
+  /**
+   * Answers a decision request that found no open approval, or that a local
+   * wait refused (for example because its turn lease stopped). When the same user
+   * already saved an equivalent decision, the request is a retry: it succeeds
+   * and has no other effect. It does not settle a wait or write an audit event,
+   * because the first decision did that.
+   */
+  private async compareSavedDecision(input: ApprovalActor & {
+    approvalId: string; decision: "approve" | "reject"; rememberForTurn?: boolean;
+  }): Promise<"resolved" | "missing" | "conflict"> {
+    const { tenantId, approvalId, userId, decision, rememberForTurn } = input;
+    let saved: ApprovalRecord | null;
+    try {
+      saved = await this.deps.approvals.getDecided(tenantId, approvalId, userId);
+    } catch (err) {
+      this.deps.logger.error({ err, approvalId, tenantId }, "failed to read saved approval decision");
+      throw err;
+    }
+    if (!saved?.decision) return "missing";
+    const equivalent = saved.decision === decision &&
+      remembersForTurn(saved, saved.decision, saved.rememberForTurn) ===
+        remembersForTurn(saved, decision, rememberForTurn);
+    return equivalent ? "resolved" : "conflict";
   }
 
   private async auditDecision(tenantId: string, approval: ApprovalRecord, decision: "approve" | "reject"): Promise<void> {

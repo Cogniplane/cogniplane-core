@@ -2,8 +2,13 @@ import { describe, expect, test, vi } from "vitest";
 
 import { withTenantScope } from "../lib/db.js";
 import { ApprovalStore } from "../services/auth/approval-store.js";
+import { ProjectMemberStore } from "../services/project-member-store.js";
+import { ProjectStore } from "../services/project-store.js";
+import { SessionExecutionStore } from "../services/session-execution-store.js";
 import { adminDatabaseUrl, appPool, maintenancePool, superuserPool } from "./support/database.js";
-import { seedApproval, seedMembership, seedTenantGraph } from "./support/fixtures.js";
+import {
+  seedApproval, seedMembership, seedRuntimeSession, seedTenant, seedTenantGraph, seedUser
+} from "./support/fixtures.js";
 
 // ApprovalStore.resolve is the last guard for a decision that arrives on
 // another replica: its UPDATE only matches a pending, unexpired row of the
@@ -122,4 +127,98 @@ describe.skipIf(!adminDatabaseUrl())("ApprovalStore.resolve", () => {
       await Promise.allSettled(pending);
     }
   });
+});
+
+// A repeated decision request reads the saved decision with getDecided. The
+// read does not need the turn lease, because a retry can arrive after the turn
+// ended. It needs the access that a decision needs today, checked when it runs.
+describe.skipIf(!adminDatabaseUrl())("ApprovalStore.getDecided", () => {
+  async function projectApproval() {
+    const tenantId = await seedTenant(), ownerId = await seedUser(), editorId = await seedUser();
+    await seedMembership(tenantId, ownerId);
+    await seedMembership(tenantId, editorId);
+    const projects = new ProjectStore(appPool()), members = new ProjectMemberStore(appPool());
+    const project = await projects.create(tenantId, ownerId, "Decided approvals");
+    const owner = { tenantId, userId: ownerId, projectId: project.projectId };
+    await members.setMember(owner, editorId, "editor");
+    const sessionId = (await projects.createSession(tenantId, ownerId, project.projectId, "Shared turn"))!;
+    const actor = { tenantId, sessionId, userId: editorId };
+    const executions = new SessionExecutionStore(appPool(), "decided-owner");
+    const execution = await executions.acquire(actor, 30_000);
+    const runtimeId = await seedRuntimeSession(tenantId, editorId, sessionId);
+    await executions.bindRuntime(execution, runtimeId);
+    const approvalId = await seedApproval({ ...actor, runtimeId });
+    return { tenantId, editorId, ownerId, sessionId, project, owner, members, executions, execution, approvalId };
+  }
+
+  test.each(["approve", "reject"] as const)("returns the owner's %s after the lease ends and the expiry passes", async (decision) => {
+    const h = await projectApproval();
+    const store = new ApprovalStore(appPool());
+    expect(await store.resolve(h.tenantId, h.approvalId, h.editorId, decision, true)).not.toBeNull();
+    await h.executions.release(h.execution);
+    await superuserPool().query("UPDATE approvals SET expires_at = NOW() - INTERVAL '1 minute' WHERE approval_id = $1",
+      [h.approvalId]);
+
+    expect(await store.getDecided(h.tenantId, h.approvalId, h.editorId)).toMatchObject({
+      approvalId: h.approvalId, status: decision === "approve" ? "approved" : "rejected", decision,
+      rememberForTurn: decision === "approve"
+    });
+  });
+
+  test("returns a saved decision in a personal chat", async () => {
+    const owner = await seedTenantGraph();
+    const store = new ApprovalStore(appPool());
+    await store.resolve(owner.tenantId, owner.approvalId, owner.userId, "reject");
+
+    expect(await store.getDecided(owner.tenantId, owner.approvalId, owner.userId))
+      .toMatchObject({ status: "rejected", decision: "reject" });
+  });
+
+  test("refuses another tenant or user, also without RLS", async () => {
+    const h = await projectApproval();
+    const other = await seedTenantGraph();
+    await new ApprovalStore(appPool()).resolve(h.tenantId, h.approvalId, h.editorId, "approve");
+
+    for (const pool of [appPool(), superuserPool()]) {
+      const store = new ApprovalStore(pool);
+      expect(await store.getDecided(other.tenantId, h.approvalId, h.editorId)).toBeNull();
+      expect(await store.getDecided(h.tenantId, h.approvalId, h.ownerId)).toBeNull();
+    }
+    expect(await new ApprovalStore(appPool()).getDecided(h.tenantId, h.approvalId, h.editorId)).not.toBeNull();
+  });
+
+  test.each(["pending", "pending past expiry", "expired"] as const)("refuses an approval that is %s", async (state) => {
+    const h = await projectApproval();
+    const store = new ApprovalStore(appPool());
+    if (state === "pending past expiry") {
+      await superuserPool().query("UPDATE approvals SET expires_at = NOW() - INTERVAL '1 minute' WHERE approval_id = $1",
+        [h.approvalId]);
+    }
+    if (state === "expired") expect(await store.expire(h.tenantId, h.approvalId)).not.toBeNull();
+
+    expect(await store.getDecided(h.tenantId, h.approvalId, h.editorId)).toBeNull();
+  });
+
+  test.each(["archived session", "deleted session", "archived project", "demoted to viewer", "removed from project"] as const)(
+    "refuses a saved decision after access ends: %s", async (change) => {
+      const h = await projectApproval();
+      const store = new ApprovalStore(appPool());
+      await store.resolve(h.tenantId, h.approvalId, h.editorId, "approve");
+      await h.executions.release(h.execution);
+      if (change === "archived session" || change === "deleted session") {
+        await superuserPool().query("UPDATE sessions SET status = $3 WHERE tenant_id = $1 AND session_id = $2",
+          [h.tenantId, h.sessionId, change === "archived session" ? "archived" : "deleted"]);
+      } else if (change === "archived project") {
+        await superuserPool().query("UPDATE projects SET archived_at = NOW() WHERE tenant_id = $1 AND project_id = $2",
+          [h.tenantId, h.project.projectId]);
+      } else if (change === "demoted to viewer") {
+        await h.members.setMember(h.owner, h.editorId, "viewer");
+      } else {
+        await h.members.setMember(h.owner, h.editorId, null);
+      }
+
+      expect(await store.getDecided(h.tenantId, h.approvalId, h.editorId)).toBeNull();
+      const saved = await superuserPool().query("SELECT status FROM approvals WHERE approval_id = $1", [h.approvalId]);
+      expect(saved.rows[0]).toEqual({ status: "approved" });
+    });
 });

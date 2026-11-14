@@ -1,56 +1,76 @@
-import { test, expect, vi } from "vitest";
+import Fastify from "fastify";
+import { expect, onTestFinished, test, vi } from "vitest";
 
-import { createRecentlyResolvedCache } from "./approvals.js";
+import { registerApprovalRoutes, type ApprovalRouteStores } from "./approvals.js";
 
-test("recently-resolved cache returns true for the same tenant and approval", () => {
-  const cache = createRecentlyResolvedCache(60_000);
-  cache.remember("tenant-a", "user-a", "approval-1");
-  expect(cache.wasRecentlyResolved("tenant-a", "user-a", "approval-1")).toBe(true);
+type DecisionResult = "resolved" | "missing" | "conflict";
+
+async function decisionApp(results: DecisionResult[]) {
+  const resolveApproval = vi.fn(async (_input: Parameters<ApprovalRouteStores["runtimeAdapter"]["resolveApproval"]>[0]) => {
+    const result = results.shift();
+    if (!result) throw new Error("unexpected decision request");
+    return result;
+  });
+  const app = Fastify();
+  onTestFinished(() => app.close());
+  app.addHook("preHandler", async (request) => {
+    request.auth = { tenantId: "tenant-a", userId: "user-a", role: "member", isAdmin: false };
+  });
+  await registerApprovalRoutes(app, {
+    approvals: { listPending: async () => [] },
+    sessions: { getReadable: async () => null },
+    runtimeAdapter: { resolveApproval }
+  });
+  const decide = (payload: Record<string, unknown>, approvalId = "approval-1") =>
+    app.inject({ method: "POST", url: `/approvals/${approvalId}/decision`, payload });
+  return { decide, resolveApproval };
+}
+
+test("forwards the authenticated identity and the request body, and returns 200 when resolved", async () => {
+  const { decide, resolveApproval } = await decisionApp(["resolved"]);
+
+  const response = await decide({ decision: "approve", rememberForTurn: true, tenantId: "tenant-b", userId: "user-b" });
+
+  expect(response.statusCode).toBe(200);
+  expect(response.json()).toEqual({ status: "resolved" });
+  expect(resolveApproval).toHaveBeenCalledExactlyOnceWith({
+    tenantId: "tenant-a", userId: "user-a", approvalId: "approval-1", decision: "approve", rememberForTurn: true
+  });
 });
 
-test("recently-resolved cache does not leak across tenants on the same approval id", () => {
-  const cache = createRecentlyResolvedCache(60_000);
-  cache.remember("tenant-a", "user-a", "approval-1");
-  // Tenant B probing the exact same approvalId must NOT get a positive
-  // "resolved" signal. A positive signal would be a cross-tenant leak.
-  expect(cache.wasRecentlyResolved("tenant-b", "user-a", "approval-1")).toBe(false);
+test("returns 404 approval_not_found when the caller cannot decide the approval", async () => {
+  const { decide } = await decisionApp(["missing"]);
+
+  const response = await decide({ decision: "reject" });
+
+  expect(response.statusCode).toBe(404);
+  expect(response.json()).toEqual({ error: "approval_not_found" });
 });
 
-test("recently-resolved cache treats non-existent entries as not recently resolved", () => {
-  const cache = createRecentlyResolvedCache(60_000);
-  expect(cache.wasRecentlyResolved("tenant-a", "user-a", "missing")).toBe(false);
+test("returns 409 approval_conflict when the approval already has a different decision", async () => {
+  const { decide } = await decisionApp(["conflict"]);
+
+  const response = await decide({ decision: "reject" });
+
+  expect(response.statusCode).toBe(409);
+  expect(response.json()).toEqual({
+    error: "approval_conflict", message: "This approval already has a different decision."
+  });
 });
 
-test("recently-resolved cache evicts expired entries", () => {
-  // Drive the TTL deterministically off a frozen clock instead of racing a
-  // real 1ms timer — the cache reads Date.now(), so advancing fake time past
-  // the TTL is the observable expiry signal.
-  vi.useFakeTimers();
-  try {
-    const cache = createRecentlyResolvedCache(1_000);
-    cache.remember("tenant-a", "user-a", "approval-1");
-    expect(cache.wasRecentlyResolved("tenant-a", "user-a", "approval-1")).toBe(true);
-    vi.advanceTimersByTime(1_001);
-    expect(cache.wasRecentlyResolved("tenant-a", "user-a", "approval-1")).toBe(false);
-  } finally {
-    vi.useRealTimers();
-  }
+test("asks the decision path again on each retry instead of returning an earlier success", async () => {
+  const { decide, resolveApproval } = await decisionApp(["resolved", "conflict", "missing", "resolved"]);
+
+  expect((await decide({ decision: "approve" })).statusCode).toBe(200);
+  expect((await decide({ decision: "reject" })).statusCode).toBe(409);
+  expect((await decide({ decision: "approve" })).statusCode).toBe(404);
+  expect((await decide({ decision: "approve" })).statusCode).toBe(200);
+  expect(resolveApproval).toHaveBeenCalledTimes(4);
 });
 
-test("recently-resolved cache key is composite, not just approvalId", () => {
-  const cache = createRecentlyResolvedCache(60_000);
-  cache.remember("tenant-a", "user-a", "shared");
-  cache.remember("tenant-b", "user-a", "shared");
-  // Both tenants independently see their own resolution.
-  expect(cache.wasRecentlyResolved("tenant-a", "user-a", "shared")).toBe(true);
-  expect(cache.wasRecentlyResolved("tenant-b", "user-a", "shared")).toBe(true);
-  // A third tenant still gets no signal.
-  expect(cache.wasRecentlyResolved("tenant-c", "user-a", "shared")).toBe(false);
-});
+test("rejects an invalid decision before it reaches the decision path", async () => {
+  const { decide, resolveApproval } = await decisionApp([]);
 
-test("another project participant cannot observe the initiator's resolved approval", () => {
-  const cache = createRecentlyResolvedCache();
-  cache.remember("tenant-a", "initiator", "approval-1");
-  expect(cache.wasRecentlyResolved("tenant-a", "editor", "approval-1")).toBe(false);
-  expect(cache.wasRecentlyResolved("tenant-a", "initiator", "approval-1")).toBe(true);
+  expect((await decide({ decision: "maybe" })).statusCode).toBe(400);
+  expect(resolveApproval).not.toHaveBeenCalled();
 });

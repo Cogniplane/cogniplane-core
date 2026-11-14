@@ -43,10 +43,30 @@ interrupt, one `approvals` row, one AG-UI event and one decision route.
   arguments or position.
 - Approval reads return public fields only, never proofs, payloads or runtime
   identity.
-- The decision route returns 404 `approval_not_found` when no open approval
-  matches the caller. In the browser (`use-agui-custom-events.ts`), a failed
-  decision shows an error notice and enables the controls again. After a 404,
-  409 or 410, the browser reads the pending approvals again and shows that list.
+- The decision route answers from the `approvals` row, so each replica gives
+  the same answer, also after a restart:
+  - 200 `{ status: "resolved" }` when the caller decides an open approval, or
+    when the caller already saved an equivalent decision. The repeated request
+    does nothing more: it does not resume the turn again, write a second audit
+    event or make a consumed proof usable again.
+  - 409 `approval_conflict` when the caller already saved a different decision.
+    "Allow for this turn" is part of the decision only when the approval allows
+    turn scope (`approvalAllowsTurnScope`); a rejection ignores it.
+  - 404 `approval_not_found` when the approval does not exist, belongs to
+    another user or tenant, expired, or is pending but cannot be decided (its
+    expiry passed or its turn lease ended). It is also 404 when the caller can
+    no longer run a turn in the session, for example after the session is
+    archived or the caller lost editor access (`ApprovalStore.getDecided`).
+  - The replica that runs the turn gives the same answers. When its local
+    check refuses the caller (for example, the turn lease stopped), it does
+    not write a decision, but it reads the saved decision as other replicas do.
+    That read does not resume the local wait; the wait reads the row itself.
+- A native approval in a turn without an execution lease (`durableNative` off)
+  resumes the local wait before it writes the row. If that write fails, the row
+  stays pending and a later request can still save a decision on it.
+- In the browser (`use-agui-custom-events.ts`), a failed decision shows an error
+  notice and enables the controls again. After a 404, 409 or 410, the browser
+  reads the pending approvals again and shows that list.
 - Tests: `deep-agents-graph.test.ts` pins the SDK behavior;
   `deep-agents-approval-cards.test.ts` runs the real graph.
 
