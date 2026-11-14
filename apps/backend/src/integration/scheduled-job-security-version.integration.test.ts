@@ -32,6 +32,7 @@ import {
   type SchedulerWorkerDeps
 } from "../services/scheduler-worker.js";
 import { SessionStore } from "../services/session-store.js";
+import { SessionExecutionStore } from "../services/session-execution-store.js";
 import { TenantOrgSettingsStore } from "../services/tenant-org-settings-store.js";
 import { UserSettingsStore } from "../services/user-settings-store.js";
 import type { RuntimeSessionRef } from "../runtime-contracts.js";
@@ -189,6 +190,14 @@ function scopedWorker(tenantId: string, options: {
     resolveRuntime: async () => {
       await options.beforeTurn?.();
       return { kind: "ok", adapter: runtime, modelId: null };
+    },
+    // The lease, caps and quota of a real scheduled turn. No test here reaches the caps.
+    turnAdmission: {
+      executions: new SessionExecutionStore(appPool()),
+      limits: { consumeTurnQuota: async () => null },
+      leaseMs: 30_000,
+      heartbeatMs: 5_000,
+      caps: { perUser: 100, perTenant: 1_000 }
     },
     auditEvents: new AuditEventStore(appPool()),
     logger: createSilentLogger()

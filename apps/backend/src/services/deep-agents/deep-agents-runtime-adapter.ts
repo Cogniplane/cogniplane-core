@@ -329,7 +329,10 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
         if (previous) await this.abortSession({ tenantId: previous.tenantId, sessionId, userId: previous.userId });
         return this.buildSession(input);
       }
-      if (previous && (!previous.execution || previous.execution.projectId)) {
+      // A scheduled runtime has no sandbox record and an interactive one has one,
+      // so a runtime serves only turns of its own context.
+      if (previous && (!previous.execution || previous.execution.projectId ||
+          (previous.execution.turnContext ?? "interactive") !== (input.execution.turnContext ?? "interactive"))) {
         await this.abortSession({ tenantId: previous.tenantId, sessionId, userId: previous.userId });
         return this.buildSession(input);
       }
@@ -580,7 +583,10 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
               maxFileReadBytes: this.config.ARTIFACT_MAX_UPLOAD_BYTES
             }
           : null,
-      ...(input.execution && !input.execution.projectId &&
+      // A scheduled run gets no sandbox record. With a record, dispose keeps the
+      // sandbox for the next turn of the session (DeepAgentsE2bBackend.kill), and
+      // each scheduled run would leave one sandbox running.
+      ...(input.execution && !input.execution.projectId && input.execution.turnContext !== "scheduled" &&
         this.stores.executions.sandboxBinding && this.stores.executions.bindSandboxId &&
         this.stores.executions.releaseSandboxId
         ? { sandboxBinding: {
@@ -1346,9 +1352,13 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
     tenantId: string;
     sessionId: string;
     userId: string;
+    executionId?: string;
   }): Promise<"interrupted" | "no_active_turn"> {
     const state = this.sessions.get(input.sessionId);
     if (!state || !this.activeTurns.has(input.sessionId)) {
+      return "no_active_turn";
+    }
+    if (input.executionId && state.execution?.executionId !== input.executionId) {
       return "no_active_turn";
     }
     const interrupt = state.activeTurnInterrupt.current;

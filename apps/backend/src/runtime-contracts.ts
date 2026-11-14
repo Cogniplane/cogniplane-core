@@ -110,6 +110,11 @@ export interface RuntimeAdapter {
     tenantId: string;
     sessionId: string;
     userId: string;
+    /**
+     * The execution that a stop fenced. A turn of another execution is not
+     * interrupted, so a late stop signal cannot stop a newer turn.
+     */
+    executionId?: string;
   }): Promise<"interrupted" | "no_active_turn">;
   readRuntimeFile(sessionId: string, filePath: string): Promise<Uint8Array>;
   /**

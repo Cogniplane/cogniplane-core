@@ -56,6 +56,16 @@ Rules:
    `TOOL_CONTEXT_TTL_MS` from that moment (`deep-agents-runtime-adapter.ts`).
 4. A context records the owner's security version
    ([revocation](local-accounts.md#security-version-and-revocation)).
+   - A context of an interactive or a scheduled turn names the execution of
+     its turn (`executionId`). Each lookup refuses it when that execution does
+     not hold an active lease with the same user and runtime: after a stop, a
+     release, a lease expiry or a newer execution
+     (`toolContextExecutionSql`, `services/session-execution-store.ts`). A call
+     that waits at the gateway after its turn ends is refused.
+   - A scheduled context that names no execution comes from a version before
+     scheduled turns took a lease. It stays valid until its TTL
+     (`SCHEDULER_JOB_TIMEOUT_MS` plus one minute), so such turns keep their
+     tools during a rolling upgrade.
    - A tool call looks up its context two times. The first lookup binds the
      call. The gateway then waits for the integration check, the upstream tool
      metadata, Policy Center and the approval claim. The second lookup comes
@@ -65,9 +75,8 @@ Rules:
      again, never the latest context of the session.
    - If the context is revoked, expired or no longer has its required execution
      at the second lookup, the action does not start and the call gets `-32000`.
-     Execution checks apply to interactive contexts and project sessions.
-     A scheduled context in a personal session remains valid until expiry or
-     revocation. A closed caller request also prevents dispatch. A claimed
+     The execution checks and legacy exception above apply.
+     A closed caller request also prevents dispatch. A claimed
      approval stays used.
    - The second lookup and the action are not one atomic step. A change that
      commits after the second lookup does not stop the action. When the

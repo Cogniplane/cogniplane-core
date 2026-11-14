@@ -84,7 +84,7 @@ it("fences a remote turn and publishes Stop to its owner", async () => {
     executions: { stopAndGetOwner: async () => ({ executionId: "turn", ownerId: "other" }) },
     turnBus: { publishStop },
     activeTurns: new ActiveTurnsRegistry(),
-    runtimeAdapter: { interruptTurn }
+    runtimeAdapter: { interruptTurn, hasActiveTurn: () => false }
   });
   const response = await app.inject({ method: "POST", url: `/sessions/${sessionId}/interrupt` });
   expect(response.statusCode).toBe(200);

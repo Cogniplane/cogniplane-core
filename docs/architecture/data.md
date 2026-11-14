@@ -139,6 +139,10 @@ Fields that agents change most often (the full list is `TenantSettingsSchema` in
   `SCHEDULED_SESSION_RETENTION_ENABLED` is on, the worker deletes such a
   session `SCHEDULED_SESSION_RETENTION_DAYS` after its last activity. The purge
   is the same as for trash (`SessionStore.cleanupExpiredScheduled`).
+  - The run does not delete its checkpoint thread
+    ([scheduler](runtime.md#scheduler)), so each run keeps one thread until
+    this purge. With `SCHEDULED_SESSION_RETENTION_ENABLED` off, the thread
+    stays until the session is deleted.
   - Last activity is the latest of: the creation or rename of the session, a
     write to one of its messages, and the end of one of its runs. A follow-up
     turn of the owner starts the window again. A session without a run row
@@ -283,6 +287,7 @@ environment its own Redis database: `tenant:delete --flush-redis` flushes it
 
 Running-turn caps ([sessions and turns](runtime.md#sessions-and-turns)) do not
 use Redis: they count in process and through the `session_executions` lease.
+Scheduled turns count only through the lease.
 
 ## Rate limits and quotas
 
@@ -292,6 +297,9 @@ use Redis: they count in process and through the `session_executions` lease.
   `*_LIMIT_PER_TENANT_PER_WINDOW`) and daily turn quotas
   (`TURN_QUOTA_PER_*_PER_DAY`, UTC days). Meaning of `0`: [startup
   rules](../configuration.md#startup-rules).
+- The daily turn quota counts interactive and scheduled turns
+  ([scheduler](runtime.md#scheduler)). The `message_turn` rate limit counts
+  `POST /messages` requests only.
 - A refusal returns `LimitExceededErrorPayload` with `retryAfterMs` and
   `resetAt`. Auth routes also send `Retry-After` in seconds
   (`services/rate-limit-reply.ts`).

@@ -2,7 +2,7 @@
 import { type Pool, withTenantScope } from "../../lib/db.js";
 import { uuidv7 } from "../../lib/uuid.js";
 import { isoTimestamp } from "../../lib/db-mappers.js";
-import { interactiveContextExecutionSql } from "../session-execution-store.js";
+import { toolContextExecutionSql } from "../session-execution-store.js";
 import { ownerSecurityVersionSql } from "./security-change.js";
 
 /**
@@ -25,7 +25,7 @@ export class ToolContextUnavailableError extends Error {
  * The state of a tool context for the runtime loop (`liveness`):
  * - `live`: a lookup returns the context.
  * - `security_change`: the owner's local account has another security version.
- * - `ended`: no row, or the TTL expired, or the interactive execution ended.
+ * - `ended`: no row, or the TTL expired, or the execution of the turn ended.
  */
 export type ToolContextLiveness = "live" | "security_change" | "ended";
 
@@ -143,7 +143,7 @@ export class ToolExecutionContextStore {
           SELECT *
           FROM tool_execution_contexts
           WHERE tenant_id = $1 AND session_id = $2 AND expires_at > NOW()
-            AND ${interactiveContextExecutionSql("tool_execution_contexts")}
+            AND ${toolContextExecutionSql("tool_execution_contexts")}
             AND ${ownerSecurityVersionSql("tool_execution_contexts")}
           ORDER BY created_at DESC
           LIMIT 1
@@ -174,7 +174,7 @@ export class ToolExecutionContextStore {
           UPDATE tool_execution_contexts
           SET expires_at = NOW() + ($3 * INTERVAL '1 millisecond')
           WHERE tenant_id = $1 AND tool_context_id = $2 AND expires_at > NOW()
-            AND ${interactiveContextExecutionSql("tool_execution_contexts")}
+            AND ${toolContextExecutionSql("tool_execution_contexts")}
             AND ${ownerSecurityVersionSql("tool_execution_contexts")}
           RETURNING expires_at
         `,
@@ -189,7 +189,7 @@ export class ToolExecutionContextStore {
    * Tells the runtime if its turn can continue. The runtime calls this at
    * each model start and before each native tool, so it must stay cheap:
    * one read of the context by its unique id, with the same conditions as
-   * `get` (TTL, interactive execution, owner's security version) as columns,
+   * `get` (TTL, execution lease, owner's security version) as columns,
    * so that a dead context also gives its reason. It reads no JSON column.
    */
   async liveness(tenantId: string, toolContextId: string): Promise<ToolContextLiveness> {
@@ -197,7 +197,7 @@ export class ToolExecutionContextStore {
       const result = await client.query<{ owner_current: boolean; usable: boolean }>(
         `
           SELECT ${ownerSecurityVersionSql("tool_execution_contexts")} AS owner_current,
-            (expires_at > NOW() AND ${interactiveContextExecutionSql("tool_execution_contexts")}) AS usable
+            (expires_at > NOW() AND ${toolContextExecutionSql("tool_execution_contexts")}) AS usable
           FROM tool_execution_contexts
           WHERE tenant_id = $1 AND tool_context_id = $2
         `,
@@ -232,7 +232,7 @@ export class ToolExecutionContextStore {
           SELECT *
           FROM tool_execution_contexts
           WHERE tenant_id = $1 AND tool_context_id = $2 AND expires_at > NOW()
-            AND ${interactiveContextExecutionSql("tool_execution_contexts")}
+            AND ${toolContextExecutionSql("tool_execution_contexts")}
             AND ${ownerSecurityVersionSql("tool_execution_contexts")}
           LIMIT 1
         `,

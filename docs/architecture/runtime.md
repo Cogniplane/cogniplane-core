@@ -85,6 +85,9 @@ at the next turn:
   same session gets `session_busy`: 429 when this replica runs the turn, 409
   when another replica holds the lease. `MAX_RUNNING_TURNS_PER_USER` and
   `MAX_RUNNING_TURNS_PER_TENANT` cap running turns (429 `running_turn_limit`).
+  Interactive and [scheduled](#scheduler) turns take the same lease and count
+  toward the same caps. The session list shows a session as running while its
+  lease is active.
 - `RUNTIME_IDLE_TIMEOUT_MS` (`idle-teardown.ts`) tears down an idle session
   runtime. It kills the sandbox only when no binding is saved (project chats); a
   bound sandbox stays until E2B expires it, and the next turn reconnects. The
@@ -145,7 +148,16 @@ scheduled turns:
   The replica that runs the turn sees the fence through dispatch authorization
   and its heartbeat, and dispatches no further model or tool call; a sandbox
   command already running continues ([sandbox](sandbox.md#sandbox-network)). A
-  Redis stop channel makes this faster.
+  Redis stop channel makes this faster. The interrupt names the fenced
+  execution, so a late stop does not stop a newer turn of the session.
+- Only a user who can edit the session stops its turn
+  (`sessionExecutionAccessSql`). An organization admin gets 404 for another
+  member's chat, also for a scheduled turn. To stop the model calls of such a
+  turn, the admin closes its spending reservation
+  ([recovery](model-spending.md#recovery)).
+- A scheduled turn publishes no turn events. A connection during the run
+  reports `activeTurn: "unavailable"`, and the browser loads the final state
+  when the turn ends.
 
 ## Streaming contract
 
@@ -177,6 +189,30 @@ delete). Limits: `SCHEDULED_JOB_CREATE_LIMIT_*` and
   start. After a crash, the stale-run sweep marks the run `failed`.
 - Limits: `SCHEDULER_MAX_CONCURRENT_JOBS`, `SCHEDULER_JOB_TIMEOUT_MS`,
   `SCHEDULER_MAX_CONSECUTIVE_FAILURES` (disables a failing job).
+- Admission is the same as for an interactive turn, in this order: the session
+  execution lease with the running-turn caps (`turn_context` is `scheduled` in
+  memory only), the prompt PII check, then one unit of the daily turn quota
+  (`TURN_QUOTA_PER_*_PER_DAY`). A blocked prompt spends no quota. The
+  `message_turn` rate limit applies to requests only. A refusal by a cap, the
+  quota or an unavailable limit store fails the run with a fixed message, does
+  not count toward `SCHEDULER_MAX_CONSECUTIVE_FAILURES`, and the job runs again
+  at its next time.
+- The worker keeps the lease, renewed by its heartbeat, until the runtime abort
+  ends, then releases it. The abort names the execution, so it does not stop a
+  newer turn of the session. When the heartbeat loses the lease (a stop, a
+  security change, an expiry), the worker aborts the runtime turn of that
+  execution. The tool context of the turn names the execution too, so the
+  gateway refuses its calls when the lease ends
+  ([tools](tools.md#mcp-gateway)).
+- At the job timeout the worker aborts the turn and waits at most the abort
+  grace (`ABORT_SETTLE_GRACE_MS`, `scheduler-worker.ts`), also when the abort
+  itself does not end. Then it frees the slot and stops renewing the lease, so
+  the lease ends at its expiry. A lease that admission gets after the timeout is
+  released at once.
+- A scheduled runtime saves no sandbox record, so its disposal kills its
+  sandbox. A later interactive turn on the session gets a new runtime.
+- The owner can continue a scheduled session with `POST /messages`. While the
+  scheduled turn runs, that message gets `session_busy`.
 - Turn order (`UserSettingsStore.listDueJobs`): the free slots go to one due
   job per tenant in each round. The tenant whose last run started first goes
   first. In a tenant, members take turns in the same way. A member's own jobs
@@ -199,9 +235,13 @@ delete). Limits: `SCHEDULED_JOB_CREATE_LIMIT_*` and
   `interrupted`; the job run records `failed`. The run summary is a redacted
   prefix of the response (`scheduler-worker.ts`).
 - Each run creates a session with `purpose = 'scheduled'`. After the run, the
-  worker purges the runtime and checkpoint thread of that session, and keeps
-  the session and its messages. Retention deletes them later
+  worker stops the runtime of that session. It keeps the session, its messages
+  and its checkpoint thread, so a follow-up `POST /messages` continues from the
+  scheduled turn. Retention deletes them later
   (`SCHEDULED_SESSION_RETENTION_DAYS`, [retention](data.md#retention-and-deletion)).
+  The worker does not delete the thread itself: after a stop or a lease expiry,
+  a new turn of the owner can use it, and no lock keeps that turn out during a
+  delete.
 
 ## Background workers
 

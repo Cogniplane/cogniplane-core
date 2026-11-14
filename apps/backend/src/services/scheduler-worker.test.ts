@@ -8,18 +8,26 @@ import type { SessionRecord } from "./session-store.js";
 import type { MessageRecord, ToolResultRecord } from "./message-store.js";
 import type { ToolExecutionContext } from "./auth/tool-execution-context-store.js";
 import type { ClaimedScheduledJob } from "./user-settings-store.js";
+import type { ExecutionActor, SessionExecution } from "./session-execution-store.js";
+import type { LimitExceededErrorPayload } from "./request-limits.js";
 import { PiiProtectionServiceError, type PiiDecision } from "./pii/pii-protection-service.js";
 import type { PiiFinding } from "./pii/pii-provider.js";
 import { textEvaluation } from "../test-helpers/pii-evaluation.js";
 import { GENERIC_TURN_FAILURE } from "./turn-transcript.js";
+import { SessionExecutionError } from "./session-execution-store.js";
+import { RequestLimitsUnavailableError } from "./redis-request-limits.js";
 import {
   OWNER_SECURITY_CHANGED_RUN_ERROR,
+  RUNNING_TURN_LIMIT_RUN_ERROR,
   SCHEDULER_STOPPED_RUN_ERROR,
+  TURN_LIMITS_UNAVAILABLE_RUN_ERROR,
+  TURN_QUOTA_RUN_ERROR,
   SchedulerWorker,
   type SchedulerRuntimeResolution,
   type SchedulerRuntimeAdapter,
   type SchedulerWorkerDeps,
-  type SchedulerWorkerOptions
+  type SchedulerWorkerOptions,
+  type ScheduledTurnAdmission
 } from "./scheduler-worker.js";
 
 function makeFakeSessionRef(sessionId: string): RuntimeSessionRef {
@@ -152,6 +160,14 @@ function createFakeDeps(options?: {
   attachReturns?: boolean;
   /** Make `completeJobRun` find no run row. */
   completeReturnsNull?: boolean;
+  /** Replace the lease admission (default: a lease for each call). */
+  acquireImpl?: (actor: ExecutionActor) => Promise<SessionExecution>;
+  /** What the daily turn quota answers, or throws. Default: allowed. */
+  quotaImpl?: () => Promise<LimitExceededErrorPayload | null>;
+  /** What a lease renewal answers. Default: the lease is still held. */
+  heartbeatImpl?: () => Promise<boolean>;
+  /** What `stoppedBySecurityChange` answers. Default false. */
+  stoppedBySecurityChange?: boolean;
 }) {
   const dueJobs = options?.dueJobs ?? [];
   const claimReturns = options?.claimReturns ?? dueJobs.map((j) => j);
@@ -218,7 +234,7 @@ function createFakeDeps(options?: {
   }> = [];
   const runtimeSessionsCreated: Array<{ sessionId: string; userId: string }> = [];
   const runMessageCalls: Array<{ sessionId: string; prompt: string; model?: string }> = [];
-  const abortSessionCalls: Array<{ tenantId: string; sessionId: string; userId: string }> = [];
+  const abortSessionCalls: Array<{ tenantId: string; sessionId: string; userId: string; executionId?: string }> = [];
   const purgeSessionDataCalls: Array<{ tenantId: string; sessionId: string; userId: string }> = [];
   const resolveRuntimeCalls: string[] = [];
   const auditEvents: Array<{
@@ -232,16 +248,26 @@ function createFakeDeps(options?: {
   const sweepStaleJobRunsCalls: Array<{ olderThanMs: number; limit: number }> = [];
   const pauseCalls: Array<{ tenantId: string; jobId: string }> = [];
   const ownerVersionReads: Array<{ tenantId: string; userId: string }> = [];
+  // Admission of the turn: lease, caps and quota.
+  const acquireCalls: Array<{ actor: ExecutionActor; leaseMs: number; caps: unknown; turnContext: unknown }> = [];
+  const executionsAcquired: SessionExecution[] = [];
+  const quotaCalls: Array<{ tenantId: string; userId: string }> = [];
+  const heartbeatCalls: string[] = [];
+  const releaseCalls: string[] = [];
+  // The order of the admission, runtime and ledger steps, for ordering assertions.
+  const order: string[] = [];
 
   // The adapter `resolveRuntime` hands back by default — what the worker
   // dispatches createSession/runMessageAGUI/abortSession to after resolution.
   const runtimeAdapter: Extract<SchedulerRuntimeResolution, { kind: "ok" }>["adapter"] = {
     id: "deep-agents",
     createSession: async (input) => {
+      order.push("createSession");
       runtimeSessionsCreated.push(input);
       return makeFakeSessionRef(input.sessionId);
     },
     runMessageAGUI: function (_session, input) {
+      order.push("run");
       runMessageCalls.push({ sessionId: _session.sessionId, prompt: input.prompt, model: input.model });
       if (options?.runMessageImpl) {
         return options.runMessageImpl(_session, { prompt: input.prompt });
@@ -255,16 +281,57 @@ function createFakeDeps(options?: {
       })();
     },
     abortSession: async (input) => {
+      order.push("abort");
       abortSessionCalls.push(input);
     },
     purgeSessionData: async (input) => {
+      order.push("purge");
       purgeSessionDataCalls.push(input);
     },
     destroySandbox: async () => "killed"
   };
 
+  const turnAdmission: ScheduledTurnAdmission = {
+    executions: {
+      acquire: async (actor, leaseMs, caps, turnContext) => {
+        order.push("acquire");
+        acquireCalls.push({ actor, leaseMs, caps, turnContext });
+        const execution = options?.acquireImpl ? await options.acquireImpl(actor) : {
+          ...actor,
+          executionId: `execution-${acquireCalls.length}`,
+          projectId: null,
+          ownerId: "scheduler-replica",
+          expiresAt: new Date(Date.now() + leaseMs).toISOString(),
+          turnContext: turnContext ?? "interactive"
+        };
+        executionsAcquired.push(execution);
+        return execution;
+      },
+      heartbeat: async (execution) => {
+        heartbeatCalls.push(execution.executionId);
+        return options?.heartbeatImpl ? options.heartbeatImpl() : true;
+      },
+      release: async (execution) => {
+        order.push("release");
+        releaseCalls.push(execution.executionId);
+      },
+      stoppedBySecurityChange: async () => options?.stoppedBySecurityChange ?? false
+    },
+    limits: {
+      consumeTurnQuota: async (input) => {
+        order.push("quota");
+        quotaCalls.push(input);
+        return options?.quotaImpl ? options.quotaImpl() : null;
+      }
+    },
+    leaseMs: 30_000,
+    heartbeatMs: 5_000,
+    caps: { perUser: 5, perTenant: 50 }
+  };
+
   const deps: SchedulerWorkerDeps = {
     runtimeAdapter,
+    turnAdmission,
     settings: {
       listDueJobs: async (limit: number) => dueJobs.slice(0, limit),
       claimJob: async (tenantId, jobId, nextRunAt, runId) => {
@@ -283,6 +350,7 @@ function createFakeDeps(options?: {
         return options?.attachReturns ?? true;
       },
       completeJobRun: async (input) => {
+        order.push("complete");
         jobRunsCompleted.push(input);
         if (options?.completeReturnsNull) return null;
         return {
@@ -465,7 +533,14 @@ function createFakeDeps(options?: {
     recordOutcomeCalls,
     failureCounts,
     pauseCalls,
-    ownerVersionReads
+    ownerVersionReads,
+    turnAdmission,
+    acquireCalls,
+    executionsAcquired,
+    quotaCalls,
+    heartbeatCalls,
+    releaseCalls,
+    order
   };
 }
 
@@ -929,7 +1004,7 @@ describe("SchedulerWorker", () => {
 
   test("a scheduled turn that throws mid-stream keeps its partial transcript", async () => {
     const job = makeFakeJob();
-    const { deps, jobRunsCompleted, messagesUpdated, toolResultsSaved, purgeSessionDataCalls } = createFakeDeps({
+    const { deps, jobRunsCompleted, messagesUpdated, toolResultsSaved, purgeSessionDataCalls, order } = createFakeDeps({
       dueJobs: [job],
       runMessageImpl: async function* () {
         yield { type: EventType.RUN_STARTED, threadId: "session-1", runId: "resp-1" } as BaseEvent;
@@ -947,12 +1022,15 @@ describe("SchedulerWorker", () => {
     expect(toolResultsSaved).toEqual([expect.objectContaining({ toolResultId: "call-1", status: "in_progress" })]);
     expect(jobRunsCompleted[0]).toMatchObject({ status: "failed", errorMessage: "The assistant run failed." });
     expect(JSON.stringify(jobRunsCompleted)).not.toContain("10.0.4.17");
-    expect(purgeSessionDataCalls).toHaveLength(1);
+    // Cleanup stops the runtime, then frees the lease. Retention deletes the thread.
+    expect(order.slice(-3)).toEqual(["abort", "release", "complete"]);
+    expect(purgeSessionDataCalls).toEqual([]);
   });
 
   test("a failed transcript write records a failed run and still cleans up", async () => {
     const job = makeFakeJob();
-    const { deps, jobRunsCompleted, messagesUpdated, toolResultsSaved, abortSessionCalls, purgeSessionDataCalls, auditEvents, recordOutcomeCalls } =
+    const { deps, jobRunsCompleted, messagesUpdated, toolResultsSaved, abortSessionCalls, purgeSessionDataCalls, auditEvents, recordOutcomeCalls,
+      releaseCalls } =
       createFakeDeps({
         dueJobs: [job],
         updateContentError: new Error("pool timeout"),
@@ -974,13 +1052,15 @@ describe("SchedulerWorker", () => {
     expect(jobRunsCompleted[0]).toMatchObject({ status: "failed", errorMessage: "The assistant run failed." });
     expect(auditEvents.some((event) => event.type === "scheduler.job.run.completed")).toBe(false);
     expect(recordOutcomeCalls).toEqual([{ tenantId: job.tenantId, jobId: job.jobId, succeeded: false }]);
-    expect(abortSessionCalls).toHaveLength(1);
-    expect(purgeSessionDataCalls).toHaveLength(1);
+    expect(abortSessionCalls).toEqual([expect.objectContaining({ sessionId: "session-1", executionId: "execution-1" })]);
+    expect(releaseCalls).toEqual(["execution-1"]);
+    expect(purgeSessionDataCalls).toEqual([]);
   });
 
   test("a text/status write that updates no row records a failed run and still cleans up", async () => {
     const job = makeFakeJob();
-    const { deps, jobRunsCompleted, messagesUpdated, toolResultsSaved, purgeSessionDataCalls, auditEvents, recordOutcomeCalls } =
+    const { deps, jobRunsCompleted, messagesUpdated, toolResultsSaved, purgeSessionDataCalls, auditEvents, recordOutcomeCalls,
+      order } =
       createFakeDeps({
         dueJobs: [job],
         updateContentReturnsNull: true,
@@ -1001,7 +1081,8 @@ describe("SchedulerWorker", () => {
     expect(jobRunsCompleted[0]).toMatchObject({ status: "failed", errorMessage: "The assistant run failed." });
     expect(auditEvents.some((event) => event.type === "scheduler.job.run.completed")).toBe(false);
     expect(recordOutcomeCalls).toEqual([{ tenantId: job.tenantId, jobId: job.jobId, succeeded: false }]);
-    expect(purgeSessionDataCalls).toHaveLength(1);
+    expect(order.slice(-3)).toEqual(["abort", "release", "complete"]);
+    expect(purgeSessionDataCalls).toEqual([]);
   });
 
   test("tick records the real token usage persisted on the assistant message, not 0", async () => {
@@ -1315,7 +1396,7 @@ describe("SchedulerWorker", () => {
       let watchdogFired!: () => void;
       const writeGate = new Promise<void>((resolve) => { watchdogFired = resolve; });
       const { deps, runtimeAdapter, jobRunsCompleted, messagesUpdated, toolResultsSaved, purgeSessionDataCalls,
-        auditEvents, recordOutcomeCalls } = createFakeDeps({
+        auditEvents, recordOutcomeCalls, releaseCalls } = createFakeDeps({
         dueJobs: [job],
         runtimeEvents: [[
           { type: EventType.TEXT_MESSAGE_CONTENT, messageId: "m", delta: "done" },
@@ -1362,7 +1443,8 @@ describe("SchedulerWorker", () => {
       expect(auditEvents.filter((event) => event.type.startsWith("scheduler.job.run."))
         .map((event) => event.type)).toEqual(["scheduler.job.run.failed"]);
       expect(recordOutcomeCalls).toEqual([{ tenantId: job.tenantId, jobId: job.jobId, succeeded: false }]);
-      expect(purgeSessionDataCalls).toHaveLength(1);
+      expect(releaseCalls).toEqual(["execution-1"]);
+      expect(purgeSessionDataCalls).toEqual([]);
     }
   );
 
@@ -1370,7 +1452,7 @@ describe("SchedulerWorker", () => {
     const job = makeFakeJob();
     let watchdogFired!: () => void;
     const cleanupGate = new Promise<void>((resolve) => { watchdogFired = resolve; });
-    const { deps, runtimeAdapter, jobRunsCompleted, messagesUpdated, recordOutcomeCalls, purgeSessionDataCalls } =
+    const { deps, runtimeAdapter, jobRunsCompleted, messagesUpdated, recordOutcomeCalls, purgeSessionDataCalls, releaseCalls } =
       createFakeDeps({ dueJobs: [job] });
     // Cleanup aborts first and waits there. The second abort comes from the
     // watchdog, which then lets cleanup continue.
@@ -1395,7 +1477,8 @@ describe("SchedulerWorker", () => {
     expect(jobRunsCompleted).toHaveLength(1);
     expect(jobRunsCompleted[0]).toMatchObject({ status: "completed", errorMessage: null });
     expect(recordOutcomeCalls).toEqual([{ tenantId: job.tenantId, jobId: job.jobId, succeeded: true }]);
-    expect(purgeSessionDataCalls).toHaveLength(1);
+    expect(releaseCalls).toEqual(["execution-1"]);
+    expect(purgeSessionDataCalls).toEqual([]);
   });
 
   // The worker must never treat `timedOut` as proof of a runtime abort.
@@ -1473,40 +1556,33 @@ describe("SchedulerWorker", () => {
     expect(purgeSessionDataCalls.length).toBe(0);
   });
 
-  test("reclamation purges the thread on the normal path, after a successful abort", async () => {
+  test("reclamation stops the runtime of its execution on the normal path, and leaves the thread to retention", async () => {
     const job = makeFakeJob();
-    const { deps, abortSessionCalls, purgeSessionDataCalls } = createFakeDeps({ dueJobs: [job] });
+    const { deps, abortSessionCalls, purgeSessionDataCalls, order } = createFakeDeps({ dueJobs: [job] });
 
     const worker = new SchedulerWorker(deps, { maxConcurrentJobs: 1, jobTimeoutMs: 5_000 });
     await worker.tick();
 
-    expect(abortSessionCalls.length).toBe(1);
-    expect(purgeSessionDataCalls.length).toBe(1);
-    expect(purgeSessionDataCalls[0].sessionId).toBe("session-1");
+    expect(abortSessionCalls).toEqual([{
+      tenantId: job.tenantId, sessionId: "session-1", userId: job.userId, executionId: "execution-1"
+    }]);
+    // The lease ends only after the runtime is gone.
+    expect(order.slice(-3)).toEqual(["abort", "release", "complete"]);
+    expect(purgeSessionDataCalls).toEqual([]);
   });
 
-  test("reclamation aborts the runtime resolved after a watchdog timeout fired", async () => {
+  test("a watchdog timeout before admission takes no lease and leaves nothing to reclaim", async () => {
     vi.useFakeTimers();
     try {
       const job = makeFakeJob();
 
-      const { deps, runtimeAdapter, abortSessionCalls, purgeSessionDataCalls } = createFakeDeps({
+      const { deps, abortSessionCalls, purgeSessionDataCalls, acquireCalls, quotaCalls, releaseCalls } = createFakeDeps({
         dueJobs: [job],
         // Resolve the runtime only AFTER the watchdog has already fired, so
         // `turn.adapter` was still null when executeJobWithTimeout checked it and
         // no abort happened there.
-        resolveRuntimeDelayMs: 40,
-        runMessageImpl: async function* () {
-          yield {
-            type: EventType.RUN_FINISHED,
-            threadId: "session-1",
-            runId: "resp-1"
-          } as BaseEvent;
-        }
+        resolveRuntimeDelayMs: 40
       });
-      runtimeAdapter.abortSession = async (input) => {
-        abortSessionCalls.push(input);
-      };
 
       const worker = new SchedulerWorker(deps, {
         maxConcurrentJobs: 1,
@@ -1514,15 +1590,15 @@ describe("SchedulerWorker", () => {
         abortSettleGraceMs: 500
       });
       const tick = worker.tick();
-      await vi.advanceTimersByTimeAsync(10);
-      expect(abortSessionCalls).toHaveLength(0);
-      expect(purgeSessionDataCalls).toHaveLength(0);
-      await vi.advanceTimersByTimeAsync(40);
+      await vi.advanceTimersByTimeAsync(50);
       await tick;
 
-      expect(abortSessionCalls.length).toBe(1);
-      expect(abortSessionCalls[0].sessionId).toBe("session-1");
-      expect(purgeSessionDataCalls.length).toBe(1);
+      // The runtime session is created only after admission, so no runtime exists.
+      expect(acquireCalls).toHaveLength(0);
+      expect(quotaCalls).toHaveLength(0);
+      expect(releaseCalls).toHaveLength(0);
+      expect(abortSessionCalls).toHaveLength(0);
+      expect(purgeSessionDataCalls).toHaveLength(0);
     } finally {
       vi.useRealTimers();
     }
@@ -1532,7 +1608,7 @@ describe("SchedulerWorker", () => {
     vi.useFakeTimers();
     try {
       const job = makeFakeJob();
-      const { deps, runtimeSessionsCreated, runMessageCalls, jobRunsCompleted, messagesUpdated } = createFakeDeps({
+      const { deps, runtimeSessionsCreated, runMessageCalls, jobRunsCompleted, messagesCreated } = createFakeDeps({
         dueJobs: [job],
         // The watchdog fires while the runtime resolves, so it has no session to abort.
         resolveRuntimeDelayMs: 40
@@ -1544,11 +1620,45 @@ describe("SchedulerWorker", () => {
 
       expect(runtimeSessionsCreated).toHaveLength(0);
       expect(runMessageCalls).toHaveLength(0);
+      expect(messagesCreated).toHaveLength(0);
       expect(jobRunsCompleted).toHaveLength(1);
       expect(jobRunsCompleted[0]).toMatchObject({ status: "failed", errorMessage: "Scheduled job timed out after 10ms" });
-      expect(messagesUpdated).toEqual([
-        expect.objectContaining({ status: "error", content: "Scheduled job timed out after 10ms" })
-      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("a timeout after admission aborts the execution, then releases the lease", async () => {
+    vi.useFakeTimers();
+    try {
+      let unblock!: () => void;
+      const blocked = new Promise<void>((resolve) => { unblock = resolve; });
+      const fake = createFakeDeps({
+        dueJobs: [makeFakeJob()],
+        runMessageImpl: async function* () {
+          yield { type: EventType.RUN_STARTED, threadId: "session-1", runId: "resp-1" } as BaseEvent;
+          await blocked;
+          yield { type: EventType.RUN_ERROR, message: "aborted" } as BaseEvent;
+        }
+      });
+      fake.runtimeAdapter.abortSession = async (input) => {
+        fake.order.push("abort");
+        fake.abortSessionCalls.push(input);
+        unblock();
+      };
+      const worker = new SchedulerWorker(fake.deps, { maxConcurrentJobs: 1, jobTimeoutMs: 10, abortSettleGraceMs: 500 });
+      const tick = worker.tick();
+      await vi.advanceTimersByTimeAsync(20);
+      await tick;
+
+      expect(fake.abortSessionCalls.length).toBeGreaterThanOrEqual(1);
+      expect(fake.abortSessionCalls.every((call) => call.executionId === "execution-1")).toBe(true);
+      expect(fake.releaseCalls).toEqual(["execution-1"]);
+      // The lease stays until the runtime is gone.
+      const tail = fake.order.slice(fake.order.lastIndexOf("abort"));
+      expect(tail).toEqual(["abort", "release", "complete"]);
+      expect(fake.purgeSessionDataCalls).toEqual([]);
+      expect(fake.jobRunsCompleted[0]).toMatchObject({ status: "failed", errorMessage: "Scheduled job timed out after 10ms" });
     } finally {
       vi.useRealTimers();
     }
@@ -2101,6 +2211,484 @@ describe("SchedulerWorker chat-prompt PII policy", () => {
 
     expect(runMessageCalls).toEqual([]);
     expect(recordOutcomeCalls).toEqual([{ tenantId: "test-tenant", jobId: "job-1", succeeded: false }]);
+  });
+});
+
+// A scheduled turn takes the admission of an interactive turn: a session
+// execution lease with the running-turn caps, then the daily turn quota.
+describe("SchedulerWorker turn admission", () => {
+  beforeEach(() => {
+    messageIdCounter = 0;
+  });
+
+  function withPiiOrder(fake: ReturnType<typeof createFakeDeps>, decision: () => PiiDecision) {
+    fake.deps.piiProtection = textEvaluation(async () => {
+      fake.order.push("pii");
+      return decision();
+    }, { mode: "block", revision: 1 });
+    fake.deps.piiScanRuns = { create: async () => ({ scanRunId: "scan-1" }) };
+  }
+
+  /** Advances the fake clock until `done` is true. */
+  async function advanceUntil(done: () => boolean, stepMs = 10, maxSteps = 1_000): Promise<void> {
+    for (let step = 0; step < maxSteps && !done(); step += 1) await vi.advanceTimersByTimeAsync(stepMs);
+    expect(done()).toBe(true);
+  }
+
+  /** Advances the fake clock until `promise` settles, and returns its value. */
+  async function settle<T>(promise: Promise<T>): Promise<T> {
+    let settled = false;
+    const result = promise.finally(() => { settled = true; });
+    await advanceUntil(() => settled);
+    return result;
+  }
+
+  /**
+   * A runtime that knows the execution of each session and the checkpoints of
+   * each thread. An abort stops only the execution it names, and a purge
+   * deletes the thread.
+   */
+  function trackRuntime(fake: ReturnType<typeof createFakeDeps>) {
+    const active = new Map<string, string>();
+    const threads = new Map<string, string[]>();
+    const createSession = fake.runtimeAdapter.createSession;
+    fake.runtimeAdapter.createSession = async (input) => {
+      if (input.execution) active.set(input.sessionId, input.execution.executionId);
+      threads.set(input.sessionId, ["scheduled turn"]);
+      return createSession(input);
+    };
+    fake.runtimeAdapter.abortSession = async (input) => {
+      fake.order.push("abort");
+      fake.abortSessionCalls.push(input);
+      if (!input.executionId || active.get(input.sessionId) === input.executionId) active.delete(input.sessionId);
+    };
+    fake.runtimeAdapter.purgeSessionData = async (input) => {
+      fake.order.push("purge");
+      fake.purgeSessionDataCalls.push(input);
+      threads.delete(input.sessionId);
+    };
+    return {
+      active,
+      threads,
+      startNewerTurn(sessionId: string, executionId: string) {
+        active.set(sessionId, executionId);
+        threads.get(sessionId)?.push("newer turn");
+      }
+    };
+  }
+
+  test("takes a scheduled lease with the caps before the PII check, and spends the quota once after it", async () => {
+    const fake = createFakeDeps({ dueJobs: [makeFakeJob()] });
+    withPiiOrder(fake, () => ({ action: "allow", reason: "no_findings" }));
+    const worker = new SchedulerWorker(fake.deps, { maxConcurrentJobs: 1, jobTimeoutMs: 60_000, maxConsecutiveFailures: 3 });
+    await worker.tick();
+
+    expect(fake.acquireCalls).toEqual([{
+      actor: { tenantId: "test-tenant", sessionId: "session-1", userId: "user-1" },
+      leaseMs: 30_000,
+      caps: { perUser: 5, perTenant: 50 },
+      turnContext: "scheduled"
+    }]);
+    expect(fake.quotaCalls).toEqual([{ userId: "user-1", tenantId: "test-tenant" }]);
+    expect(fake.order).toEqual([
+      "acquire", "pii", "quota", "createSession", "run", "abort", "release", "complete"
+    ]);
+    // The runtime and the tool context name the admitted execution.
+    const execution = fake.executionsAcquired[0];
+    expect(execution.turnContext).toBe("scheduled");
+    expect(fake.runtimeSessionsCreated[0]).toMatchObject({ execution });
+    expect(fake.toolContextsCreated[0].metadata).toMatchObject({
+      executionId: execution.executionId, turnContext: "scheduled"
+    });
+    expect(fake.abortSessionCalls[0]).toMatchObject({ executionId: execution.executionId });
+    expect(fake.purgeSessionDataCalls).toEqual([]);
+    expect(fake.releaseCalls).toEqual([execution.executionId]);
+    expect(fake.jobRunsCompleted[0]).toMatchObject({ status: "completed" });
+  });
+
+  test("a blocked prompt spends no quota and releases the lease", async () => {
+    const fake = createFakeDeps({ dueJobs: [makeFakeJob()] });
+    withPiiOrder(fake, () => ({
+      action: "block", blockReason: "email", providerType: null, providerModel: null,
+      findings: [{ entityType: "email", value: "a@b.c", start: 0, end: 5, confidence: "high" }]
+    }));
+    const worker = new SchedulerWorker(fake.deps, { maxConcurrentJobs: 1, jobTimeoutMs: 60_000 });
+    await worker.tick();
+
+    expect(fake.quotaCalls).toEqual([]);
+    expect(fake.runMessageCalls).toEqual([]);
+    expect(fake.releaseCalls).toEqual(["execution-1"]);
+    expect(fake.order.indexOf("release")).toBeLessThan(fake.order.indexOf("complete"));
+  });
+
+  test("a running-turn cap refuses the run before the PII check, with a safe message and no auto-disable count", async () => {
+    const fake = createFakeDeps({
+      dueJobs: [makeFakeJob()],
+      acquireImpl: async () => { throw new SessionExecutionError("running_turn_limit", 429); }
+    });
+    withPiiOrder(fake, () => ({ action: "allow", reason: "no_findings" }));
+    const worker = new SchedulerWorker(fake.deps, { maxConcurrentJobs: 1, jobTimeoutMs: 60_000, maxConsecutiveFailures: 1 });
+    await worker.tick();
+
+    expect(fake.order).not.toContain("pii");
+    expect(fake.quotaCalls).toEqual([]);
+    expect(fake.messagesCreated).toEqual([]);
+    expect(fake.runtimeSessionsCreated).toEqual([]);
+    expect(fake.runMessageCalls).toEqual([]);
+    // Nothing was acquired, so nothing is released or reclaimed.
+    expect(fake.releaseCalls).toEqual([]);
+    expect(fake.abortSessionCalls).toEqual([]);
+    expect(fake.jobRunsCompleted[0]).toMatchObject({ status: "failed", errorMessage: RUNNING_TURN_LIMIT_RUN_ERROR });
+    expect(fake.recordOutcomeCalls).toEqual([]);
+    expect(fake.auditEvents).not.toContainEqual(expect.objectContaining({ type: "scheduler.job.disabled" }));
+  });
+
+  test("another admission error fails the run with its safe message and counts toward auto-disable", async () => {
+    const fake = createFakeDeps({
+      dueJobs: [makeFakeJob()],
+      acquireImpl: async () => { throw new SessionExecutionError("session_unavailable", 404); }
+    });
+    const worker = new SchedulerWorker(fake.deps, { maxConcurrentJobs: 1, jobTimeoutMs: 60_000 });
+    await worker.tick();
+
+    expect(fake.runtimeSessionsCreated).toEqual([]);
+    expect(fake.jobRunsCompleted[0]).toMatchObject({
+      status: "failed", errorMessage: "This session is unavailable for execution."
+    });
+    expect(fake.recordOutcomeCalls).toEqual([{ tenantId: "test-tenant", jobId: "job-1", succeeded: false }]);
+  });
+
+  test("a used-up daily quota refuses the run without the model or the messages, and releases the lease", async () => {
+    const fake = createFakeDeps({
+      dueJobs: [makeFakeJob()],
+      quotaImpl: async () => ({
+        error: "limit_exceeded", limitType: "usage_quota", resource: "message_turn", scope: "user", limit: 200,
+        retryAfterMs: 1_000, resetAt: new Date().toISOString(), message: "Daily turn quota exceeded"
+      } as LimitExceededErrorPayload)
+    });
+    const worker = new SchedulerWorker(fake.deps, { maxConcurrentJobs: 1, jobTimeoutMs: 60_000, maxConsecutiveFailures: 1 });
+    await worker.tick();
+
+    expect(fake.quotaCalls).toHaveLength(1);
+    expect(fake.messagesCreated).toEqual([]);
+    expect(fake.runtimeSessionsCreated).toEqual([]);
+    expect(fake.runMessageCalls).toEqual([]);
+    expect(fake.releaseCalls).toEqual(["execution-1"]);
+    expect(fake.jobRunsCompleted[0]).toMatchObject({ status: "failed", errorMessage: TURN_QUOTA_RUN_ERROR });
+    expect(fake.recordOutcomeCalls).toEqual([]);
+  });
+
+  test("a limit store outage refuses the run with a safe message and no auto-disable count", async () => {
+    const fake = createFakeDeps({
+      dueJobs: [makeFakeJob()],
+      quotaImpl: async () => { throw new RequestLimitsUnavailableError(new Error("redis://internal:6379 refused")); }
+    });
+    const worker = new SchedulerWorker(fake.deps, { maxConcurrentJobs: 1, jobTimeoutMs: 60_000, maxConsecutiveFailures: 1 });
+    await worker.tick();
+
+    expect(fake.runMessageCalls).toEqual([]);
+    expect(fake.releaseCalls).toEqual(["execution-1"]);
+    expect(fake.jobRunsCompleted[0]).toMatchObject({ status: "failed", errorMessage: TURN_LIMITS_UNAVAILABLE_RUN_ERROR });
+    expect(fake.jobRunsCompleted[0].errorMessage).not.toContain("redis");
+    expect(fake.recordOutcomeCalls).toEqual([]);
+  });
+
+  test("releases the lease when the runtime session cannot start, after the cleanup", async () => {
+    const fake = createFakeDeps({ dueJobs: [makeFakeJob()] });
+    fake.runtimeAdapter.createSession = async () => { throw new Error("runtime down"); };
+    const worker = new SchedulerWorker(fake.deps, { maxConcurrentJobs: 1, jobTimeoutMs: 60_000 });
+    await worker.tick();
+
+    expect(fake.releaseCalls).toEqual(["execution-1"]);
+    expect(fake.order.slice(-3)).toEqual(["abort", "release", "complete"]);
+    expect(fake.jobRunsCompleted[0]).toMatchObject({ status: "failed" });
+  });
+
+  test("releases the lease when the PII provider is down", async () => {
+    const fake = createFakeDeps({ dueJobs: [makeFakeJob()] });
+    fake.deps.piiProtection = textEvaluation(async () => {
+      throw new PiiProtectionServiceError("pii_provider_unavailable", "down");
+    });
+    const worker = new SchedulerWorker(fake.deps, { maxConcurrentJobs: 1, jobTimeoutMs: 60_000 });
+    await worker.tick();
+
+    expect(fake.quotaCalls).toEqual([]);
+    expect(fake.releaseCalls).toEqual(["execution-1"]);
+  });
+
+  test("a lost lease stops the turn of its execution and leaves the thread", async () => {
+    vi.useFakeTimers();
+    try {
+      let unblock!: () => void;
+      const blocked = new Promise<void>((resolve) => { unblock = resolve; });
+      const fake = createFakeDeps({
+        dueJobs: [makeFakeJob()],
+        heartbeatImpl: async () => false,
+        runMessageImpl: async function* () {
+          yield { type: EventType.RUN_STARTED, threadId: "session-1", runId: "resp-1" } as BaseEvent;
+          await blocked;
+          yield { type: EventType.RUN_FINISHED, threadId: "session-1", runId: "resp-1", result: AGUI_INTERRUPTED_RESULT } as BaseEvent;
+        }
+      });
+      fake.turnAdmission.heartbeatMs = 5;
+      fake.runtimeAdapter.abortSession = async (input) => {
+        fake.order.push("abort");
+        fake.abortSessionCalls.push(input);
+        unblock();
+      };
+      const worker = new SchedulerWorker(fake.deps, { maxConcurrentJobs: 1, jobTimeoutMs: 60_000 });
+      await settle(worker.tick());
+
+      expect(fake.abortSessionCalls[0]).toEqual({
+        tenantId: "test-tenant", sessionId: "session-1", userId: "user-1", executionId: "execution-1"
+      });
+      // Another turn can use the session now, so the job does not delete its thread.
+      expect(fake.purgeSessionDataCalls).toEqual([]);
+      expect(fake.releaseCalls).toEqual(["execution-1"]);
+      expect(fake.jobRunsCompleted[0]).toMatchObject({ status: "failed" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("a lease that a security change stopped ends the turn with that reason", async () => {
+    vi.useFakeTimers();
+    try {
+      let unblock!: () => void;
+      const blocked = new Promise<void>((resolve) => { unblock = resolve; });
+      const fake = createFakeDeps({
+        dueJobs: [makeFakeJob()],
+        heartbeatImpl: async () => false,
+        stoppedBySecurityChange: true,
+        runMessageImpl: async function* () {
+          yield { type: EventType.RUN_STARTED, threadId: "session-1", runId: "resp-1" } as BaseEvent;
+          await blocked;
+          yield { type: EventType.RUN_ERROR, message: "aborted" } as BaseEvent;
+        }
+      });
+      fake.turnAdmission.heartbeatMs = 5;
+      fake.runtimeAdapter.abortSession = async (input) => {
+        fake.abortSessionCalls.push(input);
+        unblock();
+      };
+      const worker = new SchedulerWorker(fake.deps, { maxConcurrentJobs: 1, jobTimeoutMs: 60_000 });
+      await settle(worker.tick());
+
+      expect(fake.abortSessionCalls[0]).toMatchObject({ executionId: "execution-1", reason: "security_change" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("a turn that does not settle after the abort grace keeps its lease unrenewed until it ends", async () => {
+    vi.useFakeTimers();
+    try {
+      let unblock!: () => void;
+      const blocked = new Promise<void>((resolve) => { unblock = resolve; });
+      const fake = createFakeDeps({
+        dueJobs: [makeFakeJob()],
+        runMessageImpl: async function* () {
+          yield { type: EventType.RUN_STARTED, threadId: "session-1", runId: "resp-1" } as BaseEvent;
+          // The runtime ignores the abort.
+          await blocked;
+          yield { type: EventType.RUN_FINISHED, threadId: "session-1", runId: "resp-1" } as BaseEvent;
+        }
+      });
+      fake.turnAdmission.heartbeatMs = 10;
+      fake.runtimeAdapter.abortSession = async (input) => { fake.abortSessionCalls.push(input); };
+      const worker = new SchedulerWorker(fake.deps, { maxConcurrentJobs: 1, jobTimeoutMs: 100, abortSettleGraceMs: 50 });
+
+      // The tick returns after the grace, and the slot is free.
+      await settle(worker.tick());
+      // The old work can still write to the thread, so the lease is not released.
+      expect(fake.releaseCalls).toEqual([]);
+      const renewals = fake.heartbeatCalls.length;
+      expect(renewals).toBeGreaterThan(0);
+      await vi.advanceTimersByTimeAsync(1_000);
+      // The heartbeat stopped: the lease ends at its expiry.
+      expect(fake.heartbeatCalls).toHaveLength(renewals);
+
+      unblock();
+      expect(await settle(worker.drain(1_000))).toBe(true);
+      expect(fake.heartbeatCalls).toHaveLength(renewals);
+      expect(fake.purgeSessionDataCalls).toEqual([]);
+      expect(fake.releaseCalls).toEqual(["execution-1"]);
+      expect(fake.jobRunsCompleted[0]).toMatchObject({ status: "failed", errorMessage: "Scheduled job timed out after 100ms" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // abortSession waits for the runtime disposal (MCP close, sandbox kill),
+  // which has no bound of its own. The grace must bound it.
+  test("a watchdog abort that never settles cannot hold the slot, the lease or a newer turn", async () => {
+    vi.useFakeTimers();
+    try {
+      const first = makeFakeJob();
+      const second = makeFakeJob({ jobId: "job-2" });
+      const dueJobs = [first];
+      let unblock!: () => void;
+      const blocked = new Promise<void>((resolve) => { unblock = resolve; });
+      let turns = 0;
+      const fake = createFakeDeps({
+        dueJobs,
+        claimReturns: [first, second],
+        runMessageImpl: async function* () {
+          turns += 1;
+          if (turns === 1) {
+            yield { type: EventType.RUN_STARTED, threadId: "session-1", runId: "resp-1" } as BaseEvent;
+            // The runtime ignores the abort.
+            await blocked;
+          }
+          yield { type: EventType.RUN_FINISHED, threadId: "session-x", runId: "resp-x" } as BaseEvent;
+        }
+      });
+      const runtime = trackRuntime(fake);
+      // The first abort is the watchdog's, and its disposal never ends.
+      let aborts = 0;
+      const abort = fake.runtimeAdapter.abortSession;
+      fake.runtimeAdapter.abortSession = async (input) => {
+        aborts += 1;
+        if (aborts === 1) {
+          fake.abortSessionCalls.push(input);
+          await new Promise<void>(() => {});
+        }
+        await abort(input);
+      };
+      fake.turnAdmission.heartbeatMs = 10;
+      const worker = new SchedulerWorker(fake.deps, { maxConcurrentJobs: 1, jobTimeoutMs: 100, abortSettleGraceMs: 50 });
+
+      const tick = worker.tick();
+      let tickDone = false;
+      void tick.then(() => { tickDone = true; });
+      await vi.advanceTimersByTimeAsync(100);
+      expect(fake.abortSessionCalls).toEqual([{
+        tenantId: first.tenantId, sessionId: "session-1", userId: first.userId, executionId: "execution-1"
+      }]);
+      await vi.advanceTimersByTimeAsync(50);
+      // The tick returned at the end of the grace, although the abort hangs.
+      expect(tickDone).toBe(true);
+      await tick;
+      const renewals = fake.heartbeatCalls.length;
+      expect(renewals).toBeGreaterThan(0);
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(fake.heartbeatCalls).toHaveLength(renewals);
+      expect(fake.releaseCalls).toEqual([]);
+      // drain() waits for the hung abort until its budget ends.
+      expect(await settle(worker.drain(100))).toBe(false);
+
+      // The slot is free: the next job runs to its end.
+      dueJobs.splice(0, 1, second);
+      await settle(worker.tick());
+      expect(fake.jobRunsCompleted).toEqual([expect.objectContaining({ status: "completed" })]);
+
+      // The lease of the first job expired, and the owner started a new turn
+      // on its session, which wrote checkpoints.
+      runtime.startNewerTurn("session-1", "execution-newer");
+      unblock();
+      await advanceUntil(() => fake.jobRunsCompleted.length === 2);
+
+      // The late cleanup touches only its own execution.
+      expect(runtime.threads.get("session-1")).toEqual(["scheduled turn", "newer turn"]);
+      expect(runtime.active.get("session-1")).toBe("execution-newer");
+      expect(fake.abortSessionCalls.filter((call) => call.sessionId === "session-1")
+        .every((call) => call.executionId === "execution-1")).toBe(true);
+      expect(fake.purgeSessionDataCalls).toEqual([]);
+      expect(fake.heartbeatCalls.filter((id) => id === "execution-1")).toHaveLength(renewals);
+      expect(fake.jobRunsCompleted[1]).toMatchObject({ status: "failed", errorMessage: "Scheduled job timed out after 100ms" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test.each(["before", "after"] as const)(
+    "a lease that admission takes %s the end of the abort grace is released at once, with no heartbeat",
+    async (when) => {
+      vi.useFakeTimers();
+      try {
+        let admit!: () => void;
+        const admitted = new Promise<void>((resolve) => { admit = resolve; });
+        const fake = createFakeDeps({
+          dueJobs: [makeFakeJob()],
+          acquireImpl: async (actor) => {
+            await admitted;
+            return {
+              ...actor, executionId: "execution-late", projectId: null, ownerId: "scheduler-replica",
+              expiresAt: new Date(Date.now() + 30_000).toISOString(), turnContext: "scheduled"
+            };
+          }
+        });
+        fake.turnAdmission.heartbeatMs = 10;
+        const worker = new SchedulerWorker(fake.deps, { maxConcurrentJobs: 1, jobTimeoutMs: 100, abortSettleGraceMs: 50 });
+
+        const tick = worker.tick();
+        let tickDone = false;
+        void tick.then(() => { tickDone = true; });
+        // The watchdog fires while the acquire waits, so it has no execution to abort.
+        await vi.advanceTimersByTimeAsync(when === "before" ? 120 : 150);
+        expect(tickDone).toBe(when === "after");
+        expect(fake.abortSessionCalls).toEqual([]);
+
+        admit();
+        await advanceUntil(() => fake.jobRunsCompleted.length === 1);
+        await tick;
+        await vi.advanceTimersByTimeAsync(1_000);
+
+        expect(fake.heartbeatCalls).toEqual([]);
+        expect(fake.releaseCalls).toEqual(["execution-late"]);
+        expect(fake.acquireCalls).toHaveLength(1);
+        expect(fake.messagesCreated).toEqual([]);
+        expect(fake.quotaCalls).toEqual([]);
+        expect(fake.runtimeSessionsCreated).toEqual([]);
+        expect(fake.runMessageCalls).toEqual([]);
+        expect(fake.abortSessionCalls.every((call) => call.executionId === "execution-late")).toBe(true);
+        expect(fake.jobRunsCompleted[0]).toMatchObject({ status: "failed", errorMessage: "Scheduled job timed out after 100ms" });
+        expect(await worker.drain(0)).toBe(true);
+      } finally {
+        vi.useRealTimers();
+      }
+    }
+  );
+
+  // The cleanup used to check the lease, then delete the thread. Nothing held
+  // the lease between the two: the owner could stop the turn and start a new
+  // one on another replica, and the delete then removed its checkpoints.
+  test("a Stop and a new turn during cleanup keep the checkpoints and the runtime of the new turn", async () => {
+    const fake = createFakeDeps({ dueJobs: [makeFakeJob()] });
+    const runtime = trackRuntime(fake);
+    // Pause where the old cleanup deleted the thread, and before the release.
+    let reachCleanup!: () => void;
+    const cleanupReached = new Promise<void>((resolve) => { reachCleanup = resolve; });
+    let resume!: () => void;
+    const resumed = new Promise<void>((resolve) => { resume = resolve; });
+    const purge = fake.runtimeAdapter.purgeSessionData;
+    fake.runtimeAdapter.purgeSessionData = async (input) => {
+      reachCleanup();
+      await resumed;
+      await purge(input);
+    };
+    const release = fake.turnAdmission.executions.release;
+    fake.turnAdmission.executions.release = async (execution) => {
+      reachCleanup();
+      await resumed;
+      await release(execution);
+    };
+    const worker = new SchedulerWorker(fake.deps, { maxConcurrentJobs: 1, jobTimeoutMs: 60_000 });
+
+    const tick = worker.tick();
+    await cleanupReached;
+    // The owner stops the scheduled turn and starts a new one on replica B.
+    expect(runtime.active.has("session-1")).toBe(false);
+    runtime.startNewerTurn("session-1", "execution-newer");
+    resume();
+    await tick;
+
+    expect(runtime.threads.get("session-1")).toEqual(["scheduled turn", "newer turn"]);
+    expect(runtime.active.get("session-1")).toBe("execution-newer");
+    expect(fake.purgeSessionDataCalls).toEqual([]);
+    expect(fake.abortSessionCalls).toEqual([expect.objectContaining({ sessionId: "session-1", executionId: "execution-1" })]);
+    expect(fake.releaseCalls).toEqual(["execution-1"]);
+    expect(fake.jobRunsCompleted[0]).toMatchObject({ status: "completed" });
   });
 });
 

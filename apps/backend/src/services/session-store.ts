@@ -449,15 +449,11 @@ export class SessionStore {
                 AND a.status = 'pending'
             ) AS has_pending_approvals
             , (${sessionLifecycleAccessSql("s", "$2")}) AS can_edit
-            , (EXISTS (
+            , EXISTS (
               SELECT 1 FROM session_executions e
               WHERE e.tenant_id=s.tenant_id AND e.session_id=s.session_id
                 AND e.status='active' AND e.expires_at>clock_timestamp()
-            ) OR (s.purpose='scheduled' AND EXISTS (
-              SELECT 1 FROM messages streaming
-              WHERE streaming.tenant_id=s.tenant_id AND streaming.session_id=s.session_id
-                AND streaming.role='assistant' AND streaming.status='streaming'
-            ))) AS is_running
+            ) AS is_running
             , (SELECT MIN(e.started_at) FROM session_executions e
                WHERE e.tenant_id=s.tenant_id AND e.session_id=s.session_id AND e.status='active') AS active_turn_started_at
           FROM (

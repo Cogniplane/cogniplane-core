@@ -20,6 +20,7 @@ import {
   type SchedulerWorkerDeps
 } from "../services/scheduler-worker.js";
 import { SessionStore } from "../services/session-store.js";
+import { SessionExecutionStore } from "../services/session-execution-store.js";
 import { type ScheduledJobRecord, UserSettingsStore } from "../services/user-settings-store.js";
 import { createSilentLogger } from "../test-helpers/silent-logger.js";
 import { adminDatabaseUrl, appPool, maintenancePool, runMaintenanceUrl, superuserPool } from "./support/database.js";
@@ -237,6 +238,14 @@ function worker(options: { maxConcurrentJobs: number; schedulerDb?: pg.Pool; hol
     },
     runtimeAdapter: runtime,
     resolveRuntime: async () => ({ kind: "ok", adapter: runtime, modelId: null }),
+    // The lease, caps and quota of a real scheduled turn. No test here reaches the caps.
+    turnAdmission: {
+      executions: new SessionExecutionStore(appPool()),
+      limits: { consumeTurnQuota: async () => null },
+      leaseMs: 30_000,
+      heartbeatMs: 5_000,
+      caps: { perUser: 100, perTenant: 1_000 }
+    },
     auditEvents: new AuditEventStore(appPool()),
     logger: createSilentLogger()
   };

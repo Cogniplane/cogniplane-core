@@ -1,3 +1,6 @@
+import type { RuntimeAdapter } from "../runtime-contracts.js";
+import type { SessionExecution, SessionExecutionStore } from "./session-execution-store.js";
+
 // Failed queries do not prove revocation. Retry only while the last confirmed
 // lease remains valid; a stalled query must not postpone the local deadline.
 export function startExecutionHeartbeat(input: {
@@ -42,4 +45,24 @@ export function startExecutionHeartbeat(input: {
   expiryTimer.unref?.();
   timer.unref?.();
   return stop;
+}
+
+/**
+ * Stops the runtime of an execution whose lease this replica lost. The abort
+ * names the execution, so it cannot stop a newer turn of the session. A lease
+ * that a security change stopped ends the turn with that reason, as on the
+ * replica that made the change.
+ */
+export async function stopLostExecution(input: {
+  execution: SessionExecution;
+  executions: Partial<Pick<SessionExecutionStore, "stoppedBySecurityChange">>;
+  runtime: Pick<RuntimeAdapter, "abortSession">;
+}): Promise<void> {
+  const { execution } = input;
+  const bySecurityChange = await input.executions.stoppedBySecurityChange?.(execution).catch(() => false);
+  await input.runtime.abortSession({
+    tenantId: execution.tenantId, sessionId: execution.sessionId, userId: execution.userId,
+    executionId: execution.executionId,
+    ...(bySecurityChange ? { reason: "security_change" as const } : {})
+  });
 }
