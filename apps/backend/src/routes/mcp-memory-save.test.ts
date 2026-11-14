@@ -105,12 +105,13 @@ function runtimeToken(claims: { sid: string; uid: string; rid: string }): string
 
 async function setup(options: { policyService?: NonNullable<Parameters<typeof createTestApp>[0]>["policyService"] } = {}) {
   const memories = new FakeMemories();
-  const { app, toolContexts, approvals } = await createTestApp({ memories: memories as never, ...options });
+  const { app, toolContexts, approvals, sessions } = await createTestApp({ memories: memories as never, ...options });
   onTestFinished(async () => { await app.close(); });
 
   async function session(input: { sessionId: string; userId?: string; turnContext?: "interactive" | "scheduled" | null;
-    runtimePolicy?: Record<string, unknown> }) {
+    runtimePolicy?: Record<string, unknown>; projectId?: string }) {
     const userId = input.userId ?? "test-user";
+    sessions.seed({ sessionId: input.sessionId, userId, projectId: input.projectId ?? null });
     const runtimeId = `runtime-${input.sessionId}`;
     const context = await createTestToolContext(toolContexts, {
       sessionId: input.sessionId, userId, runtimeId,
@@ -152,7 +153,7 @@ async function setup(options: { policyService?: NonNullable<Parameters<typeof cr
     return proof;
   }
 
-  return { app, memories, approvals, session, approve };
+  return { app, memories, approvals, sessions, session, approve };
 }
 
 const TEXT = { name: "units", content: "User prefers metric units." };
@@ -408,4 +409,44 @@ test("memory_search and memory_delete keep their ordinary rules", async () => {
 
   expect((await call("memory_search", {})).json().result.structuredContent.memories).toHaveLength(1);
   expect((await call("memory_delete", { name: "units" })).json().result.structuredContent).toEqual({ deleted: true, name: "units" });
+});
+
+// GHSA-v366-9wpc-xrm7: other members write the input of a project chat and read its
+// replies, so a project turn must not reach the acting member's saved memories. The
+// tool context snapshot below still lists the memory tools, as a context made before
+// the fix or before a move into a project does. The gateway reads the session itself.
+test("a project chat refuses every memory tool at dispatch, also when the turn's snapshot lists it", async () => {
+  const { memories, approvals, session, approve } = await setup();
+  memories.seed("test-tenant", "test-user", "private-repo", "My private repository is acme/secret.");
+  const { context, call } = await session({ sessionId: "project-session", projectId: "project-1" });
+
+  for (const [name, args] of [["memory_search", {}], ["memory_delete", { name: "private-repo" }]] as const) {
+    const body = (await call(name, { ...args })).json();
+    expect(body.error).toMatchObject({ code: -32000,
+      message: `${name} uses your personal data, so it is not available in a project chat.` });
+    expect(JSON.stringify(body)).not.toContain("acme/secret");
+  }
+  // An approved save is refused before the approval is claimed, and nothing is saved.
+  const proof = approve({ toolContextId: context.toolContextId, sessionId: "project-session", args: { ...TEXT } });
+  expect((await call("memory_save", { ...TEXT }, proof.approvalId)).json().error)
+    .toMatchObject({ code: -32000, message: expect.stringMatching(/not available in a project chat/) });
+  expect(memories.saves).toEqual([]);
+  expect(approvals.consumed.has(proof.approvalId)).toBe(false);
+  expect(memories.forUser("test-tenant", "test-user").map((row) => row.slug)).toEqual(["private-repo"]);
+
+  // The same member's own chat keeps the memory tools.
+  const own = await session({ sessionId: "own-session" });
+  expect((await own.call("memory_search", {})).json().result.structuredContent.memories)
+    .toMatchObject([{ name: "private-repo", content: "My private repository is acme/secret." }]);
+});
+
+test("a chat moved into a project loses the memory tools at its next call", async () => {
+  const { memories, sessions, session } = await setup();
+  memories.seed("test-tenant", "test-user", "units", "Metric.");
+  const { call } = await session({ sessionId: "moved-session" });
+  expect((await call("memory_search", {})).json().result.structuredContent.memories).toHaveLength(1);
+
+  sessions.seed({ sessionId: "moved-session", userId: "test-user", projectId: "project-1" });
+  expect((await call("memory_search", {})).json().error)
+    .toMatchObject({ code: -32000, message: expect.stringMatching(/not available in a project chat/) });
 });

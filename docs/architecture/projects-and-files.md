@@ -63,6 +63,66 @@ selections. Routes: `routes/projects.ts`, `project-files.ts`,
   ([runtime](runtime.md#session-types)). A project skill release is a [sensitive
   change](sensitive-changes.md#weaker-controls-and-skill-releases).
 
+### Project chats and personal data
+
+Other members write the input of a project chat: its history, instructions,
+library files and skills. With `organization_role = 'editor'`, every tenant
+member can write them. Every member who can read the project reads the replies
+and tool results of the chat. So a turn in a project chat gets no personal
+authority of the member who sends it (`services/personal-authority.ts`):
+
+- no saved memories: no `memory_search`, `memory_save` or `memory_delete`, and
+  no saved-memory data message ([memory](memory.md#prompt-use));
+- no `read_skill_corpus`, which reads the member's own chats;
+- no personal connections: no tools of an integration that has a connection
+  probe (GitHub, Notion, Jira, Microsoft 365), and no proxy MCP server with a
+  per-member credential ([tools](tools.md#member-credentials));
+- no personal skills or personal defaults ([runtime](runtime.md#session-types)).
+
+Organization MCP servers, tenant-enabled managed tools, project tools and
+project skills stay. A personal chat keeps all of the items above.
+
+The rule follows the session's `project_id` now, not the member's role:
+
+- `DynamicConfigService.compileRuntimeConfig` leaves these tools and servers out
+  of the runtime config of a project session. It reads no member credential and
+  no connection for it. `compileProjectCatalog` offers no per-member connection.
+- The MCP gateway reads the session at each call (`personalAuthorityNow`,
+  `routes/mcp.ts`). For a session in a project, it refuses a per-member server
+  for every method (403, `-32000`), a `memory` or `skill-corpus` managed tool
+  (`-32000`), and an integration tool that uses a personal connection
+  (`IntegrationRegistryService.checkToolCall`). The refusal comes before Policy
+  Center, so it uses no approval. It applies also to a tool context whose
+  snapshot still lists the tool: a context made before this rule, or before the
+  owner moved the chat into the project.
+- The runtime does not read saved memories for a project turn, and it refuses a
+  `memory_save` approval card there.
+- A project turn has no checkpoint. Each turn rebuilds the history from saved
+  messages in a new runtime ([runtime](runtime.md#session-types)), so no
+  earlier turn's personal data or tool state carries over. A personal chat that
+  its owner moves into a project keeps its old checkpoint thread, but project
+  turns do not read it, and a session cannot leave a project.
+
+Authorship: the rebuilt history labels each user message as from the member
+who sends the current message or from another member (`member 1`, `member 2`,
+in order of first message). The server writes the label from the author id of
+the saved row (`labelProjectHistory`, `deep-agents/project-history.ts`). It
+reads no name and no label from message text. Assistant replies keep their
+saved text.
+
+Limits:
+
+- The label does not stop the model from following text that another member
+  wrote. It can still use project tools and organization connections for that
+  text, within the project's approval mode and Policy Center. The boundary is
+  that such text cannot reach the acting member's personal data.
+- Message text can contain text that looks like a label. The server label is
+  always first.
+- There is no per-member or per-project consent that turns personal authority
+  on in a project chat.
+- History that a member saved in a personal chat before moving it into a
+  project becomes visible to project members, as before.
+
 ## Artifacts
 
 `services/artifacts/`, `routes/artifacts.ts`.

@@ -47,6 +47,8 @@ variables named here.
 | Sandbox binding | Sandbox id saved; any replica reconnects while it exists; archive, delete, purge and a security change of the owner's account kill it ([sandbox](sandbox.md#e2b-sandbox)) | Not saved; disposing the runtime kills its sandbox |
 | Workspace files | Kept across turns while the sandbox exists | Kept for one turn only |
 | Personal skills and defaults | Yes | No |
+| Saved memories, own chats, personal connections and credentials | Yes | No ([project chats and personal data](projects-and-files.md#project-chats-and-personal-data)) |
+| History authorship | Not labelled | Each rebuilt user message has a server-written author label |
 
 A project chat gives each turn its own runtime, runtime token and sandbox, also
 when the same member sends two turns in a row. So the files of a turn are gone

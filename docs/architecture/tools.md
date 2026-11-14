@@ -162,6 +162,10 @@ error, because SDK errors keep request headers and client objects there.
 - A runtime call uses the acting member's credential. Project access never lends
   another member's credential. A member without a credential sees the connection
   but gets no runtime tools from it.
+- A project chat gets no per-member server and no integration tool that uses a
+  personal connection, also with the acting member's own credential. The
+  gateway refuses them for a session in a project
+  ([project chats and personal data](projects-and-files.md#project-chats-and-personal-data)).
 - Tool metadata caches key on member and credential version. The turn's tool
   context records connection hashes and credential versions, so a pending
   approval cannot run through a changed endpoint or a newly saved account.

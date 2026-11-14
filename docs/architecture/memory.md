@@ -18,6 +18,9 @@ Storage and limits: `services/memory-store.ts`.
   `EXCERPT_LENGTH` (`services/memory-workspace-section.ts`), with credentials
   redacted and non-printing characters shown as `⟦U+XXXX⟧`. The block is not
   saved in the transcript or the checkpoint.
+- Project chats: a turn in a project chat gets no memory tools and no data
+  message, and the gateway refuses the memory tools for a session in a project
+  ([project chats and personal data](projects-and-files.md#project-chats-and-personal-data)).
 
 ## Consent and provenance
 

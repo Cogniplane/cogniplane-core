@@ -62,6 +62,7 @@ import {
   scrubUpstreamCredentialValues
 } from "../services/mcp/scrub-upstream-credential.js";
 import { redactSecrets } from "../services/redact-secrets.js";
+import { isPersonalManagedToolCategory, sessionGivesPersonalAuthority } from "../services/personal-authority.js";
 import type {
   ProxyToolMetadata,
   ProxyToolMetadataCache
@@ -230,6 +231,24 @@ export async function registerMcpRoutes(app: FastifyInstance, stores: McpRouteSt
       reply.code(403);
       return failure(rpc.id, -32000, "MCP server unavailable.");
     }
+    // A personal-scope server acts with the member's own credential. A session
+    // in a project gets no personal authority, also when the tool context of
+    // the turn still lists the server (services/personal-authority.ts).
+    if (server.credentialScope === "personal") {
+      let allowed: boolean;
+      try {
+        allowed = await personalAuthorityNow(stores.sessions, tenantId, sessionIdFromRuntimeToken, runtimeTokenClaims.uid);
+      } catch (error) {
+        request.log.error({ err: error, serverId, tenantId }, "MCP session lookup failed");
+        reply.code(500);
+        return failure(rpc.id, -32603, "Internal error.");
+      }
+      if (!allowed) {
+        request.log.warn({ serverId, tenantId }, "Personal MCP server refused for a project session");
+        reply.code(403);
+        return failure(rpc.id, -32000, "MCP server unavailable.");
+      }
+    }
     if (server.credentialScope === "personal" && rpc.method === "initialize") {
       const context = await stores.toolContexts.findLatestActiveBySession(tenantId, sessionIdFromRuntimeToken);
       if (context && (context.tenantId !== runtimeTokenClaims.tid ||
@@ -312,6 +331,7 @@ export async function registerMcpRoutes(app: FastifyInstance, stores: McpRouteSt
           upstreamSignatureSecret: proxySigningSecret(app.config),
           upstreamLimits,
           integrationToolCalls: stores.integrationToolCalls,
+          sessions: stores.sessions,
           callerClosed: callerClosedSignal(reply),
           logger: request.log
         });
@@ -353,6 +373,20 @@ function handleInitialize(
       version: "0.1.0"
     }
   });
+}
+
+/**
+ * Reads the session now: true when it is readable for the member and in no
+ * project. The tool context is a snapshot of the turn start, so it cannot tell.
+ */
+async function personalAuthorityNow(
+  sessions: ManagedToolFactoryDeps["sessions"],
+  tenantId: string,
+  sessionId: string,
+  userId: string
+): Promise<boolean> {
+  const session = await sessions.getReadable(tenantId, sessionId, userId);
+  return Boolean(session) && sessionGivesPersonalAuthority(session!);
 }
 
 function proxyMetadataScope(server: McpServerRegistration, userId: string): string {
@@ -502,6 +536,7 @@ async function handleToolsCall(input: {
   upstreamSignatureSecret: string;
   upstreamLimits: ForwardRpcLimits;
   integrationToolCalls: Pick<IntegrationRegistryService, "checkToolCall">;
+  sessions: ManagedToolFactoryDeps["sessions"];
   /** Aborts when the caller closed the request (callerClosedSignal). */
   callerClosed: AbortSignal;
   logger: Pick<FastifyBaseLogger, "debug" | "warn">;
@@ -522,6 +557,7 @@ async function handleToolsCall(input: {
     upstreamSignatureSecret,
     upstreamLimits,
     integrationToolCalls,
+    sessions,
     callerClosed,
     logger
   } = input;
@@ -570,6 +606,7 @@ async function handleToolsCall(input: {
           runtimeTokenClaims,
           policyGate,
           integrationToolCalls,
+          sessions,
           callerClosed,
           logger,
           captureContext
@@ -725,6 +762,7 @@ async function handleManagedToolCall(
   runtimeTokenClaims: RuntimeTokenClaims,
   policyGate: PolicyGate,
   integrationToolCalls: Pick<IntegrationRegistryService, "checkToolCall">,
+  sessions: ManagedToolFactoryDeps["sessions"],
   callerClosed: AbortSignal,
   logger: Pick<FastifyBaseLogger, "debug" | "warn">,
   captureContext: (context: ToolExecutionContext) => void
@@ -767,6 +805,15 @@ async function handleManagedToolCall(
     if (isProjectToolUnavailableInTurn(tool, context)) {
       throw new ToolCallError("Project tools are only available during interactive project turns.");
     }
+    // A session in a project gets no personal authority (memories, own chats,
+    // personal connections). The runtime policy snapshot can still list such a
+    // tool, so read the session now. One read serves both checks below.
+    let personalAuthority: Promise<boolean> | undefined;
+    const personalConnectionsAllowed = () => personalAuthority ??=
+      personalAuthorityNow(sessions, context.tenantId, context.sessionId, context.userId);
+    if (isPersonalManagedToolCategory(tool.category) && !await personalConnectionsAllowed()) {
+      throw new ToolCallError(`${tool.name} uses your personal data, so it is not available in a project chat.`);
+    }
     // The runtime policy is a snapshot from the turn start. An integration
     // toggle or the connected account can change while the turn runs or waits
     // for an approval, so check both again for each call.
@@ -775,7 +822,8 @@ async function handleManagedToolCall(
       userId: context.userId,
       toolName: tool.name,
       boundAccounts: isPlainObject(context.metadata.integrationAccounts)
-        ? context.metadata.integrationAccounts : undefined
+        ? context.metadata.integrationAccounts : undefined,
+      personalConnectionsAllowed
     });
     if (integrationRefusal) throw new ToolCallError(integrationRefusal);
     // A tool that saves durable data never runs on the model's word. A scheduled

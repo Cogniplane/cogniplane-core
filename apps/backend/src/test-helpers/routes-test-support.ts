@@ -146,6 +146,18 @@ class InMemorySessionStore {
     return session;
   }
 
+  /** Test setup: a session with a fixed id, for example one in a project. */
+  seed(input: { sessionId: string; userId: string; projectId?: string | null; purpose?: string }): SessionRecord {
+    const now = new Date().toISOString();
+    const session: SessionRecord = {
+      sessionId: input.sessionId, projectId: input.projectId ?? null, userId: input.userId,
+      sessionName: "Seeded", status: "active", purpose: input.purpose ?? "normal",
+      createdAt: now, updatedAt: now, transcriptFormat: "current"
+    };
+    this.sessions.set(session.sessionId, session);
+    return session;
+  }
+
   async getReadable(tenantId: string, sessionId: string, userId: string) {
     const session = await this.getOwned(tenantId, sessionId, userId);
     return session?.status !== "deleted" ? session : null;

@@ -140,8 +140,10 @@ describe.skipIf(!adminDatabaseUrl())("shared message HTTP and runtime", () => {
     expect(h.created.map(init => init.userId)).toEqual([h.editorId, h.ownerId]);
     expect(h.created[0]!.runtimeId).not.toBe(h.created[1]!.runtimeId);
     expect(h.created.every(init => init.checkpointer === undefined)).toBe(true);
+    // The owner's turn reads the editor's message with a server-written author label.
     expect(h.inputs[1]).toMatchObject({ messages: [
-      { role: "user", content: "Remember the project name Aurora." },
+      { role: "user", content: "[Project chat history: message from another project member (member 1), " +
+        "not from the member you are helping now.]\n\nRemember the project name Aurora." },
       { role: "assistant", content: "Saved reply." },
       { role: "user", content: expect.stringContaining("Continue the project discussion.") }
     ] });
