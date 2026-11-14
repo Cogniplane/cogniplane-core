@@ -24,7 +24,7 @@ vi.mock("fastify", async (original) => {
   } };
 });
 vi.mock("../config.js", async original => ({ ...await original<typeof import("../config.js")>(), loadConfig: vi.fn() }));
-vi.mock("../lib/db.js", async original => ({ ...await original<typeof import("../lib/db.js")>(), createDatabase: vi.fn(), createMaintenanceDatabase: vi.fn() }));
+vi.mock("../lib/db.js", async original => ({ ...await original<typeof import("../lib/db.js")>(), createDatabase: vi.fn(), createMaintenanceDatabase: vi.fn(), createTurnControlDatabase: vi.fn() }));
 vi.mock("../lib/maintenance-db.js", () => ({ assertApplicationRole: vi.fn(), assertMaintenanceRole: vi.fn() }));
 vi.mock("../lib/redis.js", () => ({ getRedis: vi.fn(), closeRedis: vi.fn() }));
 // Keep all route and dependency builders real. Background workers do not register routes.
@@ -43,7 +43,7 @@ vi.mock("../overlays.js", async original => {
 
 import { buildApp } from "../app.js";
 import { loadConfig } from "../config.js";
-import { createDatabase, createMaintenanceDatabase } from "../lib/db.js";
+import { createDatabase, createMaintenanceDatabase, createTurnControlDatabase } from "../lib/db.js";
 import { getRedis } from "../lib/redis.js";
 import type { AppConfig } from "../config.js";
 import { STEP_UP_ROUTES } from "../services/auth/step-up-routes.js";
@@ -64,6 +64,7 @@ async function census(overlays: boolean, overrides: Partial<AppConfig> = {}) {
   const db = new FakePool().asPool();
   vi.mocked(createDatabase).mockReturnValue(db);
   vi.mocked(createMaintenanceDatabase).mockReturnValue(db);
+  vi.mocked(createTurnControlDatabase).mockReturnValue(db);
   // Local-auth stores need a Redis object at construction. Other builders use
   // in-memory limits and OAuth state here, so no pub/sub sockets are opened.
   vi.mocked(getRedis).mockReturnValue(null).mockReturnValueOnce(new FakeRefreshTokenRedis().asAppRedis());

@@ -59,6 +59,8 @@ export interface MessageAppOptions {
   runtimeFactory?: DeepAgentsRuntimeFactory;
   checkpointer?: DeepAgentsCheckpointSaver;
   managedToolCatalog?: ManagedToolCatalog;
+  /** Replaces the rate limiter, which admits every request. The turn quota stays the `quota` mock. */
+  consumeRateLimit?: MessageRouteStores["limits"]["consumeRateLimit"];
 }
 
 export interface MessageServer {
@@ -112,7 +114,7 @@ export async function buildMessageApp(options: MessageAppOptions) {
     ...stores,
     dynamicConfig,
     hasProviderKey: async () => true,
-    limits: { consumeRateLimit: async () => null, consumeTurnQuota: quota, sweepExpired: () => {} },
+    limits: { consumeRateLimit: options.consumeRateLimit ?? (async () => null), consumeTurnQuota: quota, sweepExpired: () => {} },
     customModels: { list: async () => [] },
     artifacts: { listBySession: async () => [] },
     piiProtection: { evaluateTextWithPolicy }

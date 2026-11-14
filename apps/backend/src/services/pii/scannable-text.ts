@@ -1,5 +1,5 @@
 import type { ArtifactPiiDetail } from "../artifacts/artifact-store.js";
-import { isPdfContentType, type PdfOcr } from "./pdf-ocr.js";
+import { isPdfContentType, type PdfOcr, type PdfOcrContext } from "./pdf-ocr.js";
 import { PiiProtectionServiceError } from "./pii-protection-service.js";
 import type { PdfImageCoverage } from "./pii-provider.js";
 
@@ -31,7 +31,9 @@ export async function toScannableText(
   contentType: string,
   bytes: Buffer,
   tools: PdfScanTools,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  /** Whose file it is; the OCR slots give each tenant a turn. */
+  context: PdfOcrContext = {}
 ): Promise<ScannableText> {
   if (!isPdfContentType(contentType)) return { text: bytes.toString("utf8") };
   if (!tools.extractPdfText) {
@@ -63,7 +65,7 @@ export async function toScannableText(
   }
 
   // An outer abort (the evaluation timeout) throws here: it is not a verdict.
-  const ocr = await tools.ocrPdf(bytes, signal);
+  const ocr = await tools.ocrPdf(bytes, signal, context);
   const combined = [text.trim(), ocr.text.trim()].filter((part) => part !== "").join("\n\n");
   if (combined === "") {
     throw new PiiProtectionServiceError(

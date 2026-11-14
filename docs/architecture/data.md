@@ -1,8 +1,8 @@
 # Data and tenancy
 
 Scope: tenant isolation, database pools, tenant settings, user settings,
-retention and deletion, foreign-key indexes, persistence, audit, usage, rate
-limits. Projects and artifacts are in [projects and
+retention and deletion, stored objects and their cleanup queues, foreign-key
+indexes, persistence, audit, usage, rate limits. Projects and artifacts are in [projects and
 files](projects-and-files.md). PII is in [PII protection](pii.md).
 The SQL in `apps/backend/db/migrations/` is authoritative for the schema.
 
@@ -42,8 +42,14 @@ The SQL in `apps/backend/db/migrations/` is authoritative for the schema.
    `apps/backend/src/integration/rls-write-paths.integration.test.ts`.
    `rls-catalog.integration.test.ts` and that test fail for a tenant table that
    lacks either.
-5. If the table holds storage keys, add them to the cleanup list in
-   `services/tenant-deletion-service.ts`.
+5. If the table holds an artifact storage key or a skill bundle URI, add the
+   column to `STORAGE_LOCATOR_COLUMNS` (`services/storage/storage-references.ts`)
+   as `live`, `derived` or `queue` ([stored objects](#stored-objects)). A
+   `live` column also goes into the reference check of its storage class in
+   that file, and a `live` or `queue` column into `enqueueCleanup` in
+   `services/tenant-deletion-service.ts`. `integration/storage-references.integration.test.ts`
+   fails for a column that the list does not classify, and for a tenant
+   column that it has no seeder for.
 6. If a column stores a user id without a foreign key to `users`, add it to
    `USER_ID_COLUMNS_WITHOUT_FOREIGN_KEY` in the same file. Tenant deletion
    reads foreign keys to `users` from the catalog. A `user_id`, `*_user_id` or
@@ -53,6 +59,14 @@ The SQL in `apps/backend/db/migrations/` is authoritative for the schema.
 ## Database pools
 
 - `db` (`app_user`, under RLS) serves all normal requests.
+- The turn control pool (`app_user`, under RLS, `createTurnControlDatabase`)
+  serves the checks of a running turn: lease renewal, dispatch checks, the
+  sandbox record and release in `SessionExecutionStore`, and the tool contexts
+  (`ToolExecutionContextStore`). Slow tenant queries that hold all connections
+  of `db` then do not stop the turns of other tenants. It has four connections;
+  a check waits at most 3 seconds for one and runs at most 5 seconds, so a
+  failed renewal leaves time for the next one before the lease ends. Turn
+  admission (`acquire`) and the stop route use `db`.
 - `privilegedDb` (`maintenance_user`, BYPASSRLS) is for work that RLS cannot
   authorize: sign-in lookups before the tenant is known, worker claims,
   recovery, download tokens, retention. Rules: [tenant data
@@ -171,7 +185,8 @@ Fields that agents change most often (the full list is `TenantSettingsSchema` in
   date, so its own 30 days do not restart. The `project_file_retention_deleted`
   audit event lists these drafts in `detachedFileIds`.
 - Skill revision cleanup runs only when an admin calls it
-  ([skills](skills.md#import-and-lifecycle)).
+  ([skills](skills.md#import-and-lifecycle)). Its bundle deletes go through
+  the storage queues ([stored objects](#stored-objects)).
 - Spending records stay when sessions or messages are deleted.
 - Tenant deletion is an operator command. See
   [operations](../operations.md#delete-a-tenant). `app_user` cannot delete a
@@ -179,6 +194,44 @@ Fields that agents change most often (the full list is `TenantSettingsSchema` in
   boundary](../database-roles.md#tenant-deletion-boundary)).
 - Session purge and tenant deletion need the [foreign-key
   indexes](#foreign-key-indexes).
+
+## Stored objects
+
+Artifact storage keys and skill bundle URIs live in two backends.
+`STORAGE_LOCATOR_COLUMNS` (`services/storage/storage-references.ts`) lists
+every column that holds one, with its role:
+
+- `live`: the row keeps its object. Artifacts count unless their status is
+  `deleted` or a PII rejection released them (`storage_released_at`); every
+  project file version counts; every skill revision counts, also of the
+  `system` tenant.
+- `derived`: `artifact_download_tokens.storage_key` copies an artifact key and
+  cascades with the artifact.
+- `queue`: `session_storage_gc`, `project_file_storage_gc`,
+  `skill_bundle_storage_gc` and `tenant_deletion_cleanup` hold locators until
+  the object is gone. A queue row never keeps an object, so two queues that
+  hold the same locator do not keep each other.
+
+Rules:
+
+- A change that drops the last pointer to an object writes the queue row in
+  its own transaction: session purge, project file retention, a PII rejection
+  (`ArtifactStore.rejectStoredObject`) and skill revision cleanup
+  (`SkillRevisionStore.deleteSkillRevision`). The object delete runs after the
+  commit. A storage error or a process stop keeps the row, with backoff up to
+  one hour.
+- Before a delete, the collector (`services/storage/storage-gc.ts`) checks the
+  live columns of every tenant on the maintenance pool: one object can have
+  references in more than one tenant. A referenced object stays and its queue
+  row goes. Session purge, project file retention and tenant deletion use the
+  same checks.
+- The scheduler worker drains the session, project-file and skill-bundle
+  storage queues on each tick (`StorageGc.drain`),
+  also when the scheduler, Trash retention and scheduled session retention are
+  off ([background workers](runtime.md#background-workers)).
+- Tenant deletion copies the tenant's live and queued locators into
+  `tenant_deletion_cleanup` before the tenant cascade removes them. The
+  operator command drains that queue ([operations](../operations.md#delete-a-tenant)).
 
 ## Foreign-key indexes
 
@@ -313,6 +366,15 @@ so a missed message only makes a change arrive later:
 - The shutdown closes the subscription, also during an attempt, and no attempt
   starts after it.
 
+A command of the shared client (`lib/redis.ts`) waits at most
+`REDIS_COMMAND_TIMEOUT_MS` (2 seconds), also while it waits for a reconnect.
+Without this limit, a half-open connection after a failover kept each command
+waiting until the kernel closed the socket. A rate limit or quota whose command
+fails answers 503 (`request_limits_unavailable`). The turn event reader
+(`TurnCoordinationBus.reader`) blocks on `XREAD` for 10 seconds, so its own
+client waits up to 12 seconds. Subscriber clients keep the 2 seconds: the limit
+applies to `SUBSCRIBE`, not to the wait for messages.
+
 Running-turn caps ([sessions and turns](runtime.md#sessions-and-turns)) do not
 use Redis: they count in process and through the `session_executions` lease.
 Scheduled turns count only through the lease.
@@ -327,7 +389,21 @@ Scheduled turns count only through the lease.
   rules](../configuration.md#startup-rules).
 - The daily turn quota counts interactive and scheduled turns
   ([scheduler](runtime.md#scheduler)). The `message_turn` rate limit counts
-  `POST /messages` requests only.
+  `POST /messages` requests only. It runs after the session and model checks
+  and before the turn slot and the lease, so a slow limit store holds no slot.
+  A request that then gets `session_busy`, `running_turn_limit` or an artifact
+  error also counts.
+- Admin requests (`/admin/*`, the `onRequest` hooks in `app.ts`): the
+  `admin_query` rate limit, then an in-memory cap on the requests of each
+  tenant that run at the same time in each process (`ADMIN_IN_FLIGHT_LIMITS`:
+  three; up to 32 more wait for at most 15 seconds, in arrival order). A
+  request over it gets 429 `admin_queries_busy`. The cap works without Redis,
+  and each tenant has its own count. A request gives back its slot when its
+  route has a reply, also an error; a client that disconnects keeps the slot
+  until its route ends (`lib/tenant-in-flight-limiter.ts`).
+- Heavy admin reports run with a 10-second statement limit for their own
+  transaction (`withAdminAggregateScope`, `lib/db.ts`): the session list and
+  detail, token usage, message feedback, history and the PII dashboard.
 - A refusal returns `LimitExceededErrorPayload` with `retryAfterMs` and
   `resetAt`. Auth routes also send `Retry-After` in seconds
   (`services/rate-limit-reply.ts`).

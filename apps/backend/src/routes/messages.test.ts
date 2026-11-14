@@ -4,6 +4,7 @@ import { EventType, type BaseEvent } from "@ag-ui/client";
 
 import { MAX_GENERATIVE_UI_CONTEXT_LENGTH } from "@cogniplane/shared-types";
 import { PiiProtectionServiceError } from "../services/pii/pii-protection-service.js";
+import { RequestLimitsUnavailableError } from "../services/redis-request-limits.js";
 import { ActiveTurnsRegistry } from "../services/active-turns-registry.js";
 import { generateSessionTitle } from "../services/session-titler.js";
 import { textEvaluation } from "../test-helpers/pii-evaluation.js";
@@ -303,6 +304,34 @@ test("releases the reserved slot when the rate limit is exhausted (early-return 
 
   expect(response.statusCode).toBe(429);
   expect(harness.activeTurns.snapshot().has(SESSION_ID)).toBe(false);
+});
+
+test("the rate limit runs before the turn slot and the lease: a 429 or a Redis failure holds neither", async () => {
+  const harness = makeStores({ rateLimitError: { retryAfterMs: 3_000 } });
+  let reservedDuringLimit = false;
+  const limited = harness.stores.limits.consumeRateLimit;
+  harness.stores.limits.consumeRateLimit = async (input) => {
+    reservedDuringLimit ||= harness.activeTurns.snapshot().has(SESSION_ID);
+    return limited(input);
+  };
+  activeApp = await buildApp(harness.stores);
+  const send = () => activeApp!.inject({ method: "POST", url: "/messages", payload: { sessionId: SESSION_ID, text: "hi" } });
+
+  expect((await send()).statusCode).toBe(429);
+  // The limit store does not answer: RedisRequestLimits throws after its
+  // command limit. The route answers 503, not 429, and took nothing.
+  harness.stores.limits.consumeRateLimit = async () => {
+    reservedDuringLimit ||= harness.activeTurns.snapshot().has(SESSION_ID);
+    throw new RequestLimitsUnavailableError(new Error("Command timed out"));
+  };
+  const unavailable = await send();
+  expect(unavailable.statusCode).toBe(503);
+  // app.ts maps the error to `request_limits_unavailable` (handleAppError).
+  expect(unavailable.json()).toMatchObject({ message: "Request limits are temporarily unavailable." });
+  expect(reservedDuringLimit).toBe(false);
+  expect(harness.stores.executions.acquire).not.toHaveBeenCalled();
+  expect(harness.activeTurns.snapshot().has(SESSION_ID)).toBe(false);
+  expect(harness.consumedQuota).toEqual([]);
 });
 
 test("returns the resolver's provider-key error without reserving a slot or persisting", async () => {
@@ -720,11 +749,12 @@ test("a lease lost during setup stops the setup before it persists or spends quo
   const setupGate = new Promise<void>(resolve => { resumeSetup = resolve; });
   const h = makeStores({ gateRuntime: async () => {} });
   vi.mocked(h.stores.executions.heartbeat).mockResolvedValue(false);
-  const consumeRateLimit = h.stores.limits.consumeRateLimit;
-  vi.spyOn(h.stores.limits, "consumeRateLimit").mockImplementation(async (input) => {
+  // A setup step after the lease: the artifact lookup.
+  const listBySession = h.stores.artifacts.listBySession.bind(h.stores.artifacts);
+  vi.spyOn(h.stores.artifacts, "listBySession").mockImplementation(async (...args) => {
     reachLimits();
     await setupGate;
-    return consumeRateLimit(input);
+    return listBySession(...args);
   });
   const abort = vi.fn(async () => {});
   h.stores.runtimeAdapter.abortSession = abort;

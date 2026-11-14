@@ -78,6 +78,16 @@ deadlock with a tenant deletion that runs at the same time, rolls the file back
 with no change; run it again. Do not run it while a backend of the earlier
 release still runs: those backends take no lock and do not check the records.
 
+### Upgrade to PII storage retries and the probe breaker
+
+- Migration `096` adds `pii_scan_jobs.transient_retries`. It is additive.
+  During a rolling upgrade, an older backend counts a storage retry of a new
+  backend as a used attempt, so it can fail such a job early.
+- The Redis PII breaker uses new keys (`pii:breaker:{<name>}:state` and
+  `:failures`). Older and newer backends keep separate breaker state during the
+  rollout. The old keys (`pii:breaker:<name>:state`, `:openedAt`, `:failures`)
+  are not read after it; you can delete them.
+
 ### Upgrade to execution stopping and the checkpoint fence
 
 Migration `093` adds the lease state `stopping`, the owner columns of
@@ -144,8 +154,9 @@ request:
   types](architecture/runtime.md#session-types). Files that existed only in an
   expired or replaced sandbox are lost.
 - Sticky sessions are not required.
-- Database connections: each replica opens up to three pools (`db` and
-  `privilegedDb`: `POOL_MAX` each in `lib/db.ts`; checkpointer:
+- Database connections: each replica opens up to four pools (`db` and
+  `privilegedDb`: `POOL_MAX` each in `lib/db.ts`; the turn control pool:
+  `TURN_CONTROL_POOL_MAX` in `lib/db.ts`; checkpointer:
   `CHECKPOINTER_POOL_MAX` in
   `services/deep-agents/deep-agents-checkpointer.ts`). Size PostgreSQL
   `max_connections` for their sum per replica plus the migration job (two
@@ -250,6 +261,12 @@ sandbox: a sandbox of the tenant runs until E2B expires it
 (`E2B_SANDBOX_TIMEOUT_MS` after its last turn start). It calls no other
 provider either; the receipt only counts what stays there
 ([resources outside the database](#resources-outside-the-database)).
+
+Objects: the queue gets the tenant's live storage locators and its storage
+cleanup queues ([stored objects](architecture/data.md#stored-objects)). An
+object that a live row of another tenant names stays
+(`retainedSharedObjectCount`); a cleanup queue row of another tenant does not
+keep it.
 
 User rows: the transaction finds each user that a row of the tenant names,
 also a former member with no membership left, and locks these `users` rows.

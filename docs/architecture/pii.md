@@ -13,9 +13,20 @@ shows provider status, scan metrics, queue state and the breaker timeline (`GET
 - Provider: any OpenAI-compatible `/chat/completions` endpoint, or Ollama
   `/api/chat` (`PII_LLM_WIRE_FORMAT`), configured by `PII_PROVIDER_ENABLED` and
   `PII_LLM_*`. The operator chooses the vendor and accepts its data handling.
-  `PII_PROVIDER_TIMEOUT_MS` bounds one provider call. The circuit breaker
-  (`PII_BREAKER_*`) opens after repeated failures; with `REDIS_URL`, replicas
-  share its state.
+  `PII_PROVIDER_TIMEOUT_MS` bounds one provider call, also the read of its
+  response body. The circuit breaker (`PII_BREAKER_*`,
+  `pii-circuit-breaker.ts`) opens after repeated failures; with `REDIS_URL`,
+  replicas share its state:
+  - After the cool-down, one call tests the provider (the probe). Other calls
+    are refused until the probe's outcome closes or reopens the breaker.
+  - Each call gets a permit with the state that admitted it. An outcome for an
+    older state changes nothing, so a slow success that started before an
+    outage cannot close the breaker during it.
+  - A caller abort frees the probe. A probe whose process stopped expires
+    after `PII_PROVIDER_TIMEOUT_MS` plus 10 seconds.
+  - With Redis, a Lua script makes each admission and each outcome one step.
+    When Redis fails, calls go to the provider and their outcomes are not
+    counted.
 - A rule-based detector always runs; provider findings are merged with it.
   Its rules run on the event loop in linear time; `PII_ARTIFACT_MAX_BYTES`
   bounds the text of one file scan, so a higher limit blocks the backend for
@@ -61,18 +72,31 @@ shows provider status, scan metrics, queue state and the breaker timeline (`GET
   (`runSyncBlock`). In `detect` and `transform` modes a readable file is
   queued (`runAsync`).
 - The synchronous scan records its decision on the scan run before it acts,
-  as a queued scan does. Then it deletes the bytes (block only), writes the
-  verdict and the audit event, and closes the scan run last. A write that
-  fails after the record does not turn into "not scanned": recovery finishes
-  the decision.
+  as a queued scan does. Then it writes the verdict, and closes the scan run
+  last. A write that fails after the record does not turn into "not scanned":
+  recovery finishes the decision.
+- A block, and a permanent scan error of the synchronous scan, give up the
+  object (`ArtifactStore.rejectStoredObject`). One transaction writes the
+  verdict, marks the artifact released (`storage_released_at`) and queues the
+  key that the row holds now in `session_storage_gc`. Then the scan tries the
+  delete, writes the audit event (`objectDeleted`, `objectCleanup`) and closes
+  the run. A failed delete stays queued for the scheduler worker and writes
+  `pii_block_object_orphaned` (`retry: "queued"`). The artifact stays
+  unreadable meanwhile. A key that a live row of any tenant still names is not
+  deleted ([stored objects](data.md#stored-objects)).
 - Agent project drafts (`project_write_file`, `project_reconcile_conflict`):
   `ProjectFileStore.createAgentDraftFromContent` scans the bytes at once with
   the uploads scope and mode, before it stores them. A block refuses the draft
   (422 `pii_block`). A store without the PII service refuses every draft (503
   `pii_protection_unavailable`). `app-dependencies.ts` gives the service to the
   app's store; the project file routes and tools use that store.
-- Async path: `pii_scan_runs` and `pii_scan_jobs` scan stored content,
-  `PII_SCAN_MAX_CONCURRENT_JOBS` per worker tick. The scan run, the `pending`
+- Async path: `pii_scan_runs` and `pii_scan_jobs` scan stored content, at
+  most `PII_SCAN_MAX_CONCURRENT_JOBS` at a time per worker. The worker claims
+  jobs at each tick and every 2 seconds between ticks
+  ([background workers](runtime.md#background-workers)). Tenants take turns in
+  the claim (`PiiScanJobStore.claimDueJobs`): a job's turn is its place in its
+  tenant's due queue plus the tenant's jobs that run now, so one new file of a
+  tenant does not wait for the backlog of another. The scan run, the `pending`
   verdict and the job commit in one transaction
   (`PiiScanJobStore.enqueueArtifactScan`), so a job exists if and only if its
   scan run exists. A file larger than
@@ -88,7 +112,17 @@ shows provider status, scan metrics, queue state and the breaker timeline (`GET
 - Only the attempt that claimed a job can complete it or record its failure
   (`status = 'claimed'` and the same `attempts`). An attempt whose claim
   expired changes nothing, so it cannot overwrite the outcome of a later
-  attempt.
+  attempt. Each claim adds 1 to `attempts`, so the count only goes up.
+- Object storage that is slow or down is not a verdict on the file. A read
+  that fails with a timeout, a network error, or a 5xx or 429 answer
+  (`isTransientStorageError`), or an evaluation timeout while the file is read
+  from storage, fails with `pii_storage_unavailable`. The job then goes back to
+  the queue without using its budget (`max_attempts`): the budget is
+  `attempts - transient_retries` (migration `096`). These retries wait 30
+  seconds, then twice as long each time, up to 10 minutes, for at most
+  `PII_SCAN_TRANSIENT_RETRY_LIMIT` (30) retries; after that each storage
+  failure uses the budget. A missing object uses the budget. Bucket request
+  limits: [projects and files](projects-and-files.md#artifacts).
 
 ## Recovery
 
@@ -141,7 +175,9 @@ image coverage is not stored.
   PDF. The OCR text stays in memory. Findings follow the retention policy.
 - Limits: `PII_PDF_OCR_MAX_PAGES` pages; `PII_PDF_OCR_TIMEOUT_MS` per PDF,
   including the wait for one of `PII_PDF_OCR_MAX_CONCURRENT` slots per process;
-  eight waiters per slot, then `busy`; OCR text up to `PII_ARTIFACT_MAX_BYTES`.
+  eight waiters per slot, and two per slot for one tenant, then `busy`. A free
+  slot goes to the waiting tenants in turn, and the tenant whose pass just
+  ended goes last. OCR text up to `PII_ARTIFACT_MAX_BYTES`.
   A PDF evaluation gets `PII_PROVIDER_TIMEOUT_MS + PII_PDF_OCR_TIMEOUT_MS`, which
   must stay below `SCHEDULER_JOB_TIMEOUT_MS`. A sync block-mode upload can wait
   that long. There is no memory limit per process: the container limit applies.

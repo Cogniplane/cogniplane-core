@@ -4,6 +4,12 @@ import { RedisSubscription, type RedisSubscriptionLogger } from "../lib/redis-su
 import type { SequencedTurnEvent } from "./turn-event-log.js";
 
 const STOP_CHANNEL = "cogniplane:turn-stop:v1";
+// `waitForEvents` blocks on the server for up to XREAD_BLOCK_MS. The reader's
+// command limit is longer by a margin, so a normal empty wait returns null
+// from Redis and is not a timeout. The shared client limit (2 seconds) would
+// end every such wait early.
+const XREAD_BLOCK_MS = 10_000;
+export const READER_COMMAND_TIMEOUT_MS = XREAD_BLOCK_MS + 2_000;
 const MAX_EVENTS = 1_000;
 const MAX_BYTES = 1_000_000;
 
@@ -80,14 +86,14 @@ export class TurnCoordinationBus {
   }
 
   async waitForEvents(reader: Redis, turn: TurnKey, after: number): Promise<SequencedTurnEvent[] | null> {
-    const result = await reader.call("XREAD", "BLOCK", 10_000, "COUNT", 100, "STREAMS", streamKey(turn), `${after}-0`) as
+    const result = await reader.call("XREAD", "BLOCK", XREAD_BLOCK_MS, "COUNT", 100, "STREAMS", streamKey(turn), `${after}-0`) as
       [string, StreamRow[]] | Array<[string, StreamRow[]]> | null;
     if (!result) return [];
     const entries = parseRows(typeof result[0] === "string" ? result[1] as StreamRow[] : result[0]![1]);
     return hasGap(after, entries) ? null : entries;
   }
 
-  reader(): Redis { return this.redis.duplicate(); }
+  reader(): Redis { return this.redis.duplicate({ commandTimeout: READER_COMMAND_TIMEOUT_MS }); }
 
   async publishStop(signal: StopSignal): Promise<void> {
     await this.redis.publish(STOP_CHANNEL, JSON.stringify(signal));

@@ -8,7 +8,7 @@ import {
 import type { ArtifactRecord } from "../artifacts/artifact-store.js";
 import { PiiImportScopeRegistry } from "./pii-import-scopes.js";
 import type { PiiAppliedPolicy, PiiDecision, PiiSubject } from "./pii-protection-service.js";
-import { PiiProtectionServiceError } from "./pii-protection-service.js";
+import { PiiProtectionServiceError, piiStorageUnavailableError } from "./pii-protection-service.js";
 import type { PiiScanJobClaim, PiiScanJobRecord } from "./pii-scan-job-store.js";
 import type { PiiScanRunDecision, PiiScanRunRecord } from "./pii-scan-run-store.js";
 
@@ -23,6 +23,19 @@ test("missing deployment KEK remains retryable and can complete after configurat
   overrides.evaluateThrows = undefined;
   await handler.execute(sampleJob({ attempts: 2 }));
   expect(h.completedCalls).toHaveLength(1);
+});
+
+test("a storage failure is retried as transient and does not close the subject", async () => {
+  const h = buildDeps({ evaluateThrows: piiStorageUnavailableError() });
+  await new PiiScanJobHandler(h.deps).execute(sampleJob());
+  expect(h.failureCalls).toEqual([expect.objectContaining({
+    attempts: 1, permanent: false, transient: true, error: expect.stringMatching(/^pii_storage_unavailable: /)
+  })]);
+  expect(h.artifactPiiCalls).toEqual([]);
+  // Other failures keep using the scan budget.
+  const provider = buildDeps({ evaluateThrows: new Error("provider timeout") });
+  await new PiiScanJobHandler(provider.deps).execute(sampleJob());
+  expect(provider.failureCalls).toEqual([expect.objectContaining({ permanent: false, transient: false })]);
 });
 
 test("the handler finishes a job only as the attempt that it claimed", async () => {
@@ -167,7 +180,7 @@ function buildDeps(overrides: {
   const messagePiiCalls: SetMessagePiiCall[] = [];
   const artifactPiiCalls: SetArtifactPiiCall[] = [];
   const completedCalls: Array<{ tenantId: string; jobId: string; attempts: number }> = [];
-  const failureCalls: Array<{ tenantId: string; jobId: string; attempts: number; error: string; permanent: boolean }> = [];
+  const failureCalls: Array<{ tenantId: string; jobId: string; attempts: number; error: string; permanent: boolean; transient: boolean }> = [];
   const auditCalls: Array<Record<string, unknown>> = [];
   const deleteCalls: string[] = [];
   const evaluateCalls: string[] = [];
@@ -271,9 +284,11 @@ function buildDeps(overrides: {
         async recordFailure(
           { tenantId, jobId, attempts }: PiiScanJobClaim,
           error: string,
-          options: { backoffMs?: number; permanent?: boolean } = {}
+          options: { backoffMs?: number; permanent?: boolean; transient?: boolean } = {}
         ) {
-          failureCalls.push({ tenantId, jobId, attempts, error, permanent: options.permanent ?? false });
+          failureCalls.push({
+            tenantId, jobId, attempts, error, permanent: options.permanent ?? false, transient: options.transient ?? false
+          });
           return failureReturn;
         }
       },
@@ -288,12 +303,21 @@ function buildDeps(overrides: {
         },
         async get() {
           return artifactGet();
+        },
+        // One transaction: the verdict, the release, and the key the row holds now.
+        async rejectStoredObject(tenantId: string, artifactId: string, input: { pii: Record<string, unknown> }) {
+          const current = artifactGet();
+          if (!current || current.status === "deleted") return null;
+          artifactPiiCalls.push({ tenantId, artifactId, pii: input.pii });
+          return { sessionId: "session-1", storageKey: current.storageKey };
         }
       },
-      storage: {
-        async delete(storageKey: string) {
-          if (storageDeleteThrows) throw storageDeleteThrows;
-          deleteCalls.push(storageKey);
+      storageGc: {
+        async collectArtifactObject(row: { storageKey: string }) {
+          // A failed delete stays queued for the worker.
+          if (storageDeleteThrows) return "pending" as const;
+          deleteCalls.push(row.storageKey);
+          return "deleted" as const;
         }
       },
       subjectReader: reader,
@@ -352,6 +376,7 @@ function sampleJob(overrides: Partial<PiiScanJobRecord> = {}): PiiScanJobRecord 
     status: "claimed",
     attempts: 1,
     maxAttempts: 3,
+    transientRetries: 0,
     runAfter: now,
     claimedAt: now,
     completedAt: null,
@@ -528,6 +553,7 @@ test("PiiScanJobHandler emits pii_blocked audit event for block decisions", asyn
   const payload = auditCalls[0].payload as Record<string, unknown>;
   expect(payload.blockReason).toBe("email");
   expect(payload.objectDeleted).toBe(true);
+  expect(payload.objectCleanup).toBe("deleted");
 });
 
 const blockDecision = {
@@ -563,7 +589,7 @@ test("PiiScanJobHandler does not delete an object for a message block", async ()
   expect(deleteCalls).toEqual([]);
 });
 
-test("PiiScanJobHandler blocks anyway and audits the orphan when delete fails", async () => {
+test("PiiScanJobHandler blocks anyway and keeps the key queued when delete fails", async () => {
   const { deps, auditCalls, updateCalls, setStorageDeleteThrows } = buildDeps({
     decision: blockDecision,
     withAuditEvents: true
@@ -574,11 +600,11 @@ test("PiiScanJobHandler blocks anyway and audits the orphan when delete fails", 
 
   // The block still lands: scan run flipped to blocked.
   expect(updateCalls.some((c) => c.patch.status === "blocked")).toBe(true);
-  // The orphan is queryable, and the pii_blocked payload records objectDeleted:false.
+  // The failure is queryable, and the key stays queued for the worker.
   const orphan = auditCalls.find((a) => a.type === "pii_block_object_orphaned");
-  expect(orphan).toBeTruthy();
+  expect(orphan?.payload).toMatchObject({ retry: "queued" });
   const blocked = auditCalls.find((a) => a.type === "pii_blocked");
-  expect((blocked!.payload as Record<string, unknown>).objectDeleted).toBe(false);
+  expect(blocked!.payload).toMatchObject({ objectDeleted: false, objectCleanup: "pending" });
 });
 
 test("PiiScanJobHandler writes a system audit event when sourceUserId is null", async () => {

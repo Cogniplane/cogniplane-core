@@ -27,12 +27,14 @@ export function buildAppDependencies(input: {
   db: Pool;
   schedulerDb?: Pool;
   privilegedDb?: Pool;
+  /** The turn control pool (`createTurnControlDatabase`). Defaults to `db`. */
+  turnControlDb?: Pool;
   config: AppConfig;
   logger: FastifyBaseLogger;
 }) {
-  const { db, schedulerDb = db, privilegedDb = db, config, logger } = input;
+  const { db, schedulerDb = db, privilegedDb = db, turnControlDb = db, config, logger } = input;
 
-  const stores = buildStores(db, schedulerDb, privilegedDb, logger, config);
+  const stores = buildStores(db, schedulerDb, privilegedDb, logger, config, turnControlDb);
   const { managedToolCatalog, managedToolFactoryRegistry } = buildManagedToolRegistries();
   const mcpConnectionTests = new McpConnectionTestService({
     db,
@@ -90,6 +92,7 @@ export function buildAppDependencies(input: {
     db,
     stores,
     artifactStorage: bootstrap.artifactStorage,
+    storageGc: bootstrap.storageGc,
     tenantOrgSettingsPrivileged: bootstrap.tenantOrgSettingsPrivileged,
     redis: bootstrap.redis,
     extractPdfText,
@@ -185,6 +188,7 @@ export function buildAppDependencies(input: {
     managedToolFactoryRegistry,
     limits: bootstrap.limits,
     artifactStorage: bootstrap.artifactStorage,
+    storageGc: bootstrap.storageGc,
     artifactProcessor: bootstrap.artifactProcessor,
     runtimeAdapter: deepAgentsAdapter,
     // The same adapter exposed concretely for the admin/health routes that

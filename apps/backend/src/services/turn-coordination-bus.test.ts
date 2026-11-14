@@ -4,7 +4,7 @@ import type { Redis } from "ioredis";
 import { EventType, type BaseEvent } from "@ag-ui/client";
 import { describe, expect, test, vi } from "vitest";
 
-import { TurnCoordinationBus, type TurnKey } from "./turn-coordination-bus.js";
+import { READER_COMMAND_TIMEOUT_MS, TurnCoordinationBus, type TurnKey } from "./turn-coordination-bus.js";
 
 type StreamRow = [string, string[]];
 
@@ -174,4 +174,21 @@ describe("TurnCoordinationBus.subscribeStop", () => {
       vi.useRealTimers();
     }
   });
+});
+
+test("the event reader gets a command limit longer than its blocking read; the stop subscriber keeps the shared one", async () => {
+  const duplicates: Array<unknown[]> = [];
+  const subscriber = { on() { return subscriber; }, subscribe: async () => 1 };
+  const redis = {
+    duplicate: (...args: unknown[]) => {
+      duplicates.push(args);
+      return subscriber;
+    }
+  } as unknown as Redis;
+  const bus = new TurnCoordinationBus(redis, { warn: () => {} });
+  bus.reader();
+  await bus.subscribeStop(() => {});
+  // XREAD blocks for 10 seconds; the shared limit (lib/redis.ts) is 2 seconds.
+  expect(duplicates).toEqual([[{ commandTimeout: READER_COMMAND_TIMEOUT_MS }], []]);
+  expect(READER_COMMAND_TIMEOUT_MS).toBeGreaterThan(10_000);
 });

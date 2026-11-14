@@ -199,7 +199,15 @@ export async function releaseAccountSandboxes(
 }
 
 export class SessionExecutionStore {
-  constructor(private readonly pool: Pool, readonly ownerId = uuidv7()) {}
+  /**
+   * `pool` serves admission (`acquire`), the stop route, `currentOwner` and the
+   * cross-tenant sweeps. `controlPool` serves the checks of a running turn:
+   * lease renewal, dispatch checks, the sandbox record, release, and the stop
+   * reason. In the app it is the turn control pool (`createTurnControlDatabase`),
+   * so a full app pool cannot stop running turns. Both pools are `app_user`
+   * pools, except for the sweep instance, which gets only the privileged pool.
+   */
+  constructor(private readonly pool: Pool, readonly ownerId = uuidv7(), private readonly controlPool: Pool = pool) {}
 
   /**
    * The sandbox saved for the session, with the hash of the network policy
@@ -211,7 +219,7 @@ export class SessionExecutionStore {
    * provider at the start of every turn.
    */
   async sandboxBinding(execution: SessionExecution): Promise<{ sandboxId: string; networkPolicyHash: string | null } | null> {
-    return withTenantScope(this.pool, execution.tenantId, async db => {
+    return withTenantScope(this.controlPool, execution.tenantId, async db => {
       const result = await db.query(`SELECT s.sandbox_id, s.sandbox_network_policy FROM sessions s
         JOIN session_executions e ON e.tenant_id=s.tenant_id AND e.session_id=s.session_id
         WHERE s.tenant_id=$1 AND s.session_id=$2 AND e.execution_id=$3
@@ -232,7 +240,7 @@ export class SessionExecutionStore {
   async bindSandboxId(
     execution: SessionExecution, previousId: string | null, sandboxId: string, networkPolicyHash: string
   ): Promise<void> {
-    await withTenantScope(this.pool, execution.tenantId, async db => {
+    await withTenantScope(this.controlPool, execution.tenantId, async db => {
       await lockSessionRow(db, execution);
       const result = await db.query(`UPDATE sessions s SET sandbox_id=$6, sandbox_network_policy=$8::jsonb
         FROM session_executions e WHERE e.tenant_id=s.tenant_id AND e.session_id=s.session_id
@@ -250,7 +258,7 @@ export class SessionExecutionStore {
 
   /** See DeepAgentsSandboxBinding.release. */
   async releaseSandboxId(execution: SessionExecution, sandboxId: string): Promise<void> {
-    await withTenantScope(this.pool, execution.tenantId, async db => {
+    await withTenantScope(this.controlPool, execution.tenantId, async db => {
       await lockSessionRow(db, execution);
       const result = await db.query(`UPDATE sessions s SET sandbox_id=NULL, sandbox_network_policy=NULL
         FROM session_executions e WHERE e.tenant_id=s.tenant_id AND e.session_id=s.session_id
@@ -388,7 +396,7 @@ export class SessionExecutionStore {
   }
 
   async bindRuntime(execution: SessionExecution, runtimeId: string): Promise<void> {
-    const updated = await withTenantScope(this.pool, execution.tenantId, (db) => db.query(
+    const updated = await withTenantScope(this.controlPool, execution.tenantId, (db) => db.query(
       `UPDATE session_executions SET runtime_id=$4, updated_at=NOW()
        WHERE tenant_id=$1 AND execution_id=$2 AND user_id=$3 AND status='active'
          AND expires_at>clock_timestamp() AND (runtime_id IS NULL OR runtime_id=$4) RETURNING execution_id`,
@@ -397,7 +405,7 @@ export class SessionExecutionStore {
   }
 
   async isCurrent(execution: SessionExecution, runtimeId?: string): Promise<boolean> {
-    return withTenantScope(this.pool, execution.tenantId, async (db) => {
+    return withTenantScope(this.controlPool, execution.tenantId, async (db) => {
       const result = await db.query(`SELECT e.execution_id FROM session_executions e JOIN sessions s
         ON s.tenant_id=e.tenant_id AND s.session_id=e.session_id
         WHERE e.tenant_id=$1 AND e.session_id=$2 AND e.user_id=$3 AND e.execution_id=$4
@@ -411,7 +419,7 @@ export class SessionExecutionStore {
   }
 
   async heartbeat(execution: SessionExecution, leaseMs: number): Promise<boolean> {
-    return withTenantScope(this.pool, execution.tenantId, async (db) => {
+    return withTenantScope(this.controlPool, execution.tenantId, async (db) => {
       const result = await db.query(`UPDATE session_executions e
         SET expires_at=clock_timestamp()+$5*INTERVAL '1 millisecond', heartbeat_at=clock_timestamp(), updated_at=NOW()
         FROM sessions s WHERE s.tenant_id=e.tenant_id AND s.session_id=e.session_id
@@ -432,7 +440,7 @@ export class SessionExecutionStore {
    * becomes `stopped`. The session is free for a new turn after this.
    */
   async release(execution: SessionExecution): Promise<void> {
-    await withTenantScope(this.pool, execution.tenantId, (db) => db.query(
+    await withTenantScope(this.controlPool, execution.tenantId, (db) => db.query(
       `UPDATE session_executions
         SET status=CASE WHEN status='stopping' THEN 'stopped' ELSE 'finished' END, updated_at=NOW()
         WHERE tenant_id=$1 AND execution_id=$2 AND user_id=$3 AND owner_id=$4
@@ -461,7 +469,7 @@ export class SessionExecutionStore {
    * as the tool context check does, and not the error of a lease that ended.
    */
   async stoppedBySecurityChange(execution: Pick<SessionExecution, "tenantId" | "sessionId" | "executionId">): Promise<boolean> {
-    return withTenantScope(this.pool, execution.tenantId, async db => {
+    return withTenantScope(this.controlPool, execution.tenantId, async db => {
       const result = await db.query(`SELECT 1 FROM session_executions
         WHERE tenant_id=$1 AND session_id=$2 AND execution_id=$3 AND status='stopped' AND stop_reason='security_change'`,
       [execution.tenantId, execution.sessionId, execution.executionId]);
@@ -475,7 +483,7 @@ export class SessionExecutionStore {
    * finds its own stop here and acts on the stop signal at once.
    */
   async isStopped(turn: { tenantId: string; sessionId: string; executionId: string; ownerId: string }): Promise<boolean> {
-    return withTenantScope(this.pool, turn.tenantId, async db => {
+    return withTenantScope(this.controlPool, turn.tenantId, async db => {
       const result = await db.query(`SELECT 1 FROM session_executions
         WHERE tenant_id=$1 AND session_id=$2 AND execution_id=$3 AND owner_id=$4 AND status IN ('stopping','stopped')`,
       [turn.tenantId, turn.sessionId, turn.executionId, turn.ownerId]);

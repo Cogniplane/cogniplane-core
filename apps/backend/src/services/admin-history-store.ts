@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { z } from "zod";
 import { AdminHistoryIdSchema, type AdminHistoryDetailResponse, type AdminHistoryListQuery, type AdminHistoryListResponse } from "@cogniplane/shared-types";
-import { type Pool, withTenantScope } from "../lib/db.js";
+import { type Pool, withAdminAggregateScope, withTenantScope } from "../lib/db.js";
 import { utcMicrosText } from "../lib/db-mappers.js";
 import { HISTORY_EVENTS, HISTORY_EVENT_TYPES, SETTINGS_EVENT, isHistoryEventType, projectHistoryEvent, type HistoryRow } from "./admin-history-projection.js";
 import { compareSettings } from "./admin-settings-comparison.js";
@@ -41,7 +41,7 @@ export class AdminHistoryStore {
   async list(tenantId: string, query: AdminHistoryListQuery): Promise<AdminHistoryListResponse> {
     const types = eventTypes(query), scope = scopeHash(tenantId, types);
     const cursor = query.cursor ? decodeCursor(query.cursor, scope) : null;
-    return withTenantScope(this.db, tenantId, async (db) => {
+    return withAdminAggregateScope(this.db, tenantId, async (db) => {
       const result = await db.query<HistoryRow>(`SELECT ${COLUMNS} ${FROM}
         WHERE a.tenant_id=$1 AND a.event_type=ANY($2::text[])
           AND ($3::timestamptz IS NULL OR (a.created_at,a.id)<($3::timestamptz,$4::bigint))

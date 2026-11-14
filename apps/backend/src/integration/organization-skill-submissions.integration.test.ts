@@ -5,7 +5,9 @@ import { SkillConfigStore } from "../services/skills/skill-config-store.js";
 import { SkillRevisionStore } from "../services/skills/skill-revision-store.js";
 import { OrganizationSkillSubmissionStore, SubmissionAccessError, SubmissionConflictError,
   SubmissionNotFoundError } from "../services/skills/organization-skill-submission-store.js";
-import { adminDatabaseUrl, appPool, superuserPool } from "./support/database.js";
+import { cleanupInactiveSkillRevisions } from "../services/skills/skill-revision-cleanup-service.js";
+import { StorageGc } from "../services/storage/storage-gc.js";
+import { adminDatabaseUrl, appPool, maintenancePool, superuserPool } from "./support/database.js";
 import { seedMembership, seedTenant, seedUser } from "./support/fixtures.js";
 
 const source = { kind:"inline" as const, name:"notes", description:"Write notes", instructions:"Write short notes." };
@@ -234,6 +236,52 @@ describe.skipIf(!adminDatabaseUrl())("organization skill submissions", () => {
     const nextDetail=await store.get(x.tenant,x.admin,next,true);
     expect(nextDetail.organizationSkill).toMatchObject({activeRevisionId:editedId,enabled:true,isPublished:true});
     expect(nextDetail.latest.acceptedRevisionId).not.toBe(editedId);
+  });
+
+  test("revision cleanup keeps an old accepted revision behind a newer draft, and the release still works", async () => {
+    const x=await setup(), store=submissions();
+    const id=await store.create(x.tenant,x.author,x.skill.id,1,"",null);
+    await store.decide(x.tenant,x.admin,id,{version:1,action:"accept",reason:null,organizationSkillId:"kept-notes",
+      organizationSkillName:"Kept notes",expectedOrganizationVersion:null});
+    const acceptedId=(await store.get(x.tenant,x.admin,id,true)).latest.acceptedRevisionId!;
+    const skills=new SkillConfigStore(appPool());
+    const revisions=new SkillRevisionStore(appPool(),skills);
+    // An admin edits the accepted draft: a newer revision of the skill.
+    const edited=await revisions.importSkillBundle(x.tenant,{skillId:"kept-notes",skillName:"Kept notes",
+      description:"Edited",instructions:"Admin edits.",sourceType:"inline",sourceLabel:"edited",bundleName:"kept-notes",
+      bundleHash:"c".repeat(64),validationStatus:"validated",validationMessages:[],createdBy:x.admin,metadata:{},
+      storeBundle:async()=>({storageUri:null})});
+    // The accepted revision is past retention, not active, and not the latest.
+    await superuserPool().query("UPDATE admin_skill_revisions SET created_at=now()-interval '400 days' WHERE skill_revision_id=$1",
+      [acceptedId]);
+    const bundleStorage={deleteBundle:async()=>{ throw new Error("no bundle in this test"); }};
+
+    const report=await cleanupInactiveSkillRevisions({tenantId:x.tenant,config:{SKILL_BUNDLE_RETENTION_DAYS:30},skills,
+      skillRevisions:revisions,bundleGc:new StorageGc({maintenanceDb:maintenancePool(),
+        artifactStorage:{delete:async()=>{ throw new Error("no artifact in this test"); }},skillBundleStorage:bundleStorage})});
+
+    expect(report.deletedRevisionIds).toEqual([]);
+    expect(report.keptRevisionDecisions).toContainEqual({skillRevisionId:acceptedId,reason:`accepted_submission_reference:${id}`});
+    const draft=(await store.get(x.tenant,x.admin,id,true)).organizationSkill!.currentDraftRevisionId!;
+    expect(draft).toBe(edited.revision.skillRevisionId);
+    await store.release(x.tenant,x.admin,id,{expectedOrganizationVersion:0,expectedActiveRevisionId:null,
+      expectedDraftRevisionId:draft,audience:"members"});
+    expect((await store.get(x.tenant,x.admin,id,true)).organizationSkill).toMatchObject({activeRevisionId:draft,enabled:true});
+  });
+
+  test("the final revision delete refuses an accepted revision that the cleanup policy read missed", async () => {
+    const x=await setup(), store=submissions();
+    const id=await store.create(x.tenant,x.author,x.skill.id,1,"",null);
+    await store.decide(x.tenant,x.admin,id,{version:1,action:"accept",reason:null,organizationSkillId:"guarded-notes",
+      organizationSkillName:"Guarded notes",expectedOrganizationVersion:null});
+    const acceptedId=(await store.get(x.tenant,x.admin,id,true)).latest.acceptedRevisionId!;
+    const revisions=new SkillRevisionStore(appPool(),new SkillConfigStore(appPool()));
+
+    await expect(revisions.deleteSkillRevision(x.tenant,"guarded-notes",acceptedId)).resolves.toBeNull();
+    expect((await superuserPool().query("SELECT 1 FROM admin_skill_revisions WHERE skill_revision_id=$1",[acceptedId])).rowCount)
+      .toBe(1);
+    expect(await revisions.listAcceptedSubmissionRevisions(x.tenant)).toContainEqual({revisionId:acceptedId,submissionId:id});
+    expect(await revisions.listAcceptedSubmissionRevisions(x.otherTenant)).toEqual([]);
   });
 
   test("serializes new-copy name decisions and keeps one open thread per source", async () => {

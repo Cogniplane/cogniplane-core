@@ -290,7 +290,7 @@ export const envSchema = z.object({
   // rate-limit/turn-quota; the scheduler is governed by its concurrency cap and
   // this poison guard instead.
   SCHEDULER_MAX_CONSECUTIVE_FAILURES: z.coerce.number().int().positive().default(5),
-  // Max queued `pii_scan_jobs` drained in parallel per worker tick. Independent
+  // Max queued `pii_scan_jobs` that one worker runs at the same time. Independent
   // of SCHEDULER_MAX_CONCURRENT_JOBS so PII async scans and cron jobs don't
   // share a single budget. The worker's PII drain runs whenever the async PII
   // path is wired, even when SCHEDULER_ENABLED=false.

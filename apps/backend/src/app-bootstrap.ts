@@ -185,6 +185,8 @@ export function registerAppLifecycle(input: {
   /** Shorter stage limits for lifecycle tests. Production uses SHUTDOWN_STAGE_MS. */
   shutdownStageMs?: Partial<ShutdownStageMs>;
   privilegedDb?: { end: () => Promise<void> } | null;
+  /** The turn control pool; closed with the other pools. */
+  turnControlDb?: { end: () => Promise<void> } | null;
   schedulerWorker: SchedulerWorker | null;
   /** Sends and cleans email_outbox; null in dev-headers mode. */
   mailWorker?: MailOutboxWorker | null;
@@ -222,6 +224,7 @@ export function registerAppLifecycle(input: {
     activeTurns,
     messages,
     privilegedDb,
+    turnControlDb,
     schedulerWorker,
     mailWorker,
     passwordResets,
@@ -394,6 +397,9 @@ export function registerAppLifecycle(input: {
       await app.db.end();
       if (privilegedDb && privilegedDb !== app.db) {
         await privilegedDb.end();
+      }
+      if (turnControlDb && turnControlDb !== app.db) {
+        await turnControlDb.end();
       }
     })();
     if (!(await waitWithinBudget(cleanup, stageMs.cleanup))) {

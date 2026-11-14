@@ -3,6 +3,7 @@ import type { AppConfig } from "../../config.js";
 import type { Pool } from "../../lib/db.js";
 import type { getRedis } from "../../lib/redis.js";
 import type { ArtifactStorage } from "../artifacts/artifact-storage.js";
+import type { StorageGc } from "../storage/storage-gc.js";
 import type { TenantOrgSettingsStore } from "../tenant-org-settings-store.js";
 
 import { OpenAiCompatiblePiiProvider } from "./openai-compatible-pii-provider.js";
@@ -39,13 +40,17 @@ export function buildPiiServices(input: {
   db: Pool;
   stores: Stores;
   artifactStorage: ArtifactStorage;
+  /** Deletes the objects that a PII rejection queues. */
+  storageGc: Pick<StorageGc, "collectArtifactObject">;
   tenantOrgSettingsPrivileged: TenantOrgSettingsStore;
   redis: ReturnType<typeof getRedis>;
   extractPdfText: PdfTextExtractor;
   // Read at scan time: overlays register after this call, before requests.
   importScopes: PiiImportScopeRegistry;
 }) {
-  const { config, logger, db, stores, artifactStorage, tenantOrgSettingsPrivileged, redis, extractPdfText, importScopes } = input;
+  const {
+    config, logger, db, stores, artifactStorage, storageGc, tenantOrgSettingsPrivileged, redis, extractPdfText, importScopes
+  } = input;
 
   const piiCircuitBreaker: PiiCircuitBreaker = config.PII_BREAKER_ENABLED
     ? createPiiCircuitBreaker({
@@ -54,6 +59,9 @@ export function buildPiiServices(input: {
         failureThreshold: config.PII_BREAKER_FAILURE_THRESHOLD,
         windowMs: config.PII_BREAKER_WINDOW_MS,
         cooldownMs: config.PII_BREAKER_COOLDOWN_MS,
+        // A probe call ends at PII_PROVIDER_TIMEOUT_MS; this bounds a probe
+        // whose process stopped before it recorded an outcome.
+        probeTtlMs: config.PII_PROVIDER_TIMEOUT_MS + 10_000,
         logger,
         events: stores.platformEvents
       })
@@ -121,7 +129,7 @@ export function buildPiiServices(input: {
     piiScanJobs: stores.piiScanJobs,
     messages: stores.messages,
     artifacts: stores.artifacts,
-    storage: artifactStorage,
+    storageGc,
     subjectReader: piiSubjectReader,
     auditEvents: stores.auditEvents,
     logger,
@@ -133,7 +141,7 @@ export function buildPiiServices(input: {
     piiScanRuns: stores.piiScanRuns,
     piiScanJobs: stores.piiScanJobs,
     artifacts: stores.artifacts,
-    storage: artifactStorage,
+    storageGc,
     subjectReader: piiSubjectReader,
     auditEvents: stores.auditEvents,
     logger,

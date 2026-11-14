@@ -1,4 +1,4 @@
-import { test, expect } from "vitest";
+import { test, expect, vi } from "vitest";
 
 import {
   OpenAiCompatiblePiiProvider,
@@ -543,7 +543,9 @@ test("breaker_open: provider rejects calls when the breaker disallows", async ()
     cooldownMs: 30_000
   });
   // Pre-trip the breaker.
-  await breaker.record("failure");
+  const admission = await breaker.admit();
+  if (!admission.allowed) throw new Error("expected an admission");
+  await breaker.record(admission.permit, "failure");
 
   let fetchCalled = 0;
   const trackingFetch: typeof fetch = (input, init) => {
@@ -778,4 +780,44 @@ test("ollama wire format surfaces a string-typed error field as provider_error",
   await expect(
     provider.detectText({ text: "x", entityTypes: ["email"] })
   ).rejects.toMatchObject({ code: "provider_error" });
+});
+
+test("a caller abort releases the half-open probe instead of reopening the breaker", async () => {
+  let now = 1_000_000;
+  const breaker = new InMemoryPiiCircuitBreaker({
+    name: "test", failureThreshold: 1, windowMs: 60_000, cooldownMs: 1_000, now: () => now
+  });
+  const tripping = await breaker.admit();
+  if (!tripping.allowed) throw new Error("expected an admission");
+  await breaker.record(tripping.permit, "failure");
+  now += 1_000;
+  // The call that becomes the probe hangs until its caller aborts.
+  const fetchImpl = buildFakeFetch({ delayMs: 60_000 });
+  const provider = buildProvider(fetchImpl, { breaker, timeoutMs: 30_000 });
+  const caller = new AbortController();
+  const pending = provider.detectText({ text: "hi", entityTypes: ["email"] }, caller.signal);
+  await vi.waitFor(async () => expect((await breaker.snapshot()).state).toBe("half_open"));
+  expect(await breaker.admit()).toEqual({ allowed: false });
+  caller.abort();
+  await expect(pending).rejects.toBeInstanceOf(Error);
+  // The abort says nothing about the provider: still half-open, and the next
+  // call is the probe at once, without waiting for the probe TTL.
+  expect((await breaker.snapshot()).state).toBe("half_open");
+  const next = await breaker.admit();
+  expect(next.allowed && next.permit.probe).toBeTruthy();
+});
+
+test("a provider that sends headers and then stalls the body times out and counts as a failure", async () => {
+  const breaker = new InMemoryPiiCircuitBreaker({ name: "test", failureThreshold: 1, windowMs: 60_000, cooldownMs: 30_000 });
+  const fetchImpl = (async (_url: RequestInfo | URL, init?: RequestInit) => {
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        init?.signal?.addEventListener("abort", () => controller.error(new DOMException("aborted", "AbortError")));
+      }
+    });
+    return new Response(body, { status: 200, headers: { "Content-Type": "application/json" } });
+  }) as unknown as typeof fetch;
+  const provider = buildProvider(fetchImpl, { breaker, timeoutMs: 50 });
+  await expect(provider.detectText({ text: "hi", entityTypes: ["email"] })).rejects.toMatchObject({ code: "timeout" });
+  expect((await breaker.snapshot()).state).toBe("open");
 });

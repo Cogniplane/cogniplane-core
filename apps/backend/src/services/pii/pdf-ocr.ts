@@ -25,7 +25,10 @@ export interface PdfOcrResult {
   reason?: PdfOcrIncompleteReason;
 }
 
-export type PdfOcr = (pdf: Buffer, signal?: AbortSignal) => Promise<PdfOcrResult>;
+/** Whose PDF it is. Used only to give tenants turns for the slots; never logged. */
+export type PdfOcrContext = { tenantId?: string };
+
+export type PdfOcr = (pdf: Buffer, signal?: AbortSignal, context?: PdfOcrContext) => Promise<PdfOcrResult>;
 
 /**
  * Runs a binary with a fixed argv. Resolves with stdout only after the child
@@ -59,6 +62,9 @@ const RENDER_DPI = "300";
 const RENDER_MAX_SIDE_PX = "3508";
 const MAX_TOOL_OUTPUT_BYTES = 1024 * 1024;
 const MAX_QUEUED_PER_SLOT = 8;
+// One tenant can wait for at most this many slots per slot; a tenant over
+// it gets `busy`, so it cannot fill the whole wait queue.
+const MAX_QUEUED_PER_TENANT_PER_SLOT = 2;
 
 /**
  * Tesseract often reads an email address in a proportional font with a space
@@ -87,9 +93,13 @@ class OcrError extends Error {
  */
 export function createPdfOcr(options: PdfOcrOptions): PdfOcr & { verify(): Promise<void> } {
   const run = options.runBinary ?? runBoundedBinary;
-  const slots = new OcrSlots(options.maxConcurrent, options.maxConcurrent * MAX_QUEUED_PER_SLOT);
+  const slots = new OcrSlots(
+    options.maxConcurrent,
+    options.maxConcurrent * MAX_QUEUED_PER_SLOT,
+    options.maxConcurrent * MAX_QUEUED_PER_TENANT_PER_SLOT
+  );
 
-  const ocrPdf = async (pdf: Buffer, signal?: AbortSignal): Promise<PdfOcrResult> => {
+  const ocrPdf = async (pdf: Buffer, signal?: AbortSignal, context: PdfOcrContext = {}): Promise<PdfOcrResult> => {
     const startedAt = Date.now();
     const budget = AbortSignal.timeout(options.timeoutMs);
     const combined = signal ? AbortSignal.any([signal, budget]) : budget;
@@ -97,7 +107,7 @@ export function createPdfOcr(options: PdfOcrOptions): PdfOcr & { verify(): Promi
     let failure: OcrError | undefined;
 
     try {
-      await slots.acquire(combined);
+      await slots.acquire(combined, context.tenantId ?? "");
     } catch (error) {
       if (signal?.aborted) throw signal.reason ?? error;
       failure = error instanceof OcrError ? error : new OcrError("budget", "slot");
@@ -156,7 +166,7 @@ export function createPdfOcr(options: PdfOcrOptions): PdfOcr & { verify(): Promi
       // The runner resolves only after the child exits, so no tool still
       // writes in the directory, and the slot is free for the next PDF.
       if (dir) await rm(dir, { recursive: true, force: true });
-      slots.release();
+      slots.release(context.tenantId ?? "");
     }
 
     result.text = pages.filter((text) => text !== "").join("\n\n");
@@ -221,22 +231,34 @@ export function createPdfOcr(options: PdfOcrOptions): PdfOcr & { verify(): Promi
 }
 
 /**
- * Limits the OCR passes that run at the same time in this process. A full
- * wait queue refuses at once (`busy`); an aborted waiter leaves the queue.
+ * Limits the OCR passes that run at the same time in this process. A free
+ * slot goes to the waiting tenants in turn, and the tenant whose pass just
+ * ended goes last. In a tenant, PDFs go in arrival order. A full wait queue, or a tenant at its own wait limit, is refused at
+ * once (`busy`); an aborted waiter leaves the queue.
  */
-class OcrSlots {
+export class OcrSlots {
   private active = 0;
-  private readonly waiters: Array<{ grant: () => void }> = [];
+  private waiting = 0;
+  // Waiters per tenant. The map order is the order of the tenants' turns.
+  private readonly queues = new Map<string, Array<{ grant: () => void }>>();
 
-  constructor(private readonly limit: number, private readonly maxWaiting: number) {}
+  constructor(
+    private readonly limit: number,
+    private readonly maxWaiting: number,
+    private readonly maxWaitingPerTenant: number
+  ) {}
 
-  acquire(signal: AbortSignal): Promise<void> {
+  acquire(signal: AbortSignal, tenant: string): Promise<void> {
     if (signal.aborted) return Promise.reject(new OcrError("budget", "slot"));
     if (this.active < this.limit) {
       this.active += 1;
       return Promise.resolve();
     }
-    if (this.waiters.length >= this.maxWaiting) return Promise.reject(new OcrError("busy", "slot"));
+    const queue = this.queues.get(tenant) ?? [];
+    if (this.waiting >= this.maxWaiting || queue.length >= this.maxWaitingPerTenant) {
+      return Promise.reject(new OcrError("busy", "slot"));
+    }
+    if (!this.queues.has(tenant)) this.queues.set(tenant, queue);
     return new Promise<void>((resolve, reject) => {
       const waiter = {
         grant: () => {
@@ -245,20 +267,40 @@ class OcrSlots {
         }
       };
       const onAbort = () => {
-        const index = this.waiters.indexOf(waiter);
-        if (index >= 0) this.waiters.splice(index, 1);
+        const index = queue.indexOf(waiter);
+        if (index >= 0) {
+          queue.splice(index, 1);
+          this.waiting -= 1;
+          if (queue.length === 0 && this.queues.get(tenant) === queue) this.queues.delete(tenant);
+        }
         reject(new OcrError("budget", "slot"));
       };
       signal.addEventListener("abort", onAbort, { once: true });
-      this.waiters.push(waiter);
+      queue.push(waiter);
+      this.waiting += 1;
     });
   }
 
-  release(): void {
-    const next = this.waiters.shift();
-    // The slot passes straight to the next waiter: `active` stays the same.
-    if (next) next.grant();
-    else this.active -= 1;
+  release(tenant: string): void {
+    const own = this.queues.get(tenant);
+    if (own) {
+      // The tenant whose pass ended goes to the end of the turn order.
+      this.queues.delete(tenant);
+      this.queues.set(tenant, own);
+    }
+    const next = this.queues.entries().next();
+    if (next.done) {
+      this.active -= 1;
+      return;
+    }
+    const [nextTenant, queue] = next.value;
+    const waiter = queue.shift()!;
+    this.waiting -= 1;
+    // The tenant goes to the end of the turn order, or leaves it.
+    this.queues.delete(nextTenant);
+    if (queue.length > 0) this.queues.set(nextTenant, queue);
+    // The slot passes straight to the waiter: `active` stays the same.
+    waiter.grant();
   }
 }
 

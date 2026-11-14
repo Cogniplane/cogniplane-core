@@ -13,9 +13,12 @@ export const MAINTENANCE_GRANTS = {
   // tenant is known. tenant_member_removals: WorkOS sign-in and request
   // admission read a removal before the tenant scope exists. Read only;
   // every write goes through app_user in the tenant's scope.
+  // admin_skill_revisions: the storage cleanup checks that no revision of
+  // any tenant names a bundle before it deletes it (storage/storage-gc.ts).
   "SELECT": [
     "tenant_org_settings", "artifacts", "pii_scan_runs", "projects", "project_memberships",
-    "local_identities", "auth_action_tokens", "user_passkeys", "tenant_member_removals"
+    "local_identities", "auth_action_tokens", "user_passkeys", "tenant_member_removals",
+    "admin_skill_revisions"
   ],
   "SELECT, UPDATE": [
     "scheduled_jobs", "scheduled_job_runs", "pii_scan_jobs", "approvals",
@@ -28,7 +31,11 @@ export const MAINTENANCE_GRANTS = {
     "sessions", "session_executions", "messages", "project_files", "email_outbox", "runtime_sessions"
   ],
   "SELECT, DELETE": ["project_file_versions"],
-  "SELECT, INSERT, UPDATE, DELETE": ["project_file_storage_gc", "session_storage_gc", "session_runtime_gc"],
+  // The storage cleanup queues (storage/storage-gc.ts): the worker claims,
+  // retries and removes rows of every tenant.
+  "SELECT, INSERT, UPDATE, DELETE": [
+    "project_file_storage_gc", "session_storage_gc", "session_runtime_gc", "skill_bundle_storage_gc"
+  ],
   "INSERT": ["audit_events"]
 } as const;
 

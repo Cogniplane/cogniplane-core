@@ -64,12 +64,12 @@ test("cleanup leases project storage rows and records delete failures with backo
     .onQuery("WITH candidates AS", (text) => {
       claimSql = text;
       return {
-        rows: [{ tenant_id: "tenant-1", project_id: "project-1", storage_key: "project/key" }],
+        rows: [{ tenant_id: "tenant-1", owner_id: "project-1", storage_key: "project/key" }],
         rowCount: 1,
       };
     })
-    .onQuery(/WHERE storage_key=\$1/, () => ({ rows: [], rowCount: 0 }))
-    .onQuery(/UPDATE project_file_storage_gc\s+SET next_attempt_at/, (_text, values) => {
+    .onQuery(/AS referenced$/, () => ({ rows: [{ referenced: false }], rowCount: 1 }))
+    .onQuery(/UPDATE project_file_storage_gc SET next_attempt_at/, (_text, values) => {
       retryValues = values;
       return { rows: [], rowCount: 1 };
     });

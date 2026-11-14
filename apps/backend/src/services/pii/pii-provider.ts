@@ -68,6 +68,12 @@ export interface PiiScanArtifactInput {
    * `readContent`. Undefined for a file that is not a PDF.
    */
   imageCoverage?: () => PdfImageCoverage | undefined;
+  /**
+   * True while `readContent` waits for object storage. An evaluation timeout
+   * at that moment is a storage failure (`pii_storage_unavailable`), which a
+   * queued scan retries, not a verdict on the file.
+   */
+  storageReadInProgress?: () => boolean;
   entityTypes: PiiEntityType[];
   /** Optional per-call model override; falls back to the provider's default. */
   model?: string;

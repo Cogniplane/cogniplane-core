@@ -75,14 +75,27 @@ repeat these checks; it extracts with `strict: true` and accepts files and
 directories only.
 
 Retention: an admin runs cleanup with `POST /admin/skills/revisions/cleanup`;
-send `{"dryRun": true}` first to see the report (the default is `false`). It
-deletes only revisions older than `SKILL_BUNDLE_RETENTION_DAYS` that are not
-active, not the latest of their skill, and not used by an active runtime
-(`domain/skill-cleanup-policy.ts`), and deletes a bundle only when no other
-revision points to it. No scheduler runs it. Every lifecycle action writes an
-audit event in the action's transaction. The cleanup report is the exception:
-the cleanup is many transactions and storage deletes, so its event is written
-after them.
+send `{"dryRun": true}` first to see the report (the default is `false`; a
+dry run changes nothing). It deletes only revisions older than
+`SKILL_BUNDLE_RETENTION_DAYS` that are not active, not the latest of their
+skill, not used by an active runtime, and not the accepted revision of a
+member submission (`domain/skill-cleanup-policy.ts`; reason
+`accepted_submission_reference:<submission ids>`). Release of a submission
+reads its accepted revision, also when newer drafts exist. The DELETE checks
+the active and accepted rules again under the skill row lock.
+
+- Each revision delete queues its bundle URI in `skill_bundle_storage_gc` in
+  the same transaction. The cleanup then deletes the bundle when no revision of
+  any tenant names it ([stored objects](data.md#stored-objects)).
+- Report: `deletedBundleStorageUris` lists the bundles that this call deleted;
+  `pendingBundleStorageUris` lists the bundles whose delete failed. A pending
+  bundle stays queued: the scheduler worker retries it, and the next cleanup
+  retries all queued bundles of the tenant first. `failures` lists only
+  revisions that were not deleted.
+- No scheduler deletes revisions; only the queued bundle deletes are
+  automatic. Every lifecycle action writes an audit event in the action's
+  transaction. The cleanup report is the exception: the cleanup has many
+  transactions and storage deletes, so its event is written after them.
 
 ## Bundle storage
 
@@ -112,8 +125,9 @@ after them.
   - a process crash after the upload;
   - a COMMIT error while the import transaction is still open, because the
     commit can still apply;
-  - a failed delete after a failed import;
-  - a failed bundle delete in cleanup, after its revision is gone.
+  - a failed delete after a failed import.
+
+  A failed bundle delete in revision cleanup stays queued and is retried.
 - A stored URI whose scheme does not match the configured backend is an error.
   No tool moves bundles or artifacts between local and bucket storage: choose
   the backend before tenants store files, or copy the objects and rewrite the

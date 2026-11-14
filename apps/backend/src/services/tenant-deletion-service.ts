@@ -4,6 +4,7 @@ import type { PoolClient } from "pg";
 import type { Pool } from "../lib/db.js";
 import type { ArtifactStorage } from "./artifacts/artifact-storage.js";
 import type { SkillBundleStorage } from "./skills/skill-bundle-storage.js";
+import { artifactObjectReferencedSql, skillBundleReferencedSql } from "./storage/storage-references.js";
 
 type CleanupKind = "artifact" | "skill_bundle" | "runtime_thread" | "redis_database";
 
@@ -354,6 +355,13 @@ function deleteUnreferencedUsersQuery(references: UserReference[]): string {
   `;
 }
 
+/**
+ * Copies every storage locator of the tenant into the deletion queue, before
+ * the tenant row cascade removes them: the live columns and the cleanup
+ * queues of `STORAGE_LOCATOR_COLUMNS` (`storage/storage-references.ts`).
+ * Download tokens are left out: they copy an artifact key that this list
+ * already holds.
+ */
 async function enqueueCleanup(client: PoolClient, requestId: string, tenantId: string, includeRedis: boolean) {
   await client.query(
     `
@@ -369,6 +377,8 @@ async function enqueueCleanup(client: PoolClient, requestId: string, tenantId: s
       SELECT $1, 'skill_bundle', bundle_storage_uri
         FROM admin_skill_revisions
        WHERE tenant_id = $2 AND bundle_storage_uri IS NOT NULL
+      UNION
+      SELECT $1, 'skill_bundle', storage_uri FROM skill_bundle_storage_gc WHERE tenant_id = $2
       UNION
       SELECT $1, 'runtime_thread', session_id FROM sessions WHERE tenant_id = $2
       UNION
@@ -596,28 +606,25 @@ export class TenantDeletionService {
     );
   }
 
+  // The tenant's rows are gone, so a reference is in another tenant. The
+  // migration pool sees every tenant. A cleanup queue row of another tenant
+  // does not keep the object: that queue only waits for the same delete.
   private async cleanupItem(item: CleanupRow): Promise<"deleted" | "retained_shared" | "purged"> {
     if (item.kind === "artifact") {
-      const references = await this.deps.db.query(
-        `
-          SELECT 1 FROM artifacts WHERE storage_key = $1
-          UNION ALL SELECT 1 FROM project_file_versions WHERE storage_key = $1
-          UNION ALL SELECT 1 FROM project_file_storage_gc WHERE storage_key = $1
-          UNION ALL SELECT 1 FROM session_storage_gc WHERE storage_key = $1
-          LIMIT 1
-        `,
+      const references = await this.deps.db.query<{ referenced: boolean }>(
+        `SELECT ${artifactObjectReferencedSql("$1")} AS referenced`,
         [item.locator]
       );
-      if ((references.rowCount ?? 0) > 0) return "retained_shared";
+      if (references.rows[0]?.referenced === true) return "retained_shared";
       await this.deps.artifactStorage.delete(item.locator);
       return "deleted";
     }
     if (item.kind === "skill_bundle") {
-      const references = await this.deps.db.query(
-        `SELECT 1 FROM admin_skill_revisions WHERE bundle_storage_uri = $1 LIMIT 1`,
+      const references = await this.deps.db.query<{ referenced: boolean }>(
+        `SELECT ${skillBundleReferencedSql("$1")} AS referenced`,
         [item.locator]
       );
-      if ((references.rowCount ?? 0) > 0) return "retained_shared";
+      if (references.rows[0]?.referenced === true) return "retained_shared";
       await this.deps.skillBundleStorage.deleteBundle(item.locator);
       return "deleted";
     }

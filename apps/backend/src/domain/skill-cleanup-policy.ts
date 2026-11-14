@@ -39,10 +39,20 @@ export function getCleanupDecision(input: {
   activeRuntimeReferences: ActiveRuntimeSkillReference[];
   activeRuntimeRevisionIds: Set<number>;
   latestRevisionIds: Set<number>;
+  /**
+   * Submission ids by the revision that their acceptance created. Release of
+   * an accepted submission reads that revision, also after newer drafts.
+   */
+  acceptedSubmissionsByRevisionId?: Map<number, string[]>;
   retentionCutoff: number;
 }): SkillCleanupDecision {
   if (input.activeRevisionIds.has(input.revision.skillRevisionId)) {
     return { retain: true, reason: "active_registry_revision" };
+  }
+
+  const acceptedSubmissionIds = input.acceptedSubmissionsByRevisionId?.get(input.revision.skillRevisionId);
+  if (acceptedSubmissionIds?.length) {
+    return { retain: true, reason: `accepted_submission_reference:${acceptedSubmissionIds.join(",")}` };
   }
 
   if (input.activeRuntimeRevisionIds.has(input.revision.skillRevisionId)) {

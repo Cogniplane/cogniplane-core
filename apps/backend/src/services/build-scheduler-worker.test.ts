@@ -229,3 +229,45 @@ test("scheduled turns get the lease store, the quota and the turn limits of inte
   expect(admission.limits).toBe(input.limits);
   expect(admission).toMatchObject({ leaseMs: 40_000, heartbeatMs: 6_000, caps: { perUser: 3, perTenant: 7 } });
 });
+
+test("the storage cleanup queues alone keep the worker, with every other workload off", async () => {
+  // A PII rejection or a skill revision cleanup queues object deletes while
+  // retention and the scheduler are off; a failed delete must still be retried.
+  const config = createTestConfig({
+    ...ONLY_SESSION_RETENTION,
+    SESSION_TRASH_RETENTION_ENABLED: false,
+    SCHEDULED_SESSION_RETENTION_ENABLED: false
+  });
+  const drain = vi.fn(async () => ({ deletedObjects: 1, deletedBundles: 0, pending: 0 }));
+  const { input, listDueJobs } = makeInput({ storageGc: { drain } });
+
+  const worker = buildSchedulerWorker(config, input);
+  expect(worker).not.toBeNull();
+  await worker!.tick();
+  expect(await worker!.drain(1_000)).toBe(true);
+
+  expect(drain).toHaveBeenCalledTimes(1);
+  expect(listDueJobs).not.toHaveBeenCalled();
+});
+
+test("a failed storage queue drain is logged and the next tick tries again", async () => {
+  const config = createTestConfig({ ...ONLY_SESSION_RETENTION, SESSION_TRASH_RETENTION_ENABLED: false,
+    SCHEDULED_SESSION_RETENTION_ENABLED: false });
+  const drain = vi.fn()
+    .mockRejectedValueOnce(new Error("maintenance pool unavailable"))
+    .mockResolvedValue({ deletedObjects: 0, deletedBundles: 0, pending: 0 });
+  const logger = createSilentLogger();
+  const error = vi.spyOn(logger, "error");
+  const { input } = makeInput({ storageGc: { drain }, logger });
+
+  const worker = buildSchedulerWorker(config, input)!;
+  await worker.tick();
+  expect(await worker.drain(1_000)).toBe(true);
+  expect(error).toHaveBeenCalledWith(
+    { error: expect.objectContaining({ message: "maintenance pool unavailable" }) },
+    "Storage cleanup queue drain failed; will retry"
+  );
+  await worker.tick();
+  expect(await worker.drain(1_000)).toBe(true);
+  expect(drain).toHaveBeenCalledTimes(2);
+});

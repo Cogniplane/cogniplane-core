@@ -142,6 +142,11 @@ Limits:
   segment keep `{userId}/{sessionId}/...`. Every read, download and delete uses
   the key stored on the row, so those objects need no migration.
   `ARTIFACT_STORAGE_BACKEND` is `local` or `bucket` (S3-compatible).
+- Bucket requests have limits (`BUCKET_REQUEST_LIMITS`,
+  `services/artifacts/artifact-storage.ts`; skill bundle storage uses the same
+  client): 5 seconds to connect, 30 seconds to the response headers (for an
+  upload, this includes sending the body), and 30 seconds with no data on the
+  socket while a body streams. A stalled download then frees its socket.
 - An upload stays `pending` until its [PII](pii.md) verdict. No download token
   is issued before the artifact is `ready`.
 - One rule decides if an artifact can leave the store: chat context, runtime

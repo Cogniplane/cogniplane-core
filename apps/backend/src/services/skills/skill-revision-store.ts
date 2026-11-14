@@ -16,6 +16,7 @@ import {
 } from "../admin-config-records.js";
 import { mapSkillRevision, parseSkillActivationMetadata, skillReferencesFromManifest } from "../admin-config-store-mappers.js";
 import { lockOrganizationSkillNames } from "./organization-skill-name-lock.js";
+import { enqueueSkillBundleGc } from "../storage/storage-gc.js";
 import { insertAuthorUpdate } from "./organization-skill-submission-store.js";
 import { assertSkillReleaseSnapshot, latestSkillRevisionId, skillReleaseSnapshot } from "./skill-release-impact-store.js";
 
@@ -513,10 +514,39 @@ export class SkillRevisionStore {
     });
   }
 
+  /**
+   * Revisions that an accepted member submission names
+   * (`organization_skill_submission_attempts.accepted_revision_id`, no
+   * foreign key). Release reads the accepted revision, so cleanup keeps it.
+   */
+  async listAcceptedSubmissionRevisions(tenantId: string): Promise<Array<{ revisionId: number; submissionId: string }>> {
+    return withTenantScope(this.db, tenantId, async (client) => {
+      const accepted = await client.query<{ accepted_revision_id: string; submission_id: string }>(
+        `SELECT accepted_revision_id, submission_id::text AS submission_id
+         FROM organization_skill_submission_attempts
+         WHERE tenant_id = $1 AND accepted_revision_id IS NOT NULL
+         ORDER BY accepted_revision_id, submission_id`,
+        [tenantId]
+      );
+      return accepted.rows.map((row) => ({
+        revisionId: Number(row.accepted_revision_id),
+        submissionId: String(row.submission_id)
+      }));
+    });
+  }
+
+  /**
+   * Deletes one revision that cleanup chose, and queues its bundle in the same
+   * transaction (`skill_bundle_storage_gc`). The caller deletes the bundle
+   * after the commit (`StorageGc`); a failure leaves the URI queued. The
+   * DELETE repeats the safeguards that must hold at commit time, because the
+   * cleanup policy decided on an earlier read.
+   */
   async deleteSkillRevision(tenantId: string, skillId: string, skillRevisionId: number): Promise<AdminSkillRevisionRecord | null> {
     return withTenantScope(this.db, tenantId, async (client) => {
-      // Lock the skill row as activateSkillRevision does, so a revision that a
-      // concurrent activation makes active is never deleted.
+      // Lock the skill row as activateSkillRevision, release and a submission
+      // acceptance do, so a revision that one of them makes active or
+      // accepted while cleanup runs is never deleted.
       const skill = await client.query(
         `SELECT active_revision_id FROM admin_skills
          WHERE tenant_id = $1 AND skill_id = $2 FOR UPDATE`,
@@ -525,33 +555,27 @@ export class SkillRevisionStore {
       if (!skill.rowCount) return null;
       const deletedRevisionRows = await client.query(
         `
-          DELETE FROM admin_skill_revisions
-          WHERE skill_id = $1 AND skill_revision_id = $2
-            AND tenant_id = $3
-            AND review_status <> 'active'
-            AND skill_revision_id IS DISTINCT FROM $4::bigint
+          DELETE FROM admin_skill_revisions r
+          WHERE r.skill_id = $1 AND r.skill_revision_id = $2
+            AND r.tenant_id = $3
+            AND r.review_status <> 'active'
+            AND r.skill_revision_id IS DISTINCT FROM $4::bigint
+            AND NOT EXISTS (
+              SELECT 1 FROM organization_skill_submission_attempts accepted
+              WHERE accepted.tenant_id = r.tenant_id
+                AND accepted.accepted_revision_id = r.skill_revision_id
+            )
           RETURNING *
         `,
         [skillId, skillRevisionId, tenantId, skill.rows[0].active_revision_id]
       );
-
-      return deletedRevisionRows.rows[0] ? mapSkillRevision(deletedRevisionRows.rows[0]) : null;
-    });
-  }
-
-  async countSkillRevisionsByBundleStorageUri(tenantId: string, bundleStorageUri: string): Promise<number> {
-    return withTenantScope(this.db, tenantId, async (client) => {
-      const countRows = await client.query(
-        `
-          SELECT COUNT(*)::int AS revision_count
-          FROM admin_skill_revisions
-          WHERE bundle_storage_uri = $1
-            AND tenant_id IN ($2::text, 'system')
-        `,
-        [bundleStorageUri, tenantId]
-      );
-
-      return Number(countRows.rows[0]?.revision_count ?? 0);
+      const deleted = deletedRevisionRows.rows[0] ? mapSkillRevision(deletedRevisionRows.rows[0]) : null;
+      // Queued also when another revision names the same URI: the collector
+      // checks the references and keeps a bundle in use.
+      if (deleted?.bundleStorageUri) {
+        await enqueueSkillBundleGc(client, { tenantId, storageUri: deleted.bundleStorageUri, leased: true });
+      }
+      return deleted;
     });
   }
 }

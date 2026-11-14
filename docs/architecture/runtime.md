@@ -122,7 +122,9 @@ A turn writes checkpoints only while its execution holds the session lease.
   `MAX_RUNNING_TURNS_PER_TENANT` cap running turns (429 `running_turn_limit`).
   Interactive and [scheduled](#scheduler) turns take the same lease and count
   toward the same caps. The session list shows a session as running while its
-  lease is active or stopping.
+  lease is active or stopping. The renewal and the other lease checks of a
+  running turn use the turn control pool, not the app pool
+  ([database pools](data.md#database-pools)).
 - The lease is the only rule for "a turn runs in this session". The local
   registries (`ActiveTurnsRegistry`, the adapter's turn set) only answer
   first on the replica that runs the turn. A session is busy
@@ -353,12 +355,16 @@ Every backend instance runs these; `app-bootstrap.ts` starts all but idle
 teardown.
 
 - `SCHEDULER_ENABLED=false` stops scheduled jobs.
-- The scheduler worker still runs for the PII scan drain (on by default) and the
-  retention jobs (`build-scheduler-worker.ts`).
+- The scheduler worker still runs for the PII scan drain (on by default), the
+  retention jobs and the storage cleanup queues (always on;
+  `build-scheduler-worker.ts`).
+- Between ticks, the scheduler worker claims PII scan jobs for its free slots
+  every `PII_CLAIM_INTERVAL_MS` (2 seconds, `scheduler-worker.ts`). The
+  recovery of stalled scans stays on the tick ([PII](pii.md#scan-paths)).
 
 | Worker | Code | Runs |
 |---|---|---|
-| Scheduler: jobs, PII scan jobs, session trash, scheduled session and project file retention | `services/scheduler-worker.ts`, `build-scheduler-worker.ts` | Every `SCHEDULER_POLL_INTERVAL_MS` |
+| Scheduler: jobs, PII scan jobs, session trash, scheduled session and project file retention, storage cleanup queues ([stored objects](data.md#stored-objects)) | `services/scheduler-worker.ts`, `build-scheduler-worker.ts` | Every `SCHEDULER_POLL_INTERVAL_MS` |
 | Mail outbox | `services/mail/mail-outbox-worker.ts` | Every `MAIL_POLL_INTERVAL_MS` (`MAIL_CLEANUP_INTERVAL_MS` with email off; code constants) |
 | Expired session execution leases, then replies left `pending` or `streaming` in a session that is not busy, with no write for `SESSION_EXECUTION_LEASE_MS` (`SessionExecutionStore.sweepOrphanedReplies`) | `app-bootstrap.ts` | At start, then every `SESSION_EXECUTION_HEARTBEAT_MS` |
 | `runtime_sessions` rows of a process that is gone: the process renews the owner stamp of its rows, and the sweep terminates rows not renewed for `RUNTIME_OWNER_STALE_MS`, or rows with no owner (older versions) not updated for `UNOWNED_RUNTIME_STALE_MS`. A row whose runtime holds a lease stays. | `app-bootstrap.ts`, `runtime-session-store.ts` | At start, then every `RUNTIME_OWNER_HEARTBEAT_MS` |
