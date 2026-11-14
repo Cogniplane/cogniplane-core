@@ -5,9 +5,10 @@ import type { ApprovalRecord, ApprovalStore } from "../services/auth/approval-st
 /**
  * An in-memory approvals table with the status transitions of ApprovalStore:
  * resolve only a pending row, remember only on approve, consume an approved
- * row once, and expire only a pending row. Reads and writes are scoped by
- * tenant and user. Expiry time and session access are not checked: those SQL
- * guards run against Postgres in the approval-*.integration tests.
+ * row once, expire only a pending row, and read a saved decision only from an
+ * approved or rejected row. Reads and writes are scoped by tenant and user.
+ * Expiry time and session access are not checked: those SQL guards run
+ * against Postgres in the approval-*.integration tests.
  *
  * Each method is a `vi.fn` spy, so a test can wrap or replace one call.
  * `rows` and `consumed` are the table state that tests read and seed.
@@ -29,6 +30,12 @@ export function createInMemoryApprovalStore() {
       return row;
     }),
     get: vi.fn(async (tenantId: string, approvalId: string, userId: string) => owned(tenantId, approvalId, userId)),
+    getDecided: vi.fn(async (tenantId: string, approvalId: string, userId: string) => {
+      const row = owned(tenantId, approvalId, userId);
+      const decided = (row?.status === "approved" && row.decision === "approve") ||
+        (row?.status === "rejected" && row.decision === "reject");
+      return decided ? row : null;
+    }),
     resolve: vi.fn(async (tenantId: string, approvalId: string, userId: string, decision: "approve" | "reject",
       rememberForTurn = false) => {
       const row = owned(tenantId, approvalId, userId);

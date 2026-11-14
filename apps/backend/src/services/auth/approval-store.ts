@@ -198,6 +198,31 @@ export class ApprovalStore {
   }
 
   /**
+   * Reads the saved decision of an approval, so that a repeated decision request
+   * gets the same answer on each replica. Returns null when the approval is not
+   * approved or rejected, or when the user cannot run a turn in its session now.
+   * It does not check the turn lease or `expires_at`: a retry can arrive after
+   * the turn ended.
+   */
+  async getDecided(tenantId: string, approvalId: string, userId: string): Promise<ApprovalRecord | null> {
+    return withTenantScope(this.db, tenantId, async (client) => {
+      const result = await client.query(
+        `
+          SELECT a.*
+          FROM approvals a
+          JOIN sessions s ON s.tenant_id = a.tenant_id AND s.session_id = a.session_id
+          WHERE a.tenant_id = $1 AND a.approval_id = $2 AND a.user_id = $3
+            AND ((a.status = 'approved' AND a.decision = 'approve')
+              OR (a.status = 'rejected' AND a.decision = 'reject'))
+            AND ${sessionExecutionAccessSql("s", "a.user_id")}
+        `,
+        [tenantId, approvalId, userId]
+      );
+      return result.rows[0] ? mapApproval(result.rows[0]) : null;
+    });
+  }
+
+  /**
    * Claim an approved decision for one dispatch. Returns false when the row is
    * not approved or another dispatch already claimed it.
    */

@@ -351,7 +351,7 @@ describe("approval decision ownership", () => {
     await expect(f.coordinator.decide({ ...identity, tenantId: "other-tenant", approvalId: row.approvalId, decision: "approve" })).resolves.toBe("missing");
     await expect(f.coordinator.decide({ ...identity, userId: "other-user", approvalId: row.approvalId, decision: "approve" })).resolves.toBe("missing");
     await expect(f.coordinator.decide({ ...identity, approvalId: row.approvalId, decision: "approve", rememberForTurn: true })).resolves.toBe("resolved");
-    await expect(f.coordinator.decide({ ...identity, approvalId: row.approvalId, decision: "reject" })).resolves.toBe("missing");
+    await expect(f.coordinator.decide({ ...identity, approvalId: row.approvalId, decision: "reject" })).resolves.toBe("conflict");
     expect(f.hasActor).not.toHaveBeenCalled();
     expect(f.validate).not.toHaveBeenCalled();
     expect(row).toMatchObject({ status: "approved", decision: "approve", rememberForTurn: true });
@@ -373,6 +373,178 @@ describe("approval decision ownership", () => {
     expect(settled).toBe(false);
     f.controller.abort();
     await expect(outcome).resolves.toBe("reject");
+    f.coordinator.close();
+  });
+});
+
+function seedRemoteRow(f: ReturnType<typeof setup>, overrides: Partial<Parameters<typeof f.approvals.create>[0]> = {}) {
+  return f.approvals.create({ ...identity, approvalId: "remote-request", itemId: "remote-request",
+    requestMethod: "deepagents/execute", requestId: "remote-request", kind: "command_execution",
+    title: "Approve execute", summary: "pwd", status: "pending", decision: null,
+    requestPayload: {}, expiresAt: "2099-01-01T00:00:00Z", ...overrides });
+}
+
+describe("repeated approval decisions", () => {
+  it.each(["approve", "reject"] as const)(
+    "gives the same answer to a %s retry on each replica and after a restart, with one effect", async (decision) => {
+      vi.useFakeTimers();
+      const f = setup();
+      const deps = { approvals: f.approvals, auditEvents: f.auditEvents, logger: createSilentLogger(), ttlMs: 60_000 };
+      const remote = new ApprovalCoordinator(deps);
+      const turn = f.coordinator.openTurn({ ...f.options, durableNative: true });
+      const outcome = turn.request(action, f.publish);
+      let settled = 0;
+      void outcome.then(() => { settled += 1; });
+      await flush();
+      const row = [...f.rows.values()][0]!;
+      const request = { ...identity, approvalId: row.approvalId, decision };
+      await expect(remote.decide(request)).resolves.toBe("resolved");
+      // The owner's wait still waits: only the durable row, read by its poll, resumes it.
+      await expect(f.coordinator.decide(request)).resolves.toBe("resolved");
+      await flush();
+      expect(settled).toBe(0);
+      await vi.advanceTimersByTimeAsync(1_000);
+      await expect(outcome).resolves.toBe(decision);
+      const restarted = new ApprovalCoordinator(deps);
+      const opposite = decision === "approve" ? "reject" : "approve";
+      for (const coordinator of [f.coordinator, remote, restarted]) {
+        await expect(coordinator.decide(request)).resolves.toBe("resolved");
+        await expect(coordinator.decide({ ...request, decision: opposite })).resolves.toBe("conflict");
+      }
+      expect(row).toMatchObject({ status: decision === "approve" ? "approved" : "rejected", decision });
+      expect(f.auditEvents.create).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+        approvalId: row.approvalId, type: decision === "approve" ? "approval.approved" : "approval.rejected"
+      }));
+      expect(settled).toBe(1);
+      for (const coordinator of [f.coordinator, remote, restarted]) coordinator.close();
+    });
+
+  it.each([
+    { name: "a turn approval", bound: false, saved: true, retry: true, result: "resolved" },
+    { name: "a turn approval", bound: false, saved: true, retry: false, result: "conflict" },
+    { name: "a turn approval", bound: false, saved: false, retry: true, result: "conflict" },
+    { name: "a turn approval", bound: false, saved: false, retry: undefined, result: "resolved" },
+    { name: "a bound save", bound: true, saved: true, retry: false, result: "resolved" },
+    { name: "a bound save", bound: true, saved: false, retry: true, result: "resolved" }
+  ] as const)("compares the effective turn scope of $name: saved $saved, retry $retry", async (c) => {
+    const f = setup();
+    const row = await seedRemoteRow(f, c.bound
+      ? { requestMethod: "policy/toolApproval", requestPayload: { bound: { previousContentSha256: null } } }
+      : {});
+    await expect(f.coordinator.decide({ ...identity, approvalId: row.approvalId, decision: "approve",
+      rememberForTurn: c.saved })).resolves.toBe("resolved");
+    await expect(f.coordinator.decide({ ...identity, approvalId: row.approvalId, decision: "approve",
+      rememberForTurn: c.retry })).resolves.toBe(c.result);
+    expect(f.auditEvents.create).toHaveBeenCalledOnce();
+    f.coordinator.close();
+  });
+
+  it("ignores the turn flag of a rejection", async () => {
+    const f = setup();
+    const row = await seedRemoteRow(f);
+    await expect(f.coordinator.decide({ ...identity, approvalId: row.approvalId, decision: "reject" })).resolves.toBe("resolved");
+    await expect(f.coordinator.decide({ ...identity, approvalId: row.approvalId, decision: "reject", rememberForTurn: true }))
+      .resolves.toBe("resolved");
+    f.coordinator.close();
+  });
+
+  it.each(["tenant", "user", "pending", "expired"] as const)("returns missing for a retry with a %s mismatch", async (refusal) => {
+    const f = setup();
+    const row = await seedRemoteRow(f);
+    if (refusal === "pending") f.approvals.resolve.mockResolvedValueOnce(null);
+    else if (refusal === "expired") row.status = "expired";
+    else await f.coordinator.decide({ ...identity, approvalId: row.approvalId, decision: "approve" });
+    const auditCalls = f.auditEvents.create.mock.calls.length;
+    await expect(f.coordinator.decide({ ...identity, approvalId: row.approvalId, decision: "approve",
+      ...(refusal === "tenant" ? { tenantId: "other-tenant" } : refusal === "user" ? { userId: "other-user" } : {})
+    })).resolves.toBe("missing");
+    expect(f.approvals.getDecided).toHaveBeenCalledWith(
+      refusal === "tenant" ? "other-tenant" : identity.tenantId, row.approvalId,
+      refusal === "user" ? "other-user" : identity.userId);
+    expect(f.auditEvents.create).toHaveBeenCalledTimes(auditCalls);
+    f.coordinator.close();
+  });
+
+  it("propagates a failed read of the saved decision", async () => {
+    const f = setup();
+    const row = await seedRemoteRow(f);
+    await f.coordinator.decide({ ...identity, approvalId: row.approvalId, decision: "approve" });
+    f.approvals.getDecided.mockRejectedValueOnce(new Error("read failed"));
+    await expect(f.coordinator.decide({ ...identity, approvalId: row.approvalId, decision: "approve" }))
+      .rejects.toThrow("read failed");
+    expect(f.auditEvents.create).toHaveBeenCalledOnce();
+    f.coordinator.close();
+  });
+
+  it.each([
+    { decision: "approve", refusal: "execution check failed" },
+    { decision: "reject", refusal: "execution check failed" },
+    { decision: "approve", refusal: "actor removed" },
+    { decision: "reject", refusal: "actor removed" }
+  ] as const)("answers a $decision retry from the saved row when the owner's local wait refuses it: $refusal",
+    async ({ decision, refusal }) => {
+      vi.useFakeTimers();
+      const f = setup();
+      const remote = new ApprovalCoordinator({ approvals: f.approvals, auditEvents: f.auditEvents,
+        logger: createSilentLogger(), ttlMs: 60_000 });
+      const outcome = f.coordinator.openTurn({ ...f.options, durableNative: true }).request(action, f.publish);
+      let settled = 0;
+      void outcome.then(() => { settled += 1; });
+      await flush();
+      const row = [...f.rows.values()][0]!;
+      const request = { ...identity, approvalId: row.approvalId, decision };
+      const opposite = decision === "approve" ? "reject" : "approve";
+      await expect(remote.decide(request)).resolves.toBe("resolved");
+      // The owner's lease stops before its poll reads the row.
+      if (refusal === "execution check failed") f.validate.mockRejectedValue(new Error("execution stopped"));
+      else f.hasActor.mockReturnValue(false);
+      await expect(f.coordinator.decide(request)).resolves.toBe("resolved");
+      await expect(f.coordinator.decide({ ...request, decision: opposite })).resolves.toBe("conflict");
+      // The owner read the saved row and did not write a decision.
+      expect(f.approvals.resolve).toHaveBeenCalledOnce();
+      expect(f.approvals.getDecided).toHaveBeenCalledTimes(2);
+      await expect(remote.decide(request)).resolves.toBe("resolved");
+      await expect(remote.decide({ ...request, decision: opposite })).resolves.toBe("conflict");
+      await flush();
+      expect(settled).toBe(0);
+      expect(f.auditEvents.create).toHaveBeenCalledOnce();
+      expect(row).toMatchObject({ status: decision === "approve" ? "approved" : "rejected", decision });
+      f.controller.abort();
+      await expect(outcome).resolves.toBe("reject");
+      expect(settled).toBe(1);
+      f.coordinator.close(); remote.close();
+    });
+
+  it("answers from the saved row when a native local actor leaves during the owner's check", async () => {
+    vi.useFakeTimers();
+    const f = setup();
+    const remote = new ApprovalCoordinator({ approvals: f.approvals, auditEvents: f.auditEvents,
+      logger: createSilentLogger(), ttlMs: 60_000 });
+    const outcome = f.coordinator.openTurn(f.options).request(action, f.publish);
+    await flush();
+    const row = [...f.rows.values()][0]!;
+    const request = { ...identity, approvalId: row.approvalId, decision: "approve" as const };
+    await expect(remote.decide(request)).resolves.toBe("resolved");
+    f.hasActor.mockReturnValueOnce(true).mockReturnValueOnce(false);
+    await expect(f.coordinator.decide({ ...request, decision: "reject" })).resolves.toBe("conflict");
+    expect(f.approvals.resolve).toHaveBeenCalledOnce();
+    expect(f.auditEvents.create).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(1_000);
+    await expect(outcome).resolves.toBe("approve");
+    f.coordinator.close(); remote.close();
+  });
+
+  it("does not read a saved decision when the decision write succeeds or another user asks", async () => {
+    vi.useFakeTimers();
+    const f = setup();
+    const outcome = f.coordinator.openTurn({ ...f.options, durableNative: true }).request(action, f.publish);
+    await flush();
+    const row = [...f.rows.values()][0]!;
+    await expect(f.coordinator.decide({ ...identity, userId: "other-user", approvalId: row.approvalId, decision: "approve" }))
+      .resolves.toBe("missing");
+    await expect(f.coordinator.decide({ ...identity, approvalId: row.approvalId, decision: "approve" })).resolves.toBe("resolved");
+    await expect(outcome).resolves.toBe("approve");
+    expect(f.approvals.getDecided).not.toHaveBeenCalled();
     f.coordinator.close();
   });
 });

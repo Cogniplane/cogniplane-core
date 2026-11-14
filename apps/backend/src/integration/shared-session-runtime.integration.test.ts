@@ -215,6 +215,11 @@ describe.skipIf(!adminDatabaseUrl())("shared message HTTP and runtime", () => {
     expect((await h.replica.inject({ method: "POST", url, payload: { decision: "approve" } })).statusCode).toBe(200);
     const response = await turn;
     expect(response.body).not.toContain('"type":"RUN_ERROR"');
+    // After the turn ends, each replica answers a retry from the saved decision and runs nothing again.
+    for (const server of [h.app, h.replica]) {
+      expect((await server.inject({ method: "POST", url, payload: { decision: "approve" } })).statusCode).toBe(200);
+      expect((await server.inject({ method: "POST", url, payload: { decision: "reject" } })).statusCode).toBe(409);
+    }
     expect(h.toolsStarted.filter(name => name === "write_file")).toHaveLength(1);
     expect((await h.approvals.get(h.tenantId, approvalId, h.editorId))?.status).toBe("approved");
     const history = await h.messages.listBySession(h.tenantId, h.sessionId, h.editorId);

@@ -124,9 +124,11 @@ export interface RuntimeAdapter {
   statRuntimeFile(sessionId: string, filePath: string): Promise<{ sizeBytes: number }>;
   writeRuntimeFile(sessionId: string, filePath: string, data: Uint8Array | ArrayBuffer | string): Promise<string>;
   /**
-   * Forward an approval decision to the in-flight turn waiting on it. Returns
-   * `"resolved"` when the approval was owned, `"missing"` when no matching
-   * pending approval exists.
+   * Saves an approval decision and resumes the turn that waits on it. Returns
+   * `"resolved"` when the caller decided the approval now, or when the caller
+   * already saved an equivalent decision (a retry, with no new effect).
+   * Returns `"conflict"` when the caller already saved a different decision.
+   * Returns `"missing"` when the caller cannot decide or read the approval.
    */
   resolveApproval(input: {
     tenantId: string;
@@ -134,7 +136,7 @@ export interface RuntimeAdapter {
     userId: string;
     decision: RuntimeApprovalDecision;
     rememberForTurn?: boolean;
-  }): Promise<"resolved" | "missing">;
+  }): Promise<"resolved" | "missing" | "conflict">;
   /**
    * Delete durable per-session runtime data (e.g. checkpointer threads) after
    * the session row itself is deleted. Unlike {@link abortSession} — which

@@ -263,6 +263,9 @@ const fakeApprovalStore = {
   },
   async resolve() {
     return null;
+  },
+  async getDecided() {
+    return null;
   }
 } as never;
 const fakeAuditEventStore = { async create() {} } as never;
@@ -4147,7 +4150,7 @@ describe("approval decisions: ownership, durability, and edge outcomes", () => {
     } finally { await adapter.close(); }
   });
 
-  it.each([true, false])("answers a second decision on the same approval as missing (durable: %s)", async (durable) => {
+  it.each([true, false])("answers a repeated decision from the saved decision (durable: %s)", async (durable) => {
     const { factory, resumes } = makeInterruptingFactory({ rounds: [[actionFor(durable)], []], mcpToolNames: ["github_write_file"] });
     const approvals = createInMemoryApprovalStore();
     const adapter = makeApprovalAdapter({ factory, approvals });
@@ -4155,7 +4158,8 @@ describe("approval decisions: ownership, durability, and edge outcomes", () => {
       const turn = await promptedTurn(adapter);
 
       await expect(decide(adapter, turn.approvalId)).resolves.toBe("resolved");
-      await expect(decide(adapter, turn.approvalId, { decision: "reject" })).resolves.toBe("missing");
+      await expect(decide(adapter, turn.approvalId)).resolves.toBe("resolved");
+      await expect(decide(adapter, turn.approvalId, { decision: "reject" })).resolves.toBe("conflict");
       await turn.done;
       expect(resumes).toEqual([[{ type: "approve" }]]);
     } finally { await adapter.close(); }

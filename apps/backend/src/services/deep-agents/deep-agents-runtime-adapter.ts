@@ -1639,7 +1639,7 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
     userId: string;
     decision: RuntimeApprovalDecision;
     rememberForTurn?: boolean;
-  }): Promise<"resolved" | "missing"> {
+  }): Promise<"resolved" | "missing" | "conflict"> {
     return this.approvalCoordinator.decide(input);
   }
 
