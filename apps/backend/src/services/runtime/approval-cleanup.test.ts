@@ -28,36 +28,31 @@ function makeApproval(approvalId: string): ApprovalRecord {
   };
 }
 
+/**
+ * A fake ApprovalStore. `expire` stands for the store's transaction: it
+ * records the expired row and its `approval.expired` reason together, or
+ * neither when it throws.
+ */
 function makeApprovalsFake(opts: {
   pending: ApprovalRecord[];
   expireResults?: Record<string, ApprovalRecord | null>;
   listPendingThrows?: Error;
   expireThrows?: Set<string>;
 }) {
-  const expireCalls: string[] = [];
+  const expireCalls: Array<{ approvalId: string; reason: string }> = [];
   return {
     expireCalls,
     listPending: async (_t: string, _s: string, _u: string) => {
       if (opts.listPendingThrows) throw opts.listPendingThrows;
       return opts.pending;
     },
-    expire: async (_t: string, approvalId: string): Promise<ApprovalRecord | null> => {
-      expireCalls.push(approvalId);
+    expire: async (_t: string, approvalId: string, reason: string): Promise<ApprovalRecord | null> => {
       if (opts.expireThrows?.has(approvalId)) throw new Error("expire boom");
+      expireCalls.push({ approvalId, reason });
       if (opts.expireResults && approvalId in opts.expireResults) {
         return opts.expireResults[approvalId];
       }
       return makeApproval(approvalId);
-    }
-  };
-}
-
-function makeAuditFake() {
-  const calls: Array<Record<string, unknown>> = [];
-  return {
-    calls,
-    create: async (input: Record<string, unknown>) => {
-      calls.push(input);
     }
   };
 }
@@ -73,167 +68,67 @@ function makeLogger() {
   };
 }
 
-test("empty pending list issues no expire and no audit", async () => {
+const scope = { tenantId: "t", sessionId: "s", userId: "u" };
+
+test("empty pending list issues no expire", async () => {
   const approvals = makeApprovalsFake({ pending: [] });
-  const audit = makeAuditFake();
-
-  await cancelPendingApprovals({
-    tenantId: "t",
-    sessionId: "s",
-    userId: "u",
-    reason: "turn_interrupted",
-    approvals,
-    auditEvents: audit,
-    logger: makeLogger()
-  });
-
+  await cancelPendingApprovals({ ...scope, reason: "turn_interrupted", approvals, logger: makeLogger() });
   expect(approvals.expireCalls).toEqual([]);
-  expect(audit.calls).toEqual([]);
 });
 
-test("happy path: expires each pending row and audits it with only the reason", async () => {
-  const approvals = makeApprovalsFake({
-    pending: [makeApproval("a-1"), makeApproval("a-2")]
-  });
-  const audit = makeAuditFake();
-
-  await cancelPendingApprovals({
-    tenantId: "t",
-    sessionId: "s",
-    userId: "u",
-    reason: "turn_interrupted",
-    approvals,
-    auditEvents: audit,
-    logger: makeLogger()
-  });
-
-  expect(approvals.expireCalls).toEqual(["a-1", "a-2"]);
-  expect(audit.calls).toHaveLength(2);
-  expect(audit.calls[0]).toMatchObject({
-    tenantId: "t",
-    sessionId: "s",
-    userId: "u",
-    approvalId: "a-1",
-    type: "approval.expired"
-  });
-  expect((audit.calls[0] as { payload: Record<string, unknown> }).payload).toEqual({
-    reason: "turn_interrupted"
-  });
-});
-
-test("decision-raced row (expire returns null) skips audit", async () => {
-  const approvals = makeApprovalsFake({
-    pending: [makeApproval("a-raced")],
-    expireResults: { "a-raced": null }
-  });
-  const audit = makeAuditFake();
-
-  await cancelPendingApprovals({
-    tenantId: "t",
-    sessionId: "s",
-    userId: "u",
-    reason: "turn_interrupted",
-    approvals,
-    auditEvents: audit,
-    logger: makeLogger()
-  });
-
-  expect(approvals.expireCalls).toEqual(["a-raced"]);
-  expect(audit.calls).toEqual([]);
-});
-
-test("expireApprovalById: ttl sweep expires the single row and audits with reason ttl_expired", async () => {
+test("happy path: expires each pending row with only the reason", async () => {
   const approvals = makeApprovalsFake({ pending: [makeApproval("a-1"), makeApproval("a-2")] });
-  const audit = makeAuditFake();
+  await cancelPendingApprovals({ ...scope, reason: "turn_interrupted", approvals, logger: makeLogger() });
+  expect(approvals.expireCalls).toEqual([
+    { approvalId: "a-1", reason: "turn_interrupted" },
+    { approvalId: "a-2", reason: "turn_interrupted" }
+  ]);
+});
 
-  await expireApprovalById({
-    tenantId: "t",
-    sessionId: "s",
-    userId: "u",
-    approvalId: "a-1",
-    reason: "ttl_expired",
-    approvals,
-    auditEvents: audit,
-    logger: makeLogger()
-  });
+test("runtime teardown expires only the rows of its runtime", async () => {
+  const other = { ...makeApproval("a-other"), runtimeId: "rt-2" };
+  const approvals = makeApprovalsFake({ pending: [makeApproval("a-1"), other] });
+  await cancelPendingApprovals({ ...scope, runtimeId: "rt", reason: "runtime_terminated", approvals, logger: makeLogger() });
+  expect(approvals.expireCalls).toEqual([{ approvalId: "a-1", reason: "runtime_terminated" }]);
+});
 
+test("expireApprovalById: ttl sweep expires the single row with reason ttl_expired", async () => {
+  const approvals = makeApprovalsFake({ pending: [makeApproval("a-1"), makeApproval("a-2")] });
+  await expireApprovalById({ ...scope, approvalId: "a-1", reason: "ttl_expired", approvals, logger: makeLogger() });
   // Only the aged-out row is touched. Siblings are left alone.
-  expect(approvals.expireCalls).toEqual(["a-1"]);
-  expect(audit.calls).toHaveLength(1);
-  expect(audit.calls[0]).toMatchObject({
-    tenantId: "t",
-    sessionId: "s",
-    userId: "u",
-    approvalId: "a-1",
-    type: "approval.expired",
-    payload: { reason: "ttl_expired" }
-  });
+  expect(approvals.expireCalls).toEqual([{ approvalId: "a-1", reason: "ttl_expired" }]);
 });
 
-test("expireApprovalById: decision-raced row (expire returns null) skips audit", async () => {
-  const approvals = makeApprovalsFake({
-    pending: [makeApproval("a-1")],
-    expireResults: { "a-1": null }
-  });
-  const audit = makeAuditFake();
-
-  await expireApprovalById({
-    tenantId: "t",
-    sessionId: "s",
-    userId: "u",
-    approvalId: "a-1",
-    reason: "ttl_expired",
-    approvals,
-    auditEvents: audit,
-    logger: makeLogger()
-  });
-
-  expect(approvals.expireCalls).toEqual(["a-1"]);
-  expect(audit.calls).toEqual([]);
-});
-
-test("expireApprovalById: expire throwing is logged, never rejects", async () => {
-  const approvals = makeApprovalsFake({
-    pending: [makeApproval("a-1")],
-    expireThrows: new Set(["a-1"])
-  });
-  const audit = makeAuditFake();
+test("expireApprovalById: a decision-raced row (expire returns null) is not an error", async () => {
+  const approvals = makeApprovalsFake({ pending: [makeApproval("a-1")], expireResults: { "a-1": null } });
   const logger = makeLogger();
+  await expireApprovalById({ ...scope, approvalId: "a-1", reason: "ttl_expired", approvals, logger });
+  expect(logger._errors).toEqual([]);
+});
 
-  await expireApprovalById({
-    tenantId: "t",
-    sessionId: "s",
-    userId: "u",
-    approvalId: "a-1",
-    reason: "ttl_expired",
-    approvals,
-    auditEvents: audit,
-    logger
-  });
-
-  expect(audit.calls).toEqual([]);
+test("expireApprovalById: expire throwing (for example a failed audit insert) is logged, never rejects", async () => {
+  const approvals = makeApprovalsFake({ pending: [makeApproval("a-1")], expireThrows: new Set(["a-1"]) });
+  const logger = makeLogger();
+  await expireApprovalById({ ...scope, approvalId: "a-1", reason: "ttl_expired", approvals, logger });
+  expect(approvals.expireCalls).toEqual([]);
   expect(logger._errors).toHaveLength(1);
 });
 
-test("listPending failure logs and returns; no expire, no audit", async () => {
+test("one failing row does not stop the cleanup of the others", async () => {
   const approvals = makeApprovalsFake({
-    pending: [],
-    listPendingThrows: new Error("db down")
+    pending: [makeApproval("a-1"), makeApproval("a-2")],
+    expireThrows: new Set(["a-1"])
   });
-  const audit = makeAuditFake();
   const logger = makeLogger();
+  await cancelPendingApprovals({ ...scope, reason: "turn_interrupted", approvals, logger });
+  expect(approvals.expireCalls).toEqual([{ approvalId: "a-2", reason: "turn_interrupted" }]);
+  expect(logger._errors).toHaveLength(1);
+});
 
-  await cancelPendingApprovals({
-    tenantId: "t",
-    sessionId: "s",
-    userId: "u",
-    reason: "turn_interrupted",
-    approvals,
-    auditEvents: audit,
-    logger
-  });
-
+test("listPending failure logs and returns; no expire", async () => {
+  const approvals = makeApprovalsFake({ pending: [], listPendingThrows: new Error("db down") });
+  const logger = makeLogger();
+  await cancelPendingApprovals({ ...scope, reason: "turn_interrupted", approvals, logger });
   expect(approvals.expireCalls).toEqual([]);
-  expect(audit.calls).toEqual([]);
   expect(logger._warnings).toHaveLength(1);
 });

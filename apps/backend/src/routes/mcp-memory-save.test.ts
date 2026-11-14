@@ -10,7 +10,6 @@ import { expect, onTestFinished, test } from "vitest";
 
 import type { PolicyRule } from "@cogniplane/shared-types";
 
-import { InMemoryAuditEventStore } from "../test-helpers/in-memory-audit-events.js";
 import {
   createTestApp,
   createTestToolContext,
@@ -29,7 +28,6 @@ import {
   POLICY_APPROVAL_REQUEST_METHOD,
   createPolicyApprovalProof
 } from "../services/policy/policy-approval-proof.js";
-import type { AuditEventStore } from "../services/audit-event-store.js";
 import { PolicyService } from "../services/policy/policy-service.js";
 import { MCP_INVOCATION_META_KEY } from "../services/mcp/invocation-metadata.js";
 import type { PolicyDecisionStore } from "../services/policy/policy-decision-store.js";
@@ -384,7 +382,6 @@ test("a Policy Center approval rule on the tool is satisfied by the same single 
   const service = new PolicyService({
     rules: { async list() { return [rule]; } } as unknown as PolicyRuleStore,
     decisions: { async record() { return { decisionId: "pdc_1" }; }, async list() { return []; } } as unknown as PolicyDecisionStore,
-    auditEvents: new InMemoryAuditEventStore() as unknown as AuditEventStore,
     ruleCacheTtlMs: 0
   });
   const { memories, session, approve, approvals } = await setup({ policyService: service });

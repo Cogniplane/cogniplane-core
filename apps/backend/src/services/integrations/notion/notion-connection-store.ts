@@ -1,6 +1,6 @@
 import { withTenantScope, type Pool } from "../../../lib/db.js";
 import { isoTimestamp, isoTimestampOrNull } from "../../../lib/db-mappers.js";
-import { AuditEventStore } from "../../audit-event-store.js";
+import { AuditEventStore, type AuditEventInput } from "../../audit-event-store.js";
 import { assertOwnerSecurityVersion, ownerSecurityVersionSql } from "../../auth/security-change.js";
 
 export type NotionConnectionRecord = {
@@ -162,7 +162,9 @@ export class NotionConnectionStore {
     // The callback has no session, so the write is bound to this version:
     // OwnerSecurityVersionChangedError when it is not the owner's current one.
     ownerSecurityVersion: number | null;
-  }): Promise<NotionConnectionRecord> {
+  },
+  // The connect's audit event; it commits in the connect's transaction.
+  audit?: (connection: NotionConnectionRecord) => AuditEventInput): Promise<NotionConnectionRecord> {
     return withTenantScope(this.db, input.tenantId, async (client) => {
       await assertOwnerSecurityVersion(client, input.tenantId, input.userId, input.ownerSecurityVersion);
       const result = await client.query(
@@ -212,17 +214,23 @@ export class NotionConnectionStore {
           input.ownerSecurityVersion
         ]
       );
-      return mapNotionConnection(result.rows[0]);
+      const connection = mapNotionConnection(result.rows[0]);
+      if (audit) await AuditEventStore.createInTransaction(client, audit(connection));
+      return connection;
     });
   }
 
-  async delete(tenantId: string, userId: string): Promise<boolean> {
+  /** `audit` builds the disconnect's audit event from the removed row. It commits in the delete's transaction. */
+  async delete(tenantId: string, userId: string,
+    audit?: (removed: NotionConnectionRecord) => AuditEventInput): Promise<boolean> {
     return withTenantScope(this.db, tenantId, async (client) => {
       const result = await client.query(
-        `DELETE FROM user_notion_connections WHERE tenant_id = $1 AND user_id = $2`,
+        `DELETE FROM user_notion_connections WHERE tenant_id = $1 AND user_id = $2 RETURNING *`,
         [tenantId, userId]
       );
-      return (result.rowCount ?? 0) > 0;
+      if (!result.rows[0]) return false;
+      if (audit) await AuditEventStore.createInTransaction(client, audit(mapNotionConnection(result.rows[0])));
+      return true;
     });
   }
 

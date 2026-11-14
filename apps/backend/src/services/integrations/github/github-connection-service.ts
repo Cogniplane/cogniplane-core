@@ -272,22 +272,17 @@ export class GithubConnectionService {
         refreshTokenExpiresAt: connection.refreshTokenExpiresAt,
         tokenLastRefreshedAt: connection.tokenLastRefreshedAt,
         ownerSecurityVersion: state.sv ?? null
-      });
-
-      try {
-        await this.auditEvents?.create({
-          tenantId: state.tid,
-          sessionId: null,
-          userId: state.sub,
-          type: "user.github.connected",
-          payload: {
-            githubLogin: connection.githubLogin,
-            githubUserId: connection.githubUserId
-          }
-        });
-      } catch (err) {
-        this.logger.warn({ err }, "Failed to audit GitHub connection");
-      }
+      // The event commits with the connection: a failed event saves nothing.
+      }, () => ({
+        tenantId: state.tid,
+        sessionId: null,
+        userId: state.sub,
+        type: "user.github.connected",
+        payload: {
+          githubLogin: connection.githubLogin,
+          githubUserId: connection.githubUserId
+        }
+      }));
       try {
         await this.runtimeManager?.invalidateRuntimesForIntegration(state.tid, state.sub, "github");
       } catch (err) {
@@ -319,19 +314,19 @@ export class GithubConnectionService {
 
   async disconnect(tenantId: string, userId: string): Promise<boolean> {
     const existing = await this.store.getForOwner(tenantId, userId);
-    const removed = await this.store.delete(tenantId, userId);
+    // The event commits with the delete and names the row that it removed.
+    const removed = await this.store.delete(tenantId, userId, (row) => ({
+      tenantId,
+      sessionId: null,
+      userId,
+      type: "user.github.disconnected",
+      payload: {
+        githubLogin: row.githubLogin,
+        githubUserId: row.githubUserId
+      }
+    }));
 
     if (removed && existing) {
-      await this.auditEvents?.create({
-        tenantId,
-        sessionId: null,
-        userId,
-        type: "user.github.disconnected",
-        payload: {
-          githubLogin: existing.githubLogin,
-          githubUserId: existing.githubUserId
-        }
-      });
       await this.runtimeManager?.invalidateRuntimesForIntegration(tenantId, userId, "github");
     }
 
@@ -439,7 +434,28 @@ export class GithubConnectionService {
     expectedGithubUserId: string
   ): Promise<string[]> {
     const normalized = normalizeAllowedRepositories(repositories);
-    const outcome = await this.store.setAllowedRepositories(tenantId, userId, normalized, expectedGithubUserId);
+    // The event commits with the change, and only when the list changed.
+    const outcome = await this.store.setAllowedRepositories(tenantId, userId, normalized, expectedGithubUserId,
+      (updated) => {
+        const previous = new Set(updated.previous);
+        const current = new Set(updated.record.allowedRepositories);
+        const added = updated.record.allowedRepositories.filter((repo) => !previous.has(repo));
+        const removed = updated.previous.filter((repo) => !current.has(repo));
+        if (added.length === 0 && removed.length === 0) return null;
+        return {
+          tenantId,
+          sessionId: null,
+          userId,
+          type: "user.github.repositories_updated",
+          payload: {
+            githubLogin: updated.record.githubLogin,
+            githubUserId: updated.record.githubUserId,
+            added,
+            removed,
+            count: updated.record.allowedRepositories.length
+          }
+        };
+      });
     if (outcome.status === "not_connected") {
       throw new GithubConnectionError("not_connected", "GitHub is not connected.");
     }
@@ -448,25 +464,6 @@ export class GithubConnectionService {
         "account_changed",
         "The connected GitHub account changed. Reload the page and choose the repositories again."
       );
-    }
-    const previous = new Set(outcome.previous);
-    const current = new Set(outcome.record.allowedRepositories);
-    const added = outcome.record.allowedRepositories.filter((repo) => !previous.has(repo));
-    const removed = outcome.previous.filter((repo) => !current.has(repo));
-    if (added.length > 0 || removed.length > 0) {
-      await this.auditEvents?.create({
-        tenantId,
-        sessionId: null,
-        userId,
-        type: "user.github.repositories_updated",
-        payload: {
-          githubLogin: outcome.record.githubLogin,
-          githubUserId: outcome.record.githubUserId,
-          added,
-          removed,
-          count: outcome.record.allowedRepositories.length
-        }
-      });
     }
     return outcome.record.allowedRepositories;
   }

@@ -3,7 +3,7 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { ensureUser } from "../../lib/db.js";
 import { apiError, notFoundError } from "../../lib/http-errors.js";
 import { AdminConfigError } from "../../services/admin-config-error.js";
-import type { AuditEventStore } from "../../services/audit-event-store.js";
+import type { AuditEventInput, AuditEventStore } from "../../services/audit-event-store.js";
 import type { AuditEventType } from "../../services/audit-event-types.js";
 
 export { AdminIdSchema as adminIdSchema } from "@cogniplane/shared-types";
@@ -74,6 +74,32 @@ export function respondAdminNotFound(reply: FastifyReply, errorCode: string) {
   return notFoundError(errorCode);
 }
 
+/**
+ * The audit event of an admin change, for a store that writes it in the
+ * change's transaction: the acting admin, the request's address and agent,
+ * and no session.
+ */
+export function adminAuditEvent(
+  request: FastifyRequest,
+  type: AuditEventType,
+  payload: Record<string, unknown>
+): AuditEventInput {
+  return {
+    tenantId: request.auth.tenantId,
+    sessionId: null,
+    userId: request.auth.userId,
+    type,
+    payload,
+    ipAddress: request.ip,
+    userAgent: request.headers["user-agent"] ?? null
+  };
+}
+
+/**
+ * Writes an admin audit event in a transaction of its own. Only for an admin
+ * action with no database change to join, such as a runtime teardown:
+ * `audit-event-sites.test.ts` lists each call.
+ */
 export async function createAdminAuditEvent(
   auditEvents: Pick<AuditEventStore, "create">,
   input: {

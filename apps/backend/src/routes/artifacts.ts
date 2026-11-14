@@ -15,7 +15,6 @@ import type { SessionStore } from "../services/session-store.js";
 import type { ArtifactStore } from "../services/artifacts/artifact-store.js";
 import type { ArtifactStorage } from "../services/artifacts/artifact-storage.js";
 import type { ArtifactProcessor } from "../services/artifacts/artifact-processor.js";
-import type { AuditEventStore } from "../services/audit-event-store.js";
 import type { PiiArtifactScanEnqueuer } from "../services/pii/pii-artifact-scan-enqueuer.js";
 import type { RequestLimitsInterface } from "../services/request-limits.js";
 import { ensureUser } from "../lib/db.js";
@@ -74,7 +73,6 @@ export function buildArtifactRouteStores(deps: AppDependencies) {
   return {
     sessions: deps.sessions,
     artifacts: deps.artifacts,
-    auditEvents: deps.auditEvents,
     storage: deps.artifactStorage,
     processor: deps.artifactProcessor,
     piiScanEnqueuer: deps.piiScanEnqueuer,
@@ -95,7 +93,6 @@ export type ArtifactRouteStores = {
     | "peekDownloadToken"
     | "consumeDownloadToken"
   >;
-  auditEvents: Pick<AuditEventStore, "create">;
   storage: Pick<ArtifactStorage, "put" | "openReadStream" | "delete">;
   processor: Pick<ArtifactProcessor, "extractArtifactText">;
   piiScanEnqueuer?: Pick<PiiArtifactScanEnqueuer, "plan" | "enqueue">;
@@ -385,8 +382,11 @@ export async function registerArtifactRoutes(
     //    and an expired token is never spent.
     // 3. Open the storage stream BEFORE consuming. A failure here propagates
     //    (500) with the token still unconsumed, so the client can retry.
-    // 4. `consumeDownloadToken` flips `consumed_at` atomically and only then.
+    // 4. `consumeDownloadToken` flips `consumed_at` atomically and only then,
+    //    and writes the `artifact_downloaded` event in the same transaction.
     //    A lost race (concurrent request consumed it first) returns null → 404.
+    //    When the event cannot be written, nothing commits: the file is not
+    //    sent, the token stays unconsumed, and the client can retry.
     const token = await stores.artifacts.peekDownloadToken({ token: paramsResult.value.token });
     if (!token) {
       reply.code(404);
@@ -399,43 +399,44 @@ export async function registerArtifactRoutes(
     }
 
     const streamHandle = await stores.storage.openReadStream(token.storageKey);
-
-    const consumed = await stores.artifacts.consumeDownloadToken({ token: paramsResult.value.token });
-    if (!consumed) {
-      // Lost the single-use race (a concurrent request consumed the token
-      // first). We optimistically opened the storage stream before consuming;
-      // destroy it so an S3/HTTP-backed body/connection isn't left dangling
-      // until timeout under replay or double-click.
+    // We optimistically opened the storage stream before consuming; destroy it
+    // when no file goes out, so an S3/HTTP-backed body/connection isn't left
+    // dangling until timeout under replay or double-click.
+    const closeStream = () => {
       const closable = streamHandle.stream as { destroy?: () => void };
       if (typeof closable.destroy === "function") {
         closable.destroy();
       }
+    };
+
+    let consumed: Awaited<ReturnType<typeof stores.artifacts.consumeDownloadToken>>;
+    try {
+      consumed = await stores.artifacts.consumeDownloadToken({
+        token: paramsResult.value.token,
+        audit: (row) => ({
+          tenantId: row.tenantId,
+          sessionId: row.sessionId,
+          // An admin-minted token downloads as the issuing admin.
+          userId: row.issuedByUserId ?? row.userId,
+          type: "artifact_downloaded",
+          payload: {
+            artifactId: row.artifactId,
+            fileName: row.fileName,
+            ...(row.issuedByUserId ? { ownerUserId: row.userId } : {})
+          },
+          ipAddress: request.ip,
+          userAgent: request.headers["user-agent"] ?? null
+        })
+      });
+    } catch (error) {
+      closeStream();
+      throw error;
+    }
+    if (!consumed) {
+      // Lost the single-use race (a concurrent request consumed the token first).
+      closeStream();
       reply.code(404);
       return notFoundError("download_not_found");
-    }
-
-    // Best-effort: the token is already consumed, so failing here would burn
-    // the single-use token (retry 404s) just to report a 500. Serve the file.
-    try {
-      await stores.auditEvents.create({
-        tenantId: token.tenantId,
-        sessionId: token.sessionId,
-        // An admin-minted token downloads as the issuing admin.
-        userId: token.issuedByUserId ?? token.userId,
-        type: "artifact_downloaded",
-        payload: {
-          artifactId: token.artifactId,
-          fileName: token.fileName,
-          ...(token.issuedByUserId ? { ownerUserId: token.userId } : {})
-        },
-        ipAddress: request.ip,
-        userAgent: request.headers["user-agent"] ?? null
-      });
-    } catch (err) {
-      request.log.warn(
-        { err, artifactId: token.artifactId },
-        "Failed to record artifact_downloaded audit event"
-      );
     }
 
     reply.header("cache-control", "private, no-store");

@@ -1,5 +1,4 @@
 import { describe, expect, test } from "vitest";
-import { AuditEventStore } from "../services/audit-event-store.js";
 import { PolicyDecisionStore } from "../services/policy/policy-decision-store.js";
 import { PolicyRuleStore } from "../services/policy/policy-rule-store.js";
 import { PolicyService } from "../services/policy/policy-service.js";
@@ -13,7 +12,7 @@ describe.skipIf(!adminDatabaseUrl())("Monitor summary from recorded policy actio
     await seedMembership(tenantId, userId, "admin");
     const rules = new PolicyRuleStore(appPool());
     const decisions = new PolicyDecisionStore(appPool());
-    const service = new PolicyService({ rules, decisions, auditEvents: new AuditEventStore(appPool()) });
+    const service = new PolicyService({ rules, decisions });
     const rule = await rules.create(tenantId, {
       name: "Review messages", effect: "require_approval", conditions: { toolNames: ["send_message"] }
     }, userId, ALLOW_WEAKER);

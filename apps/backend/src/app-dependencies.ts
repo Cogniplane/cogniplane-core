@@ -59,7 +59,6 @@ export function buildAppDependencies(input: {
   const policyService = new PolicyService({
     rules: stores.policyRules,
     decisions: stores.policyDecisions,
-    auditEvents: stores.auditEvents,
     logger,
     invalidationBus: bootstrap.redis
       ? new RedisPolicyInvalidationBus(bootstrap.redis, logger)

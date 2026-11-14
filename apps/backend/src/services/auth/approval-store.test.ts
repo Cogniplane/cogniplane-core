@@ -75,6 +75,19 @@ function tenantScopes(pool: FakePool): unknown[] {
   return pool.queries.filter(query => query.text.includes("set_config")).map(query => query.values[0]);
 }
 
+/** The audit rows that the store inserted: [tenant, session, user, approval, type, payload]. */
+function auditInserts(pool: FakePool): unknown[][] {
+  return pool.queries.filter(query => query.text.includes("INSERT INTO audit_events"))
+    .map(query => [...query.values.slice(0, 5), JSON.parse(String(query.values[5]))]);
+}
+
+function acceptAudits(pool: FakePool, fail = false): FakePool {
+  return pool.onQuery("INSERT INTO audit_events", () => {
+    if (fail) throw new Error("audit insert failed");
+    return { rows: [], rowCount: 1 };
+  });
+}
+
 function insertCount(pool: FakePool): number {
   return pool.queries.filter(query => query.text.includes("INSERT INTO approvals")).length;
 }
@@ -160,8 +173,8 @@ describe("ApprovalStore.create", () => {
 describe("ApprovalStore decisions", () => {
   // The WHERE predicates run against Postgres in approval-resolve and
   // approval-consume.
-  function decisionPool() {
-    return new FakePool()
+  function decisionPool(failAudit = false) {
+    return acceptAudits(new FakePool(), failAudit)
       .onQuery("SET status = $4", (_sql, [, , , status, decision, remember]) => ({
         rows: [{
           ...approvalRow(["tenant-a", "approval-1", "session-1", "user-1", "runtime-1", "turn-1", "item-1",
@@ -182,6 +195,24 @@ describe("ApprovalStore decisions", () => {
     const rejected = await new ApprovalStore(rejectPool.asPool()).resolve("tenant-a", "approval-1", "user-1", "reject", true);
     expect(rejected).toMatchObject({ status: "rejected", decision: "reject", rememberForTurn: false });
     expect(tenantScopes(rejectPool)).toEqual(["tenant-a"]);
+  });
+
+  test("writes the decision's audit event in the decision's transaction", async () => {
+    const pool = decisionPool();
+    await new ApprovalStore(pool.asPool()).resolve("tenant-a", "approval-1", "user-1", "reject");
+    expect(auditInserts(pool)).toEqual([
+      ["tenant-a", "session-1", "user-1", "approval-1", "approval.rejected", { itemId: "item-1", kind: "mcp_tool" }]
+    ]);
+    const texts = pool.queries.map(({ text }) => text.trim().split(/\s+/).slice(0, 2).join(" "));
+    expect(texts.indexOf("INSERT INTO")).toBeLessThan(texts.indexOf("COMMIT"));
+  });
+
+  test("rolls the decision back when its audit event cannot be written", async () => {
+    const pool = decisionPool(true);
+    await expect(new ApprovalStore(pool.asPool()).resolve("tenant-a", "approval-1", "user-1", "approve"))
+      .rejects.toThrow("audit insert failed");
+    expect(pool.queries.map(({ text }) => text.trim())).toContain("ROLLBACK");
+    expect(pool.queries.map(({ text }) => text.trim())).not.toContain("COMMIT");
   });
 
   test("binds the tenant, approval and user in that order for resolve and consume", async () => {
@@ -223,7 +254,7 @@ describe("ApprovalStore decisions", () => {
   });
 
   test("lists and expires pending approvals inside the caller's tenant scope", async () => {
-    const pool = new FakePool()
+    const pool = acceptAudits(new FakePool())
       .onQuery(/status = 'pending'\s+ORDER BY/, (_sql, values) => ({
         rows: [approvalRow([values[0], "approval-1", values[1], values[2], "runtime-1", "turn-1", "item-1",
           "tools/call", "request-1", "file_change", "Edit", "Edit a file", "pending", null, "{}", T0])],
@@ -237,18 +268,21 @@ describe("ApprovalStore decisions", () => {
     const store = new ApprovalStore(pool.asPool());
 
     const listed = await store.listPending("tenant-a", "session-1", "user-1");
-    const expired = await store.expire("tenant-b", "approval-9");
+    const expired = await store.expire("tenant-b", "approval-9", "turn_interrupted");
 
     expect(listed.map(record => [record.tenantId, record.sessionId, record.userId, record.kind]))
       .toEqual([["tenant-a", "session-1", "user-1", "file_change"]]);
     expect(expired).toMatchObject({ tenantId: "tenant-b", approvalId: "approval-9", status: "expired", kind: "permissions" });
     expect(tenantScopes(pool)).toEqual(["tenant-a", "tenant-b"]);
+    expect(auditInserts(pool)).toEqual([
+      ["tenant-b", "session-1", "user-1", "approval-9", "approval.expired", { reason: "turn_interrupted" }]
+    ]);
   });
 });
 
 describe("ApprovalStore.sweepExpired", () => {
-  test("runs one cross-tenant statement on the given pool without a tenant scope", async () => {
-    const pool = new FakePool().onQuery("FOR UPDATE SKIP LOCKED", (_sql, [limit]) => ({
+  function sweepPool(failAudit = false) {
+    return acceptAudits(new FakePool(), failAudit).onQuery("FOR UPDATE SKIP LOCKED", (_sql, [limit]) => ({
       rows: [
         approvalRow(["tenant-a", "approval-1", "session-1", "user-1", "runtime-1", "turn-1", "item-1",
           "tools/call", "request-1", "mcp_tool", "A", "A", "expired", null, "{}", T0]),
@@ -257,11 +291,35 @@ describe("ApprovalStore.sweepExpired", () => {
       ].slice(0, Number(limit)),
       rowCount: Math.min(2, Number(limit))
     }));
+  }
+
+  test("runs one cross-tenant transaction on the given pool without a tenant scope", async () => {
+    const pool = sweepPool();
     const store = new ApprovalStore(pool.asPool());
 
     expect((await store.sweepExpired()).map(record => record.tenantId)).toEqual(["tenant-a", "tenant-b"]);
     expect((await store.sweepExpired(1)).map(record => record.approvalId)).toEqual(["approval-1"]);
-    expect(pool.queries.map(query => query.values)).toEqual([[500], [1]]);
+    expect(pool.queries.filter(({ text }) => text.includes("SKIP LOCKED")).map(query => query.values)).toEqual([[500], [1]]);
     expect(tenantScopes(pool)).toEqual([]);
+  });
+
+  test("writes one audit event per swept row, each with its row's tenant, before the commit", async () => {
+    const pool = sweepPool();
+    await new ApprovalStore(pool.asPool()).sweepExpired();
+    expect(auditInserts(pool)).toEqual([
+      ["tenant-a", "session-1", "user-1", "approval-1", "approval.expired",
+        { itemId: "item-1", kind: "mcp_tool", reason: "stale_on_sweep" }],
+      ["tenant-b", "session-2", "user-2", "approval-2", "approval.expired",
+        { itemId: "item-2", kind: "mcp_tool", reason: "stale_on_sweep" }]
+    ]);
+    expect(pool.queries.map(({ text }) => text.trim()).at(-1)).toBe("COMMIT");
+  });
+
+  test("rolls the whole batch back when one audit event fails", async () => {
+    const pool = sweepPool(true);
+    await expect(new ApprovalStore(pool.asPool()).sweepExpired()).rejects.toThrow("audit insert failed");
+    const texts = pool.queries.map(({ text }) => text.trim());
+    expect(texts.at(-1)).toBe("ROLLBACK");
+    expect(texts).not.toContain("COMMIT");
   });
 });

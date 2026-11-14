@@ -165,16 +165,18 @@ export class IntegrationStateStore {
     });
   }
 
+  /** `audit` builds the clear's audit event, which commits in the clear's transaction. */
   async clearConfig(
     tenantId: string,
     integrationId: string,
-    updatedBy: string | null
+    updatedBy: string | null,
+    audit?: (saved: IntegrationStateRecord) => AuditEventInput
   ): Promise<IntegrationStateRecord> {
     return this.upsert(tenantId, integrationId, {
       readsEnabled: false,
       writesEnabled: false,
       config: {},
       updatedBy
-    });
+    }, audit);
   }
 }

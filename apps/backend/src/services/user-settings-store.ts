@@ -1,9 +1,10 @@
 import type { PoolClient } from "pg";
 
-import { type Pool, withTenantScope } from "../lib/db.js";
+import { type Pool, withTenantScope, withTransaction } from "../lib/db.js";
 import { isoTimestamp, isoTimestampOrNull } from "../lib/db-mappers.js";
 import { computeNextCronRunAt } from "../lib/cron.js";
 import { ownerSecurityVersionSql } from "./auth/security-change.js";
+import { AuditEventStore, type AuditEventInput } from "./audit-event-store.js";
 
 export const userSettingsSectionKeys = ["scheduled_jobs", "github", "skills", "mcp", "model"] as const;
 
@@ -270,6 +271,20 @@ export class UserSettingsStore {
     private readonly schedulerDb: Pool = db
   ) {}
 
+  /**
+   * Runs one guarded job change on the RLS-bypassing scheduler pool and, when
+   * it changed a row and `audit` is given, writes the event in the same
+   * transaction. Returns true when the change matched a row.
+   */
+  private async changeJobWithAudit(sql: string, params: unknown[], audit?: AuditEventInput): Promise<boolean> {
+    return withTransaction(this.schedulerDb, async (client) => {
+      const result = await client.query(sql, params);
+      const changed = (result.rowCount ?? 0) > 0;
+      if (changed && audit) await AuditEventStore.createInTransaction(client, audit);
+      return changed;
+    });
+  }
+
   async listSections(tenantId: string, userId: string): Promise<UserSettingsSectionRecord[]> {
     return withTenantScope(this.db, tenantId, async (client) => {
       const result = await client.query(
@@ -286,12 +301,13 @@ export class UserSettingsStore {
     });
   }
 
+  /** `audit` builds the save's audit event, which commits in the save's transaction. */
   async upsertSection(input: {
     tenantId: string;
     userId: string;
     sectionKey: UserSettingsSectionKey;
     config: Record<string, unknown>;
-  }): Promise<UserSettingsSectionRecord> {
+  }, audit?: (section: UserSettingsSectionRecord) => AuditEventInput): Promise<UserSettingsSectionRecord> {
     return withTenantScope(this.db, input.tenantId, async (client) => {
       const result = await client.query(
         `
@@ -307,7 +323,9 @@ export class UserSettingsStore {
         [input.tenantId, input.userId, input.sectionKey, JSON.stringify(input.config)]
       );
 
-      return mapSection(result.rows[0]);
+      const section = mapSection(result.rows[0]);
+      if (audit) await AuditEventStore.createInTransaction(client, audit(section));
+      return section;
     });
   }
 
@@ -351,7 +369,8 @@ export class UserSettingsStore {
    * transaction as the insert, under a per-(tenant, user) lock: only ENABLED
    * jobs fire recurring synthetic turns, so a disabled job is never counted and
    * never blocked. Without the lock, two requests could both read 49 enabled
-   * jobs and each insert one more.
+   * jobs and each insert one more. `audit` builds the create's audit event,
+   * which commits in the same transaction.
    */
   async createScheduledJob(
     input: {
@@ -369,7 +388,8 @@ export class UserSettingsStore {
       enabled: boolean;
       nextRunAt: string | null;
     } & ScheduledJobOwnerSession,
-    admission: ScheduledJobAdmission
+    admission: ScheduledJobAdmission,
+    audit?: (job: ScheduledJobRecord) => AuditEventInput
   ): Promise<CreateScheduledJobResult> {
     return withTenantScope(this.db, input.tenantId, async (client) => {
       if (input.enabled && admission.maxActive > 0) {
@@ -420,7 +440,9 @@ export class UserSettingsStore {
         ]
       );
 
-      return { status: "created", job: mapScheduledJob(result.rows[0]) };
+      const job = mapScheduledJob(result.rows[0]);
+      if (audit) await AuditEventStore.createInTransaction(client, audit(job));
+      return { status: "created", job };
     });
   }
 
@@ -433,7 +455,8 @@ export class UserSettingsStore {
    * The edit is the owner's confirmation of the job: it stores the saving
    * session's security version and clears a pause reason. It also starts a
    * new revision with no failures: the outcome of a run claimed before the
-   * edit does not count against the edited job (`finishJobRun`).
+   * edit does not count against the edited job (`finishJobRun`). `audit`
+   * builds the edit's audit event, which commits in the same transaction.
    */
   async updateScheduledJob(
     input: {
@@ -451,7 +474,8 @@ export class UserSettingsStore {
       enabled: boolean;
       nextRunAt: string | null;
     } & ScheduledJobOwnerSession,
-    admission: ScheduledJobAdmission
+    admission: ScheduledJobAdmission,
+    audit?: (job: ScheduledJobRecord) => AuditEventInput
   ): Promise<UpdateScheduledJobResult> {
     return withTenantScope(this.db, input.tenantId, async (client) => {
       if (input.enabled && admission.maxActive > 0) {
@@ -516,13 +540,16 @@ export class UserSettingsStore {
         ]
       );
 
-      return result.rows[0]
-        ? { status: "updated", job: mapScheduledJob(result.rows[0]) }
-        : { status: "not_found" };
+      if (!result.rows[0]) return { status: "not_found" };
+      const job = mapScheduledJob(result.rows[0]);
+      if (audit) await AuditEventStore.createInTransaction(client, audit(job));
+      return { status: "updated", job };
     });
   }
 
-  async deleteScheduledJob(tenantId: string, jobId: string, userId: string): Promise<boolean> {
+  /** `audit` is the delete's audit event. It commits in the delete's transaction, only when a job was deleted. */
+  async deleteScheduledJob(tenantId: string, jobId: string, userId: string,
+    audit?: AuditEventInput): Promise<boolean> {
     return withTenantScope(this.db, tenantId, async (client) => {
       const result = await client.query(
         `
@@ -532,7 +559,9 @@ export class UserSettingsStore {
         [tenantId, jobId, userId]
       );
 
-      return (result.rowCount ?? 0) > 0;
+      const deleted = (result.rowCount ?? 0) > 0;
+      if (deleted && audit) await AuditEventStore.createInTransaction(client, audit);
+      return deleted;
     });
   }
 
@@ -744,10 +773,11 @@ export class UserSettingsStore {
    * disabled. Applies only while the job has the listed `revision`, so it
    * does not park an edited job. Returns true when this call parked the job.
    * Runs on the RLS-bypassing scheduler pool, so the `tenant_id` predicate is
-   * the sole isolation guarantee and must always be present.
+   * the sole isolation guarantee and must always be present. `audit` commits
+   * with the change, only when the job changed.
    */
-  async parkJob(tenantId: string, jobId: string, revision: number): Promise<boolean> {
-    const result = await this.schedulerDb.query(
+  async parkJob(tenantId: string, jobId: string, revision: number, audit?: AuditEventInput): Promise<boolean> {
+    return this.changeJobWithAudit(
       `
         UPDATE scheduled_jobs
         SET next_run_at = NULL, updated_at = NOW()
@@ -758,10 +788,9 @@ export class UserSettingsStore {
           AND next_run_at IS NOT NULL
           AND next_run_at <= NOW()
       `,
-      [tenantId, jobId, revision]
+      [tenantId, jobId, revision],
+      audit
     );
-
-    return (result.rowCount ?? 0) > 0;
   }
 
   /**
@@ -771,10 +800,11 @@ export class UserSettingsStore {
    * this call paused the job. Only the owner can turn it on again, with an
    * edit from a current session (`updateScheduledJob`). Runs on the
    * RLS-bypassing scheduler pool, so the `tenant_id` predicate is the sole
-   * isolation guarantee and must always be present.
+   * isolation guarantee and must always be present. `audit` commits with the
+   * change, only when the job changed.
    */
-  async pauseJobForSecurityChange(tenantId: string, jobId: string): Promise<boolean> {
-    const result = await this.schedulerDb.query(
+  async pauseJobForSecurityChange(tenantId: string, jobId: string, audit?: AuditEventInput): Promise<boolean> {
+    return this.changeJobWithAudit(
       `
         UPDATE scheduled_jobs
         SET enabled = FALSE, next_run_at = NULL, paused_reason = 'security_change', updated_at = NOW()
@@ -783,10 +813,9 @@ export class UserSettingsStore {
           AND enabled = TRUE
           AND NOT (${OWNER_SECURITY_CURRENT_SQL})
       `,
-      [tenantId, jobId]
+      [tenantId, jobId],
+      audit
     );
-
-    return (result.rowCount ?? 0) > 0;
   }
 
   /**
@@ -820,19 +849,19 @@ export class UserSettingsStore {
    * (migration 080), so the disable clears it. Returns true when this call
    * disabled the job, so the caller writes one audit event. Runs on the
    * RLS-bypassing scheduler pool, so the `tenant_id` predicate is the sole
-   * isolation guarantee and must always be present.
+   * isolation guarantee and must always be present. `audit` commits with the
+   * change, only when the job changed.
    */
-  async disableJob(tenantId: string, jobId: string, revision: number): Promise<boolean> {
-    const result = await this.schedulerDb.query(
+  async disableJob(tenantId: string, jobId: string, revision: number, audit?: AuditEventInput): Promise<boolean> {
+    return this.changeJobWithAudit(
       `
         UPDATE scheduled_jobs
         SET enabled = FALSE, next_run_at = NULL, paused_reason = NULL, updated_at = NOW()
         WHERE tenant_id = $1 AND job_id = $2 AND enabled = TRUE AND revision = $3
       `,
-      [tenantId, jobId, revision]
+      [tenantId, jobId, revision],
+      audit
     );
-
-    return (result.rowCount ?? 0) > 0;
   }
 
   /**
@@ -874,6 +903,10 @@ export class UserSettingsStore {
    * the job. The job row lock then orders the disable with each claim and each
    * other outcome: no claim starts a run after the limit, and an older failure
    * cannot disable the job after a newer success.
+   *
+   * `audit` builds the events of a finished run (its outcome, and a
+   * failure-limit disable). They commit in the same transaction; when they
+   * fail, the run stays pending and the stale-run sweep fails it later.
    */
   async finishJobRun(input: {
     tenantId: string;
@@ -888,7 +921,7 @@ export class UserSettingsStore {
     summary: string | null;
     counts: boolean;
     disableAtFailures: number;
-  }): Promise<FinishJobRunResult> {
+  }, audit?: (finished: Extract<FinishJobRunResult, { status: "finished" }>) => AuditEventInput[]): Promise<FinishJobRunResult> {
     return withTenantScope(this.db, input.tenantId, async (client) => {
       const locked = await client.query<{ enabled: boolean; revision: number; consecutive_failures: number }>(
         `
@@ -937,8 +970,12 @@ export class UserSettingsStore {
         return (existing.rowCount ?? 0) > 0 ? { status: "already_finished" } : { status: "missing" };
       }
 
+      const finish = async (finished: Extract<FinishJobRunResult, { status: "finished" }>) => {
+        if (audit) await AuditEventStore.createManyInTransaction(client, audit(finished));
+        return finished;
+      };
       if (!input.counts || Number(job.revision) !== input.revision) {
-        return { status: "finished", run: mapScheduledJobRun(run), consecutiveFailures: null, disabled: false };
+        return finish({ status: "finished", run: mapScheduledJobRun(run), consecutiveFailures: null, disabled: false });
       }
 
       const failed = input.status === "failed";
@@ -961,7 +998,7 @@ export class UserSettingsStore {
         [input.tenantId, input.jobId, consecutiveFailures, disabled]
       );
 
-      return { status: "finished", run: mapScheduledJobRun(run), consecutiveFailures, disabled };
+      return finish({ status: "finished", run: mapScheduledJobRun(run), consecutiveFailures, disabled });
     });
   }
 
@@ -979,36 +1016,45 @@ export class UserSettingsStore {
    * pending and writes nothing, so the run keeps one outcome and one audit
    * event. `FOR UPDATE SKIP LOCKED` keeps concurrent sweeps from
    * double-claiming.
+   *
+   * `audit` builds each swept run's event. The batch and its events commit in
+   * one transaction: when an event fails, every run of the batch stays
+   * pending for the next sweep.
    */
-  async sweepStaleJobRuns(olderThanMs: number, limit = 100): Promise<OrphanedJobRunRecord[]> {
-    const result = await this.schedulerDb.query(
-      `
-        UPDATE scheduled_job_runs
-        SET status = 'failed',
-            completed_at = NOW(),
-            error_message = 'Run orphaned by a scheduler crash or restart'
-        WHERE status = 'pending'
-          AND run_id IN (
-            SELECT run_id
-            FROM scheduled_job_runs
-            WHERE status = 'pending'
-              AND started_at < NOW() - ($1::bigint * INTERVAL '1 millisecond')
-            ORDER BY started_at ASC
-            LIMIT $2
-            FOR UPDATE SKIP LOCKED
-          )
-        RETURNING tenant_id, run_id, job_id, user_id, session_id
-      `,
-      [olderThanMs, limit]
-    );
+  async sweepStaleJobRuns(olderThanMs: number, limit = 100,
+    audit?: (run: OrphanedJobRunRecord) => AuditEventInput): Promise<OrphanedJobRunRecord[]> {
+    return withTransaction(this.schedulerDb, async (client) => {
+      const result = await client.query(
+        `
+          UPDATE scheduled_job_runs
+          SET status = 'failed',
+              completed_at = NOW(),
+              error_message = 'Run orphaned by a scheduler crash or restart'
+          WHERE status = 'pending'
+            AND run_id IN (
+              SELECT run_id
+              FROM scheduled_job_runs
+              WHERE status = 'pending'
+                AND started_at < NOW() - ($1::bigint * INTERVAL '1 millisecond')
+              ORDER BY started_at ASC
+              LIMIT $2
+              FOR UPDATE SKIP LOCKED
+            )
+          RETURNING tenant_id, run_id, job_id, user_id, session_id
+        `,
+        [olderThanMs, limit]
+      );
 
-    return result.rows.map((row) => ({
-      tenantId: String(row.tenant_id),
-      runId: String(row.run_id),
-      jobId: String(row.job_id),
-      userId: String(row.user_id),
-      sessionId: row.session_id ? String(row.session_id) : null
-    }));
+      const runs = result.rows.map((row) => ({
+        tenantId: String(row.tenant_id),
+        runId: String(row.run_id),
+        jobId: String(row.job_id),
+        userId: String(row.user_id),
+        sessionId: row.session_id ? String(row.session_id) : null
+      }));
+      if (audit) await AuditEventStore.createManyInTransaction(client, runs.map(audit));
+      return runs;
+    });
   }
 
   async listJobRuns(tenantId: string, jobId: string, userId: string): Promise<ScheduledJobRunRecord[]> {
