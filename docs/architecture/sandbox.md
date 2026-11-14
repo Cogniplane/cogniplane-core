@@ -22,8 +22,10 @@ the variables named here.
   types](runtime.md#session-types)).
 - Archive, delete and purge of a normal chat kill its saved sandbox. The session
   store reads `sessions.sandbox_id` under the session row lock and clears it in
-  the transaction that changes the status. The status change also stops the
-  execution lease, so after that transaction no runtime can adopt the sandbox.
+  the transaction that changes the status. Archive is refused while the session
+  is busy ([lease](runtime.md#sessions-and-turns)); delete stops the execution
+  lease in the same transaction. So after that transaction no runtime can adopt
+  the sandbox.
   The kill (`services/runtime/e2b-sandbox-disposal.ts`) therefore needs no lease
   check. It sends no connect, and makes up to four tries inside
   `E2B_NETWORK_CONFIRM_TIMEOUT_MS`. A restored chat starts a new sandbox at its

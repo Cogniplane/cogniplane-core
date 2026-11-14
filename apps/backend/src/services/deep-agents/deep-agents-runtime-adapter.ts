@@ -761,6 +761,13 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
     }
     if (this.sessions.get(session.sessionId) !== state || state.abortController.signal.aborted)
       throw new SessionExecutionError("execution_stopped", 403);
+    // The turn writes checkpoints under the execution that it starts with. A
+    // later turn on this warm runtime puts its own execution on `state`, and
+    // late work of this turn must not write under it.
+    const checkpointFence = state.execution ? {
+      tenantId: state.execution.tenantId, sessionId: state.execution.sessionId, userId: state.execution.userId,
+      executionId: state.execution.executionId, ownerId: state.execution.ownerId, runtimeId: state.runtimeId
+    } : undefined;
     if (input.cancelSignal?.aborted) throw new Error("Turn stopped during setup");
     // Refresh awaits configuration and mutates capabilities. Reserve admission
     // against it before any sandbox, context or graph work can begin.
@@ -1061,6 +1068,7 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
         generativeUiTransport: input.generativeUiTransport,
         memoryContext,
         signal: turnAbort.signal,
+        checkpointFence,
         onGraphReady: async () => {
           // Availability is recorded once per turn, after MCP loading succeeds.
           // Empty-instruction skills are excluded by the library builder too.
@@ -1280,6 +1288,7 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
       // Runtime notices use this response id, and hold their events for it.
       state.activeTurnResponseId.current = null;
       state.pendingTurnEvents = [];
+      state.toolContextRef.current = null;
       state.policyContextRef.current = null;
       // Record token usage + cumulative cost onto the assistant row (no-ops when
       // the turn consumed nothing or the writer created no backing row).
@@ -1975,6 +1984,10 @@ export class DeepAgentsRuntimeAdapter implements RuntimeAdapter {
       timeoutMs: this.config.RUNTIME_IDLE_TIMEOUT_MS,
       isBusy: () =>
         state.abortController.signal.aborted || this.activeTurns.has(state.sessionId),
+      // The reuse path of createSession awaits configuration before the turn
+      // clears the timer, and the request registry admits a turn before that.
+      deferWhile: () => this.pendingSessionCreations.has(state.sessionId) ||
+        (this.stores.activeTurns?.snapshot().has(state.sessionId) ?? false),
       onIdle: () => {
         this.log.info(
           { sessionId: state.sessionId, runtimeId: state.runtimeId },

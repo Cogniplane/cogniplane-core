@@ -173,6 +173,9 @@ describe.skipIf(!adminDatabaseUrl())("tool execution context store", () => {
     expect(await requests.stopAndGetOwner(actor)).toMatchObject({ executionId: stopped.execution.executionId });
     expect(await lookups(stopped.context.toolContextId)).toEqual(ended);
     expect(await latest()).toBeNull();
+    // The worker releases the stopped lease when its runtime is gone; the context stays ended.
+    await worker.release(stopped.execution);
+    expect(await lookups(stopped.context.toolContextId)).toEqual(ended);
 
     // The normal end of a run.
     const released = await scheduledRun();

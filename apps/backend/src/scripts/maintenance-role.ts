@@ -23,8 +23,11 @@ export const MAINTENANCE_GRANTS = {
   ],
   // email_outbox: the mail worker claims, finishes, and purges messages of
   // every tenant. Messages are written by app_user in the tenant's scope.
-  "SELECT, UPDATE, DELETE": ["sessions", "session_executions", "messages", "project_files", "email_outbox"],
-  "SELECT, DELETE": ["runtime_sessions", "project_file_versions"],
+  // runtime_sessions: the runtime owner sweep (RuntimeSessionStore.sweepOrphaned).
+  "SELECT, UPDATE, DELETE": [
+    "sessions", "session_executions", "messages", "project_files", "email_outbox", "runtime_sessions"
+  ],
+  "SELECT, DELETE": ["project_file_versions"],
   "SELECT, INSERT, UPDATE, DELETE": ["project_file_storage_gc", "session_storage_gc", "session_runtime_gc"],
   "INSERT": ["audit_events"]
 } as const;

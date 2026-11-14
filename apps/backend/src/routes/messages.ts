@@ -1,4 +1,4 @@
-import { startExecutionHeartbeat, stopLostExecution } from "../services/execution-heartbeat.js";
+import { startExecutionHeartbeat, stopLostExecution, waitAtMost } from "../services/execution-heartbeat.js";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { z } from "zod";
 
@@ -219,6 +219,19 @@ export async function registerMessageRoutes(
         releaseSlot();
       }
     })();
+    // The request's own work (setup, stream, final writes) has ended. Only
+    // this releases the admission, except for the fallback in `onLost`.
+    let markSettled!: () => void;
+    const requestSettled = new Promise<void>(resolve => { markSettled = resolve; });
+    const settleAdmission = () => {
+      markSettled();
+      return releaseAdmission();
+    };
+    // Set when this replica lost the lease. Setup stops at its next step.
+    let leaseLost = false;
+    const assertLeaseHeld = () => {
+      if (leaseLost) throw new SessionExecutionError("execution_stopped", 403);
+    };
     // Everything past the reservation releases the slot on early exit or after
     // the AG-UI stream finishes.
     try {
@@ -253,13 +266,18 @@ export async function registerMessageRoutes(
           renew: () => stores.executions.heartbeat(admitted, app.config.SESSION_EXECUTION_LEASE_MS),
           onError: error => request.log.warn({ err: error, sessionId: input.sessionId }, "Execution heartbeat failed"),
           onLost: async () => {
-            // Release independently: a stuck runtime abort must not retain the
-            // admission. Dispatch checks still reject this execution generation.
-            await Promise.all([
-              stopLostExecution({ execution: admitted, executions: stores.executions, runtime: runtimeAdapter })
-                .catch(error => request.log.error({ err: error }, "Failed to stop expired execution")),
-              releaseAdmission(),
-            ]);
+            leaseLost = true;
+            // Ask the runtime to stop. `abortSession` resolves when the runtime
+            // is disposed, and the turn's stream can still run after that. So
+            // its result does not release the admission.
+            void stopLostExecution({ execution: admitted, executions: stores.executions, runtime: runtimeAdapter })
+              .catch(error => request.log.error({ err: error }, "Failed to stop expired execution"));
+            // The release comes when this request's work ends. Until then a
+            // stopped lease stays `stopping` and the session stays busy on every
+            // replica. If the work does not end in one lease period, release
+            // anyway. Dispatch checks already refuse this execution.
+            await waitAtMost(requestSettled, app.config.SESSION_EXECUTION_LEASE_MS);
+            await releaseAdmission();
           },
         });
       }
@@ -368,6 +386,7 @@ export async function registerMessageRoutes(
 
       // Past the PII gate: this turn will actually be dispatched, so it now
       // spends a daily-quota unit.
+      assertLeaseHeld();
       const quotaError = await stores.limits.consumeTurnQuota({
         userId: request.auth.userId,
         tenantId: request.auth.tenantId
@@ -396,6 +415,7 @@ export async function registerMessageRoutes(
         (tenantId, userId) => stores.toolContexts.currentOwnerSecurityVersion(tenantId, userId)
       );
 
+      assertLeaseHeld();
       openSseResponse(app, request, reply);
 
       // Session auto-titling is fire-and-forget and uses the persisted user message.
@@ -422,8 +442,9 @@ export async function registerMessageRoutes(
         execution,
         cancelSignal: stores.activeTurns?.cancelSignal(input.sessionId),
         startedAt: stores.activeTurns?.startedAt(input.sessionId),
-        onTurnCreated: (turn) => stores.activeTurns?.identify(input.sessionId, turn),
-        onTurnSettled: releaseAdmission,
+        // After a forced release the slot can belong to a newer turn.
+        onTurnCreated: (turn) => { if (slotReserved) stores.activeTurns?.identify(input.sessionId, turn); },
+        onTurnSettled: settleAdmission,
         logger: request.log,
         reply,
         messages: stores.messages,
@@ -460,7 +481,7 @@ export async function registerMessageRoutes(
         return reply.code(error.status).send(apiError(error.code, error.message));
       throw error;
     } finally {
-      await releaseAdmission();
+      await settleAdmission();
       if (eventLog) stores.activeTurns?.closeEventLog(input.sessionId, eventLog);
     }
   });

@@ -115,6 +115,45 @@ test("shutdown waits for scheduled jobs before and after the runtimes close", as
   expect(events).toEqual(["scheduler-stop", "scheduler-drain:5", "scheduler-refuse", "runtime", "scheduler-drain:40", "database"]);
 });
 
+test("the lease sweep also closes orphaned replies, and the runtime owner sweep renews this process first", async () => {
+  vi.useFakeTimers({ toFake: ["setInterval", "clearInterval", "setTimeout", "clearTimeout"] });
+  const app = Fastify();
+  app.decorate("db", { end: async () => {} } as unknown as Pool);
+  const calls: string[] = [];
+  const config = createTestConfig({ SESSION_EXECUTION_LEASE_MS: 30_000, SESSION_EXECUTION_HEARTBEAT_MS: 5_000 });
+  const sweepOrphanedReplies = vi.fn(async (_olderThanMs: number) => { calls.push("replies"); return 0; });
+  try {
+    registerAppLifecycle({
+      app, config,
+      limits: { sweepExpired: () => {} } as AppDependencies["limits"],
+      policyService: { close: async () => {} } as AppDependencies["policyService"],
+      runtimeAdapter: { close: async () => {} } as unknown as AppDependencies["runtimeAdapter"],
+      schedulerWorker: null,
+      expiredExecutions: { sweepExpired: async () => { calls.push("leases"); return 0; }, sweepOrphanedReplies },
+      runtimeOwners: {
+        heartbeatOwner: async () => { calls.push("owner"); },
+        sweepOrphaned: async () => { calls.push("runtimes"); return 0; }
+      }
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect([...calls].sort()).toEqual(["leases", "owner", "replies", "runtimes"]);
+    expect(calls.indexOf("leases")).toBeLessThan(calls.indexOf("replies"));
+    expect(calls.indexOf("owner")).toBeLessThan(calls.indexOf("runtimes"));
+    // A reply with no write for one lease period, after the expired leases are closed.
+    expect(sweepOrphanedReplies).toHaveBeenCalledWith(30_000);
+
+    calls.length = 0;
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(calls).toEqual(["leases", "replies"]);
+    calls.length = 0;
+    await vi.advanceTimersByTimeAsync(55_000);
+    expect(calls.filter(call => call === "owner" || call === "runtimes")).toEqual(["owner", "runtimes"]);
+  } finally {
+    await app.close();
+    vi.useRealTimers();
+  }
+});
+
 async function createRouteTestApp() {
   const app = Fastify();
 

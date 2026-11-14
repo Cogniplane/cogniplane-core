@@ -98,4 +98,35 @@ describe("idle-teardown", () => {
       "idle teardown failed"
     );
   });
+
+  it("reads the busy state again when the timer fires", async () => {
+    const host = makeHost();
+    const onIdle = vi.fn().mockResolvedValue(undefined);
+    let busy = false;
+    scheduleIdleTeardown(host, { timeoutMs: 1000, isBusy: () => busy, onIdle, logger, logContext: {} });
+
+    busy = true;
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(onIdle).not.toHaveBeenCalled();
+    expect(host.idleTimer).toBeNull();
+  });
+
+  it("arms again while the next turn prepares, and fires once it never started", async () => {
+    const host = makeHost();
+    const onIdle = vi.fn().mockResolvedValue(undefined);
+    let preparing = true;
+    scheduleIdleTeardown(host, {
+      timeoutMs: 1000, isBusy: () => false, deferWhile: () => preparing, onIdle, logger, logContext: {}
+    });
+
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(onIdle).not.toHaveBeenCalled();
+    expect(host.idleTimer).not.toBeNull();
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(onIdle).not.toHaveBeenCalled();
+
+    preparing = false;
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(onIdle).toHaveBeenCalledTimes(1);
+  });
 });

@@ -1337,6 +1337,71 @@ describe("DeepAgentsRuntimeAdapter", () => {
     expect(adapter.hasSession("sess-1")).toBe(false);
   });
 
+  it("the idle timer does not tear down a runtime that a pending createSession reuses", async () => {
+    vi.useFakeTimers();
+    try {
+      const { factory } = makeRuntimeFactory(() => scriptedChatStream());
+      const base = makeDynamicConfig();
+      const gate = makeDeferred();
+      let compiles = 0;
+      const dynamicConfig = {
+        ...base,
+        compileRuntimeConfig: async (...args: Parameters<DynamicConfigService["compileRuntimeConfig"]>) => {
+          compiles += 1;
+          // The reuse path waits here, as a slow configuration read would.
+          if (compiles > 1) await gate.promise;
+          return base.compileRuntimeConfig(...args);
+        }
+      } as unknown as DynamicConfigService;
+      const adapter = makeAdapter({
+        factory, dynamicConfig, config: createTestConfig({ ...testConfig, RUNTIME_IDLE_TIMEOUT_MS: 1000 })
+      });
+      const first = await adapter.createSession(sessionInput);
+      await vi.advanceTimersByTimeAsync(900);
+
+      const reuse = adapter.createSession(sessionInput);
+      await vi.advanceTimersByTimeAsync(200);
+      expect(compiles).toBe(2);
+      // The timer fired while createSession waited, and armed again.
+      expect(adapter.hasSession(sessionInput.sessionId)).toBe(true);
+
+      gate.resolve();
+      const reused = await reuse;
+      expect(reused.runtimeId).toBe(first.runtimeId);
+      const events = await collect(adapter.runMessageAGUI(reused, runMessageInput()));
+      expect(events.at(-1)).toMatchObject({ type: AGUIEventType.RUN_FINISHED });
+
+      // With no next turn, the runtime is torn down after the timeout.
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(adapter.hasSession(sessionInput.sessionId)).toBe(false);
+      await adapter.close();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("the idle timer does not tear down a runtime while the request registry admits its next turn", async () => {
+    vi.useFakeTimers();
+    try {
+      const { factory } = makeRuntimeFactory(() => scriptedChatStream());
+      const activeTurns = new ActiveTurnsRegistry();
+      const adapter = makeAdapter({
+        factory, activeTurns, config: createTestConfig({ ...testConfig, RUNTIME_IDLE_TIMEOUT_MS: 1000 })
+      });
+      await adapter.createSession(sessionInput);
+      activeTurns.mark(sessionInput.sessionId, { tenantId: sessionInput.tenantId, userId: sessionInput.userId });
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(adapter.hasSession(sessionInput.sessionId)).toBe(true);
+
+      activeTurns.clear(sessionInput.sessionId);
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(adapter.hasSession(sessionInput.sessionId)).toBe(false);
+      await adapter.close();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("invalidateTenantRuntimes with idleOnly skips sessions with an active turn", async () => {
     let release: () => void = () => {};
     const gate = new Promise<void>((resolve) => (release = resolve));
@@ -1613,6 +1678,43 @@ describe("DeepAgentsRuntimeAdapter runMessageAGUI (AG-UI)", () => {
     }
     return events;
   }
+
+  it("each turn writes checkpoints under its own execution, also after the warm runtime serves the next one", async () => {
+    const runtime = makeRuntimeFactory(() => scriptedChatStream());
+    const executions = { isCurrent: vi.fn(async () => true), bindRuntime: vi.fn(async () => {}) };
+    const adapter = makeAdapter({ factory: runtime.factory, executions });
+    const executionFor = (executionId: string) => ({ ...sessionInput, executionId, ownerId: "replica-1", projectId: null,
+      expiresAt: new Date(Date.now() + 30_000).toISOString() });
+    const fenceOf = (config: unknown) =>
+      (config as { configurable: { cogniplane_checkpoint_fence?: unknown } }).configurable.cogniplane_checkpoint_fence;
+    try {
+      const first = await adapter.createSession({ ...sessionInput, execution: executionFor("execution-1") });
+      await collectAGUI(adapter.runMessageAGUI(first, runMessageInput()));
+      const second = await adapter.createSession({ ...sessionInput, execution: executionFor("execution-2") });
+      expect(second.runtimeId).toBe(first.runtimeId);
+      expect(executions.bindRuntime).toHaveBeenLastCalledWith(expect.objectContaining({ executionId: "execution-2" }), first.runtimeId);
+      await collectAGUI(adapter.runMessageAGUI(second, runMessageInput()));
+
+      // The config of the first turn, which its late work would still use,
+      // keeps the first execution after the runtime moved to the second.
+      const fences = runtime.streamConfigs.map(fenceOf);
+      expect(fences).toEqual([
+        { ...sessionInput, executionId: "execution-1", ownerId: "replica-1", runtimeId: first.runtimeId },
+        { ...sessionInput, executionId: "execution-2", ownerId: "replica-1", runtimeId: first.runtimeId }
+      ]);
+      expect(Object.isFrozen(fences[0])).toBe(true);
+    } finally { await adapter.close(); }
+  });
+
+  it("a turn with no execution passes no checkpoint fence", async () => {
+    const runtime = makeRuntimeFactory(() => scriptedChatStream());
+    const adapter = makeAdapter({ factory: runtime.factory });
+    try {
+      const session = await adapter.createSession(sessionInput);
+      await collectAGUI(adapter.runMessageAGUI(session, runMessageInput()));
+      expect(runtime.streamConfigs[0]!.configurable).toEqual({ thread_id: sessionInput.sessionId });
+    } finally { await adapter.close(); }
+  });
 
   it("loads the complete transcript for a long project session", async () => {
     const runtime = makeRuntimeFactory(() => scriptedChatStream());
@@ -2296,6 +2398,52 @@ describe("DeepAgentsRuntimeAdapter runMessageAGUI (AG-UI)", () => {
     release.resolve();
     await disposal;
     await adapter.close();
+  });
+
+  // The message route must not treat the end of abortSession as the end of
+  // the turn (routes/messages.ts, onLost).
+  it("abortSession resolves while the turn's graph stream still runs", async () => {
+    const streamEnd = makeDeferred();
+    const factory: DeepAgentsRuntimeFactory = () =>
+      ({
+        ...emptyRuntimeCapabilities(),
+        async getAgentForModel() {
+          return {
+            // A graph step that does not watch the abort signal.
+            async *streamEvents() {
+              yield { event: "on_chat_model_stream", metadata: {}, data: { chunk: { content: "partial" } } };
+              await streamEnd.promise;
+              throw new DOMException("Aborted", "AbortError");
+            }
+          };
+        },
+        dispose: async () => {}
+      }) as unknown as DeepAgentsSessionRuntime;
+    const adapter = makeAdapter({ factory });
+    try {
+      const session = await adapter.createSession(sessionInput);
+      const events: AGUIBaseEvent[] = [];
+      let turnEnded = false;
+      const done = (async () => {
+        for await (const event of adapter.runMessageAGUI(session, { prompt: "hi", toolContextId: null })) events.push(event);
+        turnEnded = true;
+      })();
+      await waitForAGUIEvent(events, (e) => e.type === AGUIEventType.TEXT_MESSAGE_CONTENT);
+
+      await adapter.abortSession(sessionInput);
+      expect(adapter.hasSession(sessionInput.sessionId)).toBe(false);
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(turnEnded).toBe(false);
+      expect(adapter.hasActiveTurn(sessionInput.sessionId)).toBe(true);
+
+      streamEnd.resolve();
+      await done;
+      expect(isAGUIInterruptedFinish(events.at(-1) as AGUIBaseEvent)).toBe(true);
+      expect(adapter.hasActiveTurn(sessionInput.sessionId)).toBe(false);
+    } finally {
+      streamEnd.resolve();
+      await adapter.close();
+    }
   });
 
   it("fails a wedged AG-UI turn on the watchdog and releases the session slot", async () => {

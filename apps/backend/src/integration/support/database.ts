@@ -30,7 +30,8 @@ import { fileURLToPath } from "node:url";
 import pg from "pg";
 
 import { createMigrationDatabase } from "../../lib/db.js";
-import { setupDeepAgentsCheckpointer } from "../../services/deep-agents/deep-agents-checkpointer.js";
+import { PostgresSaver } from "@langchain/langgraph-checkpoint-postgres";
+import { DEEP_AGENTS_CHECKPOINT_SCHEMA, setupDeepAgentsCheckpointer } from "../../services/deep-agents/deep-agents-checkpointer.js";
 import { ensureMaintenanceRole } from "../../scripts/maintenance-role.js";
 import { applyMigrations, ensureAppUserRole } from "../../scripts/migrate-lib.js";
 
@@ -142,6 +143,15 @@ export function appPool(): pg.Pool {
     application_name: "cogniplane-integration-app-user"
   });
   return appUser;
+}
+
+/**
+ * A saver with no write fence, on the shared app_user pool. Tests use it to
+ * seed the history of a session with no turn, as a version before the fence
+ * or an older replica wrote it. Do not call `end()`: closePools closes the pool.
+ */
+export function unfencedCheckpointWriter(): PostgresSaver {
+  return new PostgresSaver(appPool(), undefined, { schema: DEEP_AGENTS_CHECKPOINT_SCHEMA });
 }
 
 export async function closePools(): Promise<void> {

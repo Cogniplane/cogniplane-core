@@ -7,6 +7,7 @@ import multipart from "@fastify/multipart";
 import { registerAppLifecycle, registerAppRoutes } from "./app-bootstrap.js";
 import { buildAppDependencies, buildSchedulerWorker } from "./app-dependencies.js";
 import { SessionExecutionStore } from "./services/session-execution-store.js";
+import { RuntimeSessionStore } from "./services/runtime/runtime-session-store.js";
 import { type AppConfig, isLoginTypeEnabled, isMailEnabled, loadConfig } from "./config.js";
 import { localDevAuth } from "./lib/auth.js";
 import { jwtAuth } from "./lib/auth-jwt.js";
@@ -382,6 +383,7 @@ export async function buildApp() {
     runtimeAdapter: deps.runtimeAdapter,
     activeTurns: deps.activeTurns,
     expiredExecutions: new SessionExecutionStore(privilegedDb),
+    runtimeOwners: new RuntimeSessionStore(privilegedDb, deps.runtimeSessions.ownerId),
     messages: deps.messages,
     privilegedDb,
     schedulerWorker,

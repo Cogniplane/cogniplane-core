@@ -4,7 +4,7 @@ import { z } from "zod";
 import { type Pool, withTenantScope, withTransaction } from "../lib/db.js";
 import { requireSessionUploadAccess } from "./session-upload-access.js";
 import { projectRoleSql, requireProjectAccess } from "./project-access.js";
-import { SessionExecutionError } from "./session-execution-store.js";
+import { SessionExecutionError, sessionBusySql, sessionExecutionBusySql } from "./session-execution-store.js";
 import type { PoolClient } from "pg";
 import { sessionReadAccessSql, sessionTrashAccessSql } from "./session-access.js";
 import type { ArtifactStorage } from "./artifacts/artifact-storage.js";
@@ -158,7 +158,8 @@ function scheduledSessionExpiredSql(session: string, days: string): string {
       WHERE m.tenant_id = ${session}.tenant_id AND m.session_id = ${session}.session_id
         AND m.updated_at > ${cutoff})
     AND NOT EXISTS (SELECT 1 FROM session_executions e
-      WHERE e.tenant_id = ${session}.tenant_id AND e.session_id = ${session}.session_id AND e.status = 'active')
+      WHERE e.tenant_id = ${session}.tenant_id AND e.session_id = ${session}.session_id
+        AND e.status IN ('active', 'stopping'))
     AND NOT EXISTS (SELECT 1 FROM approvals a
       WHERE a.tenant_id = ${session}.tenant_id AND a.session_id = ${session}.session_id AND a.status = 'pending')`;
 }
@@ -243,19 +244,19 @@ export class SessionStore {
     // Admission and assignment also lock project before session.
     const current = await client.query("SELECT project_id, status, purpose, user_id, capability_selection, capability_version, sandbox_id FROM sessions WHERE tenant_id=$1 AND session_id=$2 FOR UPDATE", [tenantId, sessionId]);
     if (!current.rows[0] || current.rows[0].project_id !== projectId) return false;
-    if (projectId && options.checkBusy !== false) {
-      const busy = await client.query(`SELECT 1 WHERE EXISTS (
-        SELECT 1 FROM session_executions WHERE tenant_id=$1 AND session_id=$2
-          AND status='active' AND expires_at>clock_timestamp()
-      ) OR EXISTS (SELECT 1 FROM approvals WHERE tenant_id=$1 AND session_id=$2 AND status='pending' AND expires_at>clock_timestamp())`,
-      [tenantId, sessionId]);
-      if (busy.rowCount) throw new SessionExecutionError("session_busy", 409);
-    }
+    // Deleting a personal chat stops its turn (trigger `session_execution_revocation`).
+    if (projectId && options.checkBusy !== false) await this.requireIdleSession(client, tenantId, sessionId);
     return { projectId, status: current.rows[0].status as SessionRecord["status"],
       purpose: current.rows[0].purpose as string, ownerId: current.rows[0].user_id as string,
       capabilitySelection: current.rows[0].capability_selection as unknown,
       capabilityVersion: current.rows[0].capability_version as unknown,
       sandboxId: current.rows[0].sandbox_id as string | null };
+  }
+
+  /** Call under the session row lock: turn admission takes the same lock. */
+  private async requireIdleSession(client: PoolClient, tenantId: string, sessionId: string): Promise<void> {
+    const busy = await client.query(`SELECT 1 WHERE ${sessionBusySql("$1", "$2")}`, [tenantId, sessionId]);
+    if (busy.rowCount) throw new SessionExecutionError("session_busy", 409);
   }
 
   // Capability selection is readable project metadata, including for viewers.
@@ -311,11 +312,7 @@ export class SessionStore {
         `SELECT s.capability_selection, s.capability_version, s.project_id, s.purpose, s.user_id,
            p.capability_selection AS project_selection, d.capability_selection AS personal_selection,
            (${sessionLifecycleAccessSql("s", "$3")} AND s.status = 'active'
-            AND NOT EXISTS (SELECT 1 FROM session_executions e WHERE e.tenant_id=s.tenant_id AND e.session_id=s.session_id AND e.status='active' AND e.expires_at>clock_timestamp())
-            AND NOT EXISTS (SELECT 1 FROM approvals a WHERE a.tenant_id = s.tenant_id
-              AND a.session_id = s.session_id AND a.status = 'pending')
-            AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.tenant_id = s.tenant_id
-              AND m.session_id = s.session_id AND m.role = 'assistant' AND m.status = 'streaming')) AS can_edit
+            AND NOT ${sessionBusySql("s.tenant_id", "s.session_id")}) AS can_edit
          FROM sessions s LEFT JOIN projects p ON p.tenant_id=s.tenant_id AND p.project_id=s.project_id
            LEFT JOIN personal_capability_defaults d ON d.tenant_id=s.tenant_id AND d.user_id=s.user_id
          WHERE s.tenant_id = $1 AND s.session_id = $2 AND ${sessionReadAccessSql("s", "$3")}`,
@@ -372,12 +369,7 @@ export class SessionStore {
            capability_version = capability_version + 1
          WHERE s.tenant_id = $1 AND s.session_id = $2 AND ${sessionLifecycleAccessSql("s", "$3")}
            AND s.status = 'active' AND s.capability_version = $5
-           AND NOT EXISTS (SELECT 1 FROM session_executions e WHERE e.tenant_id=s.tenant_id AND e.session_id=s.session_id AND e.status='active' AND e.expires_at>clock_timestamp())
-            AND NOT EXISTS (SELECT 1 FROM approvals a
-             WHERE a.tenant_id = s.tenant_id AND a.session_id = s.session_id AND a.status = 'pending')
-           AND NOT EXISTS (SELECT 1 FROM messages m
-             WHERE m.tenant_id = s.tenant_id AND m.session_id = s.session_id
-               AND m.role = 'assistant' AND m.status = 'streaming')`,
+           AND NOT ${sessionBusySql("s.tenant_id", "s.session_id")}`,
         [tenantId, sessionId, userId, input.selection === null ? null : JSON.stringify(input.selection), input.version]
       );
       return (result.rowCount ?? 0) > 0;
@@ -453,13 +445,10 @@ export class SessionStore {
                 AND a.status = 'pending'
             ) AS has_pending_approvals
             , (${sessionLifecycleAccessSql("s", "$2")}) AS can_edit
-            , EXISTS (
-              SELECT 1 FROM session_executions e
-              WHERE e.tenant_id=s.tenant_id AND e.session_id=s.session_id
-                AND e.status='active' AND e.expires_at>clock_timestamp()
-            ) AS is_running
+            , ${sessionExecutionBusySql("s.tenant_id", "s.session_id")} AS is_running
             , (SELECT MIN(e.started_at) FROM session_executions e
-               WHERE e.tenant_id=s.tenant_id AND e.session_id=s.session_id AND e.status='active') AS active_turn_started_at
+               WHERE e.tenant_id=s.tenant_id AND e.session_id=s.session_id
+                 AND e.status IN ('active','stopping')) AS active_turn_started_at
           FROM (
             SELECT s.* FROM sessions s
             WHERE s.tenant_id = $1 AND ${options.status === "deleted"
@@ -608,14 +597,8 @@ export class SessionStore {
       if (locked.projectId) {
         await requireProjectAccess(client, { tenantId, projectId: locked.projectId, userId }, "editor", { active: true });
       }
-      if (locked.projectId) {
-        const busy = await client.query(`SELECT 1 WHERE EXISTS (
-          SELECT 1 FROM session_executions WHERE tenant_id=$1 AND session_id=$2
-            AND status='active' AND expires_at>clock_timestamp()
-        ) OR EXISTS (SELECT 1 FROM approvals WHERE tenant_id=$1 AND session_id=$2 AND status='pending' AND expires_at>clock_timestamp())`,
-        [tenantId, sessionId]);
-        if (busy.rowCount) throw new SessionExecutionError("session_busy", 409);
-      }
+      // Every session, also a personal one: the turn can run on another replica.
+      await this.requireIdleSession(client, tenantId, sessionId);
       const result = await client.query(
         `UPDATE sessions s
          SET status = $4, archived_at = CASE WHEN $4 = 'archived' THEN NOW() ELSE NULL END,
@@ -624,10 +607,7 @@ export class SessionStore {
              sandbox_network_policy = CASE WHEN $4 = 'archived' THEN NULL ELSE s.sandbox_network_policy END
          WHERE s.tenant_id = $1 AND s.session_id = $2 AND ${sessionLifecycleAccessSql("s", "$3")}
            AND s.status = $5 AND s.purpose <> 'project_reference'
-           AND ($4 <> 'archived' OR NOT EXISTS (
-             SELECT 1 FROM approvals a WHERE a.tenant_id = s.tenant_id
-               AND a.session_id = s.session_id AND a.status = 'pending'
-           ))
+           AND ($4 <> 'archived' OR NOT ${sessionBusySql("s.tenant_id", "s.session_id")})
          RETURNING ${SESSION_COLUMNS}`,
         [tenantId, sessionId, userId, archived ? "archived" : "active", archived ? "active" : "archived"]
       );

@@ -40,7 +40,7 @@ function setup(handler: Handler, options: Options = {}) {
           ? [{ role: options.role ?? "owner", archived_at: options.archived ?? null, visibility: "private", organization_role: "viewer" }] : []);
       }
       if (statement.includes("FROM tenant_memberships")) return rows(options.member === false ? [] : [{}]);
-      if (statement.includes("FROM projects p WHERE") && statement.includes("NOT EXISTS")) return rows(options.idle === false ? [] : [{}]);
+      if (statement.includes("FROM projects p WHERE") && statement.includes("busy_execution")) return rows(options.idle === false ? [] : [{}]);
       if (statement.includes("SELECT capability_selection, capability_version FROM projects")) {
         return rows([{ capability_selection: options.selection ?? null, capability_version: 7 }]);
       }

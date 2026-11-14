@@ -2,7 +2,7 @@ import { readFile } from "node:fs/promises";
 import { afterAll, describe, expect, test } from "vitest";
 import { SessionStore } from "../services/session-store.js";
 import { createDeepAgentsCheckpointer } from "../services/deep-agents/deep-agents-checkpointer.js";
-import { adminDatabaseUrl, appPool, runAppUserUrl, superuserPool } from "./support/database.js";
+import { adminDatabaseUrl, appPool, runAppUserUrl, superuserPool, unfencedCheckpointWriter } from "./support/database.js";
 import { seedTenant, seedUser, seedSession, seedMessage, seedRuntimeSession, seedApproval } from "./support/fixtures.js";
 
 describe.skipIf(!adminDatabaseUrl())("session archive persistence", () => {
@@ -18,7 +18,7 @@ describe.skipIf(!adminDatabaseUrl())("session archive persistence", () => {
     const messageId = await seedMessage(tenant, user, id);
     const store = new SessionStore(appPool());
     const config = { configurable: { thread_id: id, checkpoint_ns: "" } };
-    await saver!.put(config, {
+    await unfencedCheckpointWriter().put(config, {
       v: 4, id: "cp-archive", ts: new Date().toISOString(),
       channel_values: { messages: ["preserved history"] }, channel_versions: { messages: 1 }, versions_seen: {}
     }, { source: "input", step: 1, parents: {} }, { messages: 1 });
@@ -112,7 +112,7 @@ describe.skipIf(!adminDatabaseUrl())("session archive persistence", () => {
     const runtimeId = await seedRuntimeSession(tenant, user, id);
     const approval = await seedApproval({ tenantId: tenant, userId: user, sessionId: id, runtimeId });
     const store = new SessionStore(appPool());
-    expect(await store.setArchived(tenant, id, user, true)).toBeNull();
+    await expect(store.setArchived(tenant, id, user, true)).rejects.toMatchObject({ code: "session_busy", statusCode: 409 });
     expect((await store.getOwned(tenant, id, user))?.status).toBe("active");
     await superuserPool().query("UPDATE approvals SET status = 'rejected' WHERE approval_id = $1", [approval]);
     expect((await store.setArchived(tenant, id, user, true))?.session.status).toBe("archived");

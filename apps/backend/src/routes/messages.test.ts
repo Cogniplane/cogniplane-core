@@ -588,7 +588,7 @@ test("uses PII-transformed instructions in both the saved snapshot and model inp
 });
 
 
-test("lost execution releases admission even when runtime abort and streaming are stalled", async () => {
+test("lost execution keeps admission while the runtime stops, and releases it after one lease period when the abort stalls", async () => {
   let start!: () => void;
   const started = new Promise<void>(resolve => { start = resolve; });
   let finish!: () => void;
@@ -611,6 +611,11 @@ test("lost execution releases admission even when runtime abort and streaming ar
     await vi.advanceTimersByTimeAsync(5_000);
     expect(abort).toHaveBeenCalledWith(expect.objectContaining({ executionId: "execution-test" }));
     expect(abort).not.toHaveBeenCalledWith(expect.objectContaining({ reason: expect.anything() }));
+    // A stopped lease stays `stopping` until this release: the session stays busy while the runtime stops.
+    expect(h.stores.executions.release).not.toHaveBeenCalled();
+    expect(h.activeTurns.snapshot().has(SESSION_ID)).toBe(true);
+    // The stalled abort holds the admission for one lease period, then the release goes on.
+    await vi.advanceTimersByTimeAsync(30_000);
     expect(h.stores.executions.release).toHaveBeenCalledTimes(1);
     expect(h.activeTurns.snapshot().has(SESSION_ID)).toBe(false);
     await vi.advanceTimersByTimeAsync(30_000);
@@ -644,12 +649,109 @@ test("a lease that a security change stopped ends the turn with that reason", as
     await vi.advanceTimersByTimeAsync(5_000);
     expect(stoppedBySecurityChange).toHaveBeenCalledWith(expect.objectContaining({ executionId: "execution-test" }));
     expect(abort).toHaveBeenCalledWith(expect.objectContaining({ executionId: "execution-test", reason: "security_change" }));
-    expect(h.stores.executions.release).toHaveBeenCalledTimes(1);
+    // The abort resolved, but the turn has not ended yet.
+    expect(h.stores.executions.release).not.toHaveBeenCalled();
   } finally {
     finish();
     vi.useRealTimers();
     await response;
   }
+  expect(h.stores.executions.release).toHaveBeenCalledTimes(1);
+});
+
+test("lost execution keeps admission until the old turn ends, also when the runtime abort resolves at once", async () => {
+  let start!: () => void;
+  const started = new Promise<void>(resolve => { start = resolve; });
+  // Holds the old turn's stream, as a graph that still runs after its runtime was disposed.
+  let finish!: () => void;
+  const gate = new Promise<void>(resolve => { finish = resolve; });
+  let firstTurn = true;
+  const h = makeStores({ gateRuntime: async () => {
+    if (!firstTurn) return;
+    firstTurn = false;
+    start();
+    await gate;
+  } });
+  const renew = vi.mocked(h.stores.executions.heartbeat).mockResolvedValue(false);
+  const abort = vi.fn(async () => {});
+  h.stores.runtimeAdapter.abortSession = abort;
+  activeApp = await buildApp(h.stores);
+  vi.useFakeTimers({ toFake: ["setInterval", "clearInterval", "setTimeout", "clearTimeout", "performance"] });
+  const first = activeApp.inject({ method: "POST", url: "/messages", payload: { sessionId: SESSION_ID, text: "Hello" } }).then(result => result);
+  let released = false;
+  try {
+    await started;
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(abort).toHaveBeenCalledTimes(1);
+    expect(abort).toHaveBeenCalledWith(expect.objectContaining({ executionId: "execution-test" }));
+    // Less than one lease period after the loss: the stream is pending, so the turn keeps its admission.
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(h.stores.executions.release).not.toHaveBeenCalled();
+    expect(h.finishTurnAdmission).not.toHaveBeenCalled();
+    expect(h.activeTurns.snapshot().has(SESSION_ID)).toBe(true);
+    finish();
+    released = true;
+    vi.useRealTimers();
+    expect((await first).statusCode).toBe(200);
+  } finally {
+    if (!released) {
+      finish();
+      vi.useRealTimers();
+      await first;
+    }
+  }
+  expect(h.stores.executions.release).toHaveBeenCalledTimes(1);
+  expect(h.finishTurnAdmission).toHaveBeenCalledTimes(1);
+  expect(h.activeTurns.snapshot().has(SESSION_ID)).toBe(false);
+  expect(renew).toHaveBeenCalledTimes(1);
+
+  renew.mockResolvedValue(true);
+  const next = await activeApp.inject({ method: "POST", url: "/messages", payload: { sessionId: SESSION_ID, text: "Again" } });
+  expect(next.statusCode).toBe(200);
+  expect(next.body).toContain("hello from agui");
+  expect(h.stores.executions.acquire).toHaveBeenCalledTimes(2);
+  expect(h.stores.executions.release).toHaveBeenCalledTimes(2);
+});
+
+test("a lease lost during setup stops the setup before it persists or spends quota", async () => {
+  let reachLimits!: () => void;
+  const reached = new Promise<void>(resolve => { reachLimits = resolve; });
+  let resumeSetup!: () => void;
+  const setupGate = new Promise<void>(resolve => { resumeSetup = resolve; });
+  const h = makeStores({ gateRuntime: async () => {} });
+  vi.mocked(h.stores.executions.heartbeat).mockResolvedValue(false);
+  const consumeRateLimit = h.stores.limits.consumeRateLimit;
+  vi.spyOn(h.stores.limits, "consumeRateLimit").mockImplementation(async (input) => {
+    reachLimits();
+    await setupGate;
+    return consumeRateLimit(input);
+  });
+  const abort = vi.fn(async () => {});
+  h.stores.runtimeAdapter.abortSession = abort;
+  const createSession = vi.spyOn(h.stores.runtimeAdapter, "createSession");
+  activeApp = await buildApp(h.stores);
+  vi.useFakeTimers({ toFake: ["setInterval", "clearInterval", "setTimeout", "clearTimeout", "performance"] });
+  const response = activeApp.inject({ method: "POST", url: "/messages", payload: { sessionId: SESSION_ID, text: "Hello" } }).then(result => result);
+  try {
+    await reached;
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(abort).toHaveBeenCalledTimes(1);
+    expect(h.stores.executions.release).not.toHaveBeenCalled();
+    // Setup stalls past one lease period: the fallback releases once.
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(h.stores.executions.release).toHaveBeenCalledTimes(1);
+    expect(h.activeTurns.snapshot().has(SESSION_ID)).toBe(false);
+  } finally {
+    resumeSetup();
+    vi.useRealTimers();
+  }
+  const result = await response;
+  expect(result.statusCode).toBe(403);
+  expect(result.json()).toMatchObject({ error: "execution_stopped" });
+  expect(h.createdMessages).toEqual([]);
+  expect(h.consumedQuota).toEqual([]);
+  expect(createSession).not.toHaveBeenCalled();
+  expect(h.stores.executions.release).toHaveBeenCalledTimes(1);
 });
 
 test("a tenant with a spending limit keeps the local titler but not the paid fallback", async () => {

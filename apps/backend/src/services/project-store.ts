@@ -6,13 +6,9 @@ import { ProjectAccessError, projectRoleSql, requireProjectAccess } from "./proj
 import type { PoolClient } from "pg";
 import { ProjectApprovalModeSchema, SessionCapabilitySelectionSchema, type SessionCapabilitySelection, type Project, type ProjectAgentFileMode, type ProjectApprovalMode, type ProjectCapabilitiesUpdate } from "@cogniplane/shared-types";
 import { hasUnavailableAdditions } from "./capability-selection.js";
+import { projectBusySql, sessionBusySql } from "./session-execution-store.js";
 
-export const projectCapabilityIdleSql = `NOT EXISTS (SELECT 1 FROM session_executions e
-  WHERE e.tenant_id=p.tenant_id AND e.project_id=p.project_id AND e.status='active' AND e.expires_at>clock_timestamp())
-  AND NOT EXISTS (SELECT 1 FROM approvals a JOIN sessions s ON s.tenant_id=a.tenant_id AND s.session_id=a.session_id
-    WHERE s.tenant_id=p.tenant_id AND s.project_id=p.project_id AND a.status='pending')
-  AND NOT EXISTS (SELECT 1 FROM messages m JOIN sessions s ON s.tenant_id=m.tenant_id AND s.session_id=m.session_id
-    WHERE s.tenant_id=p.tenant_id AND s.project_id=p.project_id AND m.role='assistant' AND m.status='streaming')`;
+export const projectCapabilityIdleSql = `NOT ${projectBusySql("p.tenant_id", "p.project_id")}`;
 
 // Conversation activity and new files count as project activity, without
 // touching a project row on every message or scan-progress write.
@@ -101,9 +97,7 @@ export class ProjectStore {
   }
 
   private async assertNoActiveTurns(db: PoolClient, tenantId: string, projectId: string, message: string) {
-    const running = await db.query(`SELECT 1 FROM session_executions
-      WHERE tenant_id=$1 AND project_id=$2 AND status='active' AND expires_at>clock_timestamp() LIMIT 1`,
-    [tenantId, projectId]);
+    const running = await db.query(`SELECT 1 WHERE ${projectBusySql("$1", "$2")}`, [tenantId, projectId]);
     if (running.rowCount) throw new ProjectAccessError("project_busy", message, 409);
   }
 
@@ -327,15 +321,7 @@ export class ProjectStore {
       }
       // The route's busy check sees only this process. A turn on another replica
       // holds an execution row, and a paused turn holds a pending approval.
-      const busy = await db.query(
-        `SELECT 1 FROM session_executions
-         WHERE tenant_id = $1 AND session_id = $2 AND status = 'active' AND expires_at > clock_timestamp()
-         UNION ALL
-         SELECT 1 FROM approvals
-         WHERE tenant_id = $1 AND session_id = $2 AND status = 'pending' AND expires_at > clock_timestamp()
-         LIMIT 1`,
-        [tenantId, sessionId]
-      );
+      const busy = await db.query(`SELECT 1 WHERE ${sessionBusySql("$1", "$2")}`, [tenantId, sessionId]);
       if (busy.rowCount) return "busy" as const;
       const result = await db.query(
         `UPDATE sessions SET project_id = $3

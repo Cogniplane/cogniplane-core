@@ -47,7 +47,7 @@ class ProjectWorld {
         return one({ archived_at: this.archived ? T0 : null, visibility: "private", organization_role: "viewer", role });
       })
       // Anchored: guarded UPDATEs embed the same subquery in their idle predicate.
-      .onQuery(/^SELECT 1 FROM session_executions/, () => (this.activeTurn ? one({}) : none))
+      .onQuery(/^SELECT 1 WHERE \(EXISTS \(SELECT 1 FROM session_executions busy_execution/, () => (this.activeTurn ? one({}) : none))
       .onQuery("purpose = 'normal' FOR UPDATE", (_sql, [, userId, sessionId]) => {
         const session = this.sessions.get(String(sessionId));
         return session && session.userId === userId ? one({ project_id: session.projectId }) : none;

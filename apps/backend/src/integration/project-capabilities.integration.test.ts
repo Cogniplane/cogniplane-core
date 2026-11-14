@@ -45,7 +45,7 @@ describe.skipIf(!adminDatabaseUrl())("project capability persistence", () => {
     await expect(store.setCapabilities(tenantId, owner, id, { selection, version: 2 })).rejects.toMatchObject({ code: "project_archived" });
   });
 
-  test("blocks pending approvals and streaming turns until they finish", async () => {
+  test("blocks running and stopping turns and pending approvals until they finish", async () => {
     const tenantId = await seedTenant(), owner = await seedUser();
     await seedMembership(tenantId, owner);
     const store = new ProjectStore(appPool());
@@ -57,15 +57,18 @@ describe.skipIf(!adminDatabaseUrl())("project capability persistence", () => {
     const input = { selection: { skillIds: [], connectorIds: [] }, version: 0 };
     expect((await store.getCapabilities(tenantId, owner, project.projectId)).canEdit).toBe(false);
     expect(await store.setCapabilities(tenantId, owner, project.projectId, input)).toBe(false);
+    // A stopped turn still unwinds until its owner releases the lease.
+    await executions.stop({ tenantId, userId: owner, sessionId: session! });
+    expect(await store.setCapabilities(tenantId, owner, project.projectId, input)).toBe(false);
     await executions.release(execution);
     const runtime = await seedRuntimeSession(tenantId, owner, session!);
     const approval = await seedApproval({ tenantId, userId: owner, sessionId: session!, runtimeId: runtime });
     expect((await store.getCapabilities(tenantId, owner, project.projectId)).canEdit).toBe(false);
     expect(await store.setCapabilities(tenantId, owner, project.projectId, input)).toBe(false);
-    await superuserPool().query("UPDATE approvals SET status='approved' WHERE approval_id=$1", [approval]);
-    const message = await seedStreamingMessage(tenantId, owner, session!);
-    expect(await store.setCapabilities(tenantId, owner, project.projectId, input)).toBe(false);
-    await superuserPool().query("UPDATE messages SET status='completed' WHERE message_id=$1", [message]);
+    // An approval past its expiry no longer blocks, also before the sweep reaches it.
+    await superuserPool().query("UPDATE approvals SET expires_at=NOW()-INTERVAL '1 minute' WHERE approval_id=$1", [approval]);
+    // A reply left streaming with no lease is not a running turn: the lease is the only rule.
+    await seedStreamingMessage(tenantId, owner, session!);
     expect(await store.setCapabilities(tenantId, owner, project.projectId, input)).toBe(true);
   });
 

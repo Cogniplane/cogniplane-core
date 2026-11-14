@@ -15,7 +15,8 @@ import {
   appPool,
   maintenancePool,
   runAppUserUrl,
-  superuserPool
+  superuserPool,
+  unfencedCheckpointWriter
 } from "./support/database.js";
 import {
   seedArtifact,
@@ -177,7 +178,7 @@ describe.skipIf(!adminDatabaseUrl())("tenant offboarding", () => {
       versions_seen: {}
     };
     const metadata: CheckpointMetadata = { source: "input", step: 1, parents: {} };
-    await checkpointer!.put(checkpointConfig, checkpoint, metadata, { messages: 1 });
+    await unfencedCheckpointWriter().put(checkpointConfig, checkpoint, metadata, { messages: 1 });
 
     const deleteArtifact = vi
       .fn<(storageKey: string) => Promise<void>>()
