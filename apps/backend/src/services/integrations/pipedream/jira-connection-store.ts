@@ -3,6 +3,7 @@ import type { PoolClient } from "pg";
 import { withTenantScope, type Pool } from "../../../lib/db.js";
 import { isoTimestamp } from "../../../lib/db-mappers.js";
 import { ownerSecurityVersionSql } from "../../auth/security-change.js";
+import { AuditEventStore, type AuditEventInput } from "../../audit-event-store.js";
 
 export type JiraConnectionRecord = {
   tenantId: string;
@@ -261,8 +262,10 @@ export class JiraConnectionStore {
    * Saves the selected account and site only if `expected` is still the
    * member's identity and the member still belongs to the tenant. This
    * rejects a selection that started before a disconnect or a removal.
+   * `audit` builds the selection's audit event, which commits with it.
    */
-  async upsert(input: JiraConnectionUpsert, expected: JiraIdentity): Promise<JiraConnectionRecord> {
+  async upsert(input: JiraConnectionUpsert, expected: JiraIdentity,
+    audit?: (record: JiraConnectionRecord) => AuditEventInput): Promise<JiraConnectionRecord> {
     return withTenantScope(this.db, input.tenantId, async (client) => {
       if (!(await lockMembership(client, input.tenantId, input.userId))) {
         throw new JiraLifecycleConflictError("not_member");
@@ -299,24 +302,30 @@ export class JiraConnectionStore {
           input.ownerSecurityVersion
         ]
       );
-      return mapRow(result.rows[0]);
+      const record = mapRow(result.rows[0]);
+      if (audit) await AuditEventStore.createInTransaction(client, audit(record));
+      return record;
     });
   }
 
   /**
    * Removes the active mapping and retires the external ID in one short
    * transaction, before any remote call. Returns the pending cleanup, or null
-   * when the member has no identity in use.
+   * when the member has no identity in use. `audit` builds the disconnect's
+   * audit event from the cleanup; it commits in the same transaction.
    */
   async retire(
     tenantId: string,
     userId: string,
     reason: JiraCleanupReason,
-    binding: PipedreamBinding | null
+    binding: PipedreamBinding | null,
+    audit?: (retired: JiraCleanupRecord) => AuditEventInput
   ): Promise<JiraCleanupRecord | null> {
     return withTenantScope(this.db, tenantId, async (client) => {
       await lockMembership(client, tenantId, userId);
-      return retireInTransaction(client, tenantId, userId, reason, binding);
+      const retired = await retireInTransaction(client, tenantId, userId, reason, binding);
+      if (retired && audit) await AuditEventStore.createInTransaction(client, audit(retired));
+      return retired;
     });
   }
 
@@ -343,18 +352,29 @@ export class JiraConnectionStore {
     });
   }
 
-  async completeCleanup(tenantId: string, cleanupId: string): Promise<boolean> {
+  /**
+   * `audit` is the completion's audit event. It commits with the delete; when
+   * it fails, the cleanup stays pending and runs again (remote deletion is
+   * idempotent).
+   */
+  async completeCleanup(tenantId: string, cleanupId: string, audit?: AuditEventInput): Promise<boolean> {
     return withTenantScope(this.db, tenantId, async (client) => {
       const result = await client.query(
         `DELETE FROM user_jira_cleanups WHERE tenant_id = $1 AND cleanup_id = $2::uuid`,
         [tenantId, cleanupId]
       );
-      return (result.rowCount ?? 0) > 0;
+      const completed = (result.rowCount ?? 0) > 0;
+      if (completed && audit) await AuditEventStore.createInTransaction(client, audit);
+      return completed;
     });
   }
 
-  /** `error` must be a fixed, safe message: it is shown to administrators. */
-  async recordCleanupFailure(tenantId: string, cleanupId: string, error: string): Promise<JiraCleanupRecord | null> {
+  /**
+   * `error` must be a fixed, safe message: it is shown to administrators.
+   * `audit` is the failure's audit event; it commits with the update.
+   */
+  async recordCleanupFailure(tenantId: string, cleanupId: string, error: string,
+    audit?: AuditEventInput): Promise<JiraCleanupRecord | null> {
     return withTenantScope(this.db, tenantId, async (client) => {
       const result = await client.query(
         `UPDATE user_jira_cleanups
@@ -363,7 +383,9 @@ export class JiraConnectionStore {
          RETURNING *`,
         [tenantId, cleanupId, error]
       );
-      return result.rows[0] ? mapCleanup(result.rows[0]) : null;
+      if (!result.rows[0]) return null;
+      if (audit) await AuditEventStore.createInTransaction(client, audit);
+      return mapCleanup(result.rows[0]);
     });
   }
 }

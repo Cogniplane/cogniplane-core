@@ -81,7 +81,13 @@ export async function registerMemoryRoutes(
       record = await stores.memories.updateByUser(tenantId, userId, params.value.memoryId, {
         content: body.value.content,
         expectedVersion: body.value.version
-      });
+      }, (updated) => ({
+        tenantId,
+        sessionId: null,
+        userId,
+        type: "user.memory.updated",
+        payload: { memoryId: updated.memoryId, name: updated.slug, version: updated.version }
+      }));
     } catch (error) {
       if (error instanceof MemoryNotFoundError) {
         reply.code(404);
@@ -94,13 +100,6 @@ export async function registerMemoryRoutes(
       throw error;
     }
 
-    await stores.auditEvents.create({
-      tenantId,
-      sessionId: null,
-      userId,
-      type: "user.memory.updated",
-      payload: { memoryId: record.memoryId, name: record.slug, version: record.version }
-    });
     reply.header("cache-control", "private, no-store");
     return serialize(MemoryResponseSchema, { scope: { tenantId, userId }, memory: toMemory(record) });
   });
@@ -116,19 +115,17 @@ export async function registerMemoryRoutes(
       return scopeChanged();
     }
 
-    const removed = await stores.memories.removeById(tenantId, userId, params.value.memoryId);
-    if (!removed) {
-      reply.code(404);
-      return notFoundError("memory_not_found");
-    }
-
-    await stores.auditEvents.create({
+    const removed = await stores.memories.removeById(tenantId, userId, params.value.memoryId, (memory) => ({
       tenantId,
       sessionId: null,
       userId,
       type: "user.memory.deleted",
-      payload: { memoryId: params.value.memoryId, name: removed.slug }
-    });
+      payload: { memoryId: params.value.memoryId, name: memory.slug }
+    }));
+    if (!removed) {
+      reply.code(404);
+      return notFoundError("memory_not_found");
+    }
     reply.code(204);
     return null;
   });

@@ -22,7 +22,7 @@ import type { TenantSettingsRecord } from "../../services/tenant-settings-store.
 import { customModelId, toAvailableModel } from "../../services/custom-model-store.js";
 import type { DynamicConfigService } from "../../services/dynamic-config-service.js";
 import type { OpenRouterCatalogFetcher } from "../../services/openrouter-catalog.js";
-import { createAdminAuditEvent, withAdmin } from "./admin-route-helpers.js";
+import { adminAuditEvent, withAdmin } from "./admin-route-helpers.js";
 
 export type ModelAdminRouteStores = {
   customModels: Pick<CustomModelStore, "list" | "create" | "delete">;
@@ -169,26 +169,17 @@ export async function registerAdminModelRoutes(
       description,
       contextWindow,
       createdBy: request.auth.userId
-    });
+    }, (created) => adminAuditEvent(request, "admin.custom_model.created", {
+      modelId: created.modelId,
+      provider: created.provider,
+      displayName: created.displayName,
+      contextWindow: created.contextWindow
+    }));
     if (!record) {
       return reply.status(409).send(
         apiError("custom_model_exists", `"${modelId}" has already been added.`)
       );
     }
-
-    await createAdminAuditEvent(stores.auditEvents, {
-      tenantId: request.auth.tenantId,
-      userId: request.auth.userId,
-      type: "admin.custom_model.created",
-      payload: {
-        modelId: record.modelId,
-        provider: record.provider,
-        displayName: record.displayName,
-        contextWindow: record.contextWindow
-      },
-      ipAddress: request.ip,
-      userAgent: request.headers["user-agent"]
-    });
 
     return serialize(CustomModelEnvelopeSchema, {
       model: { ...toAvailableModel(record), source: "custom" as const }

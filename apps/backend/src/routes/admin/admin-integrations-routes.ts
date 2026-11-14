@@ -22,6 +22,7 @@ import type { RuntimeAdapter } from "../../runtime-contracts.js";
 import type { DataRouteControl } from "../../services/data-route-control.js";
 import { classifyIntegrationSave } from "./data-route-fields.js";
 import {
+  adminAuditEvent,
   createAdminAuditEvent,
   respondAdminMutationError,
   respondAdminNotFound,
@@ -249,17 +250,9 @@ export async function registerAdminIntegrationsRoutes(
         await stores.integrationStates.clearConfig(
           request.auth.tenantId,
           integrationId,
-          request.auth.userId
+          request.auth.userId,
+          () => adminAuditEvent(request, "tenant.integration.config_cleared", { integrationId })
         );
-
-        await createAdminAuditEvent(stores.auditEvents, {
-          tenantId: request.auth.tenantId,
-          userId: request.auth.userId,
-          type: "tenant.integration.config_cleared",
-          payload: { integrationId },
-          ipAddress: request.ip,
-          userAgent: request.headers["user-agent"]
-        });
 
         await invalidateAndAudit(stores, request, integrationId);
 

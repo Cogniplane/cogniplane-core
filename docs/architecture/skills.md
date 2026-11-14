@@ -93,7 +93,9 @@ the active and accepted rules again under the skill row lock.
   retries all queued bundles of the tenant first. `failures` lists only
   revisions that were not deleted.
 - No scheduler deletes revisions; only the queued bundle deletes are
-  automatic. Every lifecycle action writes an audit event.
+  automatic. Every lifecycle action writes an audit event in the action's
+  transaction. The cleanup report is the exception: the cleanup has many
+  transactions and storage deletes, so its event is written after them.
 
 ## Bundle storage
 

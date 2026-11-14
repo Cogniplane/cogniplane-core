@@ -37,6 +37,7 @@ import { registerGithubSettingsRoutes } from "../services/integrations/github/gi
 import { loadIntegrationEnablement } from "../services/integrations/integration-enablement.js";
 import type { IntegrationStateStore } from "../services/integrations/integration-state-store.js";
 import { registerNotionSettingsRoutes } from "../services/integrations/notion/notion-settings-routes.js";
+import type { AuditEventInput } from "../services/audit-event-store.js";
 
 class InMemoryGithubConnectionService {
   userConnection: {
@@ -194,6 +195,9 @@ class InMemoryNotionConnectionService {
 }
 
 class InMemoryUserSettingsStore {
+  // Receives the audit events that the real store writes in each change's transaction.
+  constructor(private readonly transactionAudits?: InMemoryAuditEventStore) {}
+
   private readonly sections = new Map<string, UserSettingsSectionRecord>();
   private readonly jobs = new Map<string, ScheduledJobRecord>();
   // The security version that the saving session gave, per job.
@@ -222,7 +226,7 @@ class InMemoryUserSettingsStore {
     userId: string;
     sectionKey: UserSettingsSectionKey;
     config: Record<string, unknown>;
-  }): Promise<UserSettingsSectionRecord> {
+  }, audit?: (section: UserSettingsSectionRecord) => AuditEventInput): Promise<UserSettingsSectionRecord> {
     const key = `${input.tenantId}:${input.userId}:${input.sectionKey}`;
     const now = new Date().toISOString();
     const current = this.sections.get(key);
@@ -235,6 +239,7 @@ class InMemoryUserSettingsStore {
       updatedAt: now
     };
     this.sections.set(key, next);
+    if (audit) await this.transactionAudits?.create(audit(next));
     return next;
   }
 
@@ -277,7 +282,7 @@ class InMemoryUserSettingsStore {
     enabled: boolean;
     nextRunAt: string | null;
     ownerSecurityVersion: number | null;
-  }, admission: ScheduledJobAdmission): Promise<CreateScheduledJobResult> {
+  }, admission: ScheduledJobAdmission, audit?: (job: ScheduledJobRecord) => AuditEventInput): Promise<CreateScheduledJobResult> {
     this.admissions.push(admission);
     if (input.enabled && admission.maxActive > 0 && this.activeCount(input.userId) >= admission.maxActive) {
       return { status: "limit_reached" };
@@ -306,6 +311,7 @@ class InMemoryUserSettingsStore {
     };
     this.jobs.set(job.jobId, job);
     this.ownerSecurityVersions.set(job.jobId, input.ownerSecurityVersion);
+    if (audit) await this.transactionAudits?.create(audit(job));
     return { status: "created", job };
   }
 
@@ -324,7 +330,7 @@ class InMemoryUserSettingsStore {
     enabled: boolean;
     nextRunAt: string | null;
     ownerSecurityVersion: number | null;
-  }, admission: ScheduledJobAdmission): Promise<UpdateScheduledJobResult> {
+  }, admission: ScheduledJobAdmission, audit?: (job: ScheduledJobRecord) => AuditEventInput): Promise<UpdateScheduledJobResult> {
     this.admissions.push(admission);
     const current = this.jobs.get(input.jobId);
     if (!current || current.userId !== input.userId) {
@@ -354,14 +360,16 @@ class InMemoryUserSettingsStore {
     };
     this.jobs.set(input.jobId, next);
     this.ownerSecurityVersions.set(input.jobId, input.ownerSecurityVersion);
+    if (audit) await this.transactionAudits?.create(audit(next));
     return { status: "updated", job: next };
   }
 
-  async deleteScheduledJob(_tenantId: string, jobId: string, userId: string): Promise<boolean> {
+  async deleteScheduledJob(_tenantId: string, jobId: string, userId: string, audit?: AuditEventInput): Promise<boolean> {
     const current = this.jobs.get(jobId);
     if (!current || current.userId !== userId) {
       return false;
     }
+    if (audit) await this.transactionAudits?.create(audit);
     return this.jobs.delete(jobId);
   }
 
@@ -383,8 +391,8 @@ async function createApp(overrides: {
   const app = Fastify();
   if (overrides.appErrorHandler) app.setErrorHandler(handleAppError);
   await app.register(cookie);
-  const settings = new InMemoryUserSettingsStore();
   const auditEvents = new InMemoryAuditEventStore();
+  const settings = new InMemoryUserSettingsStore(auditEvents);
   const githubConnections = new InMemoryGithubConnectionService();
   const notionConnections = new InMemoryNotionConnectionService();
 

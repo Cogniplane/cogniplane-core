@@ -18,7 +18,8 @@ import {
 import {
   importSkillBundleFromGithub as importGithubSkillBundle,
   importSkillBundleFromInline as importInlineSkillBundle,
-  importSkillBundleFromZip as importZipSkillBundle
+  importSkillBundleFromZip as importZipSkillBundle,
+  type SkillImportAudit
 } from "./skills/skill-import-service.js";
 import { cleanupInactiveSkillRevisions as cleanupInactiveSkillRevisionsReport } from "./skills/skill-revision-cleanup-service.js";
 import {
@@ -320,13 +321,17 @@ export class DynamicConfigService {
     });
   }
 
-  disableSkill(tenantId: string, skillId: string, expectedSnapshot?: AdminSkillReleaseSnapshot): Promise<AdminSkillRecord | null> {
-    return this.stores.skills.disableSkill(tenantId, skillId, expectedSnapshot);
+  disableSkill(tenantId: string, skillId: string, expectedSnapshot?: AdminSkillReleaseSnapshot,
+    options?: { audit?: (skill: AdminSkillRecord) => AuditEventInput }): Promise<AdminSkillRecord | null> {
+    return this.stores.skills.disableSkill(tenantId, skillId, expectedSnapshot, options);
   }
 
   setSkillPublished(tenantId: string, skillId: string, isPublished: boolean,
     expectedSnapshot?: AdminSkillReleaseSnapshot,
-    options?: { alsoInTransaction?: (client: PoolClient) => Promise<void> }): Promise<AdminSkillRecord | null> {
+    options?: {
+      audit?: (skill: AdminSkillRecord) => AuditEventInput;
+      alsoInTransaction?: (client: PoolClient) => Promise<void>;
+    }): Promise<AdminSkillRecord | null> {
     return this.stores.skills.setSkillPublished(tenantId, skillId, isPublished, expectedSnapshot, options);
   }
 
@@ -349,6 +354,7 @@ export class DynamicConfigService {
     reviewNotes?: string | null;
     audience?: "test-users" | "members";
     expectedSnapshot?: AdminSkillReleaseSnapshot;
+    audit?: (activated: ActivatedSkillRevisionRecord) => AuditEventInput[];
     alsoInTransaction?: (client: PoolClient) => Promise<void>;
   }): Promise<ActivatedSkillRevisionRecord | null> {
     return this.stores.skillRevisions.activateSkillRevision(tenantId, {
@@ -358,6 +364,7 @@ export class DynamicConfigService {
       reviewNotes: input.reviewNotes ?? null,
       audience: input.audience,
       expectedSnapshot: input.expectedSnapshot,
+      audit: input.audit,
       alsoInTransaction: input.alsoInTransaction
     });
   }
@@ -382,6 +389,7 @@ export class DynamicConfigService {
     archiveBuffer: Buffer;
     originalFileName: string;
     actorUserId: string;
+    audit?: SkillImportAudit;
   }): Promise<{ skill: AdminSkillRecord; revision: AdminSkillRevisionRecord }> {
     return importZipSkillBundle({
       tenantId,
@@ -390,7 +398,8 @@ export class DynamicConfigService {
       skillBundleStorage: this.skillBundleStorage,
       archiveBuffer: input.archiveBuffer,
       originalFileName: input.originalFileName,
-      actorUserId: input.actorUserId
+      actorUserId: input.actorUserId,
+      audit: input.audit
     });
   }
 
@@ -400,6 +409,7 @@ export class DynamicConfigService {
     subdirectory?: string;
     actorUserId: string;
     githubToken?: string;
+    audit?: SkillImportAudit;
   }): Promise<{ skill: AdminSkillRecord; revision: AdminSkillRevisionRecord }> {
     return importGithubSkillBundle({
       tenantId,
@@ -411,7 +421,8 @@ export class DynamicConfigService {
       subdirectory: input.subdirectory,
       actorUserId: input.actorUserId,
       githubToken: input.githubToken,
-      fetchFn: this.fetchFn
+      fetchFn: this.fetchFn,
+      audit: input.audit
     });
   }
 
@@ -421,6 +432,7 @@ export class DynamicConfigService {
     description: string;
     instructions: string;
     actorUserId: string;
+    audit?: SkillImportAudit;
   }): Promise<{ skill: AdminSkillRecord; revision: AdminSkillRevisionRecord }> {
     // Reject inline edits of inherited (`system`) skills. Without this guard
     // the (tenant_id, skill_id) FK on admin_skill_revisions rejects the insert
@@ -443,7 +455,8 @@ export class DynamicConfigService {
       skillName: input.skillName,
       description: input.description,
       instructions: input.instructions,
-      actorUserId: input.actorUserId
+      actorUserId: input.actorUserId,
+      audit: input.audit
     });
   }
 

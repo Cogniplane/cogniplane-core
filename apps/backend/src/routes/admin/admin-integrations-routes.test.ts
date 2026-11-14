@@ -129,14 +129,15 @@ class FakeStateStore implements Pick<IntegrationStateStore, "list" | "get" | "up
   async clearConfig(
     tenantId: string,
     integrationId: string,
-    updatedBy: string | null
+    updatedBy: string | null,
+    audit?: Parameters<IntegrationStateStore["clearConfig"]>[3]
   ): Promise<IntegrationStateRecord> {
     return this.upsert(tenantId, integrationId, {
       readsEnabled: false,
       writesEnabled: false,
       config: {},
       updatedBy
-    });
+    }, audit);
   }
 }
 
@@ -442,8 +443,11 @@ test("DELETE /admin/integrations/:id/config clears state and invalidates runtime
   expect(ms!.config).toEqual({});
 
   expect(runtime.invalidations.length).toBe(1);
-  const cleared = auditEvents.events.find((e) => e.type === "tenant.integration.config_cleared");
-  expect(cleared).toBeTruthy();
+  // The clear's event commits with the clear, in the store's transaction.
+  expect(stateStore.audits.filter((e) => e.type === "tenant.integration.config_cleared")).toEqual([
+    expect.objectContaining({ tenantId: "tenant-1", payload: { integrationId: "microsoft" } })
+  ]);
+  expect(auditEvents.events.filter((e) => e.type === "tenant.integration.config_cleared")).toEqual([]);
 });
 
 test("non-admin requests are rejected with 403", async () => {

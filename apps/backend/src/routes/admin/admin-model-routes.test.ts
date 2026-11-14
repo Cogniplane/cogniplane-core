@@ -6,7 +6,7 @@ import type { ModelProvider, TenantSettings } from "@cogniplane/shared-types";
 import type { Pool } from "../../lib/db.js";
 import { FakeDatabase } from "../../test-helpers/fake-database.js";
 import { InMemoryAuditEventStore } from "../../test-helpers/in-memory-audit-events.js";
-import type { AuditEventStore } from "../../services/audit-event-store.js";
+import type { AuditEventInput, AuditEventStore } from "../../services/audit-event-store.js";
 import type { CustomModelInput, CustomModelRecord } from "../../services/custom-model-store.js";
 import { customModelId } from "../../services/custom-model-store.js";
 import type { OpenRouterCatalogEntry } from "../../services/openrouter-catalog.js";
@@ -19,7 +19,11 @@ class InMemoryCustomModels {
     return [...this.records.values()];
   }
 
-  async create(_tenantId: string, input: CustomModelInput): Promise<CustomModelRecord | null> {
+  /** Audit events that the real store writes in the create's transaction. */
+  readonly createAudits: AuditEventInput[] = [];
+
+  async create(_tenantId: string, input: CustomModelInput,
+    audit?: (record: CustomModelRecord) => AuditEventInput): Promise<CustomModelRecord | null> {
     const modelId = customModelId(input.provider, input.vendorModelId);
     if (this.records.has(modelId)) return null;
     const record: CustomModelRecord = {
@@ -34,6 +38,7 @@ class InMemoryCustomModels {
       updatedAt: new Date().toISOString()
     };
     this.records.set(modelId, record);
+    if (audit) this.createAudits.push(audit(record));
     return record;
   }
 
@@ -207,7 +212,7 @@ test("GET /admin/openrouter-models returns the slim catalog, 503 when upstream f
 });
 
 test("POST /admin/custom-models validates the OpenRouter slug and auto-fills metadata", async () => {
-  const { app, auditEvents } = await makeApp();
+  const { app, auditEvents, customModels } = await makeApp();
   try {
     const response = await app.inject({
       method: "POST",
@@ -221,7 +226,8 @@ test("POST /admin/custom-models validates the OpenRouter slug and auto-fills met
     expect(model.contextWindow).toBe(262_144);
     expect(model.source).toBe("custom");
     expect(model.supportedEfforts).toEqual([]);
-    expect(auditEvents.events.at(-1)?.type).toBe("admin.custom_model.created");
+    expect(customModels.createAudits.at(-1)?.type).toBe("admin.custom_model.created");
+    expect(auditEvents.events).toEqual([]);
 
     const unknown = await app.inject({
       method: "POST",

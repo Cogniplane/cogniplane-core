@@ -3,13 +3,16 @@ import { describe, expect, test } from "vitest";
 
 import { createTestConfig } from "../../test-helpers/test-config.js";
 import { FakePool } from "../../test-helpers/fake-pool.js";
-import { InMemoryAuditEventStore } from "../../test-helpers/in-memory-audit-events.js";
 import { registerAdminArtifactRoutes } from "./admin-artifact-routes.js";
 
 const artifactId = "0196f7ca-8d4b-7a70-9f3f-111111111111";
 
-async function buildMintApp(artifactRow: Record<string, unknown> = {}) {
+async function buildMintApp(artifactRow: Record<string, unknown> = {}, options: { failAudit?: boolean } = {}) {
   const pool = new FakePool()
+    .onQuery(/INSERT INTO audit_events/, () => {
+      if (options.failAudit) throw new Error("audit insert failed");
+      return { rows: [], rowCount: 1 };
+    })
     .onQuery(/INSERT INTO users/, () => ({ rows: [], rowCount: 1 }))
     .onQuery(/FROM artifacts/, () => ({
       rows: [
@@ -33,7 +36,6 @@ async function buildMintApp(artifactRow: Record<string, unknown> = {}) {
       rows: [{ token: "download-token", expires_at: new Date(Date.now() + 60_000) }],
       rowCount: 1
     }));
-  const auditEvents = new InMemoryAuditEventStore();
   const app = Fastify();
   app.decorate("config", createTestConfig());
   app.decorate("db", pool.asPool());
@@ -45,16 +47,21 @@ async function buildMintApp(artifactRow: Record<string, unknown> = {}) {
       isAdmin: true
     };
   });
-  await registerAdminArtifactRoutes(app, { auditEvents: auditEvents as never });
-  return { app, pool, auditEvents };
+  await registerAdminArtifactRoutes(app);
+  return { app, pool };
 }
 
 const mintedToken = (pool: FakePool) =>
   pool.queries.some((query) => query.text.includes("INSERT INTO artifact_download_tokens"));
 
+/** The mint events that the route wrote in the token's transaction. */
+const mintEvents = (pool: FakePool) => pool.queries
+  .filter((query) => query.text.includes("INSERT INTO audit_events") && query.values[4] === "admin.artifact.download_token_minted")
+  .map((query) => ({ tenantId: query.values[0], userId: query.values[2], payload: JSON.parse(String(query.values[5])) }));
+
 describe("admin artifact download tokens", () => {
-  test("records the admin actor and artifact owner when minting a token", async () => {
-    const { app, auditEvents } = await buildMintApp();
+  test("records the admin actor and artifact owner in the token's transaction", async () => {
+    const { app, pool } = await buildMintApp();
 
     const response = await app.inject({
       method: "POST",
@@ -63,15 +70,25 @@ describe("admin artifact download tokens", () => {
     });
 
     expect(response.statusCode).toBe(200);
-    const event = auditEvents.events.find(
-      (entry) => entry.type === "admin.artifact.download_token_minted"
-    );
-    expect(event?.userId).toBe("admin-user");
-    expect(event?.payload).toEqual({
-      artifactId,
-      actorUserId: "admin-user",
-      ownerUserId: "owner-user"
-    });
+    expect(mintEvents(pool)).toEqual([{
+      tenantId: "tenant-A",
+      userId: "admin-user",
+      payload: { artifactId, actorUserId: "admin-user", ownerUserId: "owner-user" }
+    }]);
+    const texts = pool.queries.map((query) => query.text.trim());
+    expect(texts.findIndex((text) => text.includes("INSERT INTO audit_events")))
+      .toBeLessThan(texts.indexOf("COMMIT"));
+    await app.close();
+  });
+
+  test("returns no token when the mint's audit event cannot be written", async () => {
+    const { app, pool } = await buildMintApp({}, { failAudit: true });
+
+    const response = await app.inject({ method: "POST", url: `/admin/artifacts/${artifactId}/download-token` });
+
+    expect(response.statusCode).toBe(500);
+    expect(response.body).not.toContain("download-token");
+    expect(pool.queries.map((query) => query.text.trim())).toContain("ROLLBACK");
     await app.close();
   });
 
@@ -79,7 +96,7 @@ describe("admin artifact download tokens", () => {
     "refuses a ready artifact whose PII verdict is %s, without a token or an audit event",
     async (piiStatus) => {
       // The status column says ready; only the PII verdict says otherwise.
-      const { app, pool, auditEvents } = await buildMintApp({
+      const { app, pool } = await buildMintApp({
         status: "ready",
         detail_json: { pii: { status: piiStatus } }
       });
@@ -92,9 +109,7 @@ describe("admin artifact download tokens", () => {
       expect(response.statusCode).toBe(409);
       expect(response.json().error).toBe("artifact_not_ready");
       expect(mintedToken(pool)).toBe(false);
-      expect(
-        auditEvents.events.some((entry) => entry.type === "admin.artifact.download_token_minted")
-      ).toBe(false);
+      expect(mintEvents(pool)).toEqual([]);
       await app.close();
     }
   );

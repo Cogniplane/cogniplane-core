@@ -9,6 +9,7 @@ import {
 import type { Pool } from "../../lib/db.js";
 
 import { PolicyDecisionStore, type PolicyDecisionInput } from "./policy-decision-store.js";
+import type { PolicyDecision } from "@cogniplane/shared-types";
 
 type QueryResult = { rows: Record<string, unknown>[]; rowCount: number };
 
@@ -16,6 +17,10 @@ type QueryResult = { rows: Record<string, unknown>[]; rowCount: number };
 // and get need. It keeps the last page query so that tests can assert on it.
 class InMemoryDecisionDatabase {
   rows: Record<string, unknown>[] = [];
+  /** The parameters of each audit insert, in the decision's transaction. */
+  audits: unknown[][] = [];
+  /** When true, the audit insert throws, as a failed insert would. */
+  failAudit = false;
   lastPageSql = "";
   lastPageParams: unknown[] = [];
   private clock = 0;
@@ -62,6 +67,12 @@ class InMemoryDecisionDatabase {
       return { rows: [row], rowCount: 1 };
     }
 
+    if (sql.includes("INSERT INTO audit_events")) {
+      if (this.failAudit) throw new Error("audit insert failed");
+      this.audits.push(params);
+      return { rows: [], rowCount: 1 };
+    }
+
     if (sql.includes("SELECT COUNT(*)")) {
       return { rows: [{ total: this.rows.length }], rowCount: 1 };
     }
@@ -100,6 +111,13 @@ function baseInput(overrides: Partial<PolicyDecisionInput> = {}): PolicyDecision
   };
 }
 
+const decisionAudit = (decision: PolicyDecision) => ({
+  tenantId: "t1",
+  sessionId: decision.sessionId,
+  type: "policy.decision.recorded" as const,
+  payload: { decisionId: decision.decisionId, authorization: "Bearer sk-audit-secret" }
+});
+
 function makeStore() {
   const db = new InMemoryDecisionDatabase();
   return { db, store: new PolicyDecisionStore(db as unknown as Pool) };
@@ -107,7 +125,7 @@ function makeStore() {
 
 test("record persists a decision and returns the mapped row", async () => {
   const { store } = makeStore();
-  const decision = await store.record("t1", baseInput());
+  const decision = await store.record("t1", baseInput(), decisionAudit);
   expect(decision.decisionId).toMatch(/^pdc_/);
   expect(decision.toolName).toBe("write_artifact");
   expect(decision.outcome).toBe("allow");
@@ -115,10 +133,28 @@ test("record persists a decision and returns the mapped row", async () => {
   expect(decision.severity).toBe("file_change");
 });
 
+test("record writes the decision's audit event in its transaction, redacted, with the decision's user", async () => {
+  const { db, store } = makeStore();
+  const decision = await store.record("t1", baseInput(), decisionAudit);
+  expect(db.audits).toHaveLength(1);
+  const [tenantId, sessionId, userId, , type, payload] = db.audits[0]!;
+  expect({ tenantId, sessionId, userId, type }).toEqual({
+    tenantId: "t1", sessionId: "sess-1", userId: "user-1", type: "policy.decision.recorded"
+  });
+  expect(JSON.parse(String(payload))).toMatchObject({ decisionId: decision.decisionId });
+  expect(String(payload)).not.toContain("sk-audit-secret");
+});
+
+test("record fails when its audit event cannot be written", async () => {
+  const { db, store } = makeStore();
+  db.failAudit = true;
+  await expect(store.record("t1", baseInput(), decisionAudit)).rejects.toThrow("audit insert failed");
+});
+
 test("list returns decisions with total and paging metadata", async () => {
   const { store } = makeStore();
-  await store.record("t1", baseInput());
-  await store.record("t1", baseInput({ toolName: "read_text_artifact", outcome: "block" }));
+  await store.record("t1", baseInput(), decisionAudit);
+  await store.record("t1", baseInput({ toolName: "read_text_artifact", outcome: "block" }), decisionAudit);
 
   const result = await store.list("t1");
   expect(result.total).toBe(2);
@@ -130,7 +166,7 @@ test("list returns decisions with total and paging metadata", async () => {
 
 test("list clamps an over-large limit to the max", async () => {
   const { db, store } = makeStore();
-  await store.record("t1", baseInput());
+  await store.record("t1", baseInput(), decisionAudit);
   const result = await store.list("t1", { limit: 99999 });
   expect(result.limit).toBe(POLICY_DECISIONS_MAX_LIMIT);
   // The clamped limit is the second-to-last positional param of the page query.
@@ -139,14 +175,14 @@ test("list clamps an over-large limit to the max", async () => {
 
 test("list clamps a negative offset to 0", async () => {
   const { store } = makeStore();
-  await store.record("t1", baseInput());
+  await store.record("t1", baseInput(), decisionAudit);
   const result = await store.list("t1", { offset: -5 });
   expect(result.offset).toBe(0);
 });
 
 test("list short-circuits an inverted date range without querying", async () => {
   const { db, store } = makeStore();
-  await store.record("t1", baseInput());
+  await store.record("t1", baseInput(), decisionAudit);
   db.lastPageSql = "";
   const result = await store.list("t1", { from: "2026-06-01", to: "2026-05-01" });
   expect(result.total).toBe(0);
@@ -156,7 +192,7 @@ test("list short-circuits an inverted date range without querying", async () => 
 
 test("list queries a range whose from time is on the same day as a date-only to", async () => {
   const { db, store } = makeStore();
-  await store.record("t1", baseInput());
+  await store.record("t1", baseInput(), decisionAudit);
   db.lastPageSql = "";
   // `to` is a whole day (exclusive end the next day), so this range is not empty.
   await store.list("t1", { from: "2026-10-13T15:30:00.000Z", to: "2026-10-13" });
@@ -165,7 +201,7 @@ test("list queries a range whose from time is on the same day as a date-only to"
 
 test("list builds filter predicates for outcomes, tool names and severities", async () => {
   const { db, store } = makeStore();
-  await store.record("t1", baseInput());
+  await store.record("t1", baseInput(), decisionAudit);
   await store.list("t1", {
     outcomes: ["block"],
     toolNames: ["write_artifact"],
@@ -182,7 +218,7 @@ test("list builds filter predicates for outcomes, tool names and severities", as
 
 test("record and list return createdAt with the microseconds that the query selects", async () => {
   const { store } = makeStore();
-  const recorded = await store.record("t1", baseInput());
+  const recorded = await store.record("t1", baseInput(), decisionAudit);
   expect(recorded.createdAt).toBe("2026-05-31T00:00:00.000000Z");
   expect((await store.list("t1")).decisions[0]?.createdAt).toBe(recorded.createdAt);
 });
@@ -216,7 +252,7 @@ test("get re-redacts secrets in the action snapshot on read", async () => {
   const { store } = makeStore();
   const recorded = await store.record(
     "t1",
-    baseInput({ actionSnapshot: { authorization: "Bearer sk-secret-value", path: "/x" } })
+    baseInput({ actionSnapshot: { authorization: "Bearer sk-secret-value", path: "/x" } }), decisionAudit
   );
 
   const detail = await store.get("t1", recorded.decisionId);

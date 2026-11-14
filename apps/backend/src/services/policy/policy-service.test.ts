@@ -1,15 +1,15 @@
 import { describe, expect, it, vi } from "vitest";
 
-import type { PolicyEnforcementMode, PolicyRule } from "@cogniplane/shared-types";
+import type { PolicyDecision, PolicyEnforcementMode, PolicyRule } from "@cogniplane/shared-types";
 
 import {
   PolicyService,
   PolicyBlockedError,
+  POLICY_EVIDENCE_UNAVAILABLE,
   type PolicyGateInput
 } from "./policy-service.js";
 import type { PolicyRuleStore } from "./policy-rule-store.js";
 import type { PolicyDecisionStore } from "./policy-decision-store.js";
-import type { AuditEventStore } from "../audit-event-store.js";
 import type { PolicyInvalidationBus } from "./policy-cache-invalidation.js";
 
 type RuleSeed = Partial<PolicyRule> & { ruleId: string; effect: PolicyRule["effect"] };
@@ -37,45 +37,41 @@ function fakeRuleStore(rules: PolicyRule[]): PolicyRuleStore {
   } as unknown as PolicyRuleStore;
 }
 
+/**
+ * A fake PolicyDecisionStore. `record` builds the audit event as the real store
+ * does in its transaction; with `fail`, the decision and its event are lost
+ * together.
+ */
 function fakeDecisionStore(opts: { fail?: boolean } = {}): {
   store: PolicyDecisionStore;
   records: Array<Record<string, unknown>>;
+  events: Array<Record<string, unknown>>;
 } {
   const records: Array<Record<string, unknown>> = [];
-  return {
-    store: {
-      record: vi.fn(async (_tenantId: string, input: Record<string, unknown>) => {
-        if (opts.fail) throw new Error("decision store down");
-        records.push(input);
-        return { decisionId: "pdc_1", ...input } as never;
-      })
-    } as unknown as PolicyDecisionStore,
-    records
-  };
-}
-
-function fakeAuditStore(): { store: AuditEventStore; events: Array<Record<string, unknown>> } {
   const events: Array<Record<string, unknown>> = [];
   return {
     store: {
-      create: vi.fn(async (event: Record<string, unknown>) => {
-        events.push(event);
-        return undefined as never;
+      record: vi.fn(async (_tenantId: string, input: Record<string, unknown>,
+        audit: (decision: PolicyDecision) => Record<string, unknown>) => {
+        if (opts.fail) throw new Error("decision store down");
+        const decision = { decisionId: "pdc_1", ...input } as unknown as PolicyDecision;
+        records.push(input);
+        events.push({ ...audit(decision), userId: input.userId });
+        return decision;
       })
-    } as unknown as AuditEventStore,
+    } as unknown as PolicyDecisionStore,
+    records,
     events
   };
 }
 
 function buildService(rules: PolicyRule[], decisionOpts: { fail?: boolean } = {}) {
   const ruleStore = fakeRuleStore(rules);
-  const { store: decisions, records } = fakeDecisionStore(decisionOpts);
-  const { store: auditEvents, events } = fakeAuditStore();
+  const { store: decisions, records, events } = fakeDecisionStore(decisionOpts);
   const warnings: Array<{ msg: string; meta?: unknown }> = [];
   const service = new PolicyService({
     rules: ruleStore,
     decisions,
-    auditEvents,
     logger: { warn: (msg, meta) => warnings.push({ msg, meta }) }
   });
   return { service, records, events, warnings };
@@ -291,7 +287,7 @@ describe("PolicyService.gateAction — enforce-mode require_approval", () => {
   });
 });
 
-describe("PolicyService.gateAction — evidence is fail-open", () => {
+describe("PolicyService.gateAction — evidence failures", () => {
   it("a decision-store write failure never changes the gating outcome (block still throws)", async () => {
     const { service, warnings } = buildService(
       [makeRule({ ruleId: "pol_1", effect: "block", conditions: {} })],
@@ -308,6 +304,27 @@ describe("PolicyService.gateAction — evidence is fail-open", () => {
     );
     const result = await service.gateAction(gateInput());
     expect(result.enforced).toBe(false);
+  });
+
+  it("a decision-store write failure does not gate a monitor-mode rule", async () => {
+    const { service, warnings } = buildService(
+      [makeRule({ ruleId: "pol_1", effect: "require_approval", conditions: {} })],
+      { fail: true }
+    );
+    const result = await service.gateAction(gateInput({ enforcementMode: "monitor" }));
+    expect(result.enforced).toBe(false);
+    expect(warnings.some((w) => w.msg.includes("failed to persist decision evidence"))).toBe(true);
+  });
+
+  it("denies an approved, enforced action whose evidence cannot be saved, with fixed text", async () => {
+    const { service } = buildService(
+      [makeRule({ ruleId: "pol_1", effect: "require_approval", conditions: {} })],
+      { fail: true }
+    );
+    const pending = service.gateAction(gateInput({ approvalDisposition: "approve" }));
+    await expect(pending).rejects.toBeInstanceOf(PolicyBlockedError);
+    await expect(pending).rejects.toMatchObject({ explanation: POLICY_EVIDENCE_UNAVAILABLE, matchedRuleId: "pol_1" });
+    await expect(pending).rejects.not.toMatchObject({ explanation: expect.stringContaining("decision store down") });
   });
 });
 
@@ -335,8 +352,7 @@ describe("PolicyService rule cache", () => {
       makeRule({ ruleId: "pol_1", effect: "block", conditions: {} })
     ]);
     const { store: decisions } = fakeDecisionStore();
-    const { store: auditEvents } = fakeAuditStore();
-    const service = new PolicyService({ rules: ruleStore, decisions, auditEvents });
+    const service = new PolicyService({ rules: ruleStore, decisions });
 
     await service.evaluate("t1", {
       toolName: "x",
@@ -384,9 +400,8 @@ describe("PolicyService rule cache", () => {
       list: vi.fn(async () => currentRules)
     } as unknown as PolicyRuleStore;
     const { store: decisions } = fakeDecisionStore();
-    const { store: auditEvents } = fakeAuditStore();
-    const replicaA = new PolicyService({ rules: ruleStore, decisions, auditEvents, invalidationBus: bus });
-    const replicaB = new PolicyService({ rules: ruleStore, decisions, auditEvents, invalidationBus: bus });
+    const replicaA = new PolicyService({ rules: ruleStore, decisions, invalidationBus: bus });
+    const replicaB = new PolicyService({ rules: ruleStore, decisions, invalidationBus: bus });
     await replicaA.start();
     await replicaB.start();
 

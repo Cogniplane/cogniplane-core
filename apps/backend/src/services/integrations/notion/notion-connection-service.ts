@@ -343,23 +343,18 @@ export class NotionConnectionService {
         refreshTokenExpiresAt: null,
         tokenLastRefreshedAt: tokenPayload.refresh_token ? new Date().toISOString() : null,
         ownerSecurityVersion: state.sv ?? null
-      });
-
-      try {
-        await this.auditEvents?.create({
-          tenantId: state.tid,
-          sessionId: null,
-          userId: state.sub,
-          type: "user.notion.connected",
-          payload: {
-            notionUserId,
-            notionWorkspaceId: tokenPayload.workspace_id ?? null,
-            notionWorkspaceName: tokenPayload.workspace_name ?? null
-          }
-        });
-      } catch (err) {
-        this.logger.warn({ err }, "Failed to audit Notion connection");
-      }
+      // The event commits with the connection: a failed event saves nothing.
+      }, () => ({
+        tenantId: state.tid,
+        sessionId: null,
+        userId: state.sub,
+        type: "user.notion.connected",
+        payload: {
+          notionUserId,
+          notionWorkspaceId: tokenPayload.workspace_id ?? null,
+          notionWorkspaceName: tokenPayload.workspace_name ?? null
+        }
+      }));
       try {
         await this.runtimeManager?.invalidateRuntimesForIntegration(state.tid, state.sub, "notion");
       } catch (err) {
@@ -417,19 +412,19 @@ export class NotionConnectionService {
 
   async disconnect(tenantId: string, userId: string): Promise<boolean> {
     const existing = await this.store.getForOwner(tenantId, userId);
-    const removed = await this.store.delete(tenantId, userId);
+    // The event commits with the delete and names the row that it removed.
+    const removed = await this.store.delete(tenantId, userId, (row) => ({
+      tenantId,
+      sessionId: null,
+      userId,
+      type: "user.notion.disconnected",
+      payload: {
+        notionUserId: row.notionUserId,
+        notionWorkspaceId: row.notionWorkspaceId
+      }
+    }));
 
     if (removed && existing) {
-      await this.auditEvents?.create({
-        tenantId,
-        sessionId: null,
-        userId,
-        type: "user.notion.disconnected",
-        payload: {
-          notionUserId: existing.notionUserId,
-          notionWorkspaceId: existing.notionWorkspaceId
-        }
-      });
       await this.runtimeManager?.invalidateRuntimesForIntegration(tenantId, userId, "notion");
     }
 

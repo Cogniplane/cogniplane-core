@@ -10,7 +10,6 @@ import {
   createTestToolContext,
   TEST_RUNTIME_TOKEN_SECRET
 } from "../test-helpers/routes-test-support.js";
-import { InMemoryAuditEventStore } from "../test-helpers/in-memory-audit-events.js";
 import { generateRuntimeToken } from "../services/auth/runtime-token.js";
 import type { ApprovalRecord } from "../services/auth/approval-store.js";
 import { PolicyService } from "../services/policy/policy-service.js";
@@ -21,7 +20,6 @@ import {
 } from "../services/policy/policy-approval-proof.js";
 import type { PolicyDecisionStore } from "../services/policy/policy-decision-store.js";
 import type { PolicyRuleStore } from "../services/policy/policy-rule-store.js";
-import type { AuditEventStore } from "../services/audit-event-store.js";
 import { deriveActionSeverity } from "../services/mcp/policy-gate.js";
 import { runGatewayAdmission } from "../services/mcp/gateway-admission.js";
 import { forwardRpc } from "../lib/mcp-upstream-client.js";
@@ -264,7 +262,6 @@ function makePolicyService(rules: PolicyRule[]) {
   const service = new PolicyService({
     rules: ruleStore as unknown as PolicyRuleStore,
     decisions: decisionStore as unknown as PolicyDecisionStore,
-    auditEvents: new InMemoryAuditEventStore() as unknown as AuditEventStore,
     ruleCacheTtlMs: 0 // no cache so each test's rules apply immediately
   });
   return { service, decisions };

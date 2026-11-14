@@ -194,7 +194,7 @@ describe.skipIf(!adminDatabaseUrl())("data route owner notices", () => {
     });
     await registerAdminPolicyRoutes(app, {
       policyRules: rules, policyDecisions: decisions,
-      policyService: new PolicyService({ rules, decisions, auditEvents: new AuditEventStore(appPool()) }),
+      policyService: new PolicyService({ rules, decisions }),
       dataRoutes: control()
     });
     await app.ready();
@@ -232,7 +232,7 @@ describe.skipIf(!adminDatabaseUrl())("data route owner notices", () => {
     const t = await workosTenant();
     const rules = new PolicyRuleStore(appPool());
     const decisions = new PolicyDecisionStore(appPool());
-    const policyService = new PolicyService({ rules, decisions, auditEvents: new AuditEventStore(appPool()) });
+    const policyService = new PolicyService({ rules, decisions });
     const invalidate = vi.spyOn(policyService, "invalidate");
     const loaded = await rules.create(t.tenantId,
       { name: "Allow exports", effect: "allow", enabled: false, conditions: { toolNames: ["export_customers"] } }, t.admin.userId, ALLOW_WEAKER);
@@ -303,7 +303,7 @@ describe.skipIf(!adminDatabaseUrl())("data route owner notices", () => {
     });
     await registerAdminPolicyRoutes(app, {
       policyRules: rules, policyDecisions: decisions,
-      policyService: new PolicyService({ rules, decisions, auditEvents: new AuditEventStore(appPool()) }),
+      policyService: new PolicyService({ rules, decisions }),
       dataRoutes: control()
     });
     await app.ready();
