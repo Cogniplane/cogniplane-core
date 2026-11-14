@@ -15,7 +15,7 @@ import {
 } from "./policy-engine.js";
 import type { PolicyDecisionStore } from "./policy-decision-store.js";
 import type { PolicyRuleStore } from "./policy-rule-store.js";
-import type { PolicyInvalidationBus } from "./policy-cache-invalidation.js";
+import type { PolicyInvalidationBus, PolicyInvalidationSubscription } from "./policy-cache-invalidation.js";
 
 type PolicyApprovalDisposition = "approve" | "reject" | "expired" | "consumed";
 
@@ -82,7 +82,7 @@ export class PolicyService {
   private readonly logger: { warn: (msg: string, meta?: unknown) => void };
   private readonly ruleCacheTtlMs: number;
   private readonly invalidationBus?: PolicyInvalidationBus;
-  private invalidationUnsubscribe: (() => Promise<void>) | null = null;
+  private invalidationSubscription: PolicyInvalidationSubscription | null = null;
 
   constructor(options: {
     rules: PolicyRuleStore;
@@ -102,16 +102,18 @@ export class PolicyService {
 
   /**
    * Subscribe to cross-replica cache invalidations. Call once at boot, before
-   * serving traffic. A subscription failure is logged, not thrown — pub/sub is
-   * a consistency optimization and the short rule-cache TTL remains the
-   * fallback (see {@link invalidate}).
+   * serving traffic. It waits for the first subscribe attempt only; the Redis
+   * bus retries a failed one in the background (lib/redis-subscription.ts).
+   * Until it is subscribed, the short rule-cache TTL is the fallback (see
+   * {@link invalidate}). A failure is logged, not thrown.
    */
   async start(): Promise<void> {
-    if (!this.invalidationBus || this.invalidationUnsubscribe) return;
+    if (!this.invalidationBus || this.invalidationSubscription) return;
     try {
-      this.invalidationUnsubscribe = await this.invalidationBus.subscribe((tenantId) =>
+      this.invalidationSubscription = this.invalidationBus.subscribe((tenantId) =>
         this.ruleCache.delete(tenantId)
       );
+      await this.invalidationSubscription.ready;
     } catch (error) {
       this.logger.warn("policy: failed to subscribe to cache invalidations", { error });
     }
@@ -145,8 +147,9 @@ export class PolicyService {
   }
 
   async close(): Promise<void> {
-    await this.invalidationUnsubscribe?.();
-    this.invalidationUnsubscribe = null;
+    const subscription = this.invalidationSubscription;
+    this.invalidationSubscription = null;
+    await subscription?.close();
   }
 
   /** Pure evaluation against the tenant's active rules (used by the simulator). */

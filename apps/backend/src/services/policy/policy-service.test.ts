@@ -369,11 +369,9 @@ describe("PolicyService rule cache", () => {
   it("broadcast invalidation evicts another replica's cached rules", async () => {
     const subscribers = new Set<(tenantId: string) => void>();
     const bus: PolicyInvalidationBus = {
-      async subscribe(onInvalidate) {
+      subscribe(onInvalidate) {
         subscribers.add(onInvalidate);
-        return async () => {
-          subscribers.delete(onInvalidate);
-        };
+        return { ready: Promise.resolve(), close: () => { subscribers.delete(onInvalidate); } };
       },
       async publish(tenantId) {
         for (const subscriber of subscribers) subscriber(tenantId);

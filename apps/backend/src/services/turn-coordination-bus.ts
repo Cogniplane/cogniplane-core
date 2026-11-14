@@ -1,4 +1,6 @@
 import type { Redis } from "ioredis";
+
+import { RedisSubscription, type RedisSubscriptionLogger } from "../lib/redis-subscription.js";
 import type { SequencedTurnEvent } from "./turn-event-log.js";
 
 const STOP_CHANNEL = "cogniplane:turn-stop:v1";
@@ -51,9 +53,12 @@ function hasGap(after: number, entries: SequencedTurnEvent[]): boolean {
 }
 
 export class TurnCoordinationBus {
-  private stopSubscriber?: Redis;
+  private stopSubscription?: RedisSubscription;
 
-  constructor(private readonly redis: Redis) {}
+  constructor(
+    private readonly redis: Redis,
+    private readonly logger: RedisSubscriptionLogger
+  ) {}
 
   async append(turn: TurnKey, entry: SequencedTurnEvent): Promise<void> {
     const key = streamKey(turn);
@@ -88,23 +93,34 @@ export class TurnCoordinationBus {
     await this.redis.publish(STOP_CHANNEL, JSON.stringify(signal));
   }
 
+  /**
+   * Subscribes to stop signals and waits for the first attempt. The
+   * subscription follows the rule in lib/redis-subscription.ts: a failure
+   * does not stop the startup, and the retries run in the background. While it
+   * is not subscribed, the owner replica sees a stop at its next lease
+   * heartbeat (session_executions).
+   */
   async subscribeStop(onStop: (signal: StopSignal) => void): Promise<void> {
-    const subscriber = this.redis.duplicate();
-    subscriber.on("error", () => undefined);
-    subscriber.on("message", (channel, payload) => {
-      if (channel !== STOP_CHANNEL) return;
-      try {
-        const signal = JSON.parse(payload) as StopSignal;
-        if ([signal.tenantId, signal.sessionId, signal.executionId, signal.ownerId, signal.userId]
-          .every(value => typeof value === "string" && value.length > 0 && value.length <= 512)) onStop(signal);
-      } catch { /* Ignore malformed Redis messages. */ }
+    if (this.stopSubscription) return;
+    const { subscription, ready } = RedisSubscription.open({
+      connect: () => this.redis.duplicate(),
+      channel: STOP_CHANNEL,
+      name: "turn stop",
+      logger: this.logger,
+      onMessage: (payload) => {
+        try {
+          const signal = JSON.parse(payload) as StopSignal;
+          if ([signal.tenantId, signal.sessionId, signal.executionId, signal.ownerId, signal.userId]
+            .every(value => typeof value === "string" && value.length > 0 && value.length <= 512)) onStop(signal);
+        } catch { /* Ignore malformed Redis messages. */ }
+      }
     });
-    await subscriber.subscribe(STOP_CHANNEL);
-    this.stopSubscriber = subscriber;
+    this.stopSubscription = subscription;
+    await ready;
   }
 
-  async close(): Promise<void> {
-    await this.stopSubscriber?.quit();
-    this.stopSubscriber = undefined;
+  /** Closes the stop subscription, also while its first attempt runs. */
+  close(): void {
+    this.stopSubscription?.close();
   }
 }

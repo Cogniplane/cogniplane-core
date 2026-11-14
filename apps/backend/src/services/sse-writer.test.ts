@@ -150,3 +150,37 @@ test("a response without destroy() is ended at the deadline", async () => {
   expect(writer.isClosed).toBe(true);
   expect(drain.listenerCount("drain")).toBe(0);
 });
+
+test("end() destroys a connection whose client does not read after the drain deadline", async () => {
+  const raw = new BlockedResponse();
+  const writer = new SseWriter(raw);
+  const onClose = vi.fn();
+  writer.onClose(onClose);
+
+  // The last bytes stay unsent, so the response never closes on its own.
+  writer.end();
+  expect(raw.writableEnded).toBe(true);
+  await vi.advanceTimersByTimeAsync(SSE_DRAIN_DEADLINE_MS - 1);
+  expect(raw.destroyCalls).toBe(0);
+  expect(onClose).not.toHaveBeenCalled();
+
+  await vi.advanceTimersByTimeAsync(1);
+  expect(raw.destroyCalls).toBe(1);
+  expect(onClose).toHaveBeenCalledOnce();
+});
+
+test("end() on a client that reads clears its deadline when the response closes", async () => {
+  const raw = new BlockedResponse();
+  const writer = new SseWriter(raw);
+  const onClose = vi.fn();
+  writer.onClose(onClose);
+
+  writer.end();
+  expect(vi.getTimerCount()).toBe(1);
+  raw.emit("close");
+
+  expect(onClose).toHaveBeenCalledOnce();
+  expect(vi.getTimerCount()).toBe(0);
+  await vi.advanceTimersByTimeAsync(SSE_DRAIN_DEADLINE_MS);
+  expect(raw.destroyCalls).toBe(0);
+});

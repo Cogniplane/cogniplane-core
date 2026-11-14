@@ -96,7 +96,7 @@ async function buildHarness(opts: { session?: SessionAuth; limits?: RequestLimit
       request.auth = { userId: "user-1", tenantId: "tenant-1", role: "admin", isAdmin: true, email: "alice@example.com", session };
     });
   }
-  await registerLocalAuthRoutes(app, {
+  const { passwordResets } = await registerLocalAuthRoutes(app, {
     db: undefined as never,
     config: opts.mail ? MAIL_CONFIG : CONFIG,
     auditEvents: auditEvents as never,
@@ -105,7 +105,7 @@ async function buildHarness(opts: { session?: SessionAuth; limits?: RequestLimit
   });
   const post = (url: string, payload: unknown, headers: Record<string, string> = { origin: ORIGIN }) =>
     app.inject({ method: "POST", url, payload: payload as object, headers });
-  return { app, redis, refreshTokens, throttle, accounts, mfa, passkeys, flows, auditEvents, post };
+  return { app, redis, refreshTokens, throttle, accounts, mfa, passkeys, flows, auditEvents, post, passwordResets };
 }
 
 function refreshCookie(res: { cookies: Array<{ name: string; value: string }> }) {
@@ -342,21 +342,22 @@ describe("POST /auth/local/password/forgot", () => {
     }
   });
 
-  test("shutdown waits for a request that was answered but not yet handled", async () => {
-    const { app, post, accounts } = await buildHarness({ mail: true });
+  test("gives its answered requests to the shutdown, and adds no shutdown hook of its own", async () => {
+    const { app, post, accounts, passwordResets } = await buildHarness({ mail: true });
     let release!: () => void;
     accounts.requestPasswordReset.mockImplementation(() => new Promise<string>((resolve) => { release = () => resolve("sent"); }));
     expect((await post("/auth/local/password/forgot", { email: "a@example.com" })).statusCode).toBe(202);
     await settle();
     expect(accounts.requestPasswordReset).toHaveBeenCalledTimes(1);
 
-    let closed = false;
-    const closing = app.close().then(() => { closed = true; });
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    expect(closed).toBe(false);
+    // The app lifecycle waits for this work (stage passwordResets). A
+    // preClose hook here would wait before the drain begins, so close() does
+    // not wait for it.
+    await app.close();
+    expect(passwordResets!.size).toBe(1);
+    expect(await passwordResets!.drain(10)).toBe(false);
     release();
-    await closing;
-    expect(closed).toBe(true);
+    expect(await passwordResets!.drain(1_000)).toBe(true);
   });
 
   test("does not exist without email", async () => {

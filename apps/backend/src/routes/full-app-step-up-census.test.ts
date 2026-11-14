@@ -4,11 +4,17 @@ import { createTestConfig } from "../test-helpers/test-config.js";
 import { FakePool } from "../test-helpers/fake-pool.js";
 import { FakeRefreshTokenRedis } from "../test-helpers/fake-refresh-token-redis.js";
 
-const capture = vi.hoisted(() => ({ routes: new Set<string>(), overlays: true, overlayPresent: false }));
+const capture = vi.hoisted(() => ({ routes: new Set<string>(), overlays: true, overlayPresent: false, closeHooks: [] as string[] }));
 vi.mock("fastify", async (original) => {
   const actual = await original<typeof import("fastify")>();
   return { ...actual, default: (options: import("fastify").FastifyServerOptions) => {
     const app = actual.default(options);
+    // Child plugin instances inherit this addHook, so it sees their hooks too.
+    const addHook = app.addHook;
+    app.addHook = function (this: typeof app, name: string, ...rest: unknown[]) {
+      if (name === "preClose" || name === "onClose") capture.closeHooks.push(name);
+      return (addHook as (...args: unknown[]) => typeof app).call(this, name, ...rest);
+    } as typeof app.addHook;
     app.addHook("onRoute", route => {
       for (const method of [route.method].flat()) {
         if (["POST", "PUT", "PATCH", "DELETE"].includes(method)) capture.routes.add(`${method} ${route.url}`);
@@ -49,6 +55,7 @@ afterEach(async () => { await app?.close(); app = undefined; });
 async function census(overlays: boolean, overrides: Partial<AppConfig> = {}) {
   capture.overlays = overlays;
   capture.routes.clear();
+  capture.closeHooks = [];
   const config = createTestConfig({ AUTH_MODE: "jwt", AUTH_LOGIN_TYPES: ["local", "workos"],
     MAINTENANCE_DATABASE_URL: "postgres://unused", LOG_LEVEL: "silent",
     WORKOS_API_KEY: "test", WORKOS_CLIENT_ID: "test", WORKOS_REDIRECT_URI: "https://example.test/callback",
@@ -141,6 +148,23 @@ describe("conditional full-app registration", () => {
     }
     expect([...routes].sort(), "exact route registration for this configuration").toEqual([...expected].sort());
   });
+});
+
+// registerAppLifecycle (mocked here) holds every shutdown wait in one preClose
+// hook, after the drain starts and within SHUTDOWN_STAGE_MS. Fastify runs root
+// preClose hooks in registration order, so a route module's own hook would
+// wait before the drain and outside the deadline.
+test("buildApp adds no shutdown hook outside the app lifecycle, and gives it the password reset work", async () => {
+  const { registerAppLifecycle } = await import("../app-bootstrap.js");
+  vi.mocked(registerAppLifecycle).mockClear();
+  await census(true);
+  expect(capture.closeHooks).toEqual([]);
+  const lifecycle = vi.mocked(registerAppLifecycle).mock.calls.at(-1)?.[0];
+  expect(lifecycle?.passwordResets).toEqual(expect.objectContaining({ close: expect.any(Function), drain: expect.any(Function) }));
+
+  await census(true, { SMTP_URL: undefined, MAIL_FROM: undefined });
+  expect(capture.closeHooks).toEqual([]);
+  expect(vi.mocked(registerAppLifecycle).mock.calls.at(-1)?.[0].passwordResets).toBeNull();
 });
 
 test("classification removal and stale entries fail closed", async () => {

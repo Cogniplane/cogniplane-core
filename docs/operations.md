@@ -16,15 +16,27 @@ deletion and monitoring of a production install. Deployment is in
 Shutdown (`server.ts`, `app-bootstrap.ts`): on `SIGTERM` the backend refuses new
 turns (503 `server_draining`), stops the scheduler and mail workers, lets
 running turns finish for a few seconds, then interrupts the rest (saved as
-`interrupted`). Scheduled jobs get the same wait, then their runtimes close and
-a second, longer wait lets them write their outcome. A scheduled run that fails
-because of the shutdown does not count toward the auto-disable of a failing job
-([scheduler](architecture/runtime.md#scheduler)). After
-`SHUTDOWN_DEADLINE_MS` (35 seconds) the process exits. Give each backend a
-termination grace of at least 40 seconds; Docker's default is 10 seconds, and
-the Compose stack sets `stop_grace_period: 40s`. Check a rolling restart: start
-a long chat turn, restart its backend, and see the turn end as interrupted, not
-stuck.
+`interrupted`). During this drain the server still answers other requests: the
+MCP gateway calls of the draining turns, approvals and Stop work, and `/ready`
+returns 503 so that the load balancer sends no new requests. After the turn
+drain, the backend ends every open SSE stream; the browser connects again,
+usually to another backend. A viewer of a turn that another backend runs loses
+only its stream, and that turn continues. Scheduled jobs get their own wait,
+then their runtimes close and a second, longer wait lets them write their
+outcome. A scheduled run that fails because of the shutdown does not count
+toward the auto-disable of a failing job
+([scheduler](architecture/runtime.md#scheduler)). Forgot-password requests
+that got their answer, but whose work did not finish, get a wait to put their
+email in the outbox. Then HTTP requests in progress get a short wait, and Redis
+and the database pools close.
+
+Each stage has a limit (`SHUTDOWN_STAGE_MS` in `lib/shutdown-budget.ts`). All
+drain waits run in one `preClose` hook of `registerAppLifecycle`, so the drain
+starts before any wait. After `SHUTDOWN_DEADLINE_MS` (57 seconds), the sum of
+the limits and a margin, the process exits with code 1. Give each backend a
+termination grace of at least 60 seconds; Docker's default is 10 seconds, and the Compose stack sets
+`stop_grace_period: 60s`. Check a rolling restart: start a long chat turn,
+restart its backend, and see the turn end as interrupted, not stuck.
 
 Migrations are forward-only; there are no down migrations, and older backends
 are not tested against a newer schema. If the new backends fail `/ready`, fix
@@ -313,8 +325,9 @@ flush; it prints a note to stderr.
 ## Monitor
 
 - `GET /health`: liveness; does not check dependencies.
-- `GET /ready`: readiness; 503 when PostgreSQL does not answer in time
-  (`routes/health.ts`). It does not check Redis: check it on its own (for
+- `GET /ready`: readiness; 503 when PostgreSQL does not answer in time, and
+  during the shutdown (`routes/health.ts`). It does not check Redis: check it
+  on its own (for
   example `redis-cli -u "$REDIS_URL" ping` answers `PONG`).
 - `GET /admin/diagnostics` (admins; Admin > Runtime diagnostics): build
   metadata, uptime and runtime activity.

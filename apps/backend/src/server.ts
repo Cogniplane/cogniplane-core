@@ -1,8 +1,8 @@
 import { buildApp } from "./app.js";
-
-// After this, a stop that has not finished exits with code 1. Container stop
+// After this, a stop that has not finished exits with code 1. It is the sum of
+// the stage limits that app-bootstrap.ts uses, plus a margin. Container stop
 // timeouts must be longer (compose.yaml: stop_grace_period).
-const SHUTDOWN_DEADLINE_MS = 35_000;
+import { SHUTDOWN_DEADLINE_MS } from "./lib/shutdown-budget.js";
 
 const app = await buildApp();
 

@@ -192,6 +192,12 @@ scheduled turns:
   does not match. Then the route sends the history with `activeTurn:
   "unavailable"`. The browser waits for the turn to end and loads the final
   state.
+- The route and `POST /messages` register their stream in the app's
+  `SseConnections` (`lib/sse-connections.ts`). The shutdown ends these streams
+  after the turn drain, so an open stream cannot keep the HTTP server open
+  ([shutdown](../operations.md#upgrade)). A stream of a turn on another replica
+  then disconnects its bus reader. That turn continues, and the browser
+  connects again.
 - Turn events are also appended to a Redis stream per turn
   (`services/turn-coordination-bus.ts`, bounded by `MAX_EVENTS` and `MAX_BYTES`,
   with a key expiry), so a connection on another replica can replay a running
@@ -367,7 +373,11 @@ Add a worker:
 2. Give it `start(intervalMs)` with an `unref()` timer, `stop()`, and
    `drain(budgetMs)` that waits for the running pass.
 3. Start it in `app-bootstrap.ts`, and stop and drain it in the `preClose` hook
-   there, so a shutdown does not cut a pass.
+   there, so a shutdown does not cut a pass. Give the drain a stage in
+   `SHUTDOWN_STAGE_MS` (`lib/shutdown-budget.ts`). Do not add a `preClose` hook
+   in another module: Fastify runs it in registration order, before the drain
+   starts, and outside the deadline. Give the pending work to
+   `registerAppLifecycle` instead, as `passwordResets` does.
 
 Cross-tenant claims use `privilegedDb` ([database roles](../database-roles.md)).
 

@@ -1,6 +1,8 @@
+import { EventEmitter } from "node:events";
+
 import type { Redis } from "ioredis";
 import { EventType, type BaseEvent } from "@ag-ui/client";
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 
 import { TurnCoordinationBus, type TurnKey } from "./turn-coordination-bus.js";
 
@@ -46,7 +48,7 @@ const event = (sequence: number): BaseEvent => ({ type: EventType.CUSTOM, name: 
 function bus(sequences: number[], forTurn = turn) {
   const redis = new FakeStreams();
   for (const sequence of sequences) redis.add(key(forTurn), sequence, ["event", JSON.stringify(event(sequence))]);
-  return { bus: new TurnCoordinationBus(redis as unknown as Redis), redis };
+  return { bus: new TurnCoordinationBus(redis as unknown as Redis, { warn: () => {} }), redis };
 }
 
 const sequencesOf = (entries: { sequence: number }[] | null) => entries?.map((entry) => entry.sequence) ?? null;
@@ -104,5 +106,72 @@ describe("TurnCoordinationBus.replay", () => {
 
     expect(await b.replay(other, 0)).toEqual([{ sequence: 1, event: event(99), bytes: Buffer.byteLength(JSON.stringify(event(99))) }]);
     expect(sequencesOf(await b.replay({ ...turn, executionId: "exec-2" }, 0))).toEqual([]);
+  });
+});
+
+describe("TurnCoordinationBus.subscribeStop", () => {
+  /** A Redis client whose duplicates fail their subscribe in the order given. */
+  function stopRedis(failures: number) {
+    const connections: EventEmitter[] = [];
+    const redis = {
+      duplicate() {
+        const connection = Object.assign(new EventEmitter(), {
+          disconnectCalls: 0,
+          async subscribe(): Promise<number> {
+            if (connections.indexOf(connection) < failures) throw new Error("connect ECONNREFUSED");
+            return 1;
+          },
+          disconnect() { connection.disconnectCalls += 1; }
+        });
+        connections.push(connection);
+        return connection;
+      }
+    };
+    return { redis: redis as unknown as Redis, connections: connections as Array<EventEmitter & { disconnectCalls: number }> };
+  }
+
+  const signal = { tenantId: "t", sessionId: "s", executionId: "e", ownerId: "o", userId: "u" };
+
+  test("a failed first subscribe does not fail the startup, and a background retry delivers stops", async () => {
+    vi.useFakeTimers();
+    const { redis, connections } = stopRedis(1);
+    const warn = vi.fn();
+    const stopBus = new TurnCoordinationBus(redis, { warn });
+    const received: unknown[] = [];
+    try {
+      await stopBus.subscribeStop((stop) => received.push(stop));
+
+      expect(warn).toHaveBeenCalledWith(expect.objectContaining({ err: expect.any(Error) }),
+        "Redis subscribe failed; retrying in the background: turn stop");
+      expect(connections[0]!.disconnectCalls).toBe(1);
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(connections).toHaveLength(2);
+      connections[1]!.emit("message", "cogniplane:turn-stop:v1", JSON.stringify(signal));
+      connections[1]!.emit("message", "cogniplane:turn-stop:v1", "{not json");
+      expect(received).toEqual([signal]);
+
+      stopBus.close();
+      expect(connections[1]!.disconnectCalls).toBe(1);
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(connections).toHaveLength(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("close during the first attempt starts no retry", async () => {
+    vi.useFakeTimers();
+    const { redis, connections } = stopRedis(10);
+    const stopBus = new TurnCoordinationBus(redis, { warn: () => {} });
+    try {
+      const subscribing = stopBus.subscribeStop(() => {});
+      stopBus.close();
+      await subscribing;
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(connections).toHaveLength(1);
+      expect(connections[0]!.disconnectCalls).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

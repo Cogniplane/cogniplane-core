@@ -3,12 +3,15 @@ import type { Redis } from "ioredis";
 
 import type { loadConfig } from "./config.js";
 import type { createDatabase } from "./lib/db.js";
+import type { SseConnections } from "./lib/sse-connections.js";
 
 declare module "fastify" {
   interface FastifyInstance {
     config: ReturnType<typeof loadConfig>;
     db: ReturnType<typeof createDatabase>;
     redis: Redis | null;
+    /** Open SSE responses; see lib/sse-connections.ts. */
+    sseConnections: SseConnections;
   }
 
   interface FastifyRequest {
