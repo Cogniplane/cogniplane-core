@@ -312,6 +312,51 @@ test("MessageStore.upsertToolResult truncates oversized tool output before persi
   expect(result.output).toContain("truncated");
 });
 
+test("MessageStore.upsertToolResult redacts a secret that crosses the storage cut before it truncates", async () => {
+  const db = new CaptureMessageDatabase();
+  const store = new MessageStore(db as unknown as Pool);
+
+  // Each secret starts before the cut and ends after it. If the store cut the
+  // text first, it would keep a partial JWT and the start of a key block,
+  // which their patterns no longer match.
+  const keyBody = "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7".repeat(4);
+  const pem = `-----BEGIN PRIVATE KEY-----\n${keyBody}\n-----END PRIVATE KEY-----`;
+  const jwt = `eyJhbGciOiJIUzI1NiJ9.${"eyJzdWIiOiIxMjM0NTY3ODkwIn0".repeat(4)}.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c`;
+  const acrossCut = (secret: string) => `${"x".repeat(MAX_TOOL_RESULT_TEXT_LENGTH - 40)} ${secret} ${"y".repeat(5_000)}`;
+  expect(acrossCut(jwt).indexOf(jwt)).toBeLessThan(MAX_TOOL_RESULT_TEXT_LENGTH);
+  expect(acrossCut(jwt).indexOf(jwt) + jwt.length).toBeGreaterThan(MAX_TOOL_RESULT_TEXT_LENGTH);
+  expect(acrossCut(pem).indexOf(pem) + pem.length).toBeGreaterThan(MAX_TOOL_RESULT_TEXT_LENGTH);
+
+  await store.upsertToolResult({
+    tenantId: "test-tenant",
+    toolResultId: "tool-1",
+    messageId: "message-1",
+    sessionId: "session-1",
+    userId: "user-1",
+    kind: "mcp",
+    title: "MCP tool",
+    status: "completed",
+    command: null,
+    cwd: null,
+    server: "files",
+    toolName: "read",
+    input: acrossCut(jwt),
+    output: acrossCut(pem),
+    exitCode: 0,
+    durationMs: 1, textOffset: 0
+  });
+
+  const storedInput = String(db.lastValues![12]);
+  const storedOutput = String(db.lastValues![13]);
+  for (const stored of [storedInput, storedOutput]) {
+    expect(stored).toContain(" [REDACTED] yyy");
+    expect(stored).toContain("[… truncated");
+  }
+  expect(storedInput).not.toContain("eyJhbGci");
+  expect(storedOutput).not.toContain("PRIVATE KEY");
+  expect(storedOutput).not.toContain("MIIEvQ");
+});
+
 test("MessageStore.upsertToolResult redacts secrets in tool input/output before persistence", async () => {
   const db = new CaptureMessageDatabase();
   const store = new MessageStore(db as unknown as Pool);
