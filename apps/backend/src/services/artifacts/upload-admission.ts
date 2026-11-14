@@ -2,7 +2,11 @@ import type { Readable } from "node:stream";
 
 import type { FastifyBaseLogger } from "fastify";
 
-import type { PiiArtifactScanEnqueuer, PiiArtifactScanSource } from "../pii/pii-artifact-scan-enqueuer.js";
+import type {
+  PiiArtifactScanEnqueuer,
+  PiiArtifactScanPlan,
+  PiiArtifactScanSource
+} from "../pii/pii-artifact-scan-enqueuer.js";
 import { SessionUploadAccessError } from "../session-upload-access.js";
 import type { SessionStore } from "../session-store.js";
 import { assertValidArtifactFilename } from "./artifact-filename.js";
@@ -21,7 +25,7 @@ export type UploadTicket = {
 };
 
 export type UploadAdmissionResult =
-  // The persisted artifact: `pending` while an async scan runs, else `ready`.
+  // The persisted artifact: `pending` while its scan is open, else `ready`.
   | { kind: "admitted"; artifact: ArtifactRecord }
   | { kind: "blocked"; blockReason: string; scanRunId: string }
   | { kind: "scan_failed"; errorCode: string; errorMessage: string };
@@ -36,9 +40,9 @@ export class UploadAdmission {
   constructor(
     private readonly deps: {
       sessions: Pick<SessionStore, "requireUploadAccess">;
-      artifacts: Pick<ArtifactStore, "createUpload" | "update" | "getReadable">;
+      artifacts: Pick<ArtifactStore, "createUpload" | "getReadable">;
       storage: Pick<ArtifactStorage, "put" | "delete">;
-      piiScanEnqueuer?: Pick<PiiArtifactScanEnqueuer, "enqueue">;
+      piiScanEnqueuer?: Pick<PiiArtifactScanEnqueuer, "plan" | "enqueue">;
       logger?: Pick<FastifyBaseLogger, "error">;
     }
   ) {}
@@ -79,9 +83,16 @@ export class UploadAdmission {
     });
 
     let artifact: ArtifactRecord;
+    let plan: PiiArtifactScanPlan;
     try {
+      // Read the policy after the bytes are stored, before the row exists.
+      // An upload that needs no scan is created `ready` in one transaction;
+      // any other upload is `pending` until its verdict.
+      plan = this.deps.piiScanEnqueuer
+        ? await this.deps.piiScanEnqueuer.plan({ tenantId, contentType: input.mimeType, source: input.source })
+        : { kind: "skip" };
       // Access is checked again under lock: it can change while bytes stream.
-      // The audit event commits with the pending row, or neither commits.
+      // The audit event commits with the row, or neither commits.
       artifact = await this.deps.artifacts.createUpload({
         expectedProjectId: ticket.expectedProjectId,
         tenantId,
@@ -95,7 +106,8 @@ export class UploadAdmission {
         checksumSha256: stored.checksumSha256,
         createdByType: input.createdByType,
         createdByRef: input.createdByRef ?? null,
-        detail: input.detail
+        detail: input.detail,
+        awaitingScan: plan.kind !== "skip"
       }, (created) => ({
         tenantId,
         sessionId,
@@ -123,7 +135,9 @@ export class UploadAdmission {
       throw error;
     }
 
-    const scan = this.deps.piiScanEnqueuer
+    // A crash or a failed write from here on leaves a pending upload; the
+    // worker's stalled-upload recovery closes it.
+    const scan = this.deps.piiScanEnqueuer && plan.kind !== "skip"
       ? await this.deps.piiScanEnqueuer.enqueue({
           tenantId,
           sessionId,
@@ -132,7 +146,7 @@ export class UploadAdmission {
           contentType: artifact.mimeType,
           storageKey: artifact.storageKey,
           source: input.source
-        })
+        }, plan)
       : ({ kind: "skipped" } as const);
     if (scan.kind === "blocked") {
       return { kind: "blocked", blockReason: scan.blockReason, scanRunId: scan.scanRunId };
@@ -140,12 +154,10 @@ export class UploadAdmission {
     if (scan.kind === "failed") {
       return { kind: "scan_failed", errorCode: scan.errorCode, errorMessage: scan.errorMessage };
     }
-    if (scan.kind === "skipped" || scan.kind === "allowed") {
-      await this.deps.artifacts.update(tenantId, artifact.artifactId, { status: "ready" });
-    }
 
-    // Return the persisted state: a queued scan stays pending, and access can
-    // change while a synchronous scan runs.
+    // Return the persisted state: a queued scan stays pending, an allowed
+    // synchronous scan made it ready, and access can change while a
+    // synchronous scan runs.
     const current = await this.deps.artifacts.getReadable(tenantId, artifact.artifactId, userId);
     if (!current) throw new SessionUploadAccessError();
     return { kind: "admitted", artifact: current };

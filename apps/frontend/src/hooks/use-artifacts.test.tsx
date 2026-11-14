@@ -95,6 +95,29 @@ describe("chat artifact selection", () => {
     expect(result.current.visibleSelectedArtifactIds).toEqual(["a", "b"]);
   });
 
+  it("does not auto-select an upload whose PII scan failed, so the request leaves it out", () => {
+    const older = artifact("older");
+    const failedScan = artifact("failed-scan", {
+      updatedAt: "2026-09-04T13:00:00Z",
+      detail: { pii: { status: "failed" } }
+    });
+    const { result } = renderSelection([older, failedScan]);
+    expect(result.current.visibleSelectedArtifactIds).toEqual(["older"]);
+  });
+
+  it("drops a manually selected upload whose PII scan failed from the request", () => {
+    const a = artifact("a");
+    const b = artifact("b");
+    const { result, rerender } = renderSelection([a, b]);
+    act(() => result.current.selectArtifact("b"));
+    expect(result.current.visibleSelectedArtifactIds).toEqual(["a", "b"]);
+
+    rerender({ selectedSessionId: "s-1", artifacts: [a, { ...b, detail: { pii: { status: "failed" } } }] });
+    expect(result.current.visibleSelectedArtifactIds).toEqual(["a"]);
+    act(() => result.current.selectArtifact("b"));
+    expect(result.current.visibleSelectedArtifactIds).toEqual(["a"]);
+  });
+
   it("forgets removed manual selections instead of restoring them if the row returns", () => {
     const a = artifact("a");
     const b = artifact("b");

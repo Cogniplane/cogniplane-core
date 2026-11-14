@@ -9,7 +9,7 @@ import type { ArtifactRecord } from "../artifacts/artifact-store.js";
 import { PiiImportScopeRegistry } from "./pii-import-scopes.js";
 import type { PiiAppliedPolicy, PiiDecision, PiiSubject } from "./pii-protection-service.js";
 import { PiiProtectionServiceError } from "./pii-protection-service.js";
-import type { PiiScanJobRecord } from "./pii-scan-job-store.js";
+import type { PiiScanJobClaim, PiiScanJobRecord } from "./pii-scan-job-store.js";
 import type { PiiScanRunDecision, PiiScanRunRecord } from "./pii-scan-run-store.js";
 
 test("missing deployment KEK remains retryable and can complete after configuration repair", async () => {
@@ -23,6 +23,28 @@ test("missing deployment KEK remains retryable and can complete after configurat
   overrides.evaluateThrows = undefined;
   await handler.execute(sampleJob({ attempts: 2 }));
   expect(h.completedCalls).toHaveLength(1);
+});
+
+test("the handler finishes a job only as the attempt that it claimed", async () => {
+  const overrides = { evaluateThrows: new Error("provider timeout") as Error | undefined };
+  const h = buildDeps(overrides);
+  const handler = new PiiScanJobHandler(h.deps);
+  await handler.execute(sampleJob({ attempts: 1 }));
+  overrides.evaluateThrows = undefined;
+  await handler.execute(sampleJob({ attempts: 2 }));
+
+  expect(h.failureCalls.map((call) => call.attempts)).toEqual([1]);
+  expect(h.completedCalls.map((call) => call.attempts)).toEqual([2]);
+});
+
+test("a stale acknowledgement changes nothing and is logged", async () => {
+  const h = buildDeps();
+  const warnings: string[] = [];
+  h.deps.logger.warn = (_payload, message) => { warnings.push(message); };
+  h.deps.piiScanJobs.markCompleted = async () => false;
+  await new PiiScanJobHandler(h.deps).execute(sampleJob());
+  expect(h.updateCalls.at(-1)?.patch.status).toBe("completed");
+  expect(warnings).toContain("PII scan job not acknowledged: this attempt no longer holds the job");
 });
 
 test("acknowledgement failure preserves an applied decision", async () => {
@@ -144,8 +166,8 @@ function buildDeps(overrides: {
   const updateCalls: UpdateScanRunCall[] = [];
   const messagePiiCalls: SetMessagePiiCall[] = [];
   const artifactPiiCalls: SetArtifactPiiCall[] = [];
-  const completedCalls: Array<{ tenantId: string; jobId: string }> = [];
-  const failureCalls: Array<{ tenantId: string; jobId: string; error: string; permanent: boolean }> = [];
+  const completedCalls: Array<{ tenantId: string; jobId: string; attempts: number }> = [];
+  const failureCalls: Array<{ tenantId: string; jobId: string; attempts: number; error: string; permanent: boolean }> = [];
   const auditCalls: Array<Record<string, unknown>> = [];
   const deleteCalls: string[] = [];
   const evaluateCalls: string[] = [];
@@ -242,16 +264,16 @@ function buildDeps(overrides: {
         }
       },
       piiScanJobs: {
-        async markCompleted(tenantId: string, jobId: string) {
-          completedCalls.push({ tenantId, jobId });
+        async markCompleted({ tenantId, jobId, attempts }: PiiScanJobClaim) {
+          completedCalls.push({ tenantId, jobId, attempts });
+          return true;
         },
         async recordFailure(
-          tenantId: string,
-          jobId: string,
+          { tenantId, jobId, attempts }: PiiScanJobClaim,
           error: string,
           options: { backoffMs?: number; permanent?: boolean } = {}
         ) {
-          failureCalls.push({ tenantId, jobId, error, permanent: options.permanent ?? false });
+          failureCalls.push({ tenantId, jobId, attempts, error, permanent: options.permanent ?? false });
           return failureReturn;
         }
       },
@@ -806,7 +828,10 @@ test("finishFailedJob finishes a recorded block instead of marking the subject f
   await new PiiScanJobHandler(h.deps).finishFailedJob(sampleJob({ status: "failed", errorMessage: "claim expired" }));
   expect(h.evaluateCalls).toEqual([]);
   expect(h.deleteCalls).toEqual([STORAGE_KEY]);
-  expect(h.artifactPiiCalls.map((call) => call.pii.status)).toEqual(["blocked"]);
+  // The artifact verdict keeps the reason, as the synchronous scan writes it.
+  expect(h.artifactPiiCalls.map((call) => call.pii)).toEqual([
+    expect.objectContaining({ status: "blocked", blockReason: recordedBlock.blockReason })
+  ]);
   expect(h.updateCalls.map((call) => call.patch)).toEqual([
     expect.objectContaining({ status: "blocked", mode: "block", policyRevision: 3, pendingDecision: null })
   ]);

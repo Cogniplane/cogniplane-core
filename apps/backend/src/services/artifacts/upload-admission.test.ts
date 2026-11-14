@@ -1,20 +1,30 @@
 import { Readable } from "node:stream";
 import { describe, expect, test } from "vitest";
 
+import type { PiiArtifactScanPlan } from "../pii/pii-artifact-scan-enqueuer.js";
 import { InvalidArtifactFilenameError } from "./artifact-filename.js";
 import { UploadAdmission } from "./upload-admission.js";
 
+const QUEUED_PLAN: PiiArtifactScanPlan = { kind: "async", mode: "detect", entityTypes: [] };
+
 type AuditInput = { tenantId: string; sessionId: string | null; userId: string; type: string; payload: Record<string, unknown> };
 
-function makeAdmission(opts: { createUploadThrows?: Error; auditThrows?: Error } = {}) {
+function makeAdmission(opts: {
+  createUploadThrows?: Error;
+  auditThrows?: Error;
+  plan?: PiiArtifactScanPlan;
+  planThrows?: Error;
+} = {}) {
+  const plan = opts.plan ?? QUEUED_PLAN;
   const calls = {
     put: [] as string[],
     delete: [] as string[],
     createUpload: [] as string[],
     rowKeys: [] as string[],
+    awaitingScan: [] as Array<boolean | undefined>,
     audits: [] as AuditInput[],
     enqueue: 0,
-    update: 0,
+    enqueuedPlans: [] as unknown[],
     order: [] as string[]
   };
   const record = (artifactName: string) => ({
@@ -34,11 +44,12 @@ function makeAdmission(opts: { createUploadThrows?: Error; auditThrows?: Error }
       // The store writes the event in the transaction of the row: when the
       // event fails, the row does not commit and createUpload rejects.
       async createUpload(
-        input: { artifactName: string; storageKey: string },
+        input: { artifactName: string; storageKey: string; awaitingScan?: boolean },
         audit: (artifact: ReturnType<typeof record>) => AuditInput
       ) {
         calls.createUpload.push(input.artifactName);
         calls.rowKeys.push(input.storageKey);
+        calls.awaitingScan.push(input.awaitingScan);
         calls.order.push("createUpload");
         if (opts.createUploadThrows) throw opts.createUploadThrows;
         const created = record(input.artifactName);
@@ -48,10 +59,6 @@ function makeAdmission(opts: { createUploadThrows?: Error; auditThrows?: Error }
         calls.order.push("audit");
         lastName = input.artifactName;
         return created;
-      },
-      async update() {
-        calls.update += 1;
-        return null;
       },
       async getReadable() { return record(lastName); }
     },
@@ -68,10 +75,16 @@ function makeAdmission(opts: { createUploadThrows?: Error; auditThrows?: Error }
       }
     },
     piiScanEnqueuer: {
-      async enqueue() {
+      async plan() {
+        calls.order.push("plan");
+        if (opts.planThrows) throw opts.planThrows;
+        return plan;
+      },
+      async enqueue(_input: unknown, given: unknown) {
         calls.enqueue += 1;
+        calls.enqueuedPlans.push(given);
         calls.order.push("enqueue");
-        return { kind: "skipped" as const };
+        return { kind: "queued" as const, scanRunId: "run-1", jobId: "job-1", mode: "detect" as const };
       }
     }
   } as never);
@@ -164,7 +177,7 @@ describe("UploadAdmission.admit audit event", () => {
         driveId: "drive-1"
       }
     }]);
-    expect(calls.order).toEqual(["put", "createUpload", "audit", "enqueue"]);
+    expect(calls.order).toEqual(["put", "plan", "createUpload", "audit", "enqueue"]);
     expect(calls.delete).toEqual([]);
   });
 
@@ -179,6 +192,39 @@ describe("UploadAdmission.admit audit event", () => {
     expect(calls.delete).toEqual(calls.put);
     expect(calls.audits).toEqual([]);
     expect(calls.enqueue).toBe(0);
-    expect(calls.update).toBe(0);
+  });
+});
+
+describe("UploadAdmission.admit scan plan", () => {
+  test("creates an upload that needs no scan as ready, in its one transaction, and starts no scan", async () => {
+    const { calls, admit } = makeAdmission({ plan: { kind: "skip" } });
+
+    const result = await admit("notes.txt");
+
+    expect(result.kind).toBe("admitted");
+    expect(calls.awaitingScan).toEqual([false]);
+    expect(calls.order).toEqual(["put", "plan", "createUpload", "audit"]);
+    expect(calls.enqueue).toBe(0);
+  });
+
+  test("creates an upload that needs a scan as pending and scans it with the plan read before the row", async () => {
+    const { calls, admit } = makeAdmission();
+
+    await admit("notes.txt");
+
+    expect(calls.awaitingScan).toEqual([true]);
+    expect(calls.enqueuedPlans).toEqual([QUEUED_PLAN]);
+  });
+
+  test("deletes the stored bytes and creates no row when the policy read fails", async () => {
+    const failure = new Error("policy read failed");
+    const { calls, admit } = makeAdmission({ planThrows: failure });
+
+    const error = await admit("notes.txt").catch((caught: unknown) => caught);
+
+    expect(error).toBe(failure);
+    expect(calls.createUpload).toEqual([]);
+    expect(calls.delete).toEqual(calls.put);
+    expect(calls.enqueue).toBe(0);
   });
 });

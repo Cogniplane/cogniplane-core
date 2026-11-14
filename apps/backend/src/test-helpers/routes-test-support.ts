@@ -14,7 +14,7 @@ import type { AppConfig } from "../config.js";
 import type { Pool } from "../lib/db.js";
 import { uuidv7 } from "../lib/uuid.js";
 import { ToolContextUnavailableError, type ToolExecutionContext } from "../services/auth/tool-execution-context-store.js";
-import { type ArtifactDetail, type ArtifactDownloadTokenRecord, type ArtifactPiiDetail, type ArtifactRecord, type ArtifactStore, isArtifactPiiEligible } from "../services/artifacts/artifact-store.js";
+import { type ArtifactDetail, type ArtifactDownloadTokenRecord, type ArtifactPiiDetail, type ArtifactRecord, type ArtifactStore, isArtifactPiiEligible, UPLOAD_SCAN_PENDING_KEY } from "../services/artifacts/artifact-store.js";
 import { LocalArtifactStorage } from "../services/artifacts/artifact-storage.js";
 import type { SessionRecord } from "../services/session-store.js";
 import { SessionUploadAccessError } from "../services/session-upload-access.js";
@@ -630,7 +630,12 @@ class InMemoryArtifactStore {
   ) {}
   async createUpload(...[input, audit]: Parameters<ArtifactStore["createUpload"]>) {
     await this.sessions.requireUploadAccess(input.tenantId, input.sessionId, input.userId);
-    const artifact = await this.create({ ...input, artifactType: "upload", createdByType: input.createdByType ?? "user", status: "pending" });
+    const { awaitingScan = true, ...row } = input;
+    const artifact = await this.create({
+      ...row, artifactType: "upload", createdByType: row.createdByType ?? "user",
+      status: awaitingScan ? "pending" : "ready",
+      detail: awaitingScan ? { ...row.detail, [UPLOAD_SCAN_PENDING_KEY]: true } : row.detail
+    });
     await this.auditEvents.create(audit(artifact));
     return artifact;
   }
@@ -680,8 +685,16 @@ class InMemoryArtifactStore {
     // Like the store: each write replaces the coverage of an earlier scan.
     const { imagesNotScanned: _n, imageScan: _s, imagePagesScanned: _p, imagePageCount: _c, ...current } =
       (artifact.detail.pii as ArtifactPiiDetail | undefined) ?? {};
+    // Like the store: a marked pending upload takes the status of its verdict.
+    const verdictStatus: Partial<Record<string, ArtifactRecord["status"]>> = {
+      scanned: "ready", transformed: "ready", blocked: "failed", failed: "failed"
+    };
+    const status = artifact.status === "pending" && artifact.detail[UPLOAD_SCAN_PENDING_KEY] && pii.status
+      ? verdictStatus[pii.status] ?? artifact.status
+      : artifact.status;
     const updated: ArtifactRecord = {
       ...artifact,
+      status,
       detail: { ...artifact.detail, pii: { ...current, ...pii } },
       updatedAt: new Date().toISOString()
     };

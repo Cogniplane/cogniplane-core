@@ -46,6 +46,14 @@ describe("artifactCardPreviewBlock", () => {
     expect(artifactCardPreviewBlock(artifact({ detail: { pii: { status } } }))).toMatch(/PII policy/);
   });
 
+  it("blocks a ready file whose PII scan failed, as the preview route does", () => {
+    expect(artifactCardPreviewBlock(artifact({ detail: { pii: { status: "failed" } } }))).toMatch(/PII scan of this file failed/);
+  });
+
+  it("blocks a ready file with a PII verdict it does not know", () => {
+    expect(artifactCardPreviewBlock(artifact({ detail: { pii: { status: "quarantined" as never } } }))).toMatch(/PII policy/);
+  });
+
   it("blocks a type that the preview does not show", () => {
     expect(artifactCardPreviewBlock(artifact({ mimeType: "application/zip" }))).toMatch(/file type/);
     expect(artifactCardPreviewBlock(artifact({ mimeType: "image/svg+xml" }))).toMatch(/file type/);

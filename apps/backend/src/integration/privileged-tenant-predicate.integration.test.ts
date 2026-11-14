@@ -619,19 +619,22 @@ describe.skipIf(!adminDatabaseUrl())("privileged pool tenant predicates", () => 
       // built side by side, and this proves they answer alike.
       const graph = await seedTenantGraph();
       const statuses = ["pending", "processing", "ready", "failed", "deleted"] as const;
-      const verdicts: Array<ArtifactPiiDetail["status"] | undefined> = [
+      // Also a verdict this code does not know, and a JSON null.
+      const verdicts: Array<ArtifactPiiDetail["status"] | "quarantined" | null | undefined> = [
         undefined,
+        null,
         "pending",
         "scanning",
         "scanned",
         "blocked",
         "transformed",
-        "failed"
+        "failed",
+        "quarantined"
       ];
 
       for (const status of statuses) {
         for (const verdict of verdicts) {
-          const detail = verdict ? { pii: { status: verdict } } : {};
+          const detail = verdict === undefined ? {} : { pii: { status: verdict as ArtifactPiiDetail["status"] } };
           await superuserPool().query(
             "UPDATE artifacts SET status = $3, detail_json = $4::jsonb WHERE tenant_id = $1 AND artifact_id = $2",
             [graph.tenantId, graph.artifactId, status, JSON.stringify(detail)]
@@ -641,7 +644,7 @@ describe.skipIf(!adminDatabaseUrl())("privileged pool tenant predicates", () => 
                FROM artifacts a WHERE a.tenant_id = $1 AND a.artifact_id = $2`,
             [graph.tenantId, graph.artifactId]
           );
-          expect(rows[0]?.eligible, `${status} / ${verdict ?? "no verdict"}`).toBe(
+          expect(rows[0]?.eligible, `${status} / ${String(verdict)}`).toBe(
             isArtifactPiiEligible({ status, detail })
           );
         }

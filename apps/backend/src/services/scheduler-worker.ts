@@ -139,7 +139,10 @@ export type SchedulerWorkerDeps = {
    * scheduled cron jobs. Kept optional so bootstrap paths and tests that don't
    * care about PII don't have to wire it.
    */
-  piiScanJobs?: Pick<PiiScanJobStore, "claimDueJobs" | "sweepStaleClaims" | "listUnfinishedFailures">;
+  piiScanJobs?: Pick<
+    PiiScanJobStore,
+    "claimDueJobs" | "sweepStaleClaims" | "listUnfinishedFailures" | "listStalledUploads" | "recoverStalledUpload"
+  >;
   piiScanJobHandler?: Pick<PiiScanJobHandler, "execute" | "finishFailedJob">;
   /** Best-effort retention sweep for project files and their stored objects. */
   projectFiles?: Pick<ProjectFileStore, "cleanupExpired">;
@@ -237,6 +240,8 @@ const STALE_RUN_SWEEP_BUFFER_MS = 60_000;
 const STALE_RUN_SWEEP_BATCH_SIZE = 100;
 // Failed PII scan jobs whose scan run each tick closes. Later ticks take the rest.
 const UNFINISHED_PII_FAILURE_BATCH = 50;
+// Stalled uploads that each tick closes. Later ticks take the rest.
+const STALLED_UPLOAD_BATCH = 50;
 
 export class SchedulerWorker {
   private interval: ReturnType<typeof setInterval> | null = null;
@@ -645,6 +650,36 @@ export class SchedulerWorker {
     }
   }
 
+  /**
+   * An upload stays `pending` when the process stops, or a write fails,
+   * between its row and its scan state. No job finds such an upload, so close
+   * it here: a recorded decision gets a new job (claimed below in this tick),
+   * any other upload fails. Same cutoff as the stale-claim sweep, which is
+   * longer than a synchronous scan can run (config.ts).
+   */
+  private async recoverStalledUploads(
+    piiScanJobs: Pick<PiiScanJobStore, "listStalledUploads" | "recoverStalledUpload">,
+    staleAfterMs: number
+  ): Promise<void> {
+    let stalled;
+    try {
+      stalled = await piiScanJobs.listStalledUploads(staleAfterMs, STALLED_UPLOAD_BATCH);
+    } catch (error) {
+      this.deps.logger.error({ error }, "Failed to list stalled uploads");
+      return;
+    }
+    for (const upload of stalled) {
+      try {
+        const outcome = await piiScanJobs.recoverStalledUpload(upload.tenantId, upload.artifactId, staleAfterMs);
+        if (outcome !== "skipped") {
+          this.deps.logger.warn({ ...upload, outcome }, "Recovered an upload left pending without a scan job");
+        }
+      } catch (error) {
+        this.deps.logger.error({ error, ...upload }, "Failed to recover a stalled upload");
+      }
+    }
+  }
+
   private async drainPiiScanJobs(executions: Promise<void>[]): Promise<void> {
     const { piiScanJobs, piiScanJobHandler } = this.deps;
     if (!piiScanJobs || !piiScanJobHandler) {
@@ -667,6 +702,7 @@ export class SchedulerWorker {
     } catch (error) {
       this.deps.logger.error({ error }, "Failed to sweep stale PII scan job claims");
     }
+    await this.recoverStalledUploads(piiScanJobs, staleAfterMs);
     await this.finishFailedPiiScanJobs(piiScanJobs, piiScanJobHandler);
 
     const limit = this.options.maxConcurrentPiiJobs ?? this.options.maxConcurrentJobs;

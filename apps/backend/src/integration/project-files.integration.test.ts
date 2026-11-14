@@ -8,7 +8,7 @@ import { describe, test, expect, onTestFinished, vi } from "vitest";
 import { ProjectMemberStore } from "../services/project-member-store.js";
 import { ProjectStore } from "../services/project-store.js";
 import { SessionStore } from "../services/session-store.js";
-import { ArtifactStore } from "../services/artifacts/artifact-store.js";
+import { ArtifactStore, isArtifactPiiEligible, type ArtifactRecord } from "../services/artifacts/artifact-store.js";
 import { ProjectFileStore } from "../services/project-file-store.js";
 import { LocalArtifactStorage } from "../services/artifacts/artifact-storage.js";
 import { ArtifactProcessor } from "../services/artifacts/artifact-processor.js";
@@ -1113,6 +1113,37 @@ describe.skipIf(!adminDatabaseUrl())("versioned project files", () => {
       await expect(operation()).rejects.toMatchObject({
         code: "project_archived",
       });
+    }
+  });
+  test("imports a source file only when the shared eligibility rule allows it, for every status and PII status", async () => {
+    // The library import uses the same rule as chat context and downloads
+    // (artifactPiiEligibleSql). A failed or unknown verdict fails closed.
+    const h = await setup();
+    const statuses: ArtifactRecord["status"][] = ["pending", "processing", "ready", "failed"];
+    const verdicts = [undefined, "pending", "scanning", "scanned", "blocked", "transformed", "failed", "quarantined"];
+    let index = 0;
+    for (const status of statuses) {
+      for (const verdict of verdicts) {
+        const source = await h.source();
+        const detail = verdict ? { pii: { status: verdict } } : {};
+        await superuserPool().query(
+          "UPDATE artifacts SET status = $3, detail_json = $4::jsonb WHERE tenant_id = $1 AND artifact_id = $2",
+          [h.actor.tenantId, source.artifactId, status, JSON.stringify(detail)],
+        );
+        const outcome = await h.files.createFromArtifact(h.actor, {
+          artifactId: source.artifactId,
+          name: `Pair-${index++}.txt`,
+          kind: "published",
+          folderId: null,
+          targetFileId: null,
+          baseVersionId: null,
+        }, h.storage, 10000).then(() => "imported", (error: { code?: string }) => error.code);
+        expect(outcome, `${status} / ${verdict ?? "no verdict"}`).toBe(
+          isArtifactPiiEligible({ status, detail: detail as ArtifactRecord["detail"] })
+            ? "imported"
+            : "project_source_unavailable",
+        );
+      }
     }
   });
   test("rejects unavailable and oversized source files", async () => {

@@ -1,6 +1,7 @@
 import { sessionReadAccessSql, sessionContentReadAccessSql, artifactReadAccessSql } from "../session-access.js";
 import { randomBytes } from "node:crypto";
 import type { PoolClient } from "pg";
+import { ARTIFACT_PII_ELIGIBLE_STATUSES, isArtifactPiiEligible } from "@cogniplane/shared-types";
 import { requireSessionUploadAccess, sessionUploadAccessSql, SessionUploadAccessError } from "../session-upload-access.js";
 import { uuidv7 } from "../../lib/uuid.js";
 
@@ -12,28 +13,22 @@ import { AuditEventStore, type AuditEventInput } from "../audit-event-store.js";
 export const PROJECT_COPY_SOURCE_KEY = "reusedFromArtifactId";
 export const UPLOAD_SCAN_PENDING_KEY = "awaitingUploadScan";
 
-// PII verdicts that keep an artifact's bytes inside the store. One list feeds
-// both the TS predicate and its SQL twin below, so they cannot drift.
-const PII_WITHHELD_STATUSES = ["pending", "scanning", "blocked"] as const;
+// The eligibility rule and its list of PII verdicts are in
+// `@cogniplane/shared-types` (schemas/artifact.ts), so the frontend shows the
+// same rule that the backend applies. Chat context, runtime workspaces,
+// downloads (token issue and redemption), previews and project library
+// imports use it. A detect-only verdict (`scanned`, even with findings) stays
+// eligible. A block on a record that is already `ready` leaves `status`
+// unchanged (see `setPiiDetail`) and must still deny.
+export { isArtifactPiiEligible };
 
-// Chat context, runtime workspaces and downloads (token issuance and redemption)
-// accept an artifact only when it is ready and its PII scan is not pending,
-// scanning, or blocked. A detect-only verdict (`scanned`, even with findings)
-// stays eligible. The verdict is read from `detail.pii` on its own, never
-// inferred from `status`: a block on a record that is already `ready` leaves
-// `status` unchanged (see `setPiiDetail`) and must still deny.
-export function isArtifactPiiEligible(artifact: Pick<ArtifactRecord, "status" | "detail">): boolean {
-  if (artifact.status !== "ready") return false;
-  const piiStatus = (artifact.detail?.pii as { status?: string } | undefined)?.status;
-  return piiStatus === undefined || !(PII_WITHHELD_STATUSES as readonly unknown[]).includes(piiStatus);
-}
-
-// SQL twin of `isArtifactPiiEligible` for an `artifacts` row aliased `alias`.
-// A missing verdict is eligible, as in the TS predicate. Keep the two together.
+// SQL twin of `isArtifactPiiEligible` for an `artifacts` row aliased `alias`,
+// built from the same list. A missing verdict is eligible, as in the TS
+// predicate.
 export function artifactPiiEligibleSql(alias: string): string {
-  const withheld = PII_WITHHELD_STATUSES.map((status) => `'${status}'`).join(", ");
+  const eligible = ARTIFACT_PII_ELIGIBLE_STATUSES.map((status) => `'${status}'`).join(", ");
   return `(${alias}.status = 'ready'
-    AND COALESCE(${alias}.detail_json->'pii'->>'status', '') NOT IN (${withheld}))`;
+    AND COALESCE(${alias}.detail_json->'pii'->>'status' IN (${eligible}), TRUE))`;
 }
 
 export type ArtifactPiiDetail = {
@@ -480,24 +475,31 @@ export class ArtifactStore {
   }
 
   /**
-   * Create a pending upload and write its audit event in one transaction,
-   * under the session/project lock of the access check. When the event
-   * cannot be written, no row commits, so the caller can delete the stored
-   * bytes and no pending upload stays without a scan.
+   * Create an upload and write its audit event in one transaction, under the
+   * session/project lock of the access check. When the event cannot be
+   * written, no row commits, so the caller can delete the stored bytes.
+   *
+   * `awaitingScan` (the default) creates the row `pending` with the
+   * `awaitingUploadScan` marker; the PII verdict makes it `ready` or `failed`.
+   * When no scan applies, the row is `ready` at once, so no later write can
+   * leave it pending.
    */
   async createUpload(
     input: Omit<Parameters<ArtifactStore["create"]>[0], "artifactType" | "createdByType" | "status"> & {
       expectedProjectId: string | null;
       createdByType?: ArtifactRecord["createdByType"];
+      awaitingScan?: boolean;
     },
     audit: (artifact: ArtifactRecord) => AuditEventInput,
   ): Promise<ArtifactRecord> {
+    const { awaitingScan = true, ...row } = input;
     return withTenantScope(this.db, input.tenantId, async client => {
-      const projectId = await requireSessionUploadAccess(client, input, true);
-      if (projectId !== input.expectedProjectId) throw new SessionUploadAccessError("session_changed", 409);
+      const projectId = await requireSessionUploadAccess(client, row, true);
+      if (projectId !== row.expectedProjectId) throw new SessionUploadAccessError("session_changed", 409);
       const artifact = await this.insert(client, {
-        ...input, artifactType: "upload", createdByType: input.createdByType ?? "user", status: "pending",
-        detail: { ...input.detail, [UPLOAD_SCAN_PENDING_KEY]: true },
+        ...row, artifactType: "upload", createdByType: row.createdByType ?? "user",
+        status: awaitingScan ? "pending" : "ready",
+        detail: awaitingScan ? { ...row.detail, [UPLOAD_SCAN_PENDING_KEY]: true } : row.detail,
       }, true);
       await AuditEventStore.createInTransaction(client, audit(artifact));
       return artifact;
@@ -772,31 +774,7 @@ export class ArtifactStore {
     artifactId: string,
     pii: ArtifactPiiDetail
   ): Promise<void> {
-    await withTenantScope(this.db, tenantId, async (client) => {
-      await client.query(
-        `
-          UPDATE artifacts
-          SET detail_json = jsonb_set(
-                COALESCE(detail_json, '{}'::jsonb),
-                '{pii}',
-                (COALESCE(detail_json->'pii', '{}'::jsonb) - $4::text[]) || $3::jsonb,
-                true
-              ),
-              -- Uploads and project copies opt into pending-until-scanned status.
-              -- Worker completion and the PII verdict become visible atomically.
-              status = CASE WHEN status = 'pending' AND
-                (detail_json ? '${PROJECT_COPY_SOURCE_KEY}' OR detail_json ? '${UPLOAD_SCAN_PENDING_KEY}')
-                THEN CASE $3::jsonb->>'status'
-                  WHEN 'scanned' THEN 'ready' WHEN 'transformed' THEN 'ready'
-                  WHEN 'blocked' THEN 'failed' WHEN 'failed' THEN 'failed'
-                  ELSE status END
-                ELSE status END,
-              updated_at = NOW()
-          WHERE tenant_id = $1 AND artifact_id = $2 AND status <> 'deleted'
-        `,
-        [tenantId, artifactId, JSON.stringify(pii), PII_COVERAGE_KEYS]
-      );
-    });
+    await withTenantScope(this.db, tenantId, (client) => writeArtifactPiiDetail(client, tenantId, artifactId, pii));
   }
 
   async createDownloadToken(input: {
@@ -907,4 +885,38 @@ export class ArtifactStore {
     );
     return tokenRows.rows[0] ? mapDownloadToken(tokenRows.rows[0]) : null;
   }
+}
+
+/**
+ * Merges `pii` into an artifact's PII detail in the caller's tenant
+ * transaction. Uploads and project copies opt into pending-until-scanned
+ * status, so the verdict and the status change commit together.
+ */
+export async function writeArtifactPiiDetail(
+  client: PoolClient,
+  tenantId: string,
+  artifactId: string,
+  pii: ArtifactPiiDetail
+): Promise<void> {
+  await client.query(
+    `
+      UPDATE artifacts
+      SET detail_json = jsonb_set(
+            COALESCE(detail_json, '{}'::jsonb),
+            '{pii}',
+            (COALESCE(detail_json->'pii', '{}'::jsonb) - $4::text[]) || $3::jsonb,
+            true
+          ),
+          status = CASE WHEN status = 'pending' AND
+            (detail_json ? '${PROJECT_COPY_SOURCE_KEY}' OR detail_json ? '${UPLOAD_SCAN_PENDING_KEY}')
+            THEN CASE $3::jsonb->>'status'
+              WHEN 'scanned' THEN 'ready' WHEN 'transformed' THEN 'ready'
+              WHEN 'blocked' THEN 'failed' WHEN 'failed' THEN 'failed'
+              ELSE status END
+            ELSE status END,
+          updated_at = NOW()
+      WHERE tenant_id = $1 AND artifact_id = $2 AND status <> 'deleted'
+    `,
+    [tenantId, artifactId, JSON.stringify(pii), PII_COVERAGE_KEYS]
+  );
 }

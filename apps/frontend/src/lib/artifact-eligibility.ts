@@ -1,19 +1,22 @@
-import type { Artifact, ArtifactPiiDetail } from "@cogniplane/shared-types";
+import {
+  isArtifactPiiEligible,
+  isArtifactPiiVerdictEligible,
+  type Artifact,
+  type ArtifactPiiDetail
+} from "@cogniplane/shared-types";
 
 /**
- * PII states that must keep an artifact out of chat context:
- * - `pending` / `scanning`: the scan hasn't cleared the document yet
- * - `blocked`: org policy rejected the document
- *
- * `failed` intentionally stays eligible so a transient provider outage doesn't
- * lock the user out — the UI surfaces the failure via a chip instead.
+ * True when the PII verdict keeps the file's bytes in the store. The rule is
+ * the backend's (`@cogniplane/shared-types`): only no verdict, `scanned` or
+ * `transformed` lets them out. A pending scan, a block, a failed scan and an
+ * unknown value hold the file. The backend refuses chat context, preview and
+ * download for it, so the UI does not offer them.
  */
-export function isPiiBlockingContext(pii: ArtifactPiiDetail | undefined): boolean {
-  if (!pii?.status) return false;
-  return pii.status === "pending" || pii.status === "scanning" || pii.status === "blocked";
+export function isPiiHoldingArtifact(pii: ArtifactPiiDetail | undefined): boolean {
+  return !isArtifactPiiVerdictEligible(pii?.status);
 }
 
+/** The artifact can go into a message request, a preview or a download. */
 export function isArtifactEligibleForChatContext(artifact: Artifact): boolean {
-  if (artifact.status !== "ready") return false;
-  return !isPiiBlockingContext(artifact.detail?.pii);
+  return isArtifactPiiEligible(artifact);
 }

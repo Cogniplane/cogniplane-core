@@ -1811,6 +1811,12 @@ describe("SchedulerWorker", () => {
     });
     const claimCalls: number[] = [];
     deps.piiScanJobs = {
+      async listStalledUploads() {
+        return [];
+      },
+      async recoverStalledUpload() {
+        return "skipped" as const;
+      },
       async sweepStaleClaims() {
         return 0;
       },
@@ -1869,6 +1875,12 @@ describe("SchedulerWorker", () => {
     });
     const finished: string[] = [];
     deps.piiScanJobs = {
+      async listStalledUploads() {
+        return [];
+      },
+      async recoverStalledUpload() {
+        return "skipped" as const;
+      },
       async sweepStaleClaims() {
         return 1;
       },
@@ -1893,6 +1905,57 @@ describe("SchedulerWorker", () => {
     expect(logger.error).toHaveBeenCalledWith(
       expect.objectContaining({ jobId: "pii-1" }),
       "Failed to close the scan run of a failed PII scan job"
+    );
+  });
+
+  test("tick recovers stalled uploads after the stale-claim sweep and before the claim, and continues after an error", async () => {
+    const { deps } = createFakeDeps({ dueJobs: [] });
+    const logger = { warn: vi.fn(), error: vi.fn(), info: vi.fn() };
+    deps.logger = logger;
+    const calls: string[] = [];
+    deps.piiScanJobs = {
+      async sweepStaleClaims(staleAfterMs) {
+        calls.push(`sweep:${staleAfterMs}`);
+        return 0;
+      },
+      async listStalledUploads(staleAfterMs, limit) {
+        calls.push(`list:${staleAfterMs}:${limit}`);
+        return [{ tenantId: "tenant-a", artifactId: "art-1" }, { tenantId: "tenant-b", artifactId: "art-2" }];
+      },
+      async recoverStalledUpload(tenantId, artifactId, staleAfterMs) {
+        calls.push(`recover:${tenantId}:${artifactId}:${staleAfterMs}`);
+        if (artifactId === "art-1") throw new Error("database unavailable");
+        return "requeued" as const;
+      },
+      async listUnfinishedFailures() {
+        calls.push("failures");
+        return [];
+      },
+      async claimDueJobs() {
+        calls.push("claim");
+        return [];
+      }
+    };
+    deps.piiScanJobHandler = { async finishFailedJob() {}, async execute() {} };
+
+    await new SchedulerWorker(deps, { maxConcurrentJobs: 2, jobTimeoutMs: 60_000, abortSettleGraceMs: 1_000 }).tick();
+
+    // Cutoff: job timeout + abort grace + 60 s buffer, as the stale-claim sweep.
+    expect(calls).toEqual([
+      "sweep:121000",
+      "list:121000:50",
+      "recover:tenant-a:art-1:121000",
+      "recover:tenant-b:art-2:121000",
+      "failures",
+      "claim"
+    ]);
+    expect(logger.error).toHaveBeenCalledWith(
+      expect.objectContaining({ tenantId: "tenant-a", artifactId: "art-1" }),
+      "Failed to recover a stalled upload"
+    );
+    expect(logger.warn).toHaveBeenCalledWith(
+      { tenantId: "tenant-b", artifactId: "art-2", outcome: "requeued" },
+      "Recovered an upload left pending without a scan job"
     );
   });
 
@@ -1924,6 +1987,12 @@ describe("SchedulerWorker", () => {
     const claimed: typeof piiJob[] = [];
     const executed: typeof piiJob[] = [];
     deps.piiScanJobs = {
+      async listStalledUploads() {
+        return [];
+      },
+      async recoverStalledUpload() {
+        return "skipped" as const;
+      },
       async sweepStaleClaims() {
         return 0;
       },
@@ -1981,6 +2050,12 @@ describe("SchedulerWorker", () => {
 
     const executed: typeof piiJob[] = [];
     deps.piiScanJobs = {
+      async listStalledUploads() {
+        return [];
+      },
+      async recoverStalledUpload() {
+        return "skipped" as const;
+      },
       async sweepStaleClaims() {
         return 0;
       },
@@ -2038,6 +2113,12 @@ describe("SchedulerWorker", () => {
     };
 
     deps.piiScanJobs = {
+      async listStalledUploads() {
+        return [];
+      },
+      async recoverStalledUpload() {
+        return "skipped" as const;
+      },
       async sweepStaleClaims() {
         return 0;
       },

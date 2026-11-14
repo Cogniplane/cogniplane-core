@@ -53,10 +53,18 @@ shows provider status, scan metrics, queue state and the breaker timeline (`GET
   organization policy.") and answers with a normal SSE reply
   (`respondWithPiiBlock`, `routes/messages.ts`). A provider error answers 422
   when it is permanent, 503 otherwise.
-- Files (`pii-artifact-scan-enqueuer.ts`): in `block` mode, and for a content
-  type the scan cannot read in any mode, the upload is scanned or rejected at
-  once (`runSyncBlock`). In `detect` and `transform` modes a readable file is
+- Files (`pii-artifact-scan-enqueuer.ts`): `UploadAdmission` reads the policy
+  (`plan`) before it creates the row. An upload that no scan applies to is
+  created `ready`, with its audit event, in one transaction. Any other upload
+  is `pending` until its verdict. In `block` mode, and for a content type the
+  scan cannot read in any mode, the upload is scanned or rejected at once
+  (`runSyncBlock`). In `detect` and `transform` modes a readable file is
   queued (`runAsync`).
+- The synchronous scan records its decision on the scan run before it acts,
+  as a queued scan does. Then it deletes the bytes (block only), writes the
+  verdict and the audit event, and closes the scan run last. A write that
+  fails after the record does not turn into "not scanned": recovery finishes
+  the decision.
 - Agent project drafts (`project_write_file`, `project_reconcile_conflict`):
   `ProjectFileStore.createAgentDraftFromContent` scans the bytes at once with
   the uploads scope and mode, before it stores them. A block refuses the draft
@@ -64,7 +72,10 @@ shows provider status, scan metrics, queue state and the breaker timeline (`GET
   `pii_protection_unavailable`). `app-dependencies.ts` gives the service to the
   app's store; the project file routes and tools use that store.
 - Async path: `pii_scan_runs` and `pii_scan_jobs` scan stored content,
-  `PII_SCAN_MAX_CONCURRENT_JOBS` per worker tick. A file larger than
+  `PII_SCAN_MAX_CONCURRENT_JOBS` per worker tick. The scan run, the `pending`
+  verdict and the job commit in one transaction
+  (`PiiScanJobStore.enqueueArtifactScan`), so a job exists if and only if its
+  scan run exists. A file larger than
   `PII_ARTIFACT_MAX_BYTES` fails with `file_too_large` and is not retried.
   Scannable text: plain and structured text, shell scripts, and PDF text through
   `pdftotext` (`scannable-text.ts`). With the uploads scope on, images and
@@ -74,6 +85,39 @@ shows provider status, scan metrics, queue state and the breaker timeline (`GET
   settings revision it read. It records its decision on the scan run
   (`pending_decision`, migration `084`) before it acts; a retry finishes that
   decision and does not evaluate again.
+- Only the attempt that claimed a job can complete it or record its failure
+  (`status = 'claimed'` and the same `attempts`). An attempt whose claim
+  expired changes nothing, so it cannot overwrite the outcome of a later
+  attempt.
+
+## Recovery
+
+Each scheduler tick, before it claims jobs, recovers scan state that no job
+owns (`listStalledUploads`, `recoverStalledUpload` in
+`pii-scan-job-store.ts`). A process stop or a failed write between the upload
+commit and its scan state leaves it:
+
+- a `pending` upload with the `awaitingUploadScan` marker and no open scan
+  run;
+- an open scan run with no job.
+
+The row must be unchanged for the stale-claim cutoff (`SCHEDULER_JOB_TIMEOUT_MS`
+plus 90 seconds). A synchronous scan is shorter, because
+`PII_PROVIDER_TIMEOUT_MS + PII_PDF_OCR_TIMEOUT_MS` must stay below
+`SCHEDULER_JOB_TIMEOUT_MS`. A subject with a queued or claimed job, or with an
+open run that a failed job owns, is left to that job.
+
+- An open scan run with a recorded decision gets a new queued job. The same
+  tick claims it and the job handler applies the decision; a block ends
+  `blocked`.
+- Without a decision, the open scan runs and the upload become `failed`
+  (`pii_scan_interrupted`). The bytes stay, because nothing scanned them. The
+  worker does not scan again: the scan run does not store the import source,
+  so a new scan could apply the wrong scope.
+
+The list reads across tenants on `privilegedDb` (existing SELECT grants). Each
+recovery runs as `app_user` in the tenant's scope and checks the conditions
+again under lock. Migration `090` adds the partial indexes for the list.
 
 ## PDF OCR
 
@@ -147,4 +191,6 @@ Verdicts:
   pii_settings_conflict`.
 - If an upload's scan job cannot be queued, the upload fails with
   `pii_enqueue_failed`.
+- A file is usable only with an eligible verdict: [artifact
+  eligibility](projects-and-files.md#artifacts).
 

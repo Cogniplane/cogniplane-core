@@ -80,6 +80,19 @@ selections. Routes: `routes/projects.ts`, `project-files.ts`,
   `ARTIFACT_STORAGE_BACKEND` is `local` or `bucket` (S3-compatible).
 - An upload stays `pending` until its [PII](pii.md) verdict. No download token
   is issued before the artifact is `ready`.
+- One rule decides if an artifact can leave the store: chat context, runtime
+  workspaces, downloads (token issue and redemption) and project library
+  imports. The artifact must be `ready`, and its PII verdict must be absent,
+  `scanned` or `transformed`. A `failed` scan and an unknown verdict are
+  refused, because PII checks fail closed
+  ([D16](../decisions.md#d16-pii-checks-fail-closed-on-provider-errors)).
+  `isArtifactPiiEligible` and its list `ARTIFACT_PII_ELIGIBLE_STATUSES` are in
+  `@cogniplane/shared-types` (`schemas/artifact.ts`). The backend builds its
+  SQL twin `artifactPiiEligibleSql` (`services/artifacts/artifact-store.ts`)
+  from the same list. The frontend (`lib/artifact-eligibility.ts`) uses the
+  same function to decide which files it selects automatically, and which
+  files it lets the user select, preview or download. The backend is the
+  boundary: it checks each request again.
 - Download: `POST /artifacts/:artifactId/download-token` issues a short-lived
   opaque token (`ARTIFACT_DOWNLOAD_TTL_MS`). `GET /downloads/:token` is public;
   it checks the token's user, current membership and session access, then
