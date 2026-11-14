@@ -20,7 +20,11 @@ import { lockAccountChats, type ReleasedAccountSandbox, releaseAccountSandboxes 
 //    (migration 081), and every lookup of a context compares it with the
 //    account's version now (tool-execution-context-store.ts). The MCP gateway
 //    looks up a context for each tool call and each tool list, so it refuses
-//    the turn on every replica, also when layer 1 failed. A runtime token
+//    the turn on every replica, also when layer 1 failed. A tool call looks
+//    up its context again immediately before the handler or the proxy
+//    request (revalidateBoundToolContext in services/mcp/tool-context-binder.ts),
+//    so a change that commits while the call waits for its checks stops it. A
+//    call that the gateway already started is not recalled. A runtime token
 //    without a live context can call no tool. The runtime reads its context
 //    at each model start (summaries included), before each native tool and
 //    at each approval round, so the turn itself stops at its next step on

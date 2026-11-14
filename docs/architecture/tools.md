@@ -56,6 +56,24 @@ Rules:
    `TOOL_CONTEXT_TTL_MS` from that moment (`deep-agents-runtime-adapter.ts`).
 4. A context records the owner's security version
    ([revocation](local-accounts.md#security-version-and-revocation)).
+   - A tool call looks up its context two times. The first lookup binds the
+     call. The gateway then waits for the integration check, the upstream tool
+     metadata, Policy Center and the approval claim. The second lookup comes
+     immediately before the action: the managed handler or the proxy
+     `tools/call` request (`revalidateBoundToolContext` in
+     `services/mcp/tool-context-binder.ts`). It reads the bound context id
+     again, never the latest context of the session.
+   - If the context is revoked, expired or no longer has its required execution
+     at the second lookup, the action does not start and the call gets `-32000`.
+     Execution checks apply to interactive contexts and project sessions.
+     A scheduled context in a personal session remains valid until expiry or
+     revocation. A closed caller request also prevents dispatch. A claimed
+     approval stays used.
+   - The second lookup and the action are not one atomic step. A change that
+     commits after the second lookup does not stop the action. When the
+     caller closes its request, the gateway aborts the proxy request, but an
+     upstream that received the call can complete it, and nothing recalls it.
+     A managed handler gets no abort signal and runs to its end.
 5. Never accept identity fields (`user_id`, `session_id`, tokens) from tool
    arguments.
 6. Before a result reaches the runtime or telemetry, the gateway removes the

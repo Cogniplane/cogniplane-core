@@ -167,6 +167,9 @@ redirect and hide. Every rule is enforced in the backend.
   member's second factor. Send links only to the person they are for
   ([email](architecture/email.md)).
 - Mail already handed to the SMTP server cannot be recalled.
+- The MCP gateway does not stop a tool action whose last context check came
+  before the commit of a security change. A proxy upstream can complete such a
+  call after the change. See [tools](architecture/tools.md#mcp-gateway).
 - A turn error with a 4xx status passes its message to the client, also from a
   provider SDK; see `clientSafeTurnFailureMessage` in
   [runtime](architecture/runtime.md#sessions-and-turns). It is an exception to
