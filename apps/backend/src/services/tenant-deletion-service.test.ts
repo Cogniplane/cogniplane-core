@@ -20,7 +20,7 @@ const hash = (value: string) => createHash("sha256").update(value).digest("hex")
 function receiptRow(requestId: string, tenantId: string, overrides: Receipt = {}): Receipt {
   return {
     request_id: requestId, tenant_id_hash: hash(tenantId), status: "cleanup_failed",
-    row_counts: {}, object_count: 0, runtime_thread_count: 0,
+    row_counts: {}, external_resources: null, object_count: 0, runtime_thread_count: 0,
     deleted_object_count: 0, retained_shared_object_count: 0, purged_runtime_thread_count: 0,
     redis_disposition: "r", third_party_disposition: "t", backup_disposition: "b",
     initiated_at: "2026-10-01T00:00:00.000Z", database_deleted_at: "2026-10-01T00:00:01.000Z",
@@ -41,6 +41,8 @@ class OffboardingDatabase {
   readonly tenantObjects = new Map<string, { kind: string; locator: string }[]>();
   // Locators that rows outside the deleted tenant still reference.
   readonly sharedLocators = new Set<string>();
+  // The row that the external resource count returns for each tenant.
+  readonly externalCounts = new Map<string, Record<string, number>>();
   // Foreign keys to users that the catalog query returns.
   userForeignKeys: Record<string, unknown>[] = [{
     constraint_name: "tenant_memberships_user_id_fkey", schema_name: "public",
@@ -104,6 +106,9 @@ class OffboardingDatabase {
         : 1;
       return this.result([{ count: String(count) }]);
     }
+    if (sql.startsWith("WITH active_jira AS")) {
+      return this.result([this.externalCounts.get(String(values[0])) ?? {}]);
+    }
     if (sql.startsWith("SELECT con.conname") && sql.includes("FROM pg_constraint")) {
       return this.result(this.userForeignKeys);
     }
@@ -111,10 +116,11 @@ class OffboardingDatabase {
       return this.result(this.members.filter(member => member.tenantId === values[0]).map(member => ({ user_id: member.userId })));
     }
     if (sql.startsWith("INSERT INTO tenant_deletion_receipts")) {
-      const [requestId, tenantIdHash, rowCounts, redis, thirdParty, backup] = values;
+      const [requestId, tenantIdHash, rowCounts, externalResources, redis, thirdParty, backup] = values;
       this.receipts.set(String(requestId), {
         request_id: requestId, tenant_id_hash: tenantIdHash, status: "cleanup_pending",
-        row_counts: JSON.parse(String(rowCounts)), object_count: 0, runtime_thread_count: 0,
+        row_counts: JSON.parse(String(rowCounts)), external_resources: JSON.parse(String(externalResources)),
+        object_count: 0, runtime_thread_count: 0,
         deleted_object_count: 0, retained_shared_object_count: 0, purged_runtime_thread_count: 0,
         redis_disposition: redis, third_party_disposition: thirdParty, backup_disposition: backup,
         initiated_at: "2026-10-01T00:00:00.000Z", database_deleted_at: "2026-10-01T00:00:01.000Z",
@@ -497,6 +503,99 @@ describe("TenantDeletionService", () => {
       status: "completed",
       completedAt: "2026-10-01T00:00:05.000Z",
       redisDisposition: REDIS_DISPOSITION.notRequested
+    });
+  });
+
+  describe("external resource counts", () => {
+    // The row that PostgreSQL returns; the SQL itself runs in the integration suite.
+    const countRow = {
+      e2b_sandboxes: 2,
+      jira_external_user_ids: 4,
+      jira_active_external_user_ids: 3,
+      jira_active_without_selected_account: 1,
+      jira_selected_accounts: 2,
+      jira_retired_pending_cleanup: 1,
+      jira_pending_cleanups: 2,
+      github_connections: 1,
+      notion_connections: 0,
+      microsoft_connections: 3,
+      personal_mcp_credentials: 5
+    };
+    const inventory = {
+      e2bSandboxes: 2,
+      jira: {
+        externalUserIds: 4,
+        activeExternalUserIds: 3,
+        activeExternalUserIdsWithoutSelectedAccount: 1,
+        selectedAccounts: 2,
+        retiredExternalUserIdsPendingCleanup: 1,
+        pendingCleanups: 2
+      },
+      oauthConnections: { github: 1, notion: 0, microsoft: 3 },
+      personalMcpCredentials: 5
+    };
+
+    test("reads the counts in the deletion transaction before the tenant delete and stores them in the receipt", async () => {
+      const db = new OffboardingDatabase();
+      seedTenant(db, "tenant-1");
+      db.externalCounts.set("tenant-1", countRow);
+      const service = new TenantDeletionService({ db: db.asPool(), ...storage() });
+
+      const receipt = await service.execute(input("request-1", "tenant-1"));
+
+      expect(receipt.externalResources).toEqual(inventory);
+      expect(db.receipts.get("request-1")!.external_resources).toEqual(inventory);
+      // Operator text stays as given; the counts do not replace it.
+      expect(receipt.thirdPartyDisposition).toBe("No third-party processors.");
+      const count = db.log.find(entry => entry.text.trim().startsWith("WITH active_jira AS"))!;
+      expect(count).toMatchObject({ via: "client", values: ["tenant-1"] });
+      const statements = db.statements();
+      const at = (prefix: string) => statements.findIndex(sql => sql.startsWith(prefix));
+      expect(at("BEGIN")).toBeLessThan(at("WITH active_jira AS"));
+      expect(at("WITH active_jira AS")).toBeLessThan(at("INSERT INTO tenant_deletion_receipts"));
+      expect(at("INSERT INTO tenant_deletion_receipts")).toBeLessThan(at("DELETE FROM tenants"));
+    });
+
+    test("a replay returns the stored counts and does not count again", async () => {
+      const db = new OffboardingDatabase();
+      db.receipts.set("request-1", receiptRow("request-1", "tenant-1", {
+        status: "completed", completed_at: "2026-10-01T00:00:05.000Z", external_resources: inventory
+      }));
+      // The tenant's rows are gone; a new count would return zeros.
+      db.externalCounts.set("tenant-1", {});
+      const service = new TenantDeletionService({ db: db.asPool(), ...storage() });
+
+      const receipt = await service.execute(input("request-1", "tenant-1"));
+
+      expect(receipt.externalResources).toEqual(inventory);
+      expect(db.ran("WITH active_jira AS")).toBe(false);
+    });
+
+    test("a receipt written before the counts existed keeps null on replay", async () => {
+      const db = new OffboardingDatabase();
+      db.receipts.set("request-1", receiptRow("request-1", "tenant-1", { status: "completed" }));
+      const service = new TenantDeletionService({ db: db.asPool(), ...storage() });
+
+      const receipt = await service.execute(input("request-1", "tenant-1"));
+
+      expect(receipt.externalResources).toBeNull();
+      expect(db.receipts.get("request-1")!.external_resources).toBeNull();
+    });
+
+    test("a failed count rolls back before a receipt or a delete", async () => {
+      const db = new OffboardingDatabase();
+      seedTenant(db, "tenant-1");
+      const failure = new Error("relation user_jira_identities does not exist");
+      db.failOn = { fragment: "WITH active_jira AS", error: failure };
+      const deps = storage();
+      const service = new TenantDeletionService({ db: db.asPool(), ...deps });
+
+      await expect(service.execute(input("request-1", "tenant-1"))).rejects.toBe(failure);
+
+      expect(db.receipts.size).toBe(0);
+      expect(db.ran("DELETE FROM")).toBe(false);
+      expect(db.tenants.has("tenant-1")).toBe(true);
+      expectRolledBackWithoutCleanup(db, deps);
     });
   });
 });

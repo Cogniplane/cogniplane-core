@@ -10,7 +10,7 @@ import {
 import { serialize } from "../../lib/serialize-response.js";
 import {
   adminIdSchema,
-  createAdminAuditEvent,
+  adminAuditEvent,
   respondAdminMutationError,
   respondAdminNotFound,
   withAdmin
@@ -50,24 +50,16 @@ export async function registerAdminUserRoutes(
       const user = await stores.tenantMembers.setUserBetaTester(
         request.auth.tenantId,
         paramsResult.value.userId,
-        bodyResult.value.isBetaTester
+        bodyResult.value.isBetaTester,
+        (member) => adminAuditEvent(request, "admin.user.beta_tester_updated", {
+          targetUserId: member.userId,
+          isBetaTester: member.isBetaTester
+        })
       );
 
       if (!user) {
         return respondAdminNotFound(reply, "user_not_found");
       }
-
-      await createAdminAuditEvent(stores.auditEvents, {
-        tenantId: request.auth.tenantId,
-        userId: request.auth.userId,
-        type: "admin.user.beta_tester_updated",
-        payload: {
-          targetUserId: user.userId,
-          isBetaTester: user.isBetaTester
-        },
-        ipAddress: request.ip,
-        userAgent: request.headers["user-agent"]
-      });
 
       return serialize(AdminUserEnvelopeSchema, { user });
     } catch (error) {

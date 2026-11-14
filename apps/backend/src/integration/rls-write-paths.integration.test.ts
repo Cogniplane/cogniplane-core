@@ -348,7 +348,10 @@ async function generateArtifact(sessionId: string) {
     status: "ready",
     createdByType: "tool",
     createdByRef: null
-  });
+  }, (artifact) => ({
+    tenantId: owner.tenantId, sessionId, userId: owner.userId,
+    type: "artifact_generated", payload: { artifactId: artifact.artifactId }
+  }));
 }
 
 const projectSession = once(async () => {
@@ -1230,7 +1233,10 @@ const WRITE_PATHS: Record<string, WritePath> = {
         enforced: false,
         explanation: null,
         actionSnapshot: { argumentKeys: ["format"] }
-      });
+      }, (saved) => ({
+        tenantId: owner.tenantId, sessionId: saved.sessionId, type: "policy.decision.recorded",
+        payload: { decisionId: saved.decisionId }
+      }));
       return { decision_id: decision.decisionId };
     }
   },

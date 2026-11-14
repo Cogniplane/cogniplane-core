@@ -10,13 +10,10 @@ import { artifactIdParams } from "../../lib/route-schemas.js";
 import { parseRequestInput } from "../../lib/route-validation.js";
 import { serialize } from "../../lib/serialize-response.js";
 import { isArtifactPiiEligible } from "../../services/artifacts/artifact-store.js";
-import type { AuditEventStore } from "../../services/audit-event-store.js";
-import { createAdminAuditEvent, withAdmin } from "./admin-route-helpers.js";
+import { AuditEventStore } from "../../services/audit-event-store.js";
+import { adminAuditEvent, withAdmin } from "./admin-route-helpers.js";
 
-export async function registerAdminArtifactRoutes(
-  app: FastifyInstance,
-  stores: { auditEvents: Pick<AuditEventStore, "create"> }
-): Promise<void> {
+export async function registerAdminArtifactRoutes(app: FastifyInstance): Promise<void> {
   app.post(
     "/admin/artifacts/:artifactId/download-token",
     withAdmin(app, async (request, reply) => {
@@ -87,6 +84,14 @@ export async function registerAdminArtifactRoutes(
         );
 
         const row = insert.rows[0];
+        // The mint's audit event commits with the token, so no token exists
+        // without its event.
+        await AuditEventStore.createInTransaction(client, adminAuditEvent(request,
+          "admin.artifact.download_token_minted", {
+            artifactId,
+            actorUserId: request.auth.userId,
+            ownerUserId: String(artifact.user_id)
+          }));
         return {
           kind: "ok" as const,
           token: String(row.token),
@@ -103,19 +108,6 @@ export async function registerAdminArtifactRoutes(
         reply.code(409);
         return apiError("artifact_not_ready");
       }
-
-      await createAdminAuditEvent(stores.auditEvents, {
-        tenantId,
-        userId: request.auth.userId,
-        type: "admin.artifact.download_token_minted",
-        payload: {
-          artifactId,
-          actorUserId: request.auth.userId,
-          ownerUserId: result.ownerUserId
-        },
-        ipAddress: request.ip,
-        userAgent: request.headers["user-agent"] ?? null
-      });
 
       return serialize(DownloadHandleEnvelopeSchema, {
         download: {

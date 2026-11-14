@@ -11,16 +11,24 @@ afterEach(async () => {
   for (const app of apps.splice(0)) await app.close();
 });
 
-async function buildApp(role: "owner" | "admin" | "member" = "owner") {
+async function buildApp(role: "owner" | "admin" | "member" = "owner", options: { failAudit?: boolean } = {}) {
   const auditEvents = new InMemoryAuditEventStore();
   // The audit events that the service writes in the change's transaction.
+  // With `failAudit`, the insert fails and the change rolls back with it.
   const changeAudits: AuditEventInput[] = [];
+  const writeAudit = (audit?: () => AuditEventInput) => {
+    if (!audit) return;
+    if (options.failAudit) throw new Error("audit insert failed");
+    changeAudits.push(audit());
+  };
   const invalidateTenantRuntimes = vi.fn(async () => ["runtime-1"]);
   const microsoftConnections = {
     setTenantMicrosoftConfig: vi.fn(async (_tenantId: string, _patch: unknown, _updatedBy: string, audit?: () => AuditEventInput) => {
-      if (audit) changeAudits.push(audit());
+      writeAudit(audit);
     }),
-    removeTenantMicrosoftConfig: vi.fn(async () => {})
+    removeTenantMicrosoftConfig: vi.fn(async (_tenantId: string, audit?: () => AuditEventInput) => {
+      writeAudit(audit);
+    })
   };
   const app = Fastify();
   apps.push(app);
@@ -109,28 +117,31 @@ describe("Microsoft tenant settings routes", () => {
     expect(microsoftConnections.setTenantMicrosoftConfig).not.toHaveBeenCalled();
   });
 
-  test("DELETE writes an audit event and resets the tenant's runtimes", async () => {
-    const { app, auditEvents, invalidateTenantRuntimes, microsoftConnections } = await buildApp();
+  test("DELETE writes an audit event with the removal and resets the tenant's runtimes", async () => {
+    const { app, auditEvents, changeAudits, invalidateTenantRuntimes, microsoftConnections } = await buildApp();
 
     const response = await app.inject({ method: "DELETE", url: "/tenant/settings/microsoft" });
 
     expect(response.statusCode).toBe(204);
-    expect(microsoftConnections.removeTenantMicrosoftConfig).toHaveBeenCalledWith("tenant-1");
-    expect(auditEvents.events.map((event) => [event.type, event.payload]))
+    expect(microsoftConnections.removeTenantMicrosoftConfig).toHaveBeenCalledWith("tenant-1", expect.any(Function));
+    expect(changeAudits.map((event) => [event.type, event.payload]))
       .toEqual([["tenant.integration.config_cleared", { integrationId: "microsoft" }]]);
+    expect(auditEvents.events).toEqual([]);
     expect(invalidateTenantRuntimes).toHaveBeenCalledWith("tenant-1", expect.objectContaining({
       workspaceResetReason: expect.stringContaining("Microsoft 365")
     }));
   });
 
-  test("DELETE still resets the runtimes when the audit write fails", async () => {
-    const { app, auditEvents, invalidateTenantRuntimes, microsoftConnections } = await buildApp();
-    auditEvents.create = async () => { throw new Error("audit unavailable"); };
+  test("DELETE fails and changes nothing when the audit write fails", async () => {
+    // The removal rolls back with its event, so the configuration and the
+    // tools stay, and no runtime needs a reset.
+    const { app, changeAudits, invalidateTenantRuntimes, microsoftConnections } = await buildApp("owner", { failAudit: true });
 
     const response = await app.inject({ method: "DELETE", url: "/tenant/settings/microsoft" });
 
     expect(response.statusCode).toBe(500);
     expect(microsoftConnections.removeTenantMicrosoftConfig).toHaveBeenCalled();
-    expect(invalidateTenantRuntimes).toHaveBeenCalledTimes(1);
+    expect(changeAudits).toEqual([]);
+    expect(invalidateTenantRuntimes).not.toHaveBeenCalled();
   });
 });

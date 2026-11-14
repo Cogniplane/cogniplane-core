@@ -28,6 +28,8 @@ function makeDeps(opts: {
   artifactReturns?: Partial<ArtifactRecord>;
   putThrows?: boolean;
   createThrows?: boolean;
+  /** The audit insert in the artifact's transaction fails, so no row commits. */
+  auditThrows?: boolean;
   readRuntimeFile?: (s: string, r: string, p: string) => Promise<Uint8Array>;
   artifactMaxBytes?: number;
 } = {}) {
@@ -37,7 +39,7 @@ function makeDeps(opts: {
   const deleteCalls: string[] = [];
   const deps: Parameters<typeof createWriteArtifactTool>[0] = {
     artifacts: {
-      async createGenerated(input) {
+      async createGenerated(input, audit) {
         artifactCalls.push(input);
         if (opts.createThrows) throw new Error("artifact create failed");
         const artifact: ArtifactRecord = {
@@ -61,6 +63,8 @@ function makeDeps(opts: {
           updatedAt: "now",
           ...opts.artifactReturns
         };
+        if (opts.auditThrows) throw new Error("audit insert failed");
+        auditCalls.push(audit(artifact));
         return artifact;
       }
     },
@@ -83,11 +87,6 @@ function makeDeps(opts: {
       },
       async delete(storageKey) {
         deleteCalls.push(storageKey);
-      }
-    },
-    auditEvents: {
-      async create(input) {
-        auditCalls.push(input);
       }
     },
     artifactMaxBytes: opts.artifactMaxBytes ?? 10_000_000,
@@ -233,6 +232,18 @@ test("write_artifact: removes the stored object when the artifact insert fails",
     arguments: { name: "failed.txt", content: "orphan me" }
   })).rejects.toThrow("artifact create failed");
 
+  expect(deleteCalls).toEqual([storageCalls[0]?.storageKey]);
+});
+
+test("write_artifact: fails and removes the stored object when its audit event cannot be written", async () => {
+  const { deps, storageCalls, deleteCalls, auditCalls } = makeDeps({ auditThrows: true });
+
+  await expect(() => tool(deps).handler({
+    context: ctx(),
+    arguments: { name: "unaudited.txt", content: "no evidence" }
+  })).rejects.toThrow("audit insert failed");
+
+  expect(auditCalls).toEqual([]);
   expect(deleteCalls).toEqual([storageCalls[0]?.storageKey]);
 });
 

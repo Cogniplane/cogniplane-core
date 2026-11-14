@@ -3,7 +3,6 @@ import { Readable } from "node:stream";
 
 import type { ArtifactStorage } from "../artifacts/artifact-storage.js";
 import type { ArtifactStore } from "../artifacts/artifact-store.js";
-import type { AuditEventStore } from "../audit-event-store.js";
 import { ToolCallError } from "../../lib/tool-call-error.js";
 import { validateArtifactFilename } from "../artifacts/artifact-filename.js";
 import { buildArtifactStorageKey } from "../artifacts/artifact-storage-key.js";
@@ -12,7 +11,6 @@ import { strictObjectSchema, withManagedToolErrorSchema, type ManagedToolDefinit
 type WriteArtifactDeps = {
   artifacts: Pick<ArtifactStore, "createGenerated">;
   storage: Pick<ArtifactStorage, "put" | "openReadStream" | "delete">;
-  auditEvents: Pick<AuditEventStore, "create">;
   readRuntimeFile?: (sessionId: string, runtimeId: string, filePath: string) => Promise<Uint8Array>;
   statRuntimeFile?: (
     sessionId: string,
@@ -154,6 +152,8 @@ export function createWriteArtifactTool(deps: WriteArtifactDeps): ManagedToolDef
 
         let artifact;
         try {
+          // The `artifact_generated` event commits with the row, so a
+          // failed event reports a failure with no artifact left behind.
           artifact = await deps.artifacts.createGenerated({
             tenantId: context.tenantId,
             artifactType: "generated",
@@ -169,7 +169,20 @@ export function createWriteArtifactTool(deps: WriteArtifactDeps): ManagedToolDef
             createdByType: "tool",
             createdByRef: context.messageId,
             detail: { source: "write_artifact" }
-          });
+          }, (created) => ({
+            tenantId: context.tenantId,
+            sessionId: context.sessionId,
+            userId: context.userId,
+            type: "artifact_generated",
+            payload: {
+              artifactId: created.artifactId,
+              artifactType: created.artifactType,
+              artifactName: created.artifactName,
+              mimeType: created.mimeType,
+              fileSizeBytes: created.fileSizeBytes,
+              source: "write_artifact"
+            }
+          }));
         } catch (error) {
           // The object is not recoverable by artifact GC until its database row
           // exists. Remove it when the transaction rejects, preserving the
@@ -177,21 +190,6 @@ export function createWriteArtifactTool(deps: WriteArtifactDeps): ManagedToolDef
           await deps.storage.delete(stored.storageKey).catch(() => undefined);
           throw error;
         }
-
-        await deps.auditEvents.create({
-          tenantId: context.tenantId,
-          sessionId: context.sessionId,
-          userId: context.userId,
-          type: "artifact_generated",
-          payload: {
-            artifactId: artifact.artifactId,
-            artifactType: artifact.artifactType,
-            artifactName: artifact.artifactName,
-            mimeType: artifact.mimeType,
-            fileSizeBytes: artifact.fileSizeBytes,
-            source: "write_artifact"
-          }
-        });
 
         return {
           artifactId: artifact.artifactId,

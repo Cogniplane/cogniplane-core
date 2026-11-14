@@ -243,7 +243,7 @@ function policyAction() {
 
 describe("approval decision ownership", () => {
   it.each(["native", "execution", "policy"] as const)(
-    "keeps the %s persistence order while a write is blocked", async (source) => {
+    "resumes no %s wait before its decision and audit event commit", async (source) => {
       vi.useFakeTimers();
       const f = setup();
       const write = deferred();
@@ -258,15 +258,16 @@ describe("approval decision ownership", () => {
       const decision = f.coordinator.decide({ ...identity, approvalId: row.approvalId, decision: "approve", rememberForTurn: true });
       await flush();
       expect(f.approvals.resolve).toHaveBeenCalledOnce();
-      expect(settled).toBe(source === "native");
+      expect(settled).toBe(false);
       expect(row.status).toBe("pending");
       write.resolve();
       await expect(decision).resolves.toBe("resolved");
       await expect(outcome).resolves.toBe("approve");
       expect(row).toMatchObject({ status: "approved", decision: "approve", rememberForTurn: true });
-      expect(f.auditEvents.create).toHaveBeenCalledWith(expect.objectContaining({
+      expect(f.approvals.audit).toHaveBeenCalledWith(expect.objectContaining({
         tenantId: identity.tenantId, userId: identity.userId, approvalId: row.approvalId, type: "approval.approved"
       }));
+      expect(f.auditEvents.create).not.toHaveBeenCalled();
       await expect(turn.request(action, f.publish)).resolves.toBe("approve");
       expect(f.rows.size).toBe(1);
       f.coordinator.close();
@@ -290,39 +291,93 @@ describe("approval decision ownership", () => {
     await flush();
     expect(settled).toBe(false);
     expect(row.status).toBe("pending");
-    expect(f.auditEvents.create).not.toHaveBeenCalled();
+    expect(f.approvals.audit).not.toHaveBeenCalled();
     f.controller.abort();
     await expect(outcome).resolves.toBe("reject");
     f.coordinator.close();
   });
 
-  it.each(["throw", "missing"] as const)("keeps a native local approval when its write returns %s", async (failure) => {
+  it("keeps a native local approval when its write changes no pending row", async () => {
     vi.useFakeTimers();
     const f = setup();
     const outcome = f.coordinator.openTurn(f.options).request(action, f.publish);
     await flush();
     const row = [...f.rows.values()][0]!;
-    if (failure === "throw") f.approvals.resolve.mockRejectedValueOnce(new Error("write failed"));
-    else f.approvals.resolve.mockResolvedValueOnce(null);
+    f.approvals.resolve.mockResolvedValueOnce(null);
     await expect(f.coordinator.decide({ ...identity, approvalId: row.approvalId, decision: "approve" })).resolves.toBe("resolved");
     await expect(outcome).resolves.toBe("approve");
     expect(row.status).toBe("pending");
-    expect(f.auditEvents.create).not.toHaveBeenCalled();
+    expect(f.approvals.audit).not.toHaveBeenCalled();
     f.coordinator.close();
   });
 
-  it.each([false, true])("keeps a stored decision when auditing fails, durable: %s", async (durableNative) => {
+  it("does not settle a native wait when its decision write throws", async () => {
+    vi.useFakeTimers();
+    const f = setup();
+    const outcome = f.coordinator.openTurn(f.options).request(action, f.publish);
+    let settled = false;
+    void outcome.then(() => { settled = true; });
+    await flush();
+    const row = [...f.rows.values()][0]!;
+    f.approvals.resolve.mockRejectedValueOnce(new Error("write failed"));
+    await expect(f.coordinator.decide({ ...identity, approvalId: row.approvalId, decision: "approve" })).rejects.toThrow("write failed");
+    await flush();
+    expect(settled).toBe(false);
+    expect(row.status).toBe("pending");
+    f.coordinator.close();
+    await expect(outcome).resolves.toBe("reject");
+  });
+
+  it.each([false, true])("rolls the decision back and keeps the wait when its audit event fails, durable: %s", async (durableNative) => {
     vi.useFakeTimers();
     const f = setup();
     const outcome = f.coordinator.openTurn({ ...f.options, durableNative }).request(action, f.publish);
+    let settled = false;
+    void outcome.then(() => { settled = true; });
     await flush();
     const row = [...f.rows.values()][0]!;
-    f.auditEvents.create.mockRejectedValueOnce(new Error("audit failed"));
+    f.approvals.audit.mockRejectedValueOnce(new Error("audit failed"));
+    await expect(f.coordinator.decide({ ...identity, approvalId: row.approvalId, decision: "reject" })).rejects.toThrow("audit failed");
+    await flush();
+    expect(settled).toBe(false);
+    expect(row).toMatchObject({ status: "pending", decision: null });
+    // The user decides again once the audit insert works.
     await expect(f.coordinator.decide({ ...identity, approvalId: row.approvalId, decision: "reject" })).resolves.toBe("resolved");
     await expect(outcome).resolves.toBe("reject");
     expect(row).toMatchObject({ status: "rejected", decision: "reject" });
+    expect(f.approvals.audit).toHaveBeenLastCalledWith(expect.objectContaining({ type: "approval.rejected", approvalId: row.approvalId }));
+    // The failed attempt saved nothing. A later retry reads the saved decision
+    // and writes no second event.
+    const events = f.approvals.audit.mock.calls.length;
+    await expect(f.coordinator.decide({ ...identity, approvalId: row.approvalId, decision: "reject" })).resolves.toBe("resolved");
+    await expect(f.coordinator.decide({ ...identity, approvalId: row.approvalId, decision: "approve" })).resolves.toBe("conflict");
+    expect(f.approvals.audit).toHaveBeenCalledTimes(events);
+    expect(row).toMatchObject({ status: "rejected", decision: "reject" });
     f.coordinator.close();
   });
+
+  it.each(["approve", "reject"] as const)(
+    "lets the first native write settle the wait when a concurrent %s request saves second", async (second) => {
+      vi.useFakeTimers();
+      const f = setup();
+      const outcome = f.coordinator.openTurn(f.options).request(action, f.publish);
+      await flush();
+      const row = [...f.rows.values()][0]!;
+      const write = deferred();
+      const storeResolve = f.approvals.resolve.getMockImplementation()!;
+      f.approvals.resolve.mockImplementationOnce(async (...args) => { await write.promise; return storeResolve(...args); });
+      const first = f.coordinator.decide({ ...identity, approvalId: row.approvalId, decision: "reject" });
+      await flush();
+      const later = f.coordinator.decide({ ...identity, approvalId: row.approvalId, decision: second });
+      await expect(later).resolves.toBe("resolved");
+      await expect(outcome).resolves.toBe(second);
+      write.resolve();
+      // The write that waited changed no row, so it compares with the saved decision.
+      await expect(first).resolves.toBe(second === "reject" ? "resolved" : "conflict");
+      expect(row).toMatchObject({ status: second === "approve" ? "approved" : "rejected", decision: second });
+      expect(f.approvals.audit).toHaveBeenCalledOnce();
+      f.coordinator.close();
+    });
 
   it.each(["tenant", "user", "actor removed", "execution check failed"] as const)("refuses a local decision for %s before writing", async (guard) => {
     vi.useFakeTimers();
@@ -412,7 +467,7 @@ describe("repeated approval decisions", () => {
         await expect(coordinator.decide({ ...request, decision: opposite })).resolves.toBe("conflict");
       }
       expect(row).toMatchObject({ status: decision === "approve" ? "approved" : "rejected", decision });
-      expect(f.auditEvents.create).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      expect(f.approvals.audit).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
         approvalId: row.approvalId, type: decision === "approve" ? "approval.approved" : "approval.rejected"
       }));
       expect(settled).toBe(1);
@@ -435,7 +490,7 @@ describe("repeated approval decisions", () => {
       rememberForTurn: c.saved })).resolves.toBe("resolved");
     await expect(f.coordinator.decide({ ...identity, approvalId: row.approvalId, decision: "approve",
       rememberForTurn: c.retry })).resolves.toBe(c.result);
-    expect(f.auditEvents.create).toHaveBeenCalledOnce();
+    expect(f.approvals.audit).toHaveBeenCalledOnce();
     f.coordinator.close();
   });
 
@@ -454,14 +509,14 @@ describe("repeated approval decisions", () => {
     if (refusal === "pending") f.approvals.resolve.mockResolvedValueOnce(null);
     else if (refusal === "expired") row.status = "expired";
     else await f.coordinator.decide({ ...identity, approvalId: row.approvalId, decision: "approve" });
-    const auditCalls = f.auditEvents.create.mock.calls.length;
+    const auditCalls = f.approvals.audit.mock.calls.length;
     await expect(f.coordinator.decide({ ...identity, approvalId: row.approvalId, decision: "approve",
       ...(refusal === "tenant" ? { tenantId: "other-tenant" } : refusal === "user" ? { userId: "other-user" } : {})
     })).resolves.toBe("missing");
     expect(f.approvals.getDecided).toHaveBeenCalledWith(
       refusal === "tenant" ? "other-tenant" : identity.tenantId, row.approvalId,
       refusal === "user" ? "other-user" : identity.userId);
-    expect(f.auditEvents.create).toHaveBeenCalledTimes(auditCalls);
+    expect(f.approvals.audit).toHaveBeenCalledTimes(auditCalls);
     f.coordinator.close();
   });
 
@@ -472,7 +527,7 @@ describe("repeated approval decisions", () => {
     f.approvals.getDecided.mockRejectedValueOnce(new Error("read failed"));
     await expect(f.coordinator.decide({ ...identity, approvalId: row.approvalId, decision: "approve" }))
       .rejects.toThrow("read failed");
-    expect(f.auditEvents.create).toHaveBeenCalledOnce();
+    expect(f.approvals.audit).toHaveBeenCalledOnce();
     f.coordinator.close();
   });
 
@@ -507,7 +562,7 @@ describe("repeated approval decisions", () => {
       await expect(remote.decide({ ...request, decision: opposite })).resolves.toBe("conflict");
       await flush();
       expect(settled).toBe(0);
-      expect(f.auditEvents.create).toHaveBeenCalledOnce();
+      expect(f.approvals.audit).toHaveBeenCalledOnce();
       expect(row).toMatchObject({ status: decision === "approve" ? "approved" : "rejected", decision });
       f.controller.abort();
       await expect(outcome).resolves.toBe("reject");
@@ -528,7 +583,7 @@ describe("repeated approval decisions", () => {
     f.hasActor.mockReturnValueOnce(true).mockReturnValueOnce(false);
     await expect(f.coordinator.decide({ ...request, decision: "reject" })).resolves.toBe("conflict");
     expect(f.approvals.resolve).toHaveBeenCalledOnce();
-    expect(f.auditEvents.create).toHaveBeenCalledOnce();
+    expect(f.approvals.audit).toHaveBeenCalledOnce();
     await vi.advanceTimersByTimeAsync(1_000);
     await expect(outcome).resolves.toBe("approve");
     f.coordinator.close(); remote.close();

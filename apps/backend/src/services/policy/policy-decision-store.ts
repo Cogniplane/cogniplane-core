@@ -16,6 +16,7 @@ import {
 
 import { type Pool, withTenantScope } from "../../lib/db.js";
 import { uuidv7 } from "../../lib/uuid.js";
+import { AuditEventStore, type AuditEventInput } from "../audit-event-store.js";
 import { redactSecrets } from "../redact-secrets.js";
 import { isoTimestamp, utcMicrosText } from "../../lib/db-mappers.js";
 
@@ -229,7 +230,13 @@ function buildWhere(tenantId: string, filters: PolicyDecisionFilters): WhereClau
 export class PolicyDecisionStore {
   constructor(private readonly db: Pool) {}
 
-  async record(tenantId: string, input: PolicyDecisionInput): Promise<PolicyDecision> {
+  /**
+   * Saves a decision and its audit event in one transaction: both rows commit,
+   * or neither does. The audit event's user is null when the decision has no
+   * user. `audit` builds the event from the saved decision.
+   */
+  async record(tenantId: string, input: PolicyDecisionInput,
+    audit: (decision: PolicyDecision) => Omit<AuditEventInput, "userId">): Promise<PolicyDecision> {
     const decisionId = `pdc_${uuidv7()}`;
     return withTenantScope(this.db, tenantId, async (client) => {
       const result = await client.query(
@@ -259,7 +266,9 @@ export class PolicyDecisionStore {
           JSON.stringify(input.actionSnapshot ?? {})
         ]
       );
-      return mapRow(result.rows[0]);
+      const decision = mapRow(result.rows[0]);
+      await AuditEventStore.createInTransaction(client, { ...audit(decision), userId: input.userId });
+      return decision;
     });
   }
 

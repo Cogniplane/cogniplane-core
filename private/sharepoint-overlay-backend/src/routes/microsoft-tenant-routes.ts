@@ -2,7 +2,7 @@ import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 
 import { requireRole } from "../../../../apps/backend/src/lib/rbac.js";
-import { createAdminAuditEvent } from "../../../../apps/backend/src/routes/admin/admin-route-helpers.js";
+import { adminAuditEvent } from "../../../../apps/backend/src/routes/admin/admin-route-helpers.js";
 import type { AuditEventStore } from "../../../../apps/backend/src/services/audit-event-store.js";
 import type { OverlayRouteControls } from "../../../../apps/backend/src/overlay-contracts.js";
 import type { TenantRuntimeInvalidator } from "../../../../apps/backend/src/services/integrations/contracts.js";
@@ -100,27 +100,15 @@ export function registerMicrosoftTenantRoutes(
     if (!requireRole(request, reply, "owner", "admin")) return;
 
     const { tenantId } = request.auth;
-    await deps.microsoftConnections.removeTenantMicrosoftConfig(tenantId);
-    // The removal is committed. Run both follow-ups, so a failed audit write
-    // cannot leave running sessions with the Microsoft tools. Removing the
-    // configuration turns reads and writes off, so sessions drop the tools now.
-    const followUps = await Promise.allSettled([
-      createAdminAuditEvent(deps.auditEvents, {
-        tenantId,
-        userId: request.auth.userId,
-        type: "tenant.integration.config_cleared",
-        payload: { integrationId: "microsoft" },
-        ipAddress: request.ip,
-        userAgent: request.headers["user-agent"]
-      }),
-      deps.runtimeInvalidator.invalidateTenantRuntimes(tenantId, {
-        workspaceResetReason:
-          "An administrator removed the Microsoft 365 configuration for this organization. " +
-          "The execution workspace was reset so the change takes effect. Recreate any files you still need."
-      })
-    ]);
-    const failed = followUps.find((result): result is PromiseRejectedResult => result.status === "rejected");
-    if (failed) throw failed.reason;
+    // The audit event commits with the removal. Removing the configuration
+    // turns reads and writes off, so sessions drop the tools now.
+    await deps.microsoftConnections.removeTenantMicrosoftConfig(tenantId,
+      () => adminAuditEvent(request, "tenant.integration.config_cleared", { integrationId: "microsoft" }));
+    await deps.runtimeInvalidator.invalidateTenantRuntimes(tenantId, {
+      workspaceResetReason:
+        "An administrator removed the Microsoft 365 configuration for this organization. " +
+        "The execution workspace was reset so the change takes effect. Recreate any files you still need."
+    });
 
     reply.code(204);
     return null;

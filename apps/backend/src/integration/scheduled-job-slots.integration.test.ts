@@ -473,7 +473,7 @@ function replicaWorker(tenantId: string, replica: string, options: ReplicaOption
       attachJobRunSession: settings.attachJobRunSession.bind(settings),
       finishJobRun: settings.finishJobRun.bind(settings),
       // Other test files leave pending runs one hour old; sweep only older ones.
-      sweepStaleJobRuns: (_olderThanMs, limit) => settings.sweepStaleJobRuns(90 * 60_000, limit),
+      sweepStaleJobRuns: (_olderThanMs, limit, audit) => settings.sweepStaleJobRuns(90 * 60_000, limit, audit),
       pauseJobForSecurityChange: settings.pauseJobForSecurityChange.bind(settings),
       getOwnerSecurityVersion: settings.getOwnerSecurityVersion.bind(settings)
     },
@@ -502,7 +502,7 @@ function replicaWorker(tenantId: string, replica: string, options: ReplicaOption
         return audits.create(event);
       }
     },
-    disableJob: (input) => settings.disableJob(input.tenantId, input.jobId, input.revision),
+    disableJob: (input) => settings.disableJob(input.tenantId, input.jobId, input.revision, input.audit),
     logger: createSilentLogger()
   }, { maxConcurrentJobs: 5, jobTimeoutMs: 60_000, maxConsecutiveFailures: 1 });
 }

@@ -1,5 +1,8 @@
-import { type Pool, withTenantScope } from "../../lib/db.js";
+import type { PoolClient } from "pg";
+
+import { type Pool, withTenantScope, withTransaction } from "../../lib/db.js";
 import { isoTimestamp, isoTimestampOrNull } from "../../lib/db-mappers.js";
+import { AuditEventStore } from "../audit-event-store.js";
 import { sessionExecutionAccessSql, SessionExecutionError } from "../session-execution-store.js";
 
 export type ApprovalStatus = "pending" | "approved" | "rejected" | "expired";
@@ -63,6 +66,18 @@ function mapApproval(row: Record<string, unknown>): ApprovalRecord {
     resolvedAt: isoTimestampOrNull(row.resolved_at),
     expiresAt: isoTimestamp(row.expires_at)
   };
+}
+
+/**
+ * Writes the audit event of an approval's status change on the client of the
+ * change. When the insert fails, the status change rolls back with it.
+ */
+async function auditStatusChange(client: PoolClient, approval: ApprovalRecord,
+  type: "approval.approved" | "approval.rejected" | "approval.expired", payload: Record<string, unknown>): Promise<void> {
+  await AuditEventStore.createInTransaction(client, {
+    tenantId: approval.tenantId, sessionId: approval.sessionId, userId: approval.userId,
+    approvalId: approval.approvalId, type, payload
+  });
 }
 
 export class ApprovalStore {
@@ -192,8 +207,11 @@ export class ApprovalStore {
         `,
         [tenantId, approvalId, userId, status, decision, rememberForTurn && decision === "approve"]
       );
-
-      return result.rows[0] ? mapApproval(result.rows[0]) : null;
+      if (!result.rows[0]) return null;
+      const approval = mapApproval(result.rows[0]);
+      await auditStatusChange(client, approval, decision === "approve" ? "approval.approved" : "approval.rejected",
+        { itemId: approval.itemId, kind: approval.kind });
+      return approval;
     });
   }
 
@@ -242,7 +260,12 @@ export class ApprovalStore {
     });
   }
 
-  async expire(tenantId: string, approvalId: string): Promise<ApprovalRecord | null> {
+  /**
+   * Expires a pending approval and writes its `approval.expired` event, with
+   * `{ reason }`, in the same transaction. Returns null when the row is not
+   * pending: a decision committed first and has its own event.
+   */
+  async expire(tenantId: string, approvalId: string, reason: string): Promise<ApprovalRecord | null> {
     return withTenantScope(this.db, tenantId, async (client) => {
       const result = await client.query(
         `
@@ -253,41 +276,53 @@ export class ApprovalStore {
         `,
         [tenantId, approvalId]
       );
-
-      return result.rows[0] ? mapApproval(result.rows[0]) : null;
+      if (!result.rows[0]) return null;
+      const approval = mapApproval(result.rows[0]);
+      await auditStatusChange(client, approval, "approval.expired", { reason });
+      return approval;
     });
   }
 
   /**
-   * DB-level backstop for the in-process TTL timers: atomically move every
-   * `pending` approval whose `expires_at` deadline has passed to `expired` and
-   * return the affected rows so the caller can write `approval.expired` audit
-   * events. Runs across ALL tenants in one statement, so it MUST be given the
-   * privileged (BYPASSRLS) pool — RLS would otherwise scope it to whatever
-   * tenant context happens to be set. This recovers rows orphaned when a crash
-   * or restart killed the in-memory timer before it could fire.
+   * DB-level backstop for the in-process TTL timers: move every `pending`
+   * approval whose `expires_at` deadline has passed to `expired`, and write
+   * one `approval.expired` event per row, in one transaction. When an event
+   * cannot be written, the whole batch rolls back and stays `pending`, so
+   * the next sweep expires it. This recovers rows orphaned when a crash or
+   * restart killed the in-memory timer before it could fire.
+   *
+   * It runs across ALL tenants, so it MUST be given the privileged
+   * (BYPASSRLS) pool: RLS would otherwise scope it to whatever tenant
+   * context happens to be set. Each audit row takes its tenant from its
+   * approval row.
    *
    * `limit` bounds the batch so a large backlog can't lock the table or balloon
    * the audit write; the caller loops until a sweep returns fewer than `limit`.
    */
   async sweepExpired(limit = 500): Promise<ApprovalRecord[]> {
-    const result = await this.db.query(
-      `
-        UPDATE approvals
-        SET status = 'expired', resolved_at = NOW(), updated_at = NOW()
-        WHERE approval_id IN (
-          SELECT approval_id
-          FROM approvals
-          WHERE status = 'pending' AND expires_at <= NOW()
-          ORDER BY expires_at ASC
-          LIMIT $1
-          FOR UPDATE SKIP LOCKED
-        )
-        RETURNING *
-      `,
-      [limit]
-    );
-
-    return result.rows.map(mapApproval);
+    return withTransaction(this.db, async (client) => {
+      const result = await client.query(
+        `
+          UPDATE approvals
+          SET status = 'expired', resolved_at = NOW(), updated_at = NOW()
+          WHERE approval_id IN (
+            SELECT approval_id
+            FROM approvals
+            WHERE status = 'pending' AND expires_at <= NOW()
+            ORDER BY expires_at ASC
+            LIMIT $1
+            FOR UPDATE SKIP LOCKED
+          )
+          RETURNING *
+        `,
+        [limit]
+      );
+      const expired = result.rows.map(mapApproval);
+      for (const approval of expired) {
+        await auditStatusChange(client, approval, "approval.expired",
+          { itemId: approval.itemId, kind: approval.kind, reason: "stale_on_sweep" });
+      }
+      return expired;
+    });
   }
 }
