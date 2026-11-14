@@ -165,9 +165,7 @@ export function buildSchedulerWorker(
       // Poison-job disable is backed by UserSettingsStore.disableJob; thread it
       // in so the worker can permanently drop invalid-cron / repeatedly-failing
       // jobs instead of leaving them dormant.
-      disableJob: async ({ tenantId, jobId }) => {
-        await input.userSettings.disableJob(tenantId, jobId);
-      },
+      disableJob: ({ tenantId, jobId, revision }) => input.userSettings.disableJob(tenantId, jobId, revision),
       logger: input.logger
     },
     {

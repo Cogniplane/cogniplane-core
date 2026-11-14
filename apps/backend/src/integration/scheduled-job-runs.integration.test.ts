@@ -29,8 +29,6 @@ import { adminDatabaseUrl, appPool, maintenancePool, superuserPool } from "./sup
 import { seedScheduledJob, seedScheduledJobRun, seedTenantGraph, type TenantFixture } from "./support/fixtures.js";
 import { buildMessageApp } from "./support/message-app.js";
 
-const LATER = () => new Date(Date.now() + 60 * 60 * 1000).toISOString();
-
 function store(): UserSettingsStore {
   return new UserSettingsStore(appPool(), maintenancePool());
 }
@@ -86,17 +84,16 @@ describe.skipIf(!adminDatabaseUrl())("scheduled job claim and run history", () =
   test("a claim commits the job and its pending run together", async () => {
     const jobId = await seedScheduledJob(tenantA);
     const runId = randomUUID();
-    const nextRunAt = LATER();
 
-    const claimed = await store().claimJob(tenantA.tenantId, jobId, nextRunAt, runId);
+    const claimed = await store().claimJob(tenantA.tenantId, jobId, runId);
 
-    expect(claimed).toMatchObject({ jobId, runId, tenantId: tenantA.tenantId });
+    expect(claimed).toMatchObject({ status: "claimed", job: { jobId, runId, tenantId: tenantA.tenantId } });
     expect(await runsOf(jobId)).toEqual([
       { run_id: runId, tenant_id: tenantA.tenantId, session_id: null, status: "pending", error_message: null, completed_at: null }
     ]);
     const job = await jobState(jobId);
     expect(job?.last_run_at).toBeInstanceOf(Date);
-    expect(job?.next_run_at?.toISOString()).toBe(nextRunAt);
+    expect(job?.next_run_at?.getTime()).toBeGreaterThan(Date.now());
   });
 
   test("a run insert that fails rolls the claim back", async () => {
@@ -106,13 +103,13 @@ describe.skipIf(!adminDatabaseUrl())("scheduled job claim and run history", () =
     await superuserPool().query("UPDATE scheduled_job_runs SET status = 'completed' WHERE run_id = $1", [takenRunId]);
     const before = await jobState(jobId);
 
-    await expect(store().claimJob(tenantA.tenantId, jobId, LATER(), takenRunId)).rejects.toMatchObject({ code: "23505" });
+    await expect(store().claimJob(tenantA.tenantId, jobId, takenRunId)).rejects.toMatchObject({ code: "23505" });
 
     // Still due, with no claim time and no new run: the next tick claims it.
     expect(await jobState(jobId)).toEqual(before);
     expect((await runsOf(jobId)).map((run) => run.run_id)).toEqual([takenRunId]);
     const retry = randomUUID();
-    expect(await store().claimJob(tenantA.tenantId, jobId, LATER(), retry)).toMatchObject({ jobId, runId: retry });
+    expect(await store().claimJob(tenantA.tenantId, jobId, retry)).toMatchObject({ status: "claimed", job: { jobId, runId: retry } });
   });
 
   test("a claim with another tenant's id changes no job and writes no run", async () => {
@@ -120,7 +117,7 @@ describe.skipIf(!adminDatabaseUrl())("scheduled job claim and run history", () =
     const before = await jobState(jobId);
     const runId = randomUUID();
 
-    expect(await store().claimJob(tenantB.tenantId, jobId, LATER(), runId)).toBeNull();
+    expect(await store().claimJob(tenantB.tenantId, jobId, runId)).toEqual({ status: "not_claimed" });
 
     expect(await jobState(jobId)).toEqual(before);
     expect(await runsOf(jobId)).toEqual([]);
@@ -128,34 +125,39 @@ describe.skipIf(!adminDatabaseUrl())("scheduled job claim and run history", () =
 
     // Positive control: the owner's tenant claims it, so the refusal above was
     // the tenant boundary and not a broken fixture.
-    expect(await store().claimJob(tenantA.tenantId, jobId, LATER(), runId)).toMatchObject({ jobId, runId });
+    expect(await store().claimJob(tenantA.tenantId, jobId, runId)).toMatchObject({ status: "claimed", job: { jobId, runId } });
     expect((await runsOf(jobId)).map((run) => run.tenant_id)).toEqual([tenantA.tenantId]);
   });
 
   test("the run gets its session, then its outcome", async () => {
     const jobId = await seedScheduledJob(tenantA);
     const runId = randomUUID();
-    await store().claimJob(tenantA.tenantId, jobId, LATER(), runId);
+    await store().claimJob(tenantA.tenantId, jobId, runId);
 
     expect(await store().attachJobRunSession({ tenantId: tenantB.tenantId, runId, sessionId: tenantB.sessionId })).toBe(false);
     expect(await store().attachJobRunSession({ tenantId: tenantA.tenantId, runId, sessionId: tenantA.sessionId })).toBe(true);
-    const completed = await store().completeJobRun({
-      tenantId: tenantA.tenantId, runId, status: "completed", durationMs: 1200,
-      inputTokens: 10, outputTokens: 20, errorMessage: null, summary: "done"
+    const completed = await store().finishJobRun({
+      tenantId: tenantA.tenantId, jobId, runId, revision: 0, status: "completed", durationMs: 1200,
+      inputTokens: 10, outputTokens: 20, errorMessage: null, summary: "done", counts: true, disableAtFailures: 0
     });
 
-    expect(completed).toMatchObject({ runId, sessionId: tenantA.sessionId, status: "completed", summary: "done" });
+    expect(completed).toMatchObject({
+      status: "finished", run: { runId, sessionId: tenantA.sessionId, status: "completed", summary: "done" }
+    });
     expect(await runsOf(jobId)).toEqual([expect.objectContaining({
       run_id: runId, session_id: tenantA.sessionId, status: "completed", completed_at: expect.any(Date)
     })]);
   });
 
-  test("completing a run that has no row returns null", async () => {
-    const result = await store().completeJobRun({
-      tenantId: tenantA.tenantId, runId: randomUUID(), status: "failed", durationMs: 1,
-      inputTokens: 0, outputTokens: 0, errorMessage: GENERIC_TURN_FAILURE, summary: null
+  test("finishing a run that has no row reports it missing", async () => {
+    const finish = (jobId: string) => store().finishJobRun({
+      tenantId: tenantA.tenantId, jobId, runId: randomUUID(), revision: 0, status: "failed", durationMs: 1,
+      inputTokens: 0, outputTokens: 0, errorMessage: GENERIC_TURN_FAILURE, summary: null, counts: true,
+      disableAtFailures: 0
     });
-    expect(result).toBeNull();
+    // The job is gone, or the job has no such run.
+    expect(await finish(randomUUID())).toEqual({ status: "missing" });
+    expect(await finish(await seedScheduledJob(tenantA))).toEqual({ status: "missing" });
   });
 });
 
@@ -192,7 +194,7 @@ class TenantSettings extends UserSettingsStore {
 
   override async claimJob(...args: Parameters<UserSettingsStore["claimJob"]>) {
     const claimed = await super.claimJob(...args);
-    if (claimed) this.afterClaim?.();
+    if (claimed.status === "claimed") this.afterClaim?.();
     return claimed;
   }
 }
@@ -248,7 +250,7 @@ function scopedWorker(tenantId: string, options: {
       caps: { perUser: 5, perTenant: 50 }
     },
     auditEvents: new AuditEventStore(appPool()),
-    disableJob: ({ tenantId: jobTenantId, jobId }) => settings.disableJob(jobTenantId, jobId),
+    disableJob: ({ tenantId: jobTenantId, jobId, revision }) => settings.disableJob(jobTenantId, jobId, revision),
     logger: createSilentLogger()
   }, {
     maxConcurrentJobs: 5,
@@ -352,7 +354,7 @@ describe.skipIf(!adminDatabaseUrl())("scheduler worker run history", () => {
   test("a run that a crash left after the claim is failed by the stale-run sweep", async () => {
     const tenant = await seedTenantGraph();
     const runId = randomUUID();
-    expect(await store().claimJob(tenant.tenantId, tenant.jobId, LATER(), runId)).not.toBeNull();
+    expect(await store().claimJob(tenant.tenantId, tenant.jobId, runId)).toMatchObject({ status: "claimed" });
     // The worker dies here: no session, no turn, no completion. Age the row
     // past the sweep cutoff (job timeout + abort grace + buffer).
     await superuserPool().query(

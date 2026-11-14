@@ -7,7 +7,7 @@ import { AGUI_INTERRUPTED_RESULT } from "./deep-agents/agui-events.js";
 import type { SessionRecord } from "./session-store.js";
 import type { MessageRecord, ToolResultRecord } from "./message-store.js";
 import type { ToolExecutionContext } from "./auth/tool-execution-context-store.js";
-import type { ClaimedScheduledJob } from "./user-settings-store.js";
+import type { ClaimJobResult, ClaimedScheduledJob } from "./user-settings-store.js";
 import type { ExecutionActor, SessionExecution } from "./session-execution-store.js";
 import type { LimitExceededErrorPayload } from "./request-limits.js";
 import { PiiProtectionServiceError, type PiiDecision } from "./pii/pii-protection-service.js";
@@ -80,6 +80,8 @@ function makeFakeJob(overrides: Partial<ClaimedScheduledJob> = {}): ClaimedSched
     updatedAt: "2026-01-01T00:00:00.000Z",
     ownerSecurityVersion: null,
     runId: "run-1",
+    scheduledFor: "2026-01-01T09:00:00.000Z",
+    revision: 0,
     ...overrides
   };
 }
@@ -120,7 +122,8 @@ function makeFakeMessageRecord(
 
 function createFakeDeps(options?: {
   dueJobs?: ClaimedScheduledJob[];
-  claimReturns?: (ClaimedScheduledJob | null)[];
+  /** A job is a `claimed` result and null is `not_claimed`. */
+  claimReturns?: (ClaimedScheduledJob | ClaimJobResult | null)[];
   /** The owner's current security version; called for each read. Default null (WorkOS). */
   ownerSecurityVersion?: () => number | null;
   /** What `pauseJobForSecurityChange` answers. Default false (nothing to pause). */
@@ -158,8 +161,14 @@ function createFakeDeps(options?: {
   getOwnedGate?: Promise<void>;
   /** What `attachJobRunSession` answers. Default true (the run row exists). */
   attachReturns?: boolean;
-  /** Make `completeJobRun` find no run row. */
+  /** Make `finishJobRun` find no run row. */
   completeReturnsNull?: boolean;
+  /** Make `finishJobRun` find the run finished by another writer. */
+  finishAlreadyFinished?: boolean;
+  /** The job is off when the run finishes, so the failure limit disables nothing. */
+  jobOffAtFinish?: boolean;
+  /** What `parkJob` answers. Default true (this call parked the job). */
+  parkReturns?: boolean;
   /** Replace the lease admission (default: a lease for each call). */
   acquireImpl?: (actor: ExecutionActor) => Promise<SessionExecution>;
   /** What the daily turn quota answers, or throws. Default: allowed. */
@@ -187,7 +196,7 @@ function createFakeDeps(options?: {
   let runtimeCallIndex = 0;
 
   const sessionsCreated: Array<{ userId: string; sessionName: string; options?: { purpose?: string } }> = [];
-  const claimsCalled: Array<{ tenantId: string; jobId: string; nextRunAt: string | null; runId: string }> = [];
+  const claimsCalled: Array<{ tenantId: string; jobId: string; runId: string }> = [];
   // Pending runs that successful claims wrote.
   const jobRunsCreated: Array<{ runId: string; jobId: string; userId: string; sessionId: string | null }> = [];
   const runSessionsAttached: Array<{ tenantId: string; runId: string; sessionId: string }> = [];
@@ -244,6 +253,7 @@ function createFakeDeps(options?: {
     payload: Record<string, unknown>;
   }> = [];
   const recordOutcomeCalls: Array<{ tenantId: string; jobId: string; succeeded: boolean }> = [];
+  const finishCalls: Array<{ jobId: string; runId: string; revision: number; counts: boolean; disableAtFailures: number }> = [];
   const failureCounts = new Map<string, number>();
   const sweepStaleJobRunsCalls: Array<{ olderThanMs: number; limit: number }> = [];
   const pauseCalls: Array<{ tenantId: string; jobId: string }> = [];
@@ -334,46 +344,60 @@ function createFakeDeps(options?: {
     turnAdmission,
     settings: {
       listDueJobs: async (limit: number) => dueJobs.slice(0, limit),
-      claimJob: async (tenantId, jobId, nextRunAt, runId) => {
-        claimsCalled.push({ tenantId, jobId, nextRunAt, runId });
+      claimJob: async (tenantId, jobId, runId): Promise<ClaimJobResult> => {
+        claimsCalled.push({ tenantId, jobId, runId });
         const result = claimReturns[claimIndex] ?? null;
         claimIndex += 1;
-        if (!result) return null;
+        if (!result) return { status: "not_claimed" };
+        if ("status" in result) return result;
         jobRunsCreated.push({ runId, jobId: result.jobId, userId: result.userId, sessionId: null });
-        return { ...result, runId };
+        return { status: "claimed", job: { ...result, runId } };
       },
       parkJob: async (tenantId, jobId) => {
         parkCalls.push({ tenantId, jobId });
+        return options?.parkReturns ?? true;
       },
       attachJobRunSession: async (input) => {
         runSessionsAttached.push(input);
         return options?.attachReturns ?? true;
       },
-      completeJobRun: async (input) => {
+      finishJobRun: async ({ counts, revision, disableAtFailures, jobId, ...input }) => {
         order.push("complete");
         jobRunsCompleted.push(input);
-        if (options?.completeReturnsNull) return null;
+        finishCalls.push({ jobId, runId: input.runId, revision, counts, disableAtFailures });
+        if (options?.completeReturnsNull) return { status: "missing" };
+        if (options?.finishAlreadyFinished) return { status: "already_finished" };
+        let consecutiveFailures: number | null = null;
+        let disabled = false;
+        if (counts) {
+          const succeeded = input.status === "completed";
+          recordOutcomeCalls.push({ tenantId: input.tenantId, jobId, succeeded });
+          consecutiveFailures = succeeded ? 0 : (failureCounts.get(jobId) ?? 0) + 1;
+          failureCounts.set(jobId, consecutiveFailures);
+          disabled = !succeeded && !options?.jobOffAtFinish && disableAtFailures > 0
+            && consecutiveFailures >= disableAtFailures;
+        }
         return {
-          runId: input.runId,
-          jobId: "job-1",
-          userId: "user-1",
-          sessionId: null,
-          status: input.status,
-          startedAt: new Date().toISOString(),
-          completedAt: new Date().toISOString(),
-          durationMs: input.durationMs,
-          inputTokens: input.inputTokens,
-          outputTokens: input.outputTokens,
-          errorMessage: input.errorMessage,
-          summary: input.summary,
-          createdAt: new Date().toISOString()
+          status: "finished",
+          consecutiveFailures,
+          disabled,
+          run: {
+            runId: input.runId,
+            jobId,
+            userId: "user-1",
+            sessionId: null,
+            status: input.status,
+            scheduledFor: null,
+            startedAt: new Date().toISOString(),
+            completedAt: new Date().toISOString(),
+            durationMs: input.durationMs,
+            inputTokens: input.inputTokens,
+            outputTokens: input.outputTokens,
+            errorMessage: input.errorMessage,
+            summary: input.summary,
+            createdAt: new Date().toISOString()
+          }
         };
-      },
-      recordJobRunOutcome: async (tenantId: string, jobId: string, succeeded: boolean) => {
-        recordOutcomeCalls.push({ tenantId, jobId, succeeded });
-        const next = succeeded ? 0 : (failureCounts.get(jobId) ?? 0) + 1;
-        failureCounts.set(jobId, next);
-        return next;
       },
       sweepStaleJobRuns: async (olderThanMs: number, limit: number) => {
         sweepStaleJobRunsCalls.push({ olderThanMs, limit });
@@ -531,6 +555,7 @@ function createFakeDeps(options?: {
     sweepStaleJobRunsCalls,
     auditEvents,
     recordOutcomeCalls,
+    finishCalls,
     failureCounts,
     pauseCalls,
     ownerVersionReads,
@@ -630,9 +655,9 @@ describe("SchedulerWorker", () => {
       }
     });
     const claim = deps.settings.claimJob.bind(deps.settings);
-    deps.settings.claimJob = async (tenantId, jobId, nextRunAt, runId) => {
+    deps.settings.claimJob = async (tenantId, jobId, runId) => {
       if (jobId === "job-2") throw new Error("claim failed");
-      return claim(tenantId, jobId, nextRunAt, runId);
+      return claim(tenantId, jobId, runId);
     };
     const worker = new SchedulerWorker(deps, { maxConcurrentJobs: 5, jobTimeoutMs: 60_000 });
 
@@ -766,11 +791,11 @@ describe("SchedulerWorker", () => {
   });
 
   test.each([
-    ["security_change", "Scheduled job stopped because your account's security settings changed."],
-    ["tool_context_ended", "Scheduled job stopped because its tool access ended."]
-  ] as const)("a scheduled turn that the backend stopped (%s) records why", async (reason, errorMessage) => {
+    ["security_change", "Scheduled job stopped because your account's security settings changed.", false],
+    ["tool_context_ended", "Scheduled job stopped because its tool access ended.", true]
+  ] as const)("a scheduled turn that the backend stopped (%s) records why", async (reason, errorMessage, counts) => {
     const job = makeFakeJob();
-    const { deps, jobRunsCompleted, messagesUpdated } = createFakeDeps({
+    const { deps, jobRunsCompleted, messagesUpdated, finishCalls } = createFakeDeps({
       dueJobs: [job],
       runMessageImpl: async function* () {
         yield { type: EventType.RUN_STARTED, threadId: "session-1", runId: "resp-1" } as BaseEvent;
@@ -784,6 +809,8 @@ describe("SchedulerWorker", () => {
     expect(jobRunsCompleted[0]).toMatchObject({ status: "failed", errorMessage });
     // The assistant row keeps the reason, so the chat shows the same notice.
     expect(messagesUpdated).toEqual([expect.objectContaining({ status: "interrupted", stopReason: reason })]);
+    // A security change pauses the job at its next claim; it is not the job's failure.
+    expect(finishCalls).toEqual([expect.objectContaining({ counts })]);
   });
 
   test("tick resolves the runtime per job tenant and dispatches to the resolved adapter", async () => {
@@ -1137,7 +1164,7 @@ describe("SchedulerWorker", () => {
       { type: EventType.RUN_STARTED, threadId: "session-1", runId: "resp-1" },
       { type: EventType.RUN_ERROR, message: "boom" }
     ];
-    const { deps, auditEvents } = createFakeDeps({
+    const { deps, auditEvents, finishCalls } = createFakeDeps({
       dueJobs: [job],
       runtimeEvents: [failedEvents]
     });
@@ -1145,6 +1172,7 @@ describe("SchedulerWorker", () => {
     const disabled: string[] = [];
     deps.disableJob = async (input) => {
       disabled.push(input.jobId);
+      return true;
     };
 
     // Threshold of 1: a single failed run trips the poison guard.
@@ -1156,9 +1184,11 @@ describe("SchedulerWorker", () => {
 
     await worker.tick();
 
-    expect(disabled).toEqual([job.jobId]);
+    // The finish disables the job in the write that counts the failure; the
+    // separate disable is only for an invalid cron.
+    expect(finishCalls).toEqual([expect.objectContaining({ jobId: job.jobId, counts: true, disableAtFailures: 1 })]);
+    expect(disabled).toEqual([]);
 
-    // The disable reason is carried on the audit event, not the disableJob call.
     const disabledAudit = auditEvents.find(
       (e) => e.type === "scheduler.job.disabled" && e.payload.reason === "repeated_failures"
     );
@@ -1180,6 +1210,7 @@ describe("SchedulerWorker", () => {
     const disabled: string[] = [];
     deps.disableJob = async (input) => {
       disabled.push(input.jobId);
+      return true;
     };
 
     const worker = new SchedulerWorker(deps, {
@@ -1203,6 +1234,7 @@ describe("SchedulerWorker", () => {
     const disabled: string[] = [];
     deps.disableJob = async (input) => {
       disabled.push(input.jobId);
+      return true;
     };
 
     const worker = new SchedulerWorker(deps, { maxConcurrentJobs: 1, jobTimeoutMs: 60_000 });
@@ -1221,6 +1253,35 @@ describe("SchedulerWorker", () => {
     if (!disabledAudit) throw new Error("Expected invalid-cron disable audit event.");
     expect(disabledAudit.payload.reason).toBe("invalid_cron");
     expect(disabledAudit.payload.disabled).toBe(true);
+  });
+
+  test("an invalid-cron job that another replica already disabled gets no second audit event", async () => {
+    const job = makeFakeJob({ cronExpression: "not-a-cron", revision: 3 });
+    const { deps, parkCalls, auditEvents } = createFakeDeps({ dueJobs: [job] });
+    const disableCalls: Array<{ revision: number }> = [];
+    deps.disableJob = async (input) => {
+      disableCalls.push(input);
+      return false;
+    };
+
+    await new SchedulerWorker(deps, { maxConcurrentJobs: 1, jobTimeoutMs: 60_000 }).tick();
+
+    expect(disableCalls).toEqual([expect.objectContaining({ revision: 3 })]);
+    // The disable ran and changed nothing; parking is only the fallback for a missing or failed disable.
+    expect(parkCalls).toEqual([]);
+    expect(auditEvents.some((e) => e.type === "scheduler.job.disabled")).toBe(false);
+  });
+
+  test("an invalid-cron job that is already parked gets no second audit event", async () => {
+    const { deps, parkCalls, auditEvents } = createFakeDeps({
+      dueJobs: [makeFakeJob({ cronExpression: "not-a-cron" })],
+      parkReturns: false
+    });
+
+    await new SchedulerWorker(deps, { maxConcurrentJobs: 1, jobTimeoutMs: 60_000 }).tick();
+
+    expect(parkCalls).toHaveLength(1);
+    expect(auditEvents.some((e) => e.type === "scheduler.job.disabled")).toBe(false);
   });
 
   test("tick parks an invalid-cron job dormant when no disable capability is wired", async () => {
@@ -1759,11 +1820,11 @@ describe("SchedulerWorker", () => {
       releaseClaim = resolve;
     });
     const originalClaim = deps.settings.claimJob.bind(deps.settings);
-    deps.settings.claimJob = async (tenantId, jobId, nextRunAt, runId) => {
+    deps.settings.claimJob = async (tenantId, jobId, runId) => {
       if (jobId === "job-1") {
         await claimGate;
       }
-      return originalClaim(tenantId, jobId, nextRunAt, runId);
+      return originalClaim(tenantId, jobId, runId);
     };
 
     const worker = new SchedulerWorker(deps, { maxConcurrentJobs: 1, jobTimeoutMs: 60_000 });
@@ -2187,6 +2248,8 @@ describe("SchedulerWorker run history", () => {
     expect(fakes.jobRunsCompleted).toEqual([expect.objectContaining({
       runId: fakes.claimsCalled[0]?.runId, status: "failed", errorMessage: SCHEDULER_STOPPED_RUN_ERROR
     })]);
+    // A deploy is not the job's fault.
+    expect(fakes.recordOutcomeCalls).toEqual([]);
   });
 
   test("session creation that outlives the timeout fails the run before the runtime resolves", async () => {
@@ -2211,12 +2274,14 @@ describe("SchedulerWorker run history", () => {
       expect(fakes.jobRunsCompleted).toEqual([expect.objectContaining({
         runId: fakes.claimsCalled[0]?.runId, status: "failed", errorMessage: "Scheduled job timed out after 10ms"
       })]);
+      // The turn never started: slow preparation is not the job's fault.
+      expect(fakes.recordOutcomeCalls).toEqual([]);
     } finally {
       vi.useRealTimers();
     }
   });
 
-  test("a run whose row is gone starts no turn, and its completion does not throw", async () => {
+  test("a run whose job was deleted starts no turn and writes no outcome event", async () => {
     const warnings: string[] = [];
     const fakes = createFakeDeps({ dueJobs: [makeFakeJob()], attachReturns: false, completeReturnsNull: true });
     fakes.deps.logger.warn = (_payload, message) => {
@@ -2228,8 +2293,113 @@ describe("SchedulerWorker run history", () => {
     expect(fakes.resolveRuntimeCalls).toEqual([]);
     expect(fakes.runMessageCalls).toEqual([]);
     expect(fakes.jobRunsCompleted).toEqual([expect.objectContaining({ status: "failed", errorMessage: GENERIC_TURN_FAILURE })]);
-    expect(warnings).toContain("Scheduled job run record is missing; outcome not saved");
-    expect(fakes.auditEvents).toContainEqual(expect.objectContaining({ type: "scheduler.job.run.failed" }));
+    expect(warnings).toContain("Scheduled job was deleted during the run; outcome not saved");
+    // The sweep can have failed the run, and written its event, before the
+    // delete. A second event here would give the run two.
+    expect(fakes.auditEvents.filter((e) => e.type.startsWith("scheduler.job."))).toEqual([]);
+  });
+
+  test("a turn that fails after shutdown began does not count toward auto-disable", async () => {
+    const fakes = createFakeDeps({
+      dueJobs: [makeFakeJob()],
+      async *runMessageImpl() {
+        yield { type: EventType.RUN_STARTED, threadId: "session-1", runId: "resp-1" } as BaseEvent;
+        // The backend refuses new turns, then closes the runtime of this one.
+        worker.refuseNewTurns();
+        yield { type: EventType.RUN_ERROR, message: "runtime closed" } as BaseEvent;
+      }
+    });
+    // The turn runs during tick(), after this assignment.
+    const worker = new SchedulerWorker(fakes.deps, { maxConcurrentJobs: 1, jobTimeoutMs: 60_000, maxConsecutiveFailures: 1 });
+
+    await worker.tick();
+
+    expect(fakes.jobRunsCompleted).toEqual([expect.objectContaining({ status: "failed" })]);
+    expect(fakes.finishCalls).toEqual([expect.objectContaining({ counts: false })]);
+    expect(fakes.recordOutcomeCalls).toEqual([]);
+    expect(fakes.auditEvents.some((e) => e.type === "scheduler.job.disabled")).toBe(false);
+  });
+
+  test("the outcome and the auto-disable use the revision that the claim read", async () => {
+    const job = makeFakeJob({ revision: 7 });
+    const fakes = createFakeDeps({
+      dueJobs: [job],
+      runtimeEvents: [[
+        { type: EventType.RUN_STARTED, threadId: "session-1", runId: "resp-1" } as BaseEvent,
+        { type: EventType.RUN_ERROR, message: "boom" } as BaseEvent
+      ]]
+    });
+
+    await new SchedulerWorker(fakes.deps, { maxConcurrentJobs: 1, jobTimeoutMs: 60_000, maxConsecutiveFailures: 1 }).tick();
+
+    expect(fakes.finishCalls).toEqual([{
+      jobId: job.jobId, runId: fakes.claimsCalled[0]?.runId, revision: 7, counts: true, disableAtFailures: 1
+    }]);
+    expect(fakes.auditEvents.map((e) => e.type)).toEqual(["scheduler.job.run.failed", "scheduler.job.disabled"]);
+    expect(fakes.auditEvents[0]).toMatchObject({ payload: { scheduledFor: job.scheduledFor } });
+  });
+
+  test("a failure at the limit that disables nothing writes no disable audit event", async () => {
+    // A security change paused the job during the run.
+    const fakes = createFakeDeps({
+      dueJobs: [makeFakeJob()],
+      jobOffAtFinish: true,
+      runtimeEvents: [[
+        { type: EventType.RUN_STARTED, threadId: "session-1", runId: "resp-1" } as BaseEvent,
+        { type: EventType.RUN_ERROR, message: "boom" } as BaseEvent
+      ]]
+    });
+
+    await new SchedulerWorker(fakes.deps, { maxConcurrentJobs: 1, jobTimeoutMs: 60_000, maxConsecutiveFailures: 1 }).tick();
+
+    expect(fakes.auditEvents.map((e) => e.type)).toEqual(["scheduler.job.run.failed"]);
+  });
+
+  test("a run that the stale-run sweep finished first gets no second outcome event", async () => {
+    const warnings: string[] = [];
+    const fakes = createFakeDeps({
+      dueJobs: [makeFakeJob()],
+      finishAlreadyFinished: true,
+      runtimeEvents: [[
+        { type: EventType.RUN_STARTED, threadId: "session-1", runId: "resp-1" } as BaseEvent,
+        { type: EventType.RUN_ERROR, message: "boom" } as BaseEvent
+      ]]
+    });
+    fakes.deps.logger.warn = (_payload, message) => {
+      warnings.push(message);
+    };
+    let disabled = false;
+    fakes.deps.disableJob = async () => {
+      disabled = true;
+      return true;
+    };
+
+    await new SchedulerWorker(fakes.deps, { maxConcurrentJobs: 1, jobTimeoutMs: 60_000, maxConsecutiveFailures: 1 }).tick();
+
+    expect(fakes.jobRunsCompleted).toHaveLength(1);
+    expect(fakes.auditEvents.filter((e) => e.type.startsWith("scheduler.job."))).toEqual([]);
+    expect(disabled).toBe(false);
+    expect(warnings).toContain("Scheduled job run was already finished, by the stale-run sweep; outcome not saved");
+  });
+
+  test.each([
+    { status: "skipped", runId: "run-skipped", scheduledFor: "2026-01-01T09:00:00.000Z" },
+    { status: "slot_taken", scheduledFor: "2026-01-01T09:00:00.000Z" }
+  ] satisfies ClaimJobResult[])("a $status claim starts no run and frees its slot", async (result) => {
+    const job = makeFakeJob();
+    const fakes = createFakeDeps({ dueJobs: [job], claimReturns: [result, job] });
+    const worker = new SchedulerWorker(fakes.deps, { maxConcurrentJobs: 1, jobTimeoutMs: 60_000 });
+
+    await worker.tick();
+    expect(fakes.sessionsCreated).toHaveLength(0);
+    // The first claim kept no slot, so the next tick runs the job in the only one.
+    await worker.tick();
+
+    expect(fakes.claimsCalled).toHaveLength(2);
+    expect(fakes.sessionsCreated).toHaveLength(1);
+    expect(fakes.jobRunsCompleted).toEqual([expect.objectContaining({ status: "completed" })]);
+    // Not a refused claim, so no pause for a security change.
+    expect(fakes.pauseCalls).toEqual([]);
   });
 });
 

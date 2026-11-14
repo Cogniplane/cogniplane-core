@@ -183,22 +183,62 @@ delete). Limits: `SCHEDULED_JOB_CREATE_LIMIT_*` and
 - `services/scheduler-worker.ts` polls `scheduled_jobs` every
   `SCHEDULER_POLL_INTERVAL_MS` and runs each due job as an unattended agent
   turn. Many replicas can run the worker.
-- The claim (`UserSettingsStore.claimJob`) is one conditional `UPDATE ...
-  RETURNING` and the insert of a `pending` row in `scheduled_job_runs`, in one
-  transaction as `app_user` in the job's tenant. Only one replica gets the job,
-  and each claim leaves one run row. The worker then links the run to its new
-  session and writes the outcome, also when the session or the turn cannot
-  start. After a crash, the stale-run sweep marks the run `failed`.
+- A slot is one `next_run_at` value of a job. The claim
+  (`UserSettingsStore.claimJob`) runs in one transaction as `app_user` in the
+  job's tenant: it locks the due job row, writes a run row with the slot in
+  `scheduled_for`, and moves `next_run_at` to the next slot. Only one replica
+  gets the job. The next slot comes from the cron expression and the database
+  clock (`clock_timestamp()`), so a worker clock that is late cannot write a
+  slot that is due again.
+- A unique index on `scheduled_job_runs (tenant_id, job_id, scheduled_for)`
+  lets each slot have one run. A claim of a slot that already has a run writes
+  no run and only moves `next_run_at` (`slot_taken`).
+- One run of a job at a time. When the job has a `pending` run, the claim
+  writes a `skipped` run for the slot (completed at once, with a fixed message)
+  and moves to the next slot; no turn starts. A skipped slot does not run
+  later, and it does not set `last_run_at`. A run left `pending` by a crash
+  blocks the job until the stale-run sweep fails it (job timeout + abort grace +
+  60 seconds), so the slots of that time are skipped.
+- The worker links the run to its new session and writes the outcome, also
+  when the session or the turn cannot start. Both writes change only a
+  `pending` run (`attachJobRunSession`, `finishJobRun`). After a crash, the
+  stale-run sweep marks the run `failed`. A late writer after the sweep changes
+  nothing and writes no audit event, so each run has at most one
+  `scheduler.job.run.*` event. A write that fails leaves the run `pending` for
+  the sweep.
+- A job delete removes its runs. The outcome of a run whose job was deleted is
+  not saved and gets no `scheduler.job.run.*` event: the sweep can have written
+  that run's event before the delete. So a run that was still running when its
+  job was deleted has no outcome event; the delete has its
+  `user.scheduled_job.deleted` event.
+- Lock order is the job row, then its run rows: the claim, `finishJobRun` and a
+  job delete (with its cascade) all take them in this order, so a finish and a
+  delete do not deadlock.
 - Limits: `SCHEDULER_MAX_CONCURRENT_JOBS`, `SCHEDULER_JOB_TIMEOUT_MS`,
   `SCHEDULER_MAX_CONSECUTIVE_FAILURES` (disables a failing job).
+- Failure counter (`consecutive_failures`): `finishJobRun` updates it in the
+  transaction of the outcome. A success sets it to 0; a failure that counts
+  adds 1. These failures do not count: a turn limit or an unavailable limit
+  store, a PII provider outage, an owner security change (before the turn, or
+  a stop of the running turn), a failure after shutdown began
+  (`refuseNewTurns`), and a job timeout before the runtime turn started. An
+  owner edit sets the counter to 0 and adds 1 to `scheduled_jobs.revision`. A
+  run keeps the revision of its claim; its outcome changes the counter only
+  while the job has that revision.
+- Auto-disable: the `finishJobRun` write that takes the counter to
+  `SCHEDULER_MAX_CONSECUTIVE_FAILURES` also turns the job off, under the job
+  row lock. No claim can start a run after that failure, and a delayed step of
+  an older run cannot turn off a job that a newer run fixed. The auto-disable
+  changes only a job that is on, so a job paused for a security change keeps
+  its review prompt. The worker writes a `scheduler.job.disabled` event only
+  when the finish turned the job off.
 - Admission is the same as for an interactive turn, in this order: the session
   execution lease with the running-turn caps (`turn_context` is `scheduled` in
   memory only), the prompt PII check, then one unit of the daily turn quota
   (`TURN_QUOTA_PER_*_PER_DAY`). A blocked prompt spends no quota. The
   `message_turn` rate limit applies to requests only. A refusal by a cap, the
-  quota or an unavailable limit store fails the run with a fixed message, does
-  not count toward `SCHEDULER_MAX_CONSECUTIVE_FAILURES`, and the job runs again
-  at its next time.
+  quota or an unavailable limit store fails the run with a fixed message, and
+  the job runs again at its next time.
 - The worker keeps the lease, renewed by its heartbeat, until the runtime abort
   ends, then releases it. The abort names the execution, so it does not stop a
   newer turn of the session. When the heartbeat loses the lease (a stop, a

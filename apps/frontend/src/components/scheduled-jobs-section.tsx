@@ -249,6 +249,7 @@ export function ScheduledJobsSection(input: {
                               {run.durationMs != null ? <span className={CHIP}>{(run.durationMs / 1000).toFixed(1)}s</span> : null}
                             </div>
                             {run.status === "failed" && run.errorMessage ? <p className="mt-1 text-xs text-danger">{run.errorMessage}</p> : null}
+                            {run.status === "skipped" && run.errorMessage ? <p className="mt-1 text-xs text-on-surface-variant">{run.errorMessage}</p> : null}
                             {run.summary ? <p className="mt-1 text-xs text-on-surface-variant">{run.summary}</p> : null}
                           </div>
                         )) : null}

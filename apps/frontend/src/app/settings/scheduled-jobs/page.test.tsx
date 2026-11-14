@@ -274,13 +274,20 @@ it("shows run loading, failure details and summary, then collapses history", asy
   fireEvent.click(await screen.findByRole("button", { name: "Runs" }));
   expect((await screen.findByRole("button", { name: "Loading..." }) as HTMLButtonElement).disabled).toBe(true);
   await act(async () => resolve([{
-    runId: "run-1", jobId: "job-1", userId: "user-1", sessionId: null, status: "failed",
+    runId: "run-1", jobId: "job-1", userId: "user-1", sessionId: null, status: "failed", scheduledFor: job.createdAt,
     startedAt: job.createdAt, completedAt: job.updatedAt, durationMs: 1250, inputTokens: 0, outputTokens: 0,
     errorMessage: "Provider unavailable", summary: "Retry tomorrow", createdAt: job.createdAt
+  }, {
+    runId: "run-2", jobId: "job-1", userId: "user-1", sessionId: null, status: "skipped", scheduledFor: job.createdAt,
+    startedAt: job.createdAt, completedAt: job.createdAt, durationMs: 0, inputTokens: 0, outputTokens: 0,
+    errorMessage: "The previous run was still running.", summary: null, createdAt: job.createdAt
   }]));
   await screen.findByText("Provider unavailable");
   expect(screen.getByText("Retry tomorrow")).toBeTruthy();
   expect(screen.getByText("1.3s")).toBeTruthy();
+  // A skipped slot shows its reason as a note, not as an error.
+  expect(screen.getByText("skipped")).toBeTruthy();
+  expect(screen.getByText("The previous run was still running.").className).not.toContain("text-danger");
   fireEvent.click(screen.getByRole("button", { name: "Runs" }));
   expect(screen.queryByText("Provider unavailable")).toBeNull();
 });
@@ -622,7 +629,7 @@ it("uses the DELETE acknowledgement when the list refresh fails without replayin
 });
 
 it("connects the Runs disclosure to a stable panel and retains known runs after failed refresh", async () => {
-  const run: ScheduledJobRun = { runId: "run-1", jobId: job.jobId, userId: job.userId, sessionId: null, status: "failed", startedAt: job.createdAt, completedAt: job.updatedAt, durationMs: 1000, inputTokens: 0, outputTokens: 0, errorMessage: "Full provider failure", summary: "Full run summary", createdAt: job.createdAt };
+  const run: ScheduledJobRun = { runId: "run-1", jobId: job.jobId, userId: job.userId, sessionId: null, status: "failed", scheduledFor: null, startedAt: job.createdAt, completedAt: job.updatedAt, durationMs: 1000, inputTokens: 0, outputTokens: 0, errorMessage: "Full provider failure", summary: "Full run summary", createdAt: job.createdAt };
   api.runs.mockResolvedValueOnce([run]);
   const client = mount();
   const button = await screen.findByRole("button", { name: "Runs" });

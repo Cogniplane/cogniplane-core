@@ -56,11 +56,11 @@ describe.skipIf(!adminDatabaseUrl())("scheduler persistence", () => {
     expect(jobs.map((job) => job.jobId)).not.toContain(future);
   });
 
-  test.each(["completed", "failed"])("persists a pending run and its %s outcome", async (status) => {
+  test.each(["completed", "failed"] as const)("persists a pending run and its %s outcome", async (status) => {
     const tenant = await seedTenantGraph();
     const runId = randomUUID();
     const store = new UserSettingsStore(appPool(), maintenancePool());
-    await store.claimJob(tenant.tenantId, tenant.jobId, null, runId);
+    await store.claimJob(tenant.tenantId, tenant.jobId, runId);
     await store.attachJobRunSession({ tenantId: tenant.tenantId, runId, sessionId: tenant.sessionId });
 
     const pending = await superuserPool().query("SELECT * FROM scheduled_job_runs WHERE run_id = $1", [runId]);
@@ -68,9 +68,9 @@ describe.skipIf(!adminDatabaseUrl())("scheduler persistence", () => {
     expect(pending.rows[0].completed_at).toBeNull();
 
     const errorMessage = status === "failed" ? "provider timeout" : null;
-    await store.completeJobRun({
-      tenantId: tenant.tenantId, runId, status, durationMs: 1532,
-      inputTokens: 23, outputTokens: 47, errorMessage, summary: "run summary"
+    await store.finishJobRun({
+      tenantId: tenant.tenantId, jobId: tenant.jobId, runId, revision: 0, status, durationMs: 1532,
+      inputTokens: 23, outputTokens: 47, errorMessage, summary: "run summary", counts: true, disableAtFailures: 0
     });
     const completed = await superuserPool().query("SELECT * FROM scheduled_job_runs WHERE run_id = $1", [runId]);
     expect(completed.rows[0]).toMatchObject({

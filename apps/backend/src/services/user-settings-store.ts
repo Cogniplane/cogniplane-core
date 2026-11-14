@@ -2,6 +2,7 @@ import type { PoolClient } from "pg";
 
 import { type Pool, withTenantScope } from "../lib/db.js";
 import { isoTimestamp, isoTimestampOrNull } from "../lib/db-mappers.js";
+import { computeNextCronRunAt } from "../lib/cron.js";
 import { ownerSecurityVersionSql } from "./auth/security-change.js";
 
 export const userSettingsSectionKeys = ["scheduled_jobs", "github", "skills", "mcp", "model"] as const;
@@ -23,6 +24,8 @@ export type ScheduledJobRunRecord = {
   userId: string;
   sessionId: string | null;
   status: string;
+  /** The slot of the run: the `next_run_at` that its claim took. Null on runs written before slots. */
+  scheduledFor: string | null;
   startedAt: string;
   completedAt: string | null;
   durationMs: number | null;
@@ -68,12 +71,60 @@ export type ScheduledJobRecord = {
 export type ScheduledJobPausedReason = "security_change";
 
 /**
+ * A due job as the scheduler lists it. `revision` counts the owner's saves; a
+ * write of the scheduler that must not apply to a newer save of the job
+ * requires it. It stays out of `ScheduledJobRecord`, so API responses do not
+ * carry it.
+ */
+export type DueScheduledJob = ScheduledJobRecord & { revision: number };
+
+/**
  * A job as the scheduler claimed it. `ownerSecurityVersion` is the security
  * version of the owner's local account from the session that last saved the
- * job; null for a WorkOS owner. It stays out of `ScheduledJobRecord`, so API
- * responses do not carry it. `runId` is the pending run that the claim wrote.
+ * job; null for a WorkOS owner. `runId` is the pending run that the claim
+ * wrote, and `scheduledFor` its slot. `revision` is the revision that the
+ * claim read.
  */
-export type ClaimedScheduledJob = ScheduledJobRecord & { ownerSecurityVersion: number | null; runId: string };
+export type ClaimedScheduledJob = DueScheduledJob & {
+  ownerSecurityVersion: number | null;
+  runId: string;
+  scheduledFor: string;
+};
+
+/**
+ * - `claimed`: the job runs; its pending run is written.
+ * - `skipped`: an earlier run of the job is still pending. The slot has a
+ *   `skipped` run and does not run.
+ * - `slot_taken`: the slot already has a run, so no run is written. The job's
+ *   next run moves forward.
+ * - `not_claimed`: the job is not due, is off, or its owner is no longer a
+ *   member or had a security change. Another worker may have claimed it.
+ *
+ * In each case except `not_claimed`, `next_run_at` moved to the next slot.
+ */
+export type ClaimJobResult =
+  | { status: "claimed"; job: ClaimedScheduledJob }
+  | { status: "skipped"; runId: string; scheduledFor: string }
+  | { status: "slot_taken"; scheduledFor: string }
+  | { status: "not_claimed" };
+
+/** The run error of a slot that came due while the previous run was still pending. */
+export const SKIPPED_RUN_MESSAGE = "The run was skipped because the previous run of this job was still running.";
+
+/**
+ * - `finished`: this call wrote the run's outcome. `consecutiveFailures` is
+ *   the new counter when the outcome counted and the job still has the claimed
+ *   revision; otherwise null. `disabled` is true when this call disabled the
+ *   job because the counter reached the limit.
+ * - `already_finished`: another writer (the stale-run sweep) finished the run
+ *   first. Nothing changed.
+ * - `missing`: the job and its runs are gone, because the job was deleted.
+ *   Nothing changed. The sweep can have failed the run before the delete.
+ */
+export type FinishJobRunResult =
+  | { status: "finished"; run: ScheduledJobRunRecord; consecutiveFailures: number | null; disabled: boolean }
+  | { status: "already_finished" }
+  | { status: "missing" };
 
 /** What a create or edit stores about the session that saved the job. */
 export type ScheduledJobOwnerSession = {
@@ -139,13 +190,18 @@ function mapScheduledJob(row: Record<string, unknown>): ScheduledJobRecord {
   };
 }
 
-function mapClaimedScheduledJob(row: Record<string, unknown>, runId: string): ClaimedScheduledJob {
+function mapDueScheduledJob(row: Record<string, unknown>): DueScheduledJob {
+  return { ...mapScheduledJob(row), revision: Number(row.revision ?? 0) };
+}
+
+function mapClaimedScheduledJob(row: Record<string, unknown>, runId: string, scheduledFor: string): ClaimedScheduledJob {
   return {
-    ...mapScheduledJob(row),
+    ...mapDueScheduledJob(row),
     ownerSecurityVersion: row.owner_security_version === null || row.owner_security_version === undefined
       ? null
       : Number(row.owner_security_version),
-    runId
+    runId,
+    scheduledFor
   };
 }
 
@@ -156,6 +212,7 @@ function mapScheduledJobRun(row: Record<string, unknown>): ScheduledJobRunRecord
     userId: String(row.user_id),
     sessionId: row.session_id ? String(row.session_id) : null,
     status: String(row.status),
+    scheduledFor: isoTimestampOrNull(row.scheduled_for),
     startedAt: isoTimestamp(row.started_at),
     completedAt: isoTimestampOrNull(row.completed_at),
     durationMs: row.duration_ms !== null && row.duration_ms !== undefined ? Number(row.duration_ms) : null,
@@ -374,7 +431,9 @@ export class UserSettingsStore {
    * counts it twice. Lock order is always quota lock, then job row.
    *
    * The edit is the owner's confirmation of the job: it stores the saving
-   * session's security version and clears a pause reason.
+   * session's security version and clears a pause reason. It also starts a
+   * new revision with no failures: the outcome of a run claimed before the
+   * edit does not count against the edited job (`finishJobRun`).
    */
   async updateScheduledJob(
     input: {
@@ -433,6 +492,8 @@ export class UserSettingsStore {
             next_run_at = $13,
             owner_security_version = $14,
             paused_reason = NULL,
+            consecutive_failures = 0,
+            revision = revision + 1,
             updated_at = NOW()
           WHERE tenant_id = $1 AND job_id = $2 AND user_id = $3
           RETURNING *
@@ -497,7 +558,7 @@ export class UserSettingsStore {
    * off does not give an earlier turn. Runs on the RLS-bypassing scheduler
    * pool; each row and each aggregate stays keyed by its own tenant_id.
    */
-  async listDueJobs(limit: number): Promise<ScheduledJobRecord[]> {
+  async listDueJobs(limit: number): Promise<DueScheduledJob[]> {
     const result = await this.schedulerDb.query(
       `
         WITH due AS (
@@ -554,49 +615,54 @@ export class UserSettingsStore {
       [limit]
     );
 
-    return result.rows.map((row) => mapScheduledJob(row));
+    return result.rows.map((row) => mapDueScheduledJob(row));
   }
 
   /**
-   * Claim a due job for execution and write its pending run (`runId`, no
-   * session yet) in the same transaction. A crash after the claim therefore
-   * leaves a run that `sweepStaleJobRuns` recovers, and a failed insert
-   * leaves the job due for the next tick. Under concurrent claims, the loser
-   * waits on the job row lock, then matches no row and writes no run.
+   * Claim the due slot of a job. The slot is the job's `next_run_at`; the run
+   * row keeps it as `scheduled_for`, and a unique index lets each slot have
+   * one run. The next slot comes from the cron expression and the database
+   * clock, not the worker's clock. See `ClaimJobResult` for the outcomes.
    *
-   * Runs as `app_user` in the tenant's scope: `maintenance_user` has no
-   * INSERT on `scheduled_job_runs`. RLS and the `tenant_id` predicate both
-   * bound the claim. The tenant comes from the job row that `listDueJobs`
-   * read, never from caller-supplied input.
+   * One transaction as `app_user` in the tenant's scope (`maintenance_user`
+   * has no INSERT on `scheduled_job_runs`). RLS and the `tenant_id` predicate
+   * both bound it. The tenant comes from the job row that `listDueJobs` read,
+   * never from caller-supplied input.
+   *
+   * Order:
+   * 1. Lock the job row if it is due and may run. Under concurrent claims, the
+   *    loser waits on the lock, then finds `next_run_at` in the future and
+   *    matches no row.
+   * 2. In a new statement, so with a new snapshot, read the database time and
+   *    whether the job has a pending run. The pending run of a claim that
+   *    committed while this one waited is visible here.
+   * 3. A pending run means the earlier run still runs: write a `skipped` run
+   *    for the slot. Otherwise write the `pending` run. Then move
+   *    `next_run_at` to the next slot.
+   *
+   * A crash after the commit leaves a pending run that `sweepStaleJobRuns`
+   * fails. A failed insert rolls the claim back, so the job stays due.
    *
    * A job whose owner had a security change since the job was saved is not
    * claimed. The worker then pauses it with `pauseJobForSecurityChange`.
    *
-   * `last_run_at = NOW()` is the record of the claim that `listDueJobs` uses
-   * for the turn order of tenants and members. Keep it in this UPDATE, so a
-   * claim and its turn record commit together.
+   * `last_run_at = NOW()` is the record of a run start that `listDueJobs`
+   * uses for the turn order of tenants and members. Only a claimed run sets
+   * it, in the same transaction as its run row.
    */
-  async claimJob(
-    tenantId: string,
-    jobId: string,
-    nextRunAt: string | null,
-    runId: string
-  ): Promise<ClaimedScheduledJob | null> {
+  async claimJob(tenantId: string, jobId: string, runId: string): Promise<ClaimJobResult> {
     return withTenantScope(this.db, tenantId, async (client) => {
-      const claimed = await client.query(
+      const due = await client.query(
         `
-          UPDATE scheduled_jobs
-          SET
-            last_run_at = NOW(),
-            next_run_at = $3,
-            updated_at = NOW()
+          SELECT *
+          FROM scheduled_jobs
           WHERE tenant_id = $1
             AND job_id = $2
             AND enabled = TRUE
             AND next_run_at IS NOT NULL
             AND next_run_at <= NOW()
             -- Also checked here, not just in listDueJobs: that query is a
-            -- pre-filter run once per tick, while this UPDATE is the atomic gate.
+            -- pre-filter run once per tick, while this lock is the gate.
             -- A tick that listed a job just before its owner was removed would
             -- otherwise still claim and execute it.
             AND EXISTS (
@@ -605,44 +671,97 @@ export class UserSettingsStore {
                 AND m.user_id = scheduled_jobs.user_id
             )
             AND ${OWNER_SECURITY_CURRENT_SQL}
+          FOR UPDATE
+        `,
+        [tenantId, jobId]
+      );
+      const job = due.rows[0];
+      if (!job) return { status: "not_claimed" };
+
+      const state = await client.query<{ db_now: Date; busy: boolean }>(
+        `
+          SELECT
+            clock_timestamp() AS db_now,
+            EXISTS (
+              SELECT 1 FROM scheduled_job_runs
+              WHERE tenant_id = $1 AND job_id = $2 AND status = 'pending'
+            ) AS busy
+        `,
+        [tenantId, jobId]
+      );
+      const { db_now: dbNow, busy } = state.rows[0]!;
+      const scheduledFor = isoTimestamp(job.next_run_at);
+      // Strictly after the current minute of the database clock, so after the
+      // slot that this claim takes too.
+      const nextRunAt = computeNextCronRunAt(String(job.cron_expression), String(job.time_zone), dbNow);
+
+      // The slot comes from the locked row, not from a JavaScript Date, so it
+      // keeps the full precision of `next_run_at`.
+      const inserted = await client.query(
+        `
+          INSERT INTO scheduled_job_runs (
+            tenant_id, run_id, job_id, user_id, session_id, status, scheduled_for,
+            started_at, completed_at, duration_ms, error_message
+          )
+          SELECT
+            tenant_id, $3::text, job_id, user_id, NULL, $4::text, next_run_at,
+            NOW(),
+            CASE WHEN $4::text = 'skipped' THEN NOW() END,
+            CASE WHEN $4::text = 'skipped' THEN 0 END,
+            CASE WHEN $4::text = 'skipped' THEN $5::text END
+          FROM scheduled_jobs
+          WHERE tenant_id = $1 AND job_id = $2
+          ON CONFLICT (tenant_id, job_id, scheduled_for) DO NOTHING
+          RETURNING run_id
+        `,
+        [tenantId, jobId, runId, busy ? "skipped" : "pending", SKIPPED_RUN_MESSAGE]
+      );
+      const wrote = (inserted.rowCount ?? 0) > 0;
+      const started = wrote && !busy;
+
+      const advanced = await client.query(
+        `
+          UPDATE scheduled_jobs
+          SET
+            last_run_at = CASE WHEN $4::boolean THEN NOW() ELSE last_run_at END,
+            next_run_at = $3,
+            updated_at = NOW()
+          WHERE tenant_id = $1 AND job_id = $2
           RETURNING *
         `,
-        [tenantId, jobId, nextRunAt]
-      );
-      const row = claimed.rows[0];
-      if (!row) return null;
-
-      await client.query(
-        `
-          INSERT INTO scheduled_job_runs (tenant_id, run_id, job_id, user_id, session_id, status, started_at)
-          VALUES ($1, $2, $3, $4, NULL, 'pending', NOW())
-        `,
-        [row.tenant_id, runId, row.job_id, row.user_id]
+        [tenantId, jobId, nextRunAt, started]
       );
 
-      return mapClaimedScheduledJob(row, runId);
+      if (!wrote) return { status: "slot_taken", scheduledFor };
+      if (busy) return { status: "skipped", runId, scheduledFor };
+      return { status: "claimed", job: mapClaimedScheduledJob(advanced.rows[0], runId, scheduledFor) };
     });
   }
 
   /**
    * Take a due job out of the due query without a run: next_run_at = NULL.
    * The fallback for a job whose cron cannot be parsed when it cannot be
-   * disabled. Runs on the RLS-bypassing scheduler pool, so the `tenant_id`
-   * predicate is the sole isolation guarantee and must always be present.
+   * disabled. Applies only while the job has the listed `revision`, so it
+   * does not park an edited job. Returns true when this call parked the job.
+   * Runs on the RLS-bypassing scheduler pool, so the `tenant_id` predicate is
+   * the sole isolation guarantee and must always be present.
    */
-  async parkJob(tenantId: string, jobId: string): Promise<void> {
-    await this.schedulerDb.query(
+  async parkJob(tenantId: string, jobId: string, revision: number): Promise<boolean> {
+    const result = await this.schedulerDb.query(
       `
         UPDATE scheduled_jobs
         SET next_run_at = NULL, updated_at = NOW()
         WHERE tenant_id = $1
           AND job_id = $2
           AND enabled = TRUE
+          AND revision = $3
           AND next_run_at IS NOT NULL
           AND next_run_at <= NOW()
       `,
-      [tenantId, jobId]
+      [tenantId, jobId, revision]
     );
+
+    return (result.rowCount ?? 0) > 0;
   }
 
   /**
@@ -690,54 +809,36 @@ export class UserSettingsStore {
   }
 
   /**
-   * Record the outcome of a finished run against the job's poison counter.
-   * On success the counter resets to 0; on failure it increments. Returns the
-   * new `consecutive_failures` value so the scheduler can decide whether to
-   * auto-disable. Runs on the RLS-bypassing scheduler pool
-   * since the worker has no per-request tenant scope, so the `tenant_id`
-   * predicate is the sole isolation guarantee and must always be present.
+   * Disable a job (enabled = FALSE, next_run_at = NULL) so it leaves the
+   * due-job query. Used for a job whose cron cannot be parsed. A job that
+   * reaches the failure limit is disabled by `finishJobRun` instead.
+   *
+   * Applies only to a job that is on and still has `revision`. A job that the
+   * owner saved since, or that is already off, does not change: a job paused
+   * for a security change keeps its `paused_reason` and its review prompt.
+   * On a job that is on, the reason can only be left over from older code
+   * (migration 080), so the disable clears it. Returns true when this call
+   * disabled the job, so the caller writes one audit event. Runs on the
+   * RLS-bypassing scheduler pool, so the `tenant_id` predicate is the sole
+   * isolation guarantee and must always be present.
    */
-  async recordJobRunOutcome(
-    tenantId: string,
-    jobId: string,
-    succeeded: boolean
-  ): Promise<number> {
+  async disableJob(tenantId: string, jobId: string, revision: number): Promise<boolean> {
     const result = await this.schedulerDb.query(
       `
         UPDATE scheduled_jobs
-        SET
-          consecutive_failures = CASE WHEN $3 THEN 0 ELSE consecutive_failures + 1 END,
-          updated_at = NOW()
-        WHERE tenant_id = $1 AND job_id = $2
-        RETURNING consecutive_failures
-      `,
-      [tenantId, jobId, succeeded]
-    );
-
-    return result.rows[0] ? Number(result.rows[0].consecutive_failures ?? 0) : 0;
-  }
-
-  /**
-   * Disable a job (enabled = FALSE, next_run_at = NULL) so it permanently
-   * leaves the due-job query. Used for poison jobs (invalid cron or repeated
-   * failures). Idempotent; runs on the RLS-bypassing scheduler pool, so the
-   * `tenant_id` predicate is the sole isolation guarantee and must always be
-   * present.
-   */
-  async disableJob(tenantId: string, jobId: string): Promise<void> {
-    await this.schedulerDb.query(
-      `
-        UPDATE scheduled_jobs
         SET enabled = FALSE, next_run_at = NULL, paused_reason = NULL, updated_at = NOW()
-        WHERE tenant_id = $1 AND job_id = $2
+        WHERE tenant_id = $1 AND job_id = $2 AND enabled = TRUE AND revision = $3
       `,
-      [tenantId, jobId]
+      [tenantId, jobId, revision]
     );
+
+    return (result.rowCount ?? 0) > 0;
   }
 
   /**
    * Link a claimed run to the session that the worker created for it.
-   * Returns false when the run row is gone (the job was deleted).
+   * Returns false when the run is no longer pending (the stale-run sweep
+   * failed it) or its row is gone (the job was deleted).
    */
   async attachJobRunSession(input: { tenantId: string; runId: string; sessionId: string }): Promise<boolean> {
     return withTenantScope(this.db, input.tenantId, async (client) => {
@@ -745,7 +846,7 @@ export class UserSettingsStore {
         `
           UPDATE scheduled_job_runs
           SET session_id = $3
-          WHERE tenant_id = $1 AND run_id = $2
+          WHERE tenant_id = $1 AND run_id = $2 AND status = 'pending'
         `,
         [input.tenantId, input.runId, input.sessionId]
       );
@@ -754,59 +855,130 @@ export class UserSettingsStore {
     });
   }
 
-  /** Record the outcome of a run. Returns null when the run row is gone. */
-  async completeJobRun(input: {
+  /**
+   * Write the outcome of a pending run and, in the same transaction, its
+   * effect on the job. See `FinishJobRunResult`.
+   *
+   * Lock order is job row, then run row, as in `claimJob` and in a job delete
+   * (the delete cascades to the runs). The reverse order could deadlock with a
+   * delete of the job. A job that is gone has no run row either: `missing`.
+   *
+   * Only a pending run changes, so a run has one outcome: a late writer after
+   * the stale-run sweep changes nothing.
+   *
+   * The job changes when `counts` is true, and only while the job still has
+   * the `revision` that the claim read: a success sets the failure counter to
+   * 0, a failure adds 1. After an owner edit, the outcome of the older
+   * definition does not count. When a failure takes the counter to
+   * `disableAtFailures` (0: never) and the job is on, the same write disables
+   * the job. The job row lock then orders the disable with each claim and each
+   * other outcome: no claim starts a run after the limit, and an older failure
+   * cannot disable the job after a newer success.
+   */
+  async finishJobRun(input: {
     tenantId: string;
+    jobId: string;
     runId: string;
-    status: string;
+    revision: number;
+    status: "completed" | "failed";
     durationMs: number;
     inputTokens: number;
     outputTokens: number;
     errorMessage: string | null;
     summary: string | null;
-  }): Promise<ScheduledJobRunRecord | null> {
+    counts: boolean;
+    disableAtFailures: number;
+  }): Promise<FinishJobRunResult> {
     return withTenantScope(this.db, input.tenantId, async (client) => {
+      const locked = await client.query<{ enabled: boolean; revision: number; consecutive_failures: number }>(
+        `
+          SELECT enabled, revision, consecutive_failures
+          FROM scheduled_jobs
+          WHERE tenant_id = $1 AND job_id = $2
+          FOR NO KEY UPDATE
+        `,
+        [input.tenantId, input.jobId]
+      );
+      const job = locked.rows[0];
+      if (!job) return { status: "missing" };
+
       const result = await client.query(
         `
           UPDATE scheduled_job_runs
           SET
-            status = $2,
+            status = $4,
             completed_at = NOW(),
-            duration_ms = $3,
-            input_tokens = $4,
-            output_tokens = $5,
-            error_message = $6,
-            summary = $7
-          WHERE tenant_id = $8 AND run_id = $1
+            duration_ms = $5,
+            input_tokens = $6,
+            output_tokens = $7,
+            error_message = $8,
+            summary = $9
+          WHERE tenant_id = $1 AND job_id = $2 AND run_id = $3 AND status = 'pending'
           RETURNING *
         `,
         [
+          input.tenantId,
+          input.jobId,
           input.runId,
           input.status,
           input.durationMs,
           input.inputTokens,
           input.outputTokens,
           input.errorMessage,
-          input.summary,
-          input.tenantId
+          input.summary
         ]
       );
+      const run = result.rows[0];
+      if (!run) {
+        const existing = await client.query(
+          "SELECT 1 FROM scheduled_job_runs WHERE tenant_id = $1 AND job_id = $2 AND run_id = $3",
+          [input.tenantId, input.jobId, input.runId]
+        );
+        return (existing.rowCount ?? 0) > 0 ? { status: "already_finished" } : { status: "missing" };
+      }
 
-      return result.rows[0] ? mapScheduledJobRun(result.rows[0]) : null;
+      if (!input.counts || Number(job.revision) !== input.revision) {
+        return { status: "finished", run: mapScheduledJobRun(run), consecutiveFailures: null, disabled: false };
+      }
+
+      const failed = input.status === "failed";
+      const consecutiveFailures = failed ? Number(job.consecutive_failures) + 1 : 0;
+      const disabled = failed && job.enabled && input.disableAtFailures > 0
+        && consecutiveFailures >= input.disableAtFailures;
+      // The disable clears `paused_reason` as `disableJob` does: on a job that
+      // is on, a reason can only be left over from older code.
+      await client.query(
+        `
+          UPDATE scheduled_jobs
+          SET
+            consecutive_failures = $3,
+            enabled = CASE WHEN $4::boolean THEN FALSE ELSE enabled END,
+            next_run_at = CASE WHEN $4::boolean THEN NULL ELSE next_run_at END,
+            paused_reason = CASE WHEN $4::boolean THEN NULL ELSE paused_reason END,
+            updated_at = NOW()
+          WHERE tenant_id = $1 AND job_id = $2
+        `,
+        [input.tenantId, input.jobId, consecutiveFailures, disabled]
+      );
+
+      return { status: "finished", run: mapScheduledJobRun(run), consecutiveFailures, disabled };
     });
   }
 
   /**
    * Recover run rows orphaned by a crash/restart: stuck in `status='pending'`
-   * with no live `executeJob` to ever call `completeJobRun`. Marks them failed
-   * with a deterministic error message and returns identifying fields so the
-   * caller can audit each one. Cross-tenant by design (runs on the
-   * RLS-bypassing scheduler pool); `olderThanMs` must exceed the longest a
-   * healthy run can legitimately stay pending (job timeout + abort-settle
-   * grace), so a live in-flight run is never swept. If a presumed-dead run
-   * does settle later, its `completeJobRun` overwrites this row with the true
-   * outcome — acceptable, since that outcome is strictly more accurate.
-   * `FOR UPDATE SKIP LOCKED` keeps concurrent sweeps from double-claiming.
+   * with no live `executeJob` to ever finish them. Marks them failed with a
+   * fixed error message and returns identifying fields so the caller can
+   * audit each one. A job with a pending run is not claimed again
+   * (`claimJob`), so this sweep also frees the job for its next slot.
+   *
+   * Cross-tenant by design (runs on the RLS-bypassing scheduler pool).
+   * `olderThanMs` must exceed the longest a healthy run can stay pending (job
+   * timeout + abort-settle grace), so a live in-flight run is never swept. If
+   * a presumed-dead run settles later, `finishJobRun` finds it no longer
+   * pending and writes nothing, so the run keeps one outcome and one audit
+   * event. `FOR UPDATE SKIP LOCKED` keeps concurrent sweeps from
+   * double-claiming.
    */
   async sweepStaleJobRuns(olderThanMs: number, limit = 100): Promise<OrphanedJobRunRecord[]> {
     const result = await this.schedulerDb.query(
@@ -815,15 +987,16 @@ export class UserSettingsStore {
         SET status = 'failed',
             completed_at = NOW(),
             error_message = 'Run orphaned by a scheduler crash or restart'
-        WHERE run_id IN (
-          SELECT run_id
-          FROM scheduled_job_runs
-          WHERE status = 'pending'
-            AND started_at < NOW() - ($1::bigint * INTERVAL '1 millisecond')
-          ORDER BY started_at ASC
-          LIMIT $2
-          FOR UPDATE SKIP LOCKED
-        )
+        WHERE status = 'pending'
+          AND run_id IN (
+            SELECT run_id
+            FROM scheduled_job_runs
+            WHERE status = 'pending'
+              AND started_at < NOW() - ($1::bigint * INTERVAL '1 millisecond')
+            ORDER BY started_at ASC
+            LIMIT $2
+            FOR UPDATE SKIP LOCKED
+          )
         RETURNING tenant_id, run_id, job_id, user_id, session_id
       `,
       [olderThanMs, limit]
