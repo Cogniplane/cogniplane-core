@@ -147,7 +147,8 @@ export function buildProviderBaseUrlOptions(
   baseUrl: string | null
 ): Record<string, unknown> {
   if (!baseUrl) return {};
-  switch (MODEL_PROVIDER_META[provider].initPrefix) {
+  const prefix = MODEL_PROVIDER_META[provider].initPrefix;
+  switch (prefix) {
     case "anthropic":
       return { anthropicApiUrl: baseUrl };
     case "openai":
@@ -157,7 +158,7 @@ export function buildProviderBaseUrlOptions(
     case "google-genai":
       return { baseUrl };
     default:
-      return {};
+      return unreachableMapping(prefix);
   }
 }
 
@@ -194,16 +195,20 @@ export function buildOpenAiResponsesApiOptions(
  * - Google (`@langchain/google-genai`): `thinkingConfig.thinkingLevel` takes
  *   LOW/MEDIUM/HIGH; `none` sets `thinkingBudget: 0` to disable thinking.
  *
- * Returns an empty object when there is no effort to apply (null/undefined, or
- * a provider we don't map), so the client keeps its own default. Effort levels
- * a provider can't express are clamped to its nearest supported level.
+ * The mapping comes from `MODEL_PROVIDER_META[provider].reasoningEffort`, a
+ * required field, and the switch has a `never` check: a new provider or a new
+ * mapping fails to compile until it has a branch. `"unsupported"` and a turn
+ * without effort return an empty object, so the client keeps its own default.
+ * Effort levels a provider can't express are clamped to its nearest supported
+ * level.
  */
 export function applyReasoningEffort(
   provider: ModelProvider,
   effort: RuntimeReasoningEffort | null | undefined
 ): Record<string, unknown> {
   if (!effort) return {};
-  switch (MODEL_PROVIDER_META[provider].initPrefix) {
+  const mapping = MODEL_PROVIDER_META[provider].reasoningEffort;
+  switch (mapping) {
     case "anthropic": {
       if (effort === "none") return {};
       // Anthropic's effort scale starts at "low"; "minimal" clamps up to it.
@@ -214,11 +219,11 @@ export function applyReasoningEffort(
       };
     }
     case "openai":
-      // Includes OpenRouter (rides the OpenAI client). OpenAI's ReasoningEffort
-      // enum covers none/minimal/low/medium/high/xhigh — pass through. OpenRouter
-      // models advertise no efforts today, so this path is OpenAI-only in practice.
+      // OpenAI, and the providers that ride its client (OpenRouter, Z.AI).
+      // OpenAI's ReasoningEffort enum covers none/minimal/low/medium/high/xhigh,
+      // so the level passes through.
       return { reasoning: { effort } };
-    case "google-genai": {
+    case "google": {
       if (effort === "none") return { thinkingConfig: { thinkingBudget: 0 } };
       // Gemini thinkingLevel is LOW/MEDIUM/HIGH; minimal→LOW, xhigh/max→HIGH.
       const level =
@@ -229,9 +234,15 @@ export function applyReasoningEffort(
             : "HIGH";
       return { thinkingConfig: { thinkingLevel: level } };
     }
-    default:
+    case "unsupported":
       return {};
+    default:
+      return unreachableMapping(mapping);
   }
+}
+
+function unreachableMapping(value: never): never {
+  throw new Error(`No mapping for provider option ${String(value)}.`);
 }
 
 /** Built-in Deep Agents tools that mutate state — gated whenever approvals are on. */

@@ -102,9 +102,10 @@ describe("AguiTurnAccumulator", () => {
     expect(turn.toolResults()[0]?.status).toBe("declined");
   });
 
-  test("tool_status carries durationMs on a successful call without forcing failure", () => {
-    // durationMs must apply even when the status is not failed or declined.
-    // Otherwise a successful card loses its timing on reload.
+  test("a tool_status without a status is malformed and ignored", () => {
+    // The shared schema requires status failed or declined, and the emitter
+    // (stream-events-to-agui.ts) sends tool_status only for those. Before
+    // issue #121 the accumulator read this shape through a cast.
     const turn = feed([
       e({ type: EventType.TOOL_CALL_START, toolCallId: "c1", toolCallName: "execute" }),
       e({ type: EventType.TOOL_CALL_RESULT, toolCallId: "c1", content: "ok" }),
@@ -112,14 +113,14 @@ describe("AguiTurnAccumulator", () => {
     ]);
     const [result] = turn.toolResults();
     expect(result?.status).toBe("completed");
-    expect(result?.durationMs).toBe(17);
+    expect(result?.durationMs).toBeNull();
   });
 
   test("a later tool_status without durationMs does not null a previously-captured duration", () => {
     const turn = feed([
       e({ type: EventType.TOOL_CALL_START, toolCallId: "c1", toolCallName: "execute" }),
       e({ type: EventType.TOOL_CALL_RESULT, toolCallId: "c1", content: "ok" }),
-      e({ type: EventType.CUSTOM, name: "tool_status", value: { toolCallId: "c1", durationMs: 17 } }),
+      e({ type: EventType.CUSTOM, name: "tool_status", value: { toolCallId: "c1", status: "failed", durationMs: 17 } }),
       e({ type: EventType.CUSTOM, name: "tool_status", value: { toolCallId: "c1", status: "failed" } })
     ]);
     const [result] = turn.toolResults();

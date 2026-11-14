@@ -120,7 +120,10 @@ describe("enforcePolicyCenter outcome", () => {
     };
     return gate;
   }
-  const policySnapshot = { policyEnforcementMode: "monitor" };
+  // Every snapshot carries the four closed-set controls (parseRuntimePolicySnapshot).
+  const policySnapshot = {
+    policyEnforcementMode: "monitor", webSearchMode: "disabled", approvalPolicy: "on-request", approvalReviewer: "user"
+  };
 
   // The approval id comes from the request's trusted `_meta`, which the gateway passes apart from the arguments.
   function run(input: ReturnType<typeof approvedCall>, gate: PolicyGate, approvalId: string | null = input.approval.approvalId) {

@@ -3,6 +3,7 @@ import type { PolicyEffect } from "@cogniplane/shared-types";
 import {
   type EvaluableRule,
   evaluatePolicy,
+  hasUnreadableConditions,
   normalizeToolName,
   type PolicyActionContext
 } from "./policy-engine.js";
@@ -28,6 +29,12 @@ import {
 // name). This covers every case that the rules can tell apart, so the result
 // is exact, not an estimate.
 //
+// A rule with unreadable conditions blocks every action while it is enabled
+// (policy-engine.ts, hasUnreadableConditions). The check reads it the same way,
+// so disabling, deleting or repairing it is weaker unless the result still
+// blocks every action, and an edit that keeps the unreadable conditions (a new
+// name) is not.
+//
 // Only an action that a changed rule matches (its version before or after the
 // change) can get a different outcome. For any other action, the same enabled
 // rules match, in the same order.
@@ -45,8 +52,13 @@ const STRICTNESS: Record<PolicyEffect, number> = { allow: 0, require_approval: 1
 type Dimension = "toolNames" | "categories" | "severities" | "turnContexts";
 const DIMENSIONS: readonly Dimension[] = ["toolNames", "categories", "severities", "turnContexts"];
 
-/** The values of a dimension that a rule lists, or null when the rule does not constrain it (the engine's rule). */
+/**
+ * The values of a dimension that a rule lists, or null when the rule does not
+ * constrain it (the engine's rule). A rule with unreadable conditions matches
+ * every action, so it constrains nothing.
+ */
 function listedValues(rule: EvaluableRule, dimension: Dimension): string[] | null {
+  if (hasUnreadableConditions(rule)) return null;
   const values: unknown = rule.conditions[dimension];
   if (!Array.isArray(values) || values.length === 0) return null;
   return values.filter((value): value is string => typeof value === "string");

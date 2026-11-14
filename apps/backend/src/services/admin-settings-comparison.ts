@@ -1,4 +1,11 @@
-import { EFFORT_LEVELS, WEB_SEARCH_MODES, type AdminSettingsComparison } from "@cogniplane/shared-types";
+import {
+  APPROVAL_REVIEWERS,
+  EFFORT_LEVELS,
+  POLICY_ENFORCEMENT_MODES,
+  WEB_SEARCH_MODES,
+  type AdminSettingsComparison
+} from "@cogniplane/shared-types";
+import type { TenantSettingsField } from "@cogniplane/shared-types/tenant-settings-request";
 import { projectHistoryEvent, record, safeIdentifier, type HistoryRow } from "./admin-history-projection.js";
 
 type Value = { display: string; key: string | null };
@@ -58,29 +65,35 @@ const efforts: Reader = (value) => {
 };
 // Keep old rows partial. Reading them through today's TenantSettingsSchema
 // would either reject them or invite default values that were never recorded.
-const FIELDS: Array<[string, string, Reader]> = [
-  ["approvalPolicy", "Approval policy", approval],
-  ["approvalReviewer", "Approval reviewer", choice(["user", "guardian_subagent"])],
-  ["allowCommandExecution", "Command execution", boolean],
-  ["autoApproveReadOnlyTools", "Automatic approval for read-only tools", boolean],
-  ["policyEnforcementMode", "Policy enforcement", choice(["monitor", "enforce"])],
-  ["webSearchMode", "Web search", choice(WEB_SEARCH_MODES)],
-  ["developerInstructions", "Organization instructions", instructions],
-  ["enabledToolIds", "Enabled tools", list],
-  ["approvedSandboxEgressDomains", "Approved sandbox hosts", sandboxHosts],
-  ["enabledMcpServerIds", "Enabled connections", list],
-  ["enabledProviders", "Enabled providers", list],
-  ["enabledModelIds", "Enabled models", nullable(list, "All catalog models")],
-  ["defaultModelId", "Default model", nullable(identifier, "No organization default")],
-  ["modelDefaultEfforts", "Model reasoning defaults", efforts],
-  ["showEffortSelector", "Reasoning selector", boolean]
-];
+// The record type makes a new setting fail to compile until it has a label and
+// a reader. The key order is the order of the comparison rows.
+const FIELDS: Record<TenantSettingsField, { label: string; read: Reader }> = {
+  approvalPolicy: { label: "Approval policy", read: approval },
+  approvalReviewer: { label: "Approval reviewer", read: choice(APPROVAL_REVIEWERS) },
+  allowCommandExecution: { label: "Command execution", read: boolean },
+  autoApproveReadOnlyTools: { label: "Automatic approval for read-only tools", read: boolean },
+  policyEnforcementMode: { label: "Policy enforcement", read: choice(POLICY_ENFORCEMENT_MODES) },
+  webSearchMode: { label: "Web search", read: choice(WEB_SEARCH_MODES) },
+  developerInstructions: { label: "Organization instructions", read: instructions },
+  enabledToolIds: { label: "Enabled tools", read: list },
+  approvedSandboxEgressDomains: { label: "Approved sandbox hosts", read: sandboxHosts },
+  enabledMcpServerIds: { label: "Enabled connections", read: list },
+  enabledProviders: { label: "Enabled providers", read: list },
+  enabledModelIds: { label: "Enabled models", read: nullable(list, "All catalog models") },
+  defaultModelId: { label: "Default model", read: nullable(identifier, "No organization default") },
+  modelDefaultEfforts: { label: "Model reasoning defaults", read: efforts },
+  showEffortSelector: { label: "Reasoning selector", read: boolean }
+};
+
+/** The compared settings, in row order. Exported for the field-set test. */
+export const COMPARED_SETTINGS = Object.keys(FIELDS) as TenantSettingsField[];
 
 export function compareSettings(older: HistoryRow, newer: HistoryRow): AdminSettingsComparison {
   const before = record(older.payload), after = record(newer.payload);
   const changes: AdminSettingsComparison["changes"] = [];
   let unchangedCount = 0;
-  for (const [field, label, read] of FIELDS) {
+  for (const field of COMPARED_SETTINGS) {
+    const { label, read } = FIELDS[field];
     const left = Object.hasOwn(before, field) ? read(before[field]) : absent;
     const right = Object.hasOwn(after, field) ? read(after[field]) : absent;
     if (left.key !== null && right.key !== null && left.key === right.key) { unchangedCount++; continue; }

@@ -98,6 +98,23 @@ Fields that agents change most often (the full list is `TenantSettingsSchema` in
 | `developer_instructions` | Extra system prompt text |
 | `show_effort_selector` | Effort selector in the chat |
 
+- Stored closed-set values (`web_search_mode`, `approval_policy`,
+  `approval_reviewer`, `policy_enforcement_mode`) are read with the shared
+  schemas. A value outside the set throws `UnreadableControlValueError`
+  (`services/admin-config-store-mappers.ts`): no fallback picks a mode, and the
+  tenant's turns and settings saves fail until an operator fixes the row. A
+  stored granular approval policy with a key that this version does not know
+  is also refused (`StoredApprovalPolicySchema`); the request schema removes
+  unknown keys, and the response schema keeps them. The same rule applies to `enabled_providers` and `enabled_model_ids` when they are
+  not lists. The runtime policy snapshot that the MCP gateway reads follows it
+  too (`parseRuntimePolicySnapshot`); the gateway then refuses the tool call.
+- Each setting is a key of `TenantSettingsUpdateRequestSchema`
+  (`@cogniplane/shared-types/tenant-settings-request`). The step-up
+  classification (`TENANT_SETTINGS_FIELDS`), the audit payload
+  (`tenantSettingsAuditValues`) and the Admin History comparison
+  (`services/admin-settings-comparison.ts`) use that key set, so a new setting
+  fails the build until each one has it. Admin History shows "Not recorded" for
+  a setting that an older audit event does not have.
 - Inert fields: `approval_reviewer` (shown in admin views; no runtime effect)
   and `web_search_mode` (recorded in the runtime manifest; no tool uses it). Do
   not build on them.

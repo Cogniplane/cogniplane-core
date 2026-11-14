@@ -4,13 +4,11 @@ import type { Approval } from "@cogniplane/shared-types";
 // Chat-card row types.
 //
 // The CopilotKit chat host renders these row shapes as cards: approvals,
-// MCP-server status, runtime notices, and plan. The custom AG-UI events in
+// runtime notices, tool failures, and plan. The custom AG-UI events in
 // `use-agui-custom-events.ts` feed them.
 // ---------------------------------------------------------------------------
 
 export type RuntimeNoticeLevel = "info" | "warning" | "error";
-
-export type McpServerTransitionStatus = "starting" | "failed" | "cancelled";
 
 export type ApprovalDecisionState = "pending" | "approving" | "rejecting";
 
@@ -43,14 +41,6 @@ export type ApprovalRow = {
   status: Approval["status"];
   decisionState: ApprovalDecisionState;
   allowForTurn: boolean;
-};
-
-export type McpServerStatusRow = {
-  type: "mcp-server-status";
-  rowId: string;
-  serverName: string;
-  status: McpServerTransitionStatus;
-  error: string | null;
 };
 
 export type RuntimeNoticeRow = {

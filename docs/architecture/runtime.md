@@ -232,6 +232,17 @@ scheduled turns:
   Apps) are AG-UI `CUSTOM` events. `CogniplaneCustomEventSchema`
   (`packages/shared-types/src/schemas/custom-events.ts`) defines them; add new
   events there.
+- A new event fails the backend build until each backend consumer handles
+  it, and so decides where it is saved (`CUSTOM_EVENT_STORAGE` and
+  `applyCustom` in `services/agui-turn-accumulator.ts`, `progressWriteOf` in
+  `services/turn-transcript.ts`). The browser hook
+  (`lib/agui/use-agui-custom-events.ts`) has a `default` branch, so it does not
+  fail the build. Tool events go into the tool result rows,
+  `runtime_notice` into the message's runtime notices, `approval_required` and
+  the user message events into their own stores before they are sent;
+  `turn_started` and `session_connection` describe the stream and are not
+  saved. The backend and the browser read events with the shared schema and
+  ignore a malformed or unknown one.
 - `write_todos` updates `/plan` with `STATE_DELTA`.
 - The route hijacks the reply, so it sets CORS headers itself with
   `isCorsOriginAllowed`.

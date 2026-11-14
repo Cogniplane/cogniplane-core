@@ -4,10 +4,20 @@ import { computeConfigHash } from "../lib/crypto-utils.js";
 import { AuditEventStore, type AuditEventInput } from "./audit-event-store.js";
 
 import type { EffortLevel, ModelProvider, PolicyEnforcementMode, WebSearchMode } from "@cogniplane/shared-types";
-import { EFFORT_LEVELS, MODEL_PROVIDERS } from "@cogniplane/shared-types";
+import {
+  EFFORT_LEVELS,
+  MODEL_PROVIDERS,
+  PolicyEnforcementModeSchema,
+  WebSearchModeSchema
+} from "@cogniplane/shared-types";
 
 import type { ApprovalPolicy, ApprovalReviewer } from "./admin-config-records.js";
-import { parseApprovalPolicy, parseApprovalReviewer } from "./admin-config-store-mappers.js";
+import {
+  parseApprovalPolicy,
+  parseApprovalReviewer,
+  readStoredControl,
+  UnreadableControlValueError
+} from "./admin-config-store-mappers.js";
 import { isoTimestamp } from "../lib/db-mappers.js";
 
 export class TenantSettingsConflictError extends Error {
@@ -17,8 +27,26 @@ export class TenantSettingsConflictError extends Error {
   }
 }
 
+// The rollout decision for each tenant-configurable managed tool (catalog
+// entries with `tenantConfigurable: true`). A tool is in exactly one of
+// DEFAULT_TENANT_TOOL_IDS (on for a new tenant) or
+// OFF_BY_DEFAULT_TENANT_TOOL_IDS (off until an admin turns it on);
+// `tenant-tool-defaults.test.ts` fails for a catalog tool in neither list.
+// These lists are only the settings of a NEW tenant. An existing tenant keeps
+// its stored `enabled_tool_ids`; turning a new tool on for existing tenants
+// needs a reviewed backfill migration (examples: 024, 028). See "Add a core
+// managed tool" in docs/architecture/tools.md.
+
+/**
+ * Not a tool: the id of the managed MCP server. The default list has had it
+ * since the first schema (`001_init.sql`), and stored lists have it. No tool
+ * has this name, so it allows nothing. It stays so that the defaults do not
+ * change; the catalog test does not count it as a tool.
+ */
+export const LEGACY_DEFAULT_TOOL_ID_ALIASES = ["managed-session-context"] as const;
+
 export const DEFAULT_TENANT_TOOL_IDS = [
-  "managed-session-context",
+  ...LEGACY_DEFAULT_TOOL_ID_ALIASES,
   "session_context",
   "list_artifacts",
   "read_text_artifact",
@@ -33,6 +61,13 @@ export const DEFAULT_TENANT_TOOL_IDS = [
   "project_reconcile_conflict",
   "project_write_file"
 ];
+
+/** Tenant-configurable tools that a new tenant does not get, each with the reason. */
+export const OFF_BY_DEFAULT_TENANT_TOOL_IDS = {
+  // Works only with a sandbox page on a dedicated origin
+  // (docs/architecture/mcp-apps.md, "Enable render_interactive_ui").
+  render_interactive_ui: "needs the MCP App sandbox origin"
+} as const satisfies Record<string, string>;
 
 export const DEFAULT_TENANT_MCP_SERVER_IDS = ["managed-session-context"];
 
@@ -68,9 +103,8 @@ export type TenantSettingsRecord = {
   updatedAt: string;
 };
 
-function parsePolicyEnforcementMode(value: unknown): PolicyEnforcementMode {
-  return value === "enforce" ? "enforce" : "monitor";
-}
+// The source name in an UnreadableControlValueError of this store.
+const SOURCE = "tenant_settings";
 
 function toStringArray(value: unknown): string[] {
   return Array.isArray(value)
@@ -78,22 +112,22 @@ function toStringArray(value: unknown): string[] {
     : [];
 }
 
-function parseWebSearchMode(value: unknown): WebSearchMode {
-  return value === "cached" || value === "live" ? value : "disabled";
-}
-
+// A provider name that this version does not know is left out (the list gets
+// shorter, not longer). A value that is not a list is unreadable: reading it as
+// "all providers" would open every provider.
 function toProviderArray(value: unknown): ModelProvider[] {
-  return Array.isArray(value)
-    ? value.filter((entry): entry is ModelProvider =>
-        (MODEL_PROVIDERS as readonly string[]).includes(entry as string)
-      )
-    : [...MODEL_PROVIDERS];
+  if (!Array.isArray(value)) throw new UnreadableControlValueError(SOURCE, "enabledProviders");
+  return value.filter((entry): entry is ModelProvider =>
+    (MODEL_PROVIDERS as readonly string[]).includes(entry as string)
+  );
 }
 
+// null (SQL NULL or JSON null) means "all catalog models". Any other value
+// that is not a list is unreadable: reading it as null would allow every model.
 function toNullableStringArray(value: unknown): string[] | null {
-  return Array.isArray(value)
-    ? value.filter((entry): entry is string => typeof entry === "string")
-    : null;
+  if (value === null || value === undefined) return null;
+  if (!Array.isArray(value)) throw new UnreadableControlValueError(SOURCE, "enabledModelIds");
+  return value.filter((entry): entry is string => typeof entry === "string");
 }
 
 function normalizeEgressDomains(domains: readonly string[]): string[] {
@@ -111,16 +145,26 @@ function toEffortMap(value: unknown): Record<string, EffortLevel> {
   return efforts;
 }
 
+/**
+ * Reads a `tenant_settings` row. A closed-set control (web search, approval
+ * policy and reviewer, Policy Center mode) goes through its shared schema. A
+ * value outside the set throws UnreadableControlValueError: no fallback
+ * chooses a mode for the tenant. The CHECK constraints keep bad web search and
+ * enforcement values out of the table; approval policy and reviewer have no
+ * CHECK, so this read is their only check.
+ */
 function mapRow(row: Record<string, unknown>): TenantSettingsRecord {
   return {
     tenantId: String(row.tenant_id),
     showEffortSelector: Boolean(row.show_effort_selector),
-    webSearchMode: parseWebSearchMode(row.web_search_mode),
-    approvalPolicy: parseApprovalPolicy(row.approval_policy),
-    approvalReviewer: parseApprovalReviewer(row.approval_reviewer),
+    webSearchMode: readStoredControl(WebSearchModeSchema, row.web_search_mode, SOURCE, "webSearchMode"),
+    approvalPolicy: parseApprovalPolicy(row.approval_policy, SOURCE),
+    approvalReviewer: parseApprovalReviewer(row.approval_reviewer, SOURCE),
     allowCommandExecution: Boolean(row.allow_command_execution),
     autoApproveReadOnlyTools: Boolean(row.auto_approve_read_only_tools),
-    policyEnforcementMode: parsePolicyEnforcementMode(row.policy_enforcement_mode),
+    policyEnforcementMode: readStoredControl(
+      PolicyEnforcementModeSchema, row.policy_enforcement_mode, SOURCE, "policyEnforcementMode"
+    ),
     developerInstructions: row.developer_instructions ? String(row.developer_instructions) : null,
     enabledToolIds: toStringArray(row.enabled_tool_ids),
     enabledMcpServerIds: toStringArray(row.enabled_mcp_server_ids),

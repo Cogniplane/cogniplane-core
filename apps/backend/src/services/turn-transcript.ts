@@ -23,9 +23,13 @@
 // actions, and it does not recover a turn after a process stops.
 
 import { EventType, type BaseEvent } from "@ag-ui/client";
-import type { TurnStopReason } from "@cogniplane/shared-types";
+import type { CogniplaneCustomEvent, TurnStopReason } from "@cogniplane/shared-types";
 
-import { AguiTurnAccumulator, type AccumulatedToolResult } from "./agui-turn-accumulator.js";
+import {
+  AguiTurnAccumulator,
+  parseCogniplaneCustomEvent,
+  type AccumulatedToolResult
+} from "./agui-turn-accumulator.js";
 import { interruptedFinishReason, isAGUIInterruptedFinish } from "./deep-agents/agui-events.js";
 import type { MessageStore } from "./message-store.js";
 import { redactSecrets } from "./redact-secrets.js";
@@ -56,8 +60,6 @@ type TurnTranscriptLogger = {
   warn(payload: unknown, message: string): void;
   error(payload: unknown, message: string): void;
 };
-
-const PROGRESS_TOOL_EVENTS = new Set(["tool_meta", "tool_status", "tool_mcp_app"]);
 
 // A thrown error does not pass through the global error handler: the SSE
 // reply is hijacked, and a scheduled turn has no reply. Error instances with
@@ -104,6 +106,35 @@ function contentFor(outcome: TurnOutcome, text: string): string {
   return outcome.status === "error" ? text || outcome.message : text;
 }
 
+/**
+ * The mid-turn write that a custom event causes: the tool result it changes,
+ * the runtime notices, or none (CUSTOM_EVENT_STORAGE in
+ * agui-turn-accumulator.ts). The `never` check makes a new event fail the
+ * build until it is listed.
+ */
+function progressWriteOf(
+  custom: CogniplaneCustomEvent
+): { kind: "tool"; toolCallId: string } | { kind: "notices" } | null {
+  switch (custom.name) {
+    case "tool_meta":
+    case "tool_status":
+    case "tool_mcp_app":
+      return { kind: "tool", toolCallId: custom.value.toolCallId };
+    case "runtime_notice":
+      return { kind: "notices" };
+    case "approval_required":
+    case "user_message_persisted":
+    case "user_message_replaced":
+    case "turn_started":
+    case "session_connection":
+      return null;
+    default: {
+      const unlisted: never = custom;
+      throw new Error(`Unclassified custom event: ${String((unlisted as { name?: unknown }).name)}`);
+    }
+  }
+}
+
 export class TurnTranscript {
   private readonly turn = new AguiTurnAccumulator();
   private eventOutcome: TurnOutcome = { status: "completed" };
@@ -147,7 +178,9 @@ export class TurnTranscript {
    * event causes, if any. A caller that writes the row only at the end omits it.
    */
   apply(event: BaseEvent, options: { saveProgress?: boolean } = {}): void {
-    this.turn.apply(event);
+    const custom = parseCogniplaneCustomEvent(event);
+    if (custom) this.turn.applyCustom(custom);
+    else this.turn.apply(event);
     if (isAGUIInterruptedFinish(event)) {
       // Turn-abort marker carried on RUN_FINISHED.result. See
       // AGUI_INTERRUPTED_RESULT for why it is not the AG-UI interrupt outcome.
@@ -160,20 +193,17 @@ export class TurnTranscript {
         status: "error",
         message: typeof message === "string" ? message : GENERIC_TURN_FAILURE
       };
-    } else if (event.type === EventType.CUSTOM) {
-      const custom = event as { name?: string; value?: unknown };
-      if (custom.name === "runtime_notice" && custom.value) {
-        this.notices.push(custom.value);
-        if (this.notices.length > MAX_RUNTIME_NOTICES) this.notices.shift();
-        this.noticeVersion += 1;
-      }
+    } else if (custom?.name === "runtime_notice") {
+      this.notices.push(custom.value);
+      if (this.notices.length > MAX_RUNTIME_NOTICES) this.notices.shift();
+      this.noticeVersion += 1;
     }
-    if (options.saveProgress) this.queueProgress(event);
+    if (options.saveProgress) this.queueProgress(event, custom);
   }
 
   // Queues the mid-turn write for an event already recorded: plan, runtime
   // notices, or the affected tool result. Other events queue nothing. Writes run in order and are best effort.
-  private queueProgress(event: BaseEvent): void {
+  private queueProgress(event: BaseEvent, custom: CogniplaneCustomEvent | null): void {
     const plan = event.type === EventType.STATE_DELTA ? this.turn.planMarkdown : undefined;
     let toolId: string | undefined;
     let notices: { snapshot: unknown[]; version: number } | undefined;
@@ -181,15 +211,9 @@ export class TurnTranscript {
       event.type === EventType.TOOL_CALL_RESULT) {
       toolId = (event as { toolCallId?: string }).toolCallId;
     }
-    if (event.type === EventType.CUSTOM) {
-      const custom = event as { name?: string; value?: Record<string, unknown> };
-      if (PROGRESS_TOOL_EVENTS.has(custom.name ?? "")) {
-        toolId = typeof custom.value?.toolCallId === "string" ? custom.value.toolCallId : undefined;
-      }
-      if (custom.name === "runtime_notice" && custom.value) {
-        notices = { snapshot: this.notices.slice(), version: this.noticeVersion };
-      }
-    }
+    const write = custom ? progressWriteOf(custom) : null;
+    if (write?.kind === "tool") toolId = write.toolCallId;
+    if (write?.kind === "notices") notices = { snapshot: this.notices.slice(), version: this.noticeVersion };
     const tool = toolId ? this.turn.toolResults().find((item) => item.toolResultId === toolId) : undefined;
     if (plan === undefined && !notices && !tool) return;
     const assistantText = this.turn.assistantText;

@@ -1,6 +1,6 @@
 "use client";
 // The state of the Cogniplane custom events of a chat: approvals, notices,
-// MCP server status, tool failures, and MCP Apps. This hook renders nothing.
+// tool failures, and MCP Apps. This hook renders nothing.
 // The host renders the rows, and copilot-render-slots renders the tool card
 // and the plan.
 //
@@ -21,12 +21,16 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { AbstractAgent } from "@ag-ui/client";
-import { CogniplaneCustomEventSchema, type Approval, type McpAppCall } from "@cogniplane/shared-types";
+import {
+  CogniplaneCustomEventSchema,
+  expiredApprovalIdFromNotice,
+  type Approval,
+  type McpAppCall
+} from "@cogniplane/shared-types";
 
 import type {
   ApprovalDecision,
   ApprovalRow,
-  McpServerStatusRow,
   RuntimeNoticeRow,
   ToolStatusRow
 } from "../../components/chat-cards/chat-cards.types";
@@ -44,25 +48,13 @@ import { isReconnectRun } from "./deep-agents-browser-agent";
 import type { RemoteTurnSnapshot } from "./use-remote-turn";
 import { SEND_REFUSED_NOTICE_PREFIX } from "./use-session-connection";
 
-// Approval expiry has no dedicated AG-UI event. The backend encodes it in the
-// noticeId of the `runtime_notice` custom event (the native approval coordinator and
-// Policy Center emit their own prefix).
-const EXPIRY_NOTICE_PREFIXES = ["approval-expired:", "policy-approval-expired:"];
-
-export function expiredApprovalIdFromNotice(noticeId: string): string | null {
-  for (const prefix of EXPIRY_NOTICE_PREFIXES) {
-    if (noticeId.startsWith(prefix) && noticeId.length > prefix.length) {
-      return noticeId.slice(prefix.length);
-    }
-  }
-  return null;
-}
+// Approval expiry rides the noticeId of a `runtime_notice` (shared-types).
+export { expiredApprovalIdFromNotice };
 
 export type AguiCustomEvents = {
   dismissStatusRows: () => void;
   approvals: ApprovalRow[];
   notices: RuntimeNoticeRow[];
-  mcpStatuses: McpServerStatusRow[];
   // Tool calls that failed or were declined. The tool cards read these by
   // toolCallId, and the notification list shows them.
   toolStatuses: ToolStatusRow[];
@@ -187,7 +179,6 @@ export function useAguiCustomEvents(agent: AbstractAgent, options: AguiCustomEve
   } = options;
   const [approvals, setApprovals] = useState(() => pendingApprovalRows(initialApprovals));
   const [notices, setNotices] = useState<RuntimeNoticeRow[]>(initialNotices);
-  const [mcpStatuses, setMcpStatuses] = useState<McpServerStatusRow[]>([]);
   const [toolStatuses, setToolStatuses] = useState<ToolStatusRow[]>(initialToolStatuses);
   const [mcpApps, setMcpApps] = useState(initialMcpApps);
   // A saved-state snapshot, a run transition, or a clean end outranks an
@@ -321,28 +312,6 @@ export function useAguiCustomEvents(agent: AbstractAgent, options: AguiCustomEve
             }
             break;
           }
-          case "mcp_server_status": {
-            const v = customEvent.value;
-            // A healthy "ready" is not a surfaced transition (matches the
-            // timeline, which only renders starting/failed/cancelled) — skip it
-            // so a normal successful run leaves no persistent "server · ready".
-            if (v.status === "ready") break;
-            // Capture the narrowed status in a const — control-flow narrowing
-            // from the guard above doesn't reach into the setState closure.
-            const status = v.status;
-            setMcpStatuses((prev) => [
-              // Keep only the latest status per server.
-              ...prev.filter((s) => s.serverName !== v.serverName),
-              {
-                type: "mcp-server-status",
-                rowId: `mcp:${v.serverName}`,
-                serverName: v.serverName,
-                status,
-                error: v.error ?? null
-              }
-            ]);
-            break;
-          }
           case "tool_mcp_app": {
             const { toolCallId, app } = customEvent.value;
             setMcpApps((current) => ({ ...current, [toolCallId]: app }));
@@ -465,11 +434,10 @@ export function useAguiCustomEvents(agent: AbstractAgent, options: AguiCustomEve
       return [];
     });
     setToolStatuses([]);
-    setMcpStatuses([]);
   }, []);
 
   return {
-    approvals, notices, mcpStatuses, toolStatuses, mcpApps,
+    approvals, notices, toolStatuses, mcpApps,
     onApprovalDecision, syncServerState, addNotice, clearApprovals, dismissStatusRows
   };
 }

@@ -129,9 +129,8 @@ import { SafeMarkdown } from "./safe-markdown";
 import { watchReadingOverflow } from "../lib/reading-overflow";
 import { WidgetDraftNotice, useWidgetDraft, type WidgetDraftComposer, type WidgetDraftSeam } from "./widget-draft";
 import { Button } from "./ui/button";
-import type { ApprovalRow, McpServerStatusRow, RuntimeNoticeRow, ToolStatusRow } from "./chat-cards/chat-cards.types";
+import type { ApprovalRow, RuntimeNoticeRow, ToolStatusRow } from "./chat-cards/chat-cards.types";
 import {
-  McpServerStatusRowView,
   RuntimeNoticeRowView,
   ToolStatusRowView
 } from "./chat-cards/status-rows";
@@ -663,24 +662,23 @@ function ChatComposer(props: CopilotChatInputProps) {
 
 /** The notification list. Its own component, so a tool card that mounts or
  *  unmounts renders this list again, not the transcript. */
-function SessionNotifications({ approvals, toolApprovals, notices, mcpStatuses, toolStatuses, onDismiss }: {
+function SessionNotifications({ approvals, toolApprovals, notices, toolStatuses, onDismiss }: {
   approvals: ApprovalRow[];
   toolApprovals: ToolApprovals;
   notices: RuntimeNoticeRow[];
-  mcpStatuses: McpServerStatusRow[];
   toolStatuses: ToolStatusRow[];
   onDismiss: () => void;
 }) {
   const listed = useListedApprovals(approvals, toolApprovals);
   const [region, setRegion] = useState<HTMLDivElement | null>(null);
   const { moreBelow, moreAbove } = useRegionMetrics(region);
-  const count = listed.length + notices.length + mcpStatuses.length + toolStatuses.length;
+  const count = listed.length + notices.length + toolStatuses.length;
   if (count === 0) return null;
   return (
     <div className="shrink-0 border-b border-outline-variant bg-surface px-4 py-2">
       <div className="mb-2 flex flex-wrap items-center justify-between gap-2 text-xs text-on-surface-variant">
         <p>{count} session {count === 1 ? "notification" : "notifications"}{notices.some(row => row.level === "error") ? " · Error" : ""}{notices.some(row => row.level === "warning") ? " · Warning" : ""}</p>
-      {notices.length + mcpStatuses.length + toolStatuses.length > 0 && (
+      {notices.length + toolStatuses.length > 0 && (
         <button type="button" className="self-end rounded-sm text-sm text-on-surface-variant underline underline-offset-2 outline-none hover:text-on-surface focus-visible:ring-[3px] focus-visible:ring-ring/50" onClick={onDismiss}>
           Dismiss notifications
         </button>
@@ -692,9 +690,6 @@ function SessionNotifications({ approvals, toolApprovals, notices, mcpStatuses, 
       ))}
       {notices.map((row) => (
         <RuntimeNoticeRowView key={row.rowId} row={row} />
-      ))}
-      {mcpStatuses.map((row) => (
-        <McpServerStatusRowView key={row.rowId} row={row} />
       ))}
       {toolStatuses.map((row) => (
         <ToolStatusRowView key={row.rowId} row={row} />
@@ -897,7 +892,7 @@ function ChatSession({ session, modelSelection, usage, events, agent, draftScope
   const sidePanelToggleRef = useRef<HTMLButtonElement | null>(null);
 
   const {
-    approvals, notices, mcpStatuses, toolStatuses, mcpApps,
+    approvals, notices, toolStatuses, mcpApps,
     onApprovalDecision, syncServerState, addNotice, clearApprovals, dismissStatusRows
   } = useAguiCustomEvents(agent, { initialToolStatuses, initialApprovals, initialNotices, initialMcpApps });
 
@@ -1144,7 +1139,7 @@ function ChatSession({ session, modelSelection, usage, events, agent, draftScope
           displayed below.
         </div>
       ) : null}
-      <SessionNotifications approvals={approvals} toolApprovals={toolApprovals} notices={notices} mcpStatuses={mcpStatuses}
+      <SessionNotifications approvals={approvals} toolApprovals={toolApprovals} notices={notices}
         toolStatuses={toolStatuses} onDismiss={dismissStatusRows} />
       {/* The panel opens and closes beside the chat. This row never changes
           its children, so neither does the transcript. The panel measures

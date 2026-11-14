@@ -1,8 +1,9 @@
 import { test, expect } from "vitest";
+import { MODEL_PROVIDER_META, MODEL_PROVIDERS, type ModelProvider } from "@cogniplane/shared-types";
 
 import { isSensitiveQueryParameterName } from "../lib/sensitive-query-params.js";
 import { randomText, runIsolated, seededRandom } from "../test-helpers/isolated-timing.js";
-import { redactAppData, redactSecrets } from "./redact-secrets.js";
+import { PROVIDER_KEY_PATTERNS, redactAppData, redactSecrets } from "./redact-secrets.js";
 
 test("redaction preserves app data types and removes nested credentials", () => {
   expect(redactAppData({ tokenLimits: [100, 200], token: "abc", idToken: "def",
@@ -186,6 +187,30 @@ test.each([
   ["zai", `${"a1b2c3d4".repeat(4)}.${"Xy9z".repeat(4)}`, "token [REDACTED] done"]
 ])("redactSecrets redacts %s credentials in plain text", (_name, credential, expected) => {
   expect(redactSecrets(`token ${credential} done`)).toBe(expected);
+});
+
+// One sample key per model provider. The record type makes a new provider
+// fail to compile until it has a sample, and the test fails until its
+// MODEL_PROVIDER_META entry has a pattern that matches it (or a null whose
+// comment names the pattern that does).
+const PROVIDER_SAMPLE_KEYS: Record<ModelProvider, string> = {
+  anthropic: `sk-ant-api03-${"a".repeat(24)}`,
+  openai: `sk-proj-${"b".repeat(24)}`,
+  google: `AIza${"C".repeat(35)}`,
+  openrouter: `sk-or-v1-${"d1".repeat(16)}`,
+  zai: `${"0123456789abcdef".repeat(2)}.${"Xy9z".repeat(4)}`
+};
+
+test.each(MODEL_PROVIDERS)("redactSecrets redacts a %s API key from the provider metadata", (provider) => {
+  expect(redactSecrets(`key ${PROVIDER_SAMPLE_KEYS[provider]} done`)).toBe("key [REDACTED] done");
+});
+
+test("each provider key pattern runs once, global, in provider order", () => {
+  const declared = MODEL_PROVIDERS.map((provider) => MODEL_PROVIDER_META[provider].keyPattern).filter((pattern) => pattern !== null);
+  expect(PROVIDER_KEY_PATTERNS.map((pattern) => pattern.source)).toEqual(declared.map((pattern) => pattern!.source));
+  for (const pattern of PROVIDER_KEY_PATTERNS) expect(pattern.flags).toBe("g");
+  // A metadata pattern has no flags: a global or sticky RegExp keeps state.
+  for (const pattern of declared) expect(pattern!.flags).toBe("");
 });
 
 test("redactSecrets does not redact incomplete provider prefixes or ordinary identifiers", () => {
@@ -446,7 +471,11 @@ test("redactSecrets stays linear on large adversarial input", { timeout: 60_000 
       // 100,000 BEGIN lines and no END line.
       pemHeaders: timed(() => redactSecrets("-----BEGIN PRIVATE KEY-----\\n".repeat(100_000) + "Bearer abc").slice(-17)),
       // 300,000 nested parameters.
-      nestedQuery: timed(() => redactSecrets("?a=".repeat(300_000) + "?token=abc").slice(-15))
+      nestedQuery: timed(() => redactSecrets("?a=".repeat(300_000) + "?token=abc").slice(-15)),
+      // Provider key patterns: a hex run with no dot after it (Z.AI), and many
+      // short provider prefixes.
+      providerHexRun: timed(() => redactSecrets("a".repeat(2_000_000) + ". Bearer abc").slice(-17)),
+      providerPrefixes: timed(() => redactSecrets("sk-ant-x AIza sk- ".repeat(200_000) + "Bearer abc").slice(-17))
     });
   `);
 
@@ -454,5 +483,7 @@ test("redactSecrets stays linear on large adversarial input", { timeout: 60_000 
   expect(runs.jwtRunThenToken!.result).toBe(" [REDACTED]");
   expect(runs.pemHeaders!.result).toBe("Bearer [REDACTED]");
   expect(runs.nestedQuery!.result).toBe("?token=REDACTED");
+  expect(runs.providerHexRun!.result).toBe("Bearer [REDACTED]");
+  expect(runs.providerPrefixes!.result).toBe("Bearer [REDACTED]");
   for (const [name, run] of Object.entries(runs)) expect(run.ms, name).toBeLessThan(2_000);
 });

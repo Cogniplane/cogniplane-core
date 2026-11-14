@@ -339,6 +339,7 @@ function toEvaluable(rule: {
   enabled: boolean;
   effect: EvaluableRule["effect"];
   conditions: EvaluableRule["conditions"];
+  conditionsInvalid?: boolean;
   reason: string | null;
 }): EvaluableRule {
   return {
@@ -348,6 +349,7 @@ function toEvaluable(rule: {
     enabled: rule.enabled,
     effect: rule.effect,
     conditions: rule.conditions,
+    ...(rule.conditionsInvalid ? { conditionsInvalid: true } : {}),
     reason: rule.reason
   };
 }

@@ -1,4 +1,4 @@
-import type { AdminHistoryCategory, AdminHistoryEvent } from "@cogniplane/shared-types";
+import { MODEL_PROVIDERS, POLICY_EFFECTS, type AdminHistoryCategory, type AdminHistoryEvent } from "@cogniplane/shared-types";
 import type { AuditEventType } from "./audit-event-types.js";
 import { redactSecrets } from "./redact-secrets.js";
 
@@ -74,9 +74,9 @@ const LABELS: Record<string, string> = {
 // Accept every stored spelling so old rows still render.
 const ENUMS: Record<string, readonly string[]> = {
   previousRole: ["owner", "admin", "member"], role: ["owner", "admin", "member"],
-  effect: ["allow", "block", "require_approval"], credentialScope: ["organization", "personal", "member"],
+  effect: POLICY_EFFECTS, credentialScope: ["organization", "personal", "member"],
   audience: ["off", "test_users", "test-users", "members"],
-  provider: ["anthropic", "openai", "google", "openrouter", "zai"]
+  provider: MODEL_PROVIDERS
 };
 const BOOLEANS = new Set(["enabled", "isBetaTester", "readsEnabled", "writesEnabled", "configChanged"]);
 const USD = new Set(["monthlyLimitUsd", "turnReservationUsd", "actualUsd"]);

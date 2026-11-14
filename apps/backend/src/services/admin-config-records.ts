@@ -1,9 +1,11 @@
-import type {
-  GranularApprovalPolicy,
-  ApprovalPolicy,
-  ApprovalReviewer,
-  PolicyEnforcementMode,
-  WebSearchMode,
+import {
+  PolicyEnforcementModeSchema,
+  WebSearchModeSchema,
+  type GranularApprovalPolicy,
+  type ApprovalPolicy,
+  type ApprovalReviewer,
+  type PolicyEnforcementMode,
+  type WebSearchMode,
 } from "@cogniplane/shared-types";
 import type { McpUpstreamAuth } from "../lib/mcp-upstream-client.js";
 
@@ -136,6 +138,7 @@ export type TenantMemberRecord = {
 };
 
 import type { TenantSettingsRecord } from "./tenant-settings-store.js";
+import { parseApprovalPolicy, parseApprovalReviewer, readStoredControl } from "./admin-config-store-mappers.js";
 
 export function tenantSettingsToRuntimePolicy(settings: TenantSettingsRecord): ResolvedRuntimePolicy {
   return {
@@ -158,29 +161,34 @@ export function tenantSettingsToRuntimePolicy(settings: TenantSettingsRecord): R
   };
 }
 
-function parseSnapshotApprovalPolicy(value: unknown): ApprovalPolicy {
-  if (value === "never" || value === "on-request") return value;
-  if (typeof value === "object" && value !== null && "granular" in value) {
-    return value as ApprovalPolicy;
-  }
-  return "never";
-}
+const SNAPSHOT_SOURCE = "runtime policy snapshot";
 
 /**
  * Reverses `tenantSettingsToRuntimePolicy` for the JSONB snapshot stored in
- * `tool_execution_contexts.metadata.runtimePolicy`. The MCP gateway uses it to
- * enforce the per-turn snapshot of the tenant's runtime policy.
+ * `tool_execution_contexts.metadata.runtimePolicy`. The MCP gateway reads the
+ * per-turn policy from it (`getRuntimePolicySnapshot` in
+ * `services/mcp/policy-gate.ts`).
  *
- * The parser coerces each field to its declared type with a safe fallback, so
- * one bad row cannot crash a turn. Unknown enum values use the conservative defaults
- * (`approvalReviewer: "user"`, `approvalPolicy: "never"`).
+ * Closed-set controls (`webSearchMode`, `approvalPolicy`, `approvalReviewer`,
+ * `policyEnforcementMode`) go through their shared schemas. A missing or
+ * unknown value throws UnreadableControlValueError, and the gateway refuses
+ * the tool call with its generic error. No fallback picks a mode: before this
+ * check, an unknown enforcement mode read as "monitor" and gated nothing.
+ * The current writer, `tenantSettingsToRuntimePolicy`, always writes all
+ * four fields. This reader keeps no older form of them, so a snapshot without
+ * one of them is refused like a damaged one.
+ *
+ * Other fields are not checked against a schema. `Boolean()` reads a missing
+ * value as false and any truthy value, also a non-boolean one, as true. A list
+ * keeps only its strings.
  *
  * `sandboxMode` has one value today, `"workspace-write"`. When the type allows
  * more values, this parser and `tenantSettingsToRuntimePolicy` must both pass
  * the real setting through. Keep the literal here as the fallback.
  *
- * An empty `sandboxEgressDomains` is the strictest policy. A snapshot that
- * predates the field, or one that is malformed, gives the sandbox no network.
+ * An empty `sandboxEgressDomains` is the strictest policy. The current writer
+ * always writes the list. This reader keeps the form without the field: that
+ * snapshot, or one with a malformed list, gives the sandbox no network.
  */
 export function parseRuntimePolicySnapshot(
   value: unknown,
@@ -202,20 +210,18 @@ export function parseRuntimePolicySnapshot(
     id: String(profile.id),
     label: String(profile.label ?? profile.id),
     description: profile.description ? String(profile.description) : null,
-    webSearchMode: (profile.webSearchMode === "cached" || profile.webSearchMode === "live"
-      ? profile.webSearchMode
-      : "disabled") as WebSearchMode,
-    approvalPolicy: parseSnapshotApprovalPolicy(profile.approvalPolicy),
-    approvalReviewer: (profile.approvalReviewer === "guardian_subagent" ? "guardian_subagent" : "user") as ApprovalReviewer,
+    webSearchMode: readStoredControl(WebSearchModeSchema, profile.webSearchMode, SNAPSHOT_SOURCE, "webSearchMode"),
+    approvalPolicy: parseApprovalPolicy(profile.approvalPolicy, SNAPSHOT_SOURCE),
+    approvalReviewer: parseApprovalReviewer(profile.approvalReviewer, SNAPSHOT_SOURCE),
     sandboxMode: "workspace-write",
     sandboxEgressDomains: Array.isArray(profile.sandboxEgressDomains)
       ? profile.sandboxEgressDomains.filter((entry): entry is string => typeof entry === "string")
       : [],
     allowCommandExecution: Boolean(profile.allowCommandExecution),
     autoApproveReadOnlyTools: Boolean(profile.autoApproveReadOnlyTools),
-    // A missing or old snapshot defaults to "monitor", so it never gates
-    // actions unexpectedly.
-    policyEnforcementMode: profile.policyEnforcementMode === "enforce" ? "enforce" : "monitor",
+    policyEnforcementMode: readStoredControl(
+      PolicyEnforcementModeSchema, profile.policyEnforcementMode, SNAPSHOT_SOURCE, "policyEnforcementMode"
+    ),
     developerInstructions: profile.developerInstructions ? String(profile.developerInstructions) : null,
     enabledToolIds,
     enabledMcpServers,

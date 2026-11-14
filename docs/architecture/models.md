@@ -64,17 +64,29 @@ settings in the same transaction. Custom models need no code change.
   (`services/token-cost-calculator.ts`). Without rates, it cannot run for a
   tenant with a spending limit.
 - New provider: also add it to `MODEL_PROVIDERS` and `MODEL_PROVIDER_META`
-  (`packages/shared-types/src/primitives.ts`), its key variable to
+  (`packages/shared-types/src/primitives.ts`). The entry needs `keyPattern`
+  (how `redactSecrets()` finds its key, or `null` with a comment that names the
+  pattern that matches it) and `reasoningEffort` (the `applyReasoningEffort`
+  mapping, or `"unsupported"`); the build fails without them. A new pattern
+  needs a sample key in `redact-secrets.test.ts` and a large-input case
+  ([security](../security.md#secrets-and-encryption)). Add its key variable to
   `apps/backend/src/config.ts`, an encrypted key column in `tenant_org_settings`
   (new migration) with its mapping in `services/tenant-org-settings-store.ts`.
   `resolveModelConstruction` reads `initPrefix` and `baseUrl` from the
   `MODEL_PROVIDER_META` entry. An OpenAI-compatible API needs only `initPrefix:
   "openai"` and its `baseUrl` (as OpenRouter and Z.AI). Another API needs its
   LangChain package in `apps/backend/package.json` and its prefix added to the
-  `initPrefix` type. Add the provider's effort mapping to `applyReasoningEffort`
-  (`deep-agents-graph.ts`). Then update every file that `git grep
+  `initPrefix` type. A new effort mapping needs its branch in
+  `applyReasoningEffort` (`deep-agents-graph.ts`); the `never` check fails the
+  build without it. Then update every file that `git grep
   MODEL_PROVIDER_META` lists (admin model and runtime routes, settings schemas,
   frontend provider rows).
+- Rollout of a new provider: a new tenant gets every provider
+  (`buildDefaultTenantSettingsInput`). An existing tenant keeps its stored
+  `tenant_settings.enabled_providers`, so the new provider stays off for it.
+  Do not widen stored lists silently. To turn it on for existing tenants, add
+  a reviewed backfill migration; a provider change is a [data
+  route](sensitive-changes.md#data-routes).
 
 ## Utility model
 

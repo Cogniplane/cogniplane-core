@@ -5,6 +5,14 @@
 import { EventType, type BaseEvent } from "@ag-ui/client";
 import { describe, expect, it } from "vitest";
 
+import {
+  approvalExpiredNoticeId,
+  CogniplaneCustomEventSchema,
+  expiredApprovalIdFromNotice,
+  ToolResultSchema
+} from "@cogniplane/shared-types";
+
+import { CUSTOM_EVENT_STORAGE } from "./agui-turn-accumulator.js";
 import { toAguiMessages, type HistoryMessage } from "./agui-history.js";
 import { interruptedResult } from "./deep-agents/agui-events.js";
 import { TurnTranscript, type TurnOutcome, type TurnTranscriptMessages } from "./turn-transcript.js";
@@ -98,5 +106,109 @@ describe("TurnTranscript tool calls that never returned", () => {
       expect.objectContaining({ toolCallId: "reported", error: "failed" }),
       expect.objectContaining({ toolCallId: "open", error: "interrupted" })
     ]);
+  });
+});
+
+// Issue #121: the transcript and the accumulator read custom events through
+// the shared schema and classify each name. These cases feed the events that
+// the runtime emits, then read back what a reload gets: the saved tool rows
+// (ToolResultSchema, as GET /sessions/:id/messages returns them), the saved
+// notices, and the history snapshot.
+describe("TurnTranscript custom events round trip", () => {
+  const app = {
+    resourceUri: "ui://widget/chart",
+    readOnly: true,
+    input: { series: [1, 2, 3] },
+    result: { content: [{ type: "text", text: "drawn" }], structuredContent: { ok: true } }
+  };
+  const notice = {
+    noticeId: approvalExpiredNoticeId("ap-1"), level: "warning", title: "Approval expired",
+    message: "The approval request expired.", createdAt: "2026-11-14T00:00:00.000Z"
+  };
+  const custom = (name: string, value: unknown): BaseEvent => ({ type: EventType.CUSTOM, name, value } as BaseEvent);
+  const events: BaseEvent[] = [
+    { type: EventType.TEXT_MESSAGE_CONTENT, delta: "Here is the chart." } as BaseEvent,
+    ...started("mcp1"),
+    custom("tool_meta", { toolCallId: "mcp1", kind: "mcp", server: "charts" }),
+    returned("mcp1", "drawn"),
+    custom("tool_mcp_app", { toolCallId: "mcp1", app }),
+    ...started("cmd1"),
+    custom("tool_meta", { toolCallId: "cmd1", kind: "command", command: "rm -rf build" }),
+    returned("cmd1", "denied"),
+    custom("tool_status", { toolCallId: "cmd1", toolName: "execute", status: "declined", durationMs: 12 }),
+    custom("runtime_notice", notice),
+    // Transport and other stores: nothing to save here.
+    custom("turn_started", { messageId: "a1", sequence: 1 }),
+    custom("session_connection", { activeTurn: "none", hasMoreHistory: false }),
+    custom("user_message_persisted", { messageId: "u1", text: "draw" }),
+    // Malformed or unknown: ignored, never cast into a saved field.
+    custom("tool_mcp_app", { toolCallId: "cmd1", app: { resourceUri: "https://evil.example/app" } }),
+    custom("tool_status", { toolCallId: "mcp1", status: "exploded" }),
+    custom("tool_meta", { toolCallId: "mcp1", server: 42 }),
+    custom("runtime_notice", { noticeId: "n-bad", title: "no level" }),
+    custom("mcp_server_status", { serverName: "charts", status: "failed" }),
+    custom("future_event", { toolCallId: "mcp1" }),
+    finish()
+  ];
+
+  async function run() {
+    const tools = new Map<string, Record<string, unknown>>();
+    const notices: unknown[][] = [];
+    const messages = {
+      updateContent: async () => ({}) as never,
+      updateStreamingContent: async () => undefined,
+      setRuntimeNotices: async (_t: string, _m: string, _u: string, saved: unknown[]) => { notices.push(saved); },
+      upsertToolResult: async (row: Record<string, unknown>) => { tools.set(String(row.toolResultId), row); return row as never; }
+    } as unknown as TurnTranscriptMessages;
+    const transcript = new TurnTranscript({ messages, tenantId: "t", sessionId: "s", userId: "u", messageId: "a1" });
+    for (const event of events) transcript.apply(event, { saveProgress: true });
+    await transcript.settleProgress();
+    await transcript.finalize();
+    return { tools, notices, transcript };
+  }
+
+  it("saves the rich parts once, and a reload reads them back", async () => {
+    const { tools, notices, transcript } = await run();
+
+    const reloaded = [...tools.values()].map((row) => ToolResultSchema.parse(row));
+    expect(reloaded).toEqual([
+      expect.objectContaining({ toolResultId: "mcp1", kind: "mcp", server: "charts", status: "completed", mcpApp: app }),
+      expect.objectContaining({ toolResultId: "cmd1", kind: "command", command: "rm -rf build", status: "declined", durationMs: 12 })
+    ]);
+    expect(reloaded[1]).not.toHaveProperty("mcpApp");
+    expect(transcript.hasSavedAppCall("mcp1")).toBe(true);
+    expect(notices.at(-1)).toEqual([notice]);
+    expect(expiredApprovalIdFromNotice(notice.noticeId)).toBe("ap-1");
+
+    const history = toAguiMessages([{
+      messageId: "a1", role: "assistant", status: "completed", content: "Here is the chart.",
+      toolResults: reloaded
+    } as HistoryMessage]);
+    expect(history.filter((message) => message.role === "tool").map((message) => message.toolCallId)).toEqual(["mcp1", "cmd1"]);
+  });
+
+  it("a replay of the same events on another replica saves the same rows", async () => {
+    const first = await run();
+    const second = await run();
+    expect([...second.tools.values()]).toEqual([...first.tools.values()]);
+    expect(second.notices.at(-1)).toEqual(first.notices.at(-1));
+  });
+});
+
+describe("custom event storage classification", () => {
+  it("classifies every event name of the shared schema, and only those", () => {
+    const names = CogniplaneCustomEventSchema.options.map((option) => option.shape.name.value).sort();
+    expect(Object.keys(CUSTOM_EVENT_STORAGE).sort()).toEqual(names);
+  });
+
+  it("keeps the current owners: notices in the transcript, approvals and user messages in their stores", () => {
+    expect(CUSTOM_EVENT_STORAGE).toMatchObject({
+      runtime_notice: "turn_transcript",
+      approval_required: "approval_store",
+      user_message_persisted: "message_store",
+      user_message_replaced: "message_store",
+      turn_started: "transport_only",
+      session_connection: "transport_only"
+    });
   });
 });

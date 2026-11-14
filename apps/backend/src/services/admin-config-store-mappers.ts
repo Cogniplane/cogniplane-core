@@ -8,6 +8,8 @@ import type {
   TenantMemberRecord
 } from "./admin-config-records.js";
 import { isoTimestamp, isoTimestampOrNull } from "../lib/db-mappers.js";
+import { ApprovalReviewerSchema, StoredApprovalPolicySchema } from "@cogniplane/shared-types";
+import type { ZodType } from "zod";
 
 /**
  * Reads the skills that a runtime loaded, from its manifest metadata. The
@@ -53,24 +55,53 @@ function toNullableString(value: unknown): string | null {
   return value === null || value === undefined ? null : String(value);
 }
 
-export function parseApprovalPolicy(value: unknown): ApprovalPolicy {
-  if (value === "never" || value === "on-request") return value;
-  // Stored as JSON string for granular mode
-  if (typeof value === "string") {
-    try {
-      const parsed = JSON.parse(value) as unknown;
-      if (typeof parsed === "object" && parsed !== null && "granular" in parsed) {
-        return parsed as ApprovalPolicy;
-      }
-    } catch {
-      // Invalid JSON is not a granular policy, so use the default below.
-    }
+/**
+ * A stored control value (a tenant setting or a field of the runtime policy
+ * snapshot) that this version cannot read. The readers throw it instead of
+ * choosing a value: a fallback could weaken the control, and a guess at the
+ * strictest value could hide the damage. The message names the source and the
+ * field, never the stored value. It is not a public error: routes answer with
+ * their generic failure, and the gateway refuses the tool call.
+ */
+export class UnreadableControlValueError extends Error {
+  constructor(readonly source: string, readonly field: string) {
+    super(`${source}: the stored ${field} cannot be read.`);
+    this.name = "UnreadableControlValueError";
   }
-  return "never";
 }
 
-export function parseApprovalReviewer(value: unknown): ApprovalReviewer {
-  return value === "guardian_subagent" ? "guardian_subagent" : "user";
+/** Reads a stored value of a closed set with its shared schema. */
+export function readStoredControl<T>(
+  schema: ZodType<T>,
+  value: unknown,
+  source: string,
+  field: string
+): T {
+  const parsed = schema.safeParse(value);
+  if (!parsed.success) throw new UnreadableControlValueError(source, field);
+  return parsed.data;
+}
+
+/**
+ * Reads an approval policy. `tenant_settings.approval_policy` is text: a mode
+ * name, or the JSON of a granular policy. The runtime policy snapshot keeps
+ * the parsed object. Both go through the shared StoredApprovalPolicySchema,
+ * which refuses a granular policy with a key that this version does not know.
+ */
+export function parseApprovalPolicy(value: unknown, source: string): ApprovalPolicy {
+  let candidate = value;
+  if (typeof value === "string" && value.startsWith("{")) {
+    try {
+      candidate = JSON.parse(value) as unknown;
+    } catch {
+      throw new UnreadableControlValueError(source, "approvalPolicy");
+    }
+  }
+  return readStoredControl(StoredApprovalPolicySchema, candidate, source, "approvalPolicy");
+}
+
+export function parseApprovalReviewer(value: unknown, source: string): ApprovalReviewer {
+  return readStoredControl(ApprovalReviewerSchema, value, source, "approvalReviewer");
 }
 
 function assertEnum<T extends string>(value: unknown, allowed: T[], label: string): T {

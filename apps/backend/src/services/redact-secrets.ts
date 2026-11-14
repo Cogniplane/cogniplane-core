@@ -1,3 +1,5 @@
+import { MODEL_PROVIDERS, MODEL_PROVIDER_META } from "@cogniplane/shared-types";
+
 import { isSensitiveQueryParameterName } from "../lib/sensitive-query-params.js";
 
 // Matches anywhere in the key (`accessToken`, `x-api-key`, `passwordHash`);
@@ -15,17 +17,16 @@ const GITHUB_TOKEN_PATTERN =
 const PEM_PRIVATE_KEY_BEGIN = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/g;
 const PEM_PRIVATE_KEY_END = /-----END [A-Z0-9 ]*PRIVATE KEY-----/g;
 
-// Provider API keys. Anthropic must precede OpenAI because `sk-ant-...` also
-// satisfies the OpenAI prefix.
-const ANTHROPIC_KEY_PATTERN = /\bsk-ant-[A-Za-z0-9_-]{20,}/g;
-const OPENAI_KEY_PATTERN = /\bsk-[A-Za-z0-9_-]{20,}/g;
+// Model provider API keys: the `keyPattern` of each MODEL_PROVIDER_META entry,
+// in MODEL_PROVIDERS order (Anthropic `sk-ant-` before OpenAI `sk-`). The
+// record type makes a new provider fail to compile until it has a pattern or
+// an explicit null.
+export const PROVIDER_KEY_PATTERNS: readonly RegExp[] = MODEL_PROVIDERS.flatMap((provider) => {
+  const pattern = MODEL_PROVIDER_META[provider].keyPattern;
+  return pattern ? [new RegExp(pattern.source, "g")] : [];
+});
 const AWS_ACCESS_KEY_PATTERN = /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g;
 const SLACK_TOKEN_PATTERN = /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/g;
-const GOOGLE_API_KEY_PATTERN = /\bAIza[0-9A-Za-z_-]{35}\b/g;
-// Z.AI (Zhipu / GLM) keys: a hex key-id, a dot, then an alphanumeric secret
-// (e.g. `1a2b...def.AbCd1234EfGh5678`). No distinctive prefix, so anchor on the
-// `{hex}.{alnum}` shape with a long-enough id to avoid matching ordinary text.
-const ZAI_API_KEY_PATTERN = /\b[0-9a-f]{20,}\.[A-Za-z0-9]{12,}\b/g;
 const RUNTIME_TOKEN_PATTERN = /\brt_[A-Za-z0-9._-]+\b/g;
 // A JWT starts with `eyJ` (base64url of `{"`) and has three dot-separated
 // segments. Sticky: redactJwts tries it only at a possible start.
@@ -124,15 +125,13 @@ function redactJwts(value: string): string {
 // Bearer and URL query rules can match a non-ASCII character. Update it when a
 // rule can.
 function redactInlineSecrets(value: string): string {
-  const beforeJwts = redactPemBlocks(value)
+  let beforeJwts = redactPemBlocks(value)
     .replace(BEARER_TOKEN_PATTERN, "$1[REDACTED]")
-    .replace(GITHUB_TOKEN_PATTERN, "[REDACTED]")
-    .replace(ANTHROPIC_KEY_PATTERN, "[REDACTED]")
-    .replace(OPENAI_KEY_PATTERN, "[REDACTED]")
+    .replace(GITHUB_TOKEN_PATTERN, "[REDACTED]");
+  for (const pattern of PROVIDER_KEY_PATTERNS) beforeJwts = beforeJwts.replace(pattern, "[REDACTED]");
+  beforeJwts = beforeJwts
     .replace(AWS_ACCESS_KEY_PATTERN, "[REDACTED]")
     .replace(SLACK_TOKEN_PATTERN, "[REDACTED]")
-    .replace(GOOGLE_API_KEY_PATTERN, "[REDACTED]")
-    .replace(ZAI_API_KEY_PATTERN, "[REDACTED]")
     .replace(RUNTIME_TOKEN_PATTERN, "[REDACTED]");
   return redactJwts(beforeJwts)
     .replace(STRIPE_KEY_PATTERN, "[REDACTED]")

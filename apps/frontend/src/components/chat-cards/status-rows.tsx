@@ -4,41 +4,11 @@ import {
   AlertTriangleIcon,
   ChevronDownIcon,
   InfoIcon,
-  ServerIcon,
   WrenchIcon,
   XCircleIcon
 } from "lucide-react";
 
-import type { McpServerStatusRow, RuntimeNoticeRow, ToolStatusRow } from "./chat-cards.types";
-
-export function McpServerStatusRowView({ row }: { row: McpServerStatusRow }) {
-  const isFailed = row.status === "failed";
-  return (
-    <article
-      className={`flex items-center gap-3 rounded-md border px-3 py-2 ${
-        isFailed
-          ? "border-danger/30 bg-danger-surface text-on-surface"
-          : "border-outline-variant bg-surface-container-low text-on-surface-variant"
-      }`}
-    >
-      <ServerIcon aria-hidden="true" className={`size-4 shrink-0 ${isFailed ? "text-danger" : "text-on-surface-faint"}`} />
-      <div className="min-w-0 flex-1">
-        <div className="break-words text-sm font-medium [overflow-wrap:anywhere]">
-          {row.serverName} · {row.status}
-        </div>
-        {row.error ? (
-          <details className="group mt-1">
-            <summary className="flex w-fit cursor-pointer list-none items-center gap-1 rounded-sm text-xs font-medium outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50 [&::-webkit-details-marker]:hidden">
-              <ChevronDownIcon aria-hidden="true" className="size-3 shrink-0 -rotate-90 group-open:rotate-0" />
-              Error details
-            </summary>
-            <p className="mt-2 whitespace-pre-wrap break-words text-xs leading-relaxed [overflow-wrap:anywhere]">{row.error}</p>
-          </details>
-        ) : null}
-      </div>
-    </article>
-  );
-}
+import type { RuntimeNoticeRow, ToolStatusRow } from "./chat-cards.types";
 
 export function ToolStatusRowView({ row }: { row: ToolStatusRow }) {
   return (

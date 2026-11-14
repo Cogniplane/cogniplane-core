@@ -4,7 +4,15 @@ import { IsoDateSchema } from "./_helpers.js";
 import { ApprovalSchema, McpAppCallSchema } from "./message.js";
 
 // AG-UI's CUSTOM envelope is open-ended. These are the payloads Cogniplane owns.
-// The retired `tool_ui_resources` event is not listed. Consumers ignore it.
+// The current backend does not send `tool_ui_resources` or
+// `mcp_server_status`, so they are not listed. Readers ignore them when an
+// older backend or a replay sends them.
+//
+// The backend consumers `services/agui-turn-accumulator.ts` (where to save
+// each event) and `services/turn-transcript.ts` switch on `name` with a
+// `never` check, so a new event fails the backend build until each one
+// decides what to do with it. The browser hook `use-agui-custom-events.ts`
+// has a `default` branch and does not fail the build.
 export const CogniplaneCustomEventSchema = z.discriminatedUnion("name", [
   z.object({
     name: z.literal("turn_started"),
@@ -33,14 +41,6 @@ export const CogniplaneCustomEventSchema = z.discriminatedUnion("name", [
       title: z.string(),
       message: z.string(),
       createdAt: IsoDateSchema
-    })
-  }),
-  z.object({
-    name: z.literal("mcp_server_status"),
-    value: z.object({
-      serverName: z.string(),
-      status: z.enum(["starting", "ready", "failed", "cancelled"]),
-      error: z.string().optional()
     })
   }),
   z.object({
@@ -99,3 +99,32 @@ export const CogniplaneCustomEventSchema = z.discriminatedUnion("name", [
 export type CogniplaneCustomEvent = z.infer<typeof CogniplaneCustomEventSchema>;
 export type CustomEventValue<Name extends CogniplaneCustomEvent["name"]> =
   Extract<CogniplaneCustomEvent, { name: Name }>["value"];
+
+// Approval expiry has no event of its own: the backend sends a
+// `runtime_notice` whose noticeId is this prefix and the approval id
+// (`runtime/approval-coordinator.ts`). The browser removes the approval card.
+export const APPROVAL_EXPIRED_NOTICE_PREFIX = "approval-expired:";
+
+// Read only. The current backend does not send this prefix. The browser still
+// reads it, because saved runtime notices of older turns can have it. Do not
+// emit it.
+export const LEGACY_POLICY_APPROVAL_EXPIRED_NOTICE_PREFIX = "policy-approval-expired:";
+
+const EXPIRED_APPROVAL_NOTICE_PREFIXES = [
+  APPROVAL_EXPIRED_NOTICE_PREFIX,
+  LEGACY_POLICY_APPROVAL_EXPIRED_NOTICE_PREFIX
+] as const;
+
+export function approvalExpiredNoticeId(approvalId: string): string {
+  return `${APPROVAL_EXPIRED_NOTICE_PREFIX}${approvalId}`;
+}
+
+/** The approval id of an expiry notice, or null for any other notice. */
+export function expiredApprovalIdFromNotice(noticeId: string): string | null {
+  for (const prefix of EXPIRED_APPROVAL_NOTICE_PREFIXES) {
+    if (noticeId.startsWith(prefix) && noticeId.length > prefix.length) {
+      return noticeId.slice(prefix.length);
+    }
+  }
+  return null;
+}

@@ -1,7 +1,12 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, expectTypeOf } from "vitest";
+import type { z } from "zod";
 import {
   AdminMcpServerCreateRequestSchema,
-  AdminMcpServerUpdateRequestSchema
+  AdminMcpServerUpdateRequestSchema,
+  TenantSettingsSchema,
+  type ApprovalPolicy,
+  type ApprovalReviewer,
+  type WebSearchMode
 } from "@cogniplane/shared-types";
 
 import {
@@ -174,6 +179,59 @@ describe("tenantSettingsBodySchema", () => {
     });
 
     expect(result.success).toBe(false);
+  });
+
+  // The schema moved to shared-types (TenantSettingsUpdateRequestSchema). Each
+  // constraint of the backend copy stays.
+  it("keeps the constraints of each field", () => {
+    const granular = { sandbox_approval: true, mcp_elicitations: false, rules: true };
+    const ok = (body: Record<string, unknown>) => tenantSettingsBodySchema.safeParse(body).success;
+
+    expect(ok({})).toBe(true);
+    expect(ok({ expectedVersion: 0 })).toBe(true);
+    expect(ok({ expectedVersion: -1 })).toBe(false);
+    expect(ok({ expectedVersion: 1.5 })).toBe(false);
+    expect(ok({ approvalPolicy: { granular } })).toBe(true);
+    expect(ok({ approvalPolicy: { granular: { ...granular, request_permissions: true, skill_approval: false } } })).toBe(true);
+    expect(ok({ approvalPolicy: { granular: { sandbox_approval: true, mcp_elicitations: false } } })).toBe(false);
+    expect(ok({ approvalPolicy: "sometimes" })).toBe(false);
+    expect(ok({ approvalReviewer: "anyone" })).toBe(false);
+    expect(ok({ webSearchMode: "unlimited" })).toBe(false);
+    expect(ok({ developerInstructions: "a".repeat(4001) })).toBe(false);
+    expect(ok({ developerInstructions: null })).toBe(true);
+    expect(ok({ enabledToolIds: ["Not An Id"] })).toBe(false);
+    expect(ok({ enabledMcpServerIds: ["github"] })).toBe(true);
+    expect(ok({ enabledProviders: ["anthropic", "unknown"] })).toBe(false);
+    expect(ok({ enabledModelIds: null })).toBe(true);
+    expect(ok({ enabledModelIds: [""] })).toBe(false);
+    expect(ok({ defaultModelId: "x".repeat(201) })).toBe(false);
+    expect(ok({ modelDefaultEfforts: { "anthropic/claude": "turbo" } })).toBe(false);
+    expect(ok({ approvedSandboxEgressDomains: ["pypi.org"] })).toBe(true);
+    expect(ok({ approvedSandboxEgressDomains: ["*.com"] })).toBe(false);
+    const trimmed = tenantSettingsBodySchema.parse({ developerInstructions: "  hi  " });
+    expect(trimmed.developerInstructions).toBe("hi");
+  });
+
+  // The request keeps its old behavior. Only the stored reader refuses
+  // unknown keys (StoredApprovalPolicySchema).
+  it("drops unknown keys of a granular approval policy", () => {
+    const parsed = tenantSettingsBodySchema.parse({
+      approvalPolicy: { granular: { sandbox_approval: true, mcp_elicitations: true, rules: true, extra: true }, mode: "x" }
+    });
+    expect(parsed.approvalPolicy).toEqual({ granular: { sandbox_approval: true, mcp_elicitations: true, rules: true } });
+  });
+
+  it("returns a granular approval policy with its unknown keys", () => {
+    const approvalPolicy = { granular: { sandbox_approval: true, mcp_elicitations: true, rules: true, extra: true }, mode: "x" };
+    const parsed = TenantSettingsSchema.shape.approvalPolicy.parse(approvalPolicy);
+    expect(parsed).toEqual(approvalPolicy);
+  });
+
+  it("parses into the shared ApprovalPolicy and ApprovalReviewer types", () => {
+    type Body = z.output<typeof tenantSettingsBodySchema>;
+    expectTypeOf<NonNullable<Body["approvalPolicy"]>>().toEqualTypeOf<ApprovalPolicy>();
+    expectTypeOf<NonNullable<Body["approvalReviewer"]>>().toEqualTypeOf<ApprovalReviewer>();
+    expectTypeOf<NonNullable<Body["webSearchMode"]>>().toEqualTypeOf<WebSearchMode>();
   });
 });
 

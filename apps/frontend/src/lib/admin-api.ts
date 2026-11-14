@@ -64,7 +64,6 @@ import type {
   AdminSkillReleaseImpact,
   AdminSkillReleaseSnapshot,
   AdminUser,
-  ApprovalPolicy,
   PiiActivityMetrics,
   PiiJobsStatsResponse,
   PiiProtectionSettings,
@@ -77,7 +76,6 @@ import type {
   PolicyDecisionDetail,
   PolicyDecisionFilters,
   PolicyDecisionsListResponse,
-  PolicyEnforcementMode,
   PolicyLintWarning,
   PolicyMonitorSummaryResponse,
   PolicyRule,
@@ -92,20 +90,17 @@ import type {
   SkillRevisionFilePreview,
   AdminModelCatalogResponse,
   CustomModelCreateRequest,
-  EffortLevel,
   Model,
   OpenRouterModelOption,
   TenantDetails,
-  TenantSettings,
-  WebSearchMode
+  TenantSettings
 } from "@cogniplane/shared-types";
+import type { TenantSettingsUpdateRequest } from "@cogniplane/shared-types/tenant-settings-request";
 
 export type {
   AdminManagedTool,
   SkillRevisionFilePreview
 } from "@cogniplane/shared-types";
-
-import type { ModelProvider } from "@cogniplane/shared-types";
 
 /**
  * Build "?a=1&b=x,y" from list filters. Empty strings, empty arrays, null, and
@@ -458,19 +453,34 @@ export async function deleteCustomModel(modelId: string): Promise<TenantSettings
   return parseResponse(TenantSettingsEnvelopeSchema, raw, "DELETE /admin/custom-models").settings;
 }
 
+// Both settings pages send a subset of the shared request schema
+// (`TenantSettingsUpdateRequest`) and always the version that they loaded.
+// The Models page sends the model fields; Agent behavior sends the others.
+type ModelAvailabilityField =
+  "enabledProviders" | "enabledModelIds" | "defaultModelId" | "modelDefaultEfforts" | "showEffortSelector";
+type AgentSettingsField =
+  | "showEffortSelector"
+  | "webSearchMode"
+  | "approvalPolicy"
+  | "approvalReviewer"
+  | "allowCommandExecution"
+  | "autoApproveReadOnlyTools"
+  | "policyEnforcementMode"
+  | "developerInstructions"
+  | "enabledToolIds"
+  | "enabledMcpServerIds"
+  | "approvedSandboxEgressDomains";
+export type TenantModelAvailabilityUpdate =
+  { expectedVersion: number } & Pick<TenantSettingsUpdateRequest, ModelAvailabilityField>;
+export type TenantAgentSettingsUpdate =
+  { expectedVersion: number } & Pick<TenantSettingsUpdateRequest, AgentSettingsField>;
+
 /**
  * Partial tenant-settings update carrying only the model-availability fields.
  * The backend upsert leaves absent fields untouched, so this cannot stomp
  * concurrent edits to the broader Agent Settings form.
  */
-export async function updateTenantModelAvailability(input: {
-  expectedVersion: number;
-  enabledProviders?: ModelProvider[];
-  enabledModelIds?: string[] | null;
-  defaultModelId?: string | null;
-  modelDefaultEfforts?: Record<string, EffortLevel>;
-  showEffortSelector?: boolean;
-}): Promise<TenantSettings> {
+export async function updateTenantModelAvailability(input: TenantModelAvailabilityUpdate): Promise<TenantSettings> {
   const raw = await request<unknown>("/admin/tenant-settings", {
     method: "PUT",
     body: JSON.stringify(input)
@@ -478,21 +488,7 @@ export async function updateTenantModelAvailability(input: {
   return parseResponse(TenantSettingsEnvelopeSchema, raw, "PUT /admin/tenant-settings").settings;
 }
 
-export async function updateTenantAgentSettings(input: {
-  expectedVersion: number;
-} & Partial<{
-  showEffortSelector: boolean;
-  webSearchMode: WebSearchMode;
-  approvalPolicy: ApprovalPolicy;
-  approvalReviewer: "user" | "guardian_subagent";
-  allowCommandExecution: boolean;
-  autoApproveReadOnlyTools: boolean;
-  policyEnforcementMode: PolicyEnforcementMode;
-  developerInstructions: string | null;
-  enabledToolIds: string[];
-  enabledMcpServerIds: string[];
-  approvedSandboxEgressDomains: string[];
-}>): Promise<TenantSettings> {
+export async function updateTenantAgentSettings(input: TenantAgentSettingsUpdate): Promise<TenantSettings> {
   const raw = await request<unknown>("/admin/tenant-settings", {
     method: "PUT",
     body: JSON.stringify(input)

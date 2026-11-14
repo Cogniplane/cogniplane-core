@@ -1,6 +1,6 @@
 import { describe, test, expect } from "vitest";
 import { TenantSettingsStore } from "../services/tenant-settings-store.js";
-import { adminDatabaseUrl, appPool } from "./support/database.js";
+import { adminDatabaseUrl, appPool, superuserPool } from "./support/database.js";
 import { seedTenant } from "./support/fixtures.js";
 
 describe.skipIf(!adminDatabaseUrl())("tenant settings persistence", () => {
@@ -176,4 +176,30 @@ test("TenantSettingsStore.upsert persists webSearchMode and preserves it across 
     expect(resaved.configHash).toBe(first.configHash);
   });
 
+  // Issue #121: approval_policy and approval_reviewer have no CHECK
+  // constraint, so the read is their only check. It refuses instead of
+  // reading "never" or "user".
+  test.each([
+    ["approval_reviewer", "anyone", "approvalReviewer"],
+    ["approval_policy", "sometimes", "approvalPolicy"],
+    ["approval_policy", JSON.stringify({ granular: { writeFile: true } }), "approvalPolicy"],
+    ["approval_policy", JSON.stringify({ granular: { sandbox_approval: true, mcp_elicitations: true, rules: true, writeFile: true } }), "approvalPolicy"]
+  ])("refuses a stored %s it cannot read", async (column, value, field) => {
+    const store = new TenantSettingsStore(appPool());
+    const tenantId = await seedTenant();
+    await store.upsert(tenantId, {});
+    await superuserPool().query(`UPDATE tenant_settings SET ${column} = $2 WHERE tenant_id = $1`, [tenantId, value]);
+
+    await expect(store.get(tenantId)).rejects.toMatchObject({ name: "UnreadableControlValueError", field });
+    await expect(store.upsert(tenantId, { showEffortSelector: true })).rejects.toMatchObject({ field });
+  });
+
+  test("the CHECK constraints refuse unknown web search and enforcement modes", async () => {
+    const tenantId = await seedTenant();
+    await new TenantSettingsStore(appPool()).upsert(tenantId, {});
+    for (const [column, value] of [["web_search_mode", "unlimited"], ["policy_enforcement_mode", "strict"]]) {
+      await expect(superuserPool().query(`UPDATE tenant_settings SET ${column} = $2 WHERE tenant_id = $1`, [tenantId, value]))
+        .rejects.toThrow(/check constraint/);
+    }
+  });
 });

@@ -1,6 +1,7 @@
 import {
+  PolicyConditionsInputSchema,
+  PolicyEffectSchema,
   type PolicyConditions,
-  type PolicyEffect,
   type PolicyRule,
   type PolicyRuleInput,
   type PolicyRulePatch
@@ -15,33 +16,19 @@ import { weakensPolicy } from "./policy-weakening.js";
 import { isoTimestamp } from "../../lib/db-mappers.js";
 import { AuditEventStore, type AuditEventInput } from "../audit-event-store.js";
 import { WeakerChangeError } from "../weaker-change-error.js";
+import { readStoredControl } from "../admin-config-store-mappers.js";
 
-// Coerce a JSONB dimension to a clean string[]. A value that is not an array,
-// or an empty result, becomes undefined ("no constraint"). Non-string entries are
-// dropped. The engine must never get a non-array, because `.includes()` would
-// crash on the hot path.
-function toStringArray(value: unknown): string[] | undefined {
-  if (!Array.isArray(value)) return undefined;
-  const entries = value.filter((entry): entry is string => typeof entry === "string");
-  return entries.length > 0 ? entries : undefined;
-}
-
-function toConditions(value: unknown): PolicyConditions {
-  if (!value || typeof value !== "object") return {};
-  const raw = value as Record<string, unknown>;
-  const conditions: PolicyConditions = {};
-  const toolNames = toStringArray(raw.toolNames);
-  const categories = toStringArray(raw.categories);
-  const severities = toStringArray(raw.severities);
-  const turnContexts = toStringArray(raw.turnContexts);
-  if (toolNames) conditions.toolNames = toolNames;
-  if (categories) conditions.categories = categories;
-  if (severities) conditions.severities = severities as PolicyConditions["severities"];
-  if (turnContexts) conditions.turnContexts = turnContexts as PolicyConditions["turnContexts"];
-  return conditions;
-}
-
+/**
+ * Reads a `policy_rule` row. The conditions go through the shared strict
+ * schema. When they fail it, the rule gets `conditions: {}` and
+ * `conditionsInvalid: true`: the engine blocks every action while the rule is
+ * enabled, and the weaker-change check reads the rule the same way. The stored
+ * JSON is not changed; `update` keeps it until a patch sends new conditions.
+ * The effect has a CHECK constraint; a value outside it throws, so the tenant's
+ * rules cannot be evaluated and the gateway refuses tool calls.
+ */
 function mapRow(row: Record<string, unknown>): PolicyRule {
+  const conditions = PolicyConditionsInputSchema.safeParse(row.conditions_json);
   return {
     ruleId: String(row.rule_id),
     tenantId: String(row.tenant_id),
@@ -49,8 +36,9 @@ function mapRow(row: Record<string, unknown>): PolicyRule {
     description: row.description == null ? null : String(row.description),
     priority: Number(row.priority),
     enabled: Boolean(row.enabled),
-    effect: row.effect as PolicyEffect,
-    conditions: toConditions(row.conditions_json),
+    effect: readStoredControl(PolicyEffectSchema, row.effect, "policy_rule", "effect"),
+    conditions: conditions.success ? conditions.data : {},
+    ...(conditions.success ? {} : { conditionsInvalid: true as const }),
     reason: row.reason == null ? null : String(row.reason),
     createdBy: row.created_by == null ? null : String(row.created_by),
     revision: Number(row.revision),
@@ -88,14 +76,10 @@ export class PolicyRuleStore {
   }
 
   /**
-   * Rules for the conflict lint, carrying the RAW `conditions_json` rather than
-   * the normalized {@link PolicyRule.conditions}. The lint must see unknown/typo'd
-   * dimension keys (e.g. `toolName` for `toolNames`) to warn on them — but
-   * {@link mapRow} runs `toConditions()`, which silently drops those keys at the
-   * read boundary. Reading the raw JSONB here is what makes the `unknown_condition`
-   * warning fire for persisted rules. The known-dimension subset checks behave
-   * identically on raw vs. normalized input (both ignore unknown keys), so the
-   * shadow/duplicate verdicts are unaffected.
+   * Rules for the conflict lint, with the RAW `conditions_json`, so the lint
+   * can name the unknown keys of a rule whose conditions cannot be read
+   * ({@link mapRow} lists such a rule with `conditions: {}`).
+   * `conditionsInvalid` comes from the same shared schema as in mapRow.
    */
   async listForLint(tenantId: string): Promise<LintableRule[]> {
     return withTenantScope(this.db, tenantId, async (client) => {
@@ -104,16 +88,18 @@ export class PolicyRuleStore {
            FROM policy_rule WHERE tenant_id = $1 ORDER BY priority ASC, rule_id ASC`,
         [tenantId]
       );
-      return result.rows.map((row: Record<string, unknown>) => ({
-        ruleId: String(row.rule_id),
-        name: String(row.name),
-        priority: Number(row.priority),
-        enabled: Boolean(row.enabled),
-        conditions:
-          row.conditions_json && typeof row.conditions_json === "object"
-            ? (row.conditions_json as PolicyConditions)
-            : {}
-      }));
+      return result.rows.map((row: Record<string, unknown>) => {
+        const raw = row.conditions_json;
+        const readable = PolicyConditionsInputSchema.safeParse(raw).success;
+        return {
+          ruleId: String(row.rule_id),
+          name: String(row.name),
+          priority: Number(row.priority),
+          enabled: Boolean(row.enabled),
+          conditions: raw && typeof raw === "object" && !Array.isArray(raw) ? (raw as PolicyConditions) : {},
+          ...(readable ? {} : { conditionsInvalid: true as const })
+        };
+      });
     });
   }
 
@@ -201,7 +187,6 @@ export class PolicyRuleStore {
         priority: input.priority ?? existing.priority,
         enabled: input.enabled ?? existing.enabled,
         effect: input.effect ?? existing.effect,
-        conditions: input.conditions ?? existing.conditions,
         reason: input.reason !== undefined ? input.reason : existing.reason
       };
 
@@ -213,7 +198,7 @@ export class PolicyRuleStore {
             priority = $5,
             enabled = $6,
             effect = $7,
-            conditions_json = $8::jsonb,
+            conditions_json = COALESCE($8::jsonb, conditions_json),
             reason = $9,
             revision = revision + 1,
             updated_at = NOW()
@@ -228,7 +213,10 @@ export class PolicyRuleStore {
           next.priority,
           next.enabled,
           next.effect,
-          JSON.stringify(next.conditions),
+          // A patch without conditions keeps the stored JSON as it is. Writing
+          // back the read form would turn unreadable conditions (read as
+          // `{}`) into a valid catch-all.
+          input.conditions === undefined ? null : JSON.stringify(input.conditions),
           next.reason,
           input.expectedRevision
         ]

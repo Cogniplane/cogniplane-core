@@ -43,13 +43,27 @@ export type ModelProvider = (typeof MODEL_PROVIDERS)[number];
  *   tenants when no tenant key is stored.
  * - `keyField` — the camelCase field used in the tenant key request/response
  *   contract and the settings store (`<provider>ApiKey`).
+ * - `keyPattern` — how `redactSecrets()` finds this provider's API key in any
+ *   text. `null` only when another provider's pattern already matches the key
+ *   (say which in a comment). The pattern has no flags, and it must take linear
+ *   time: add a large-input case to `redact-secrets.test.ts`
+ *   (docs/security.md, "Secrets and encryption"). The patterns run in
+ *   MODEL_PROVIDERS order, so a pattern whose prefix extends another's (Anthropic
+ *   `sk-ant-` over OpenAI `sk-`) must come first.
+ * - `reasoningEffort` — which mapping `applyReasoningEffort` uses for the
+ *   turn's effort: the request shape of the provider's client, or
+ *   `"unsupported"` to send no effort.
  */
+export type ReasoningEffortMapping = "anthropic" | "openai" | "google" | "unsupported";
+
 export type ModelProviderMeta = {
   label: string;
   initPrefix: "anthropic" | "openai" | "google-genai";
   baseUrl: string | null;
   envKey: "ANTHROPIC_API_KEY" | "OPENAI_API_KEY" | "GOOGLE_API_KEY" | "OPENROUTER_API_KEY" | "ZAI_API_KEY";
   keyField: "anthropicApiKey" | "openaiApiKey" | "googleApiKey" | "openrouterApiKey" | "zaiApiKey";
+  keyPattern: RegExp | null;
+  reasoningEffort: ReasoningEffortMapping;
 };
 
 export const MODEL_PROVIDER_META: Record<ModelProvider, ModelProviderMeta> = {
@@ -58,21 +72,27 @@ export const MODEL_PROVIDER_META: Record<ModelProvider, ModelProviderMeta> = {
     initPrefix: "anthropic",
     baseUrl: null,
     envKey: "ANTHROPIC_API_KEY",
-    keyField: "anthropicApiKey"
+    keyField: "anthropicApiKey",
+    keyPattern: /\bsk-ant-[A-Za-z0-9_-]{20,}/,
+    reasoningEffort: "anthropic"
   },
   openai: {
     label: "OpenAI",
     initPrefix: "openai",
     baseUrl: null,
     envKey: "OPENAI_API_KEY",
-    keyField: "openaiApiKey"
+    keyField: "openaiApiKey",
+    keyPattern: /\bsk-[A-Za-z0-9_-]{20,}/,
+    reasoningEffort: "openai"
   },
   google: {
     label: "Google",
     initPrefix: "google-genai",
     baseUrl: null,
     envKey: "GOOGLE_API_KEY",
-    keyField: "googleApiKey"
+    keyField: "googleApiKey",
+    keyPattern: /\bAIza[0-9A-Za-z_-]{35}\b/,
+    reasoningEffort: "google"
   },
   openrouter: {
     // No native initChatModel provider: ride the OpenAI client with the
@@ -81,7 +101,12 @@ export const MODEL_PROVIDER_META: Record<ModelProvider, ModelProviderMeta> = {
     initPrefix: "openai",
     baseUrl: "https://openrouter.ai/api/v1",
     envKey: "OPENROUTER_API_KEY",
-    keyField: "openrouterApiKey"
+    keyField: "openrouterApiKey",
+    // OpenRouter keys start with `sk-or-`, which the OpenAI pattern matches.
+    keyPattern: null,
+    // The OpenAI client sends `reasoning.effort`. OpenRouter models advertise
+    // no efforts today, so no turn sends one.
+    reasoningEffort: "openai"
   },
   zai: {
     // Z.AI (Zhipu, the GLM models). Like OpenRouter, no native initChatModel
@@ -99,7 +124,12 @@ export const MODEL_PROVIDER_META: Record<ModelProvider, ModelProviderMeta> = {
     initPrefix: "openai",
     baseUrl: "https://api.z.ai/api/coding/paas/v4",
     envKey: "ZAI_API_KEY",
-    keyField: "zaiApiKey"
+    keyField: "zaiApiKey",
+    // A hex key id, a dot, then an alphanumeric secret
+    // (`1a2b...def.AbCd1234EfGh5678`). No distinctive prefix, so the pattern
+    // needs a long id to stay off ordinary text.
+    keyPattern: /\b[0-9a-f]{20,}\.[A-Za-z0-9]{12,}\b/,
+    reasoningEffort: "openai"
   }
 };
 
