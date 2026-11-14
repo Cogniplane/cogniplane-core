@@ -68,7 +68,8 @@ the variables named here.
   - A turn that a request under the older security version admits while the
     change transaction runs can keep its lease. The tool context check refuses
     that turn at its first model call, before it can make a sandbox.
-  - Tenant deletion kills no sandbox.
+  - Tenant deletion kills no sandbox. Its receipt counts the saved sandbox ids
+    ([resources outside the database](../operations.md#resources-outside-the-database)).
 - Limits: `DEEP_AGENTS_EXECUTE_TIMEOUT_MS` per command, an output cap
   (`MAX_EXECUTE_OUTPUT_CHARS` in `deep-agents-e2b-backend.ts`), and
   `E2B_SANDBOX_TIMEOUT_MS`, a lifetime deadline that each turn start extends
