@@ -77,6 +77,26 @@ const POOL_CONNECTION_TIMEOUT_MS = 10_000;
 const POOL_STATEMENT_TIMEOUT_MS = 30_000;
 const POOL_IDLE_IN_TRANSACTION_TIMEOUT_MS = 60_000;
 
+/**
+ * The turn control pool (`createTurnControlDatabase`). A running turn renews
+ * its lease every `SESSION_EXECUTION_HEARTBEAT_MS` and loses it after
+ * `SESSION_EXECUTION_LEASE_MS` (10 seconds or more). A full app pool must not
+ * stop these renewals, so they have their own connections. One renewal waits
+ * at most 3 seconds for a connection and runs at most 5 seconds, so a failed
+ * renewal leaves time for the next one before the lease ends.
+ */
+const TURN_CONTROL_POOL_MAX = 4;
+const TURN_CONTROL_CONNECTION_TIMEOUT_MS = 3_000;
+const TURN_CONTROL_STATEMENT_TIMEOUT_MS = 5_000;
+const TURN_CONTROL_IDLE_IN_TRANSACTION_TIMEOUT_MS = 10_000;
+
+/**
+ * Statement limit of an admin aggregate (`withAdminAggregateScope`). It is
+ * lower than the pool limit, so a heavy report of one tenant gives its
+ * connection back sooner.
+ */
+export const ADMIN_AGGREGATE_STATEMENT_TIMEOUT = "10s";
+
 /** The properties that keep one pool apart from the others. */
 export type PoolIdentity = {
   connectionString: string;
@@ -85,17 +105,29 @@ export type PoolIdentity = {
   max: number;
 };
 
+type PoolLimits = {
+  connectionTimeoutMs: number;
+  statementTimeoutMs: number;
+  idleInTransactionTimeoutMs: number;
+};
+
+const OPERATIONAL_LIMITS: PoolLimits = {
+  connectionTimeoutMs: POOL_CONNECTION_TIMEOUT_MS,
+  statementTimeoutMs: POOL_STATEMENT_TIMEOUT_MS,
+  idleInTransactionTimeoutMs: POOL_IDLE_IN_TRANSACTION_TIMEOUT_MS
+};
+
 /**
  * Pool options for a request, worker, or agent-turn pool. `createOperationalPool`
  * applies them, so that no such pool gets pg's unbounded defaults.
  */
-export function operationalPoolOptions(identity: PoolIdentity): PoolConfig {
+export function operationalPoolOptions(identity: PoolIdentity, limits: PoolLimits = OPERATIONAL_LIMITS): PoolConfig {
   return {
     connectionString: identity.connectionString,
     max: identity.max,
-    connectionTimeoutMillis: POOL_CONNECTION_TIMEOUT_MS,
-    statement_timeout: POOL_STATEMENT_TIMEOUT_MS,
-    idle_in_transaction_session_timeout: POOL_IDLE_IN_TRANSACTION_TIMEOUT_MS,
+    connectionTimeoutMillis: limits.connectionTimeoutMs,
+    statement_timeout: limits.statementTimeoutMs,
+    idle_in_transaction_session_timeout: limits.idleInTransactionTimeoutMs,
     application_name: identity.applicationName
   };
 }
@@ -131,9 +163,10 @@ const defaultPoolErrorLogger: PoolErrorLogger = {
  */
 export function createOperationalPool(
   identity: PoolIdentity,
-  logger: PoolErrorLogger = defaultPoolErrorLogger
+  logger: PoolErrorLogger = defaultPoolErrorLogger,
+  limits: PoolLimits = OPERATIONAL_LIMITS
 ): Pool {
-  return logIdleConnectionErrors(new Pool(operationalPoolOptions(identity)), identity.applicationName, logger);
+  return logIdleConnectionErrors(new Pool(operationalPoolOptions(identity, limits)), identity.applicationName, logger);
 }
 
 /** The `error` listener of `createOperationalPool`, for any pool. */
@@ -193,6 +226,25 @@ export function createDatabase(config: AppConfig, logger?: PoolErrorLogger): Poo
 }
 
 /**
+ * The `app_user` pool of a running turn: lease renewal and the other lease
+ * checks of `SessionExecutionStore`, and tool contexts. It is separate from
+ * the app pool, so slow tenant queries that hold all app connections do not
+ * stop the turns of every tenant. It uses the same role and RLS as the app
+ * pool. Turn admission (`acquire`) and the stop route stay on the app pool.
+ */
+export function createTurnControlDatabase(config: Pick<AppConfig, "DATABASE_URL">, logger?: PoolErrorLogger): Pool {
+  return createOperationalPool(
+    { connectionString: config.DATABASE_URL, applicationName: "cogniplane-turn-control", max: TURN_CONTROL_POOL_MAX },
+    logger,
+    {
+      connectionTimeoutMs: TURN_CONTROL_CONNECTION_TIMEOUT_MS,
+      statementTimeoutMs: TURN_CONTROL_STATEMENT_TIMEOUT_MS,
+      idleInTransactionTimeoutMs: TURN_CONTROL_IDLE_IN_TRANSACTION_TIMEOUT_MS
+    }
+  );
+}
+
+/**
  * The RLS-bypassing pool. It gets the same caps as the app pool for the same
  * reasons: it serves the WorkOS auth hook on every request and both background
  * workers, so pg's defaults (max 10, wait forever, no statement timeout) would
@@ -236,6 +288,23 @@ export async function withTenantScope<T>(
   } finally {
     client.release(rollbackError ?? undefined);
   }
+}
+
+/**
+ * `withTenantScope` for a heavy admin report (aggregates over all messages,
+ * findings or events of a tenant). `SET LOCAL` lowers the statement limit
+ * for this transaction only; the connection keeps the pool limit after the
+ * commit or rollback.
+ */
+export async function withAdminAggregateScope<T>(
+  db: Pool,
+  tenantId: string,
+  fn: (client: PoolClient) => Promise<T>
+): Promise<T> {
+  return withTenantScope(db, tenantId, async (client) => {
+    await client.query("SELECT set_config('statement_timeout', $1, true)", [ADMIN_AGGREGATE_STATEMENT_TIMEOUT]);
+    return fn(client);
+  });
 }
 
 // Escape LIKE/ILIKE wildcards (%, _, \) so a user-supplied query is always

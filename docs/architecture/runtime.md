@@ -122,7 +122,9 @@ A turn writes checkpoints only while its execution holds the session lease.
   `MAX_RUNNING_TURNS_PER_TENANT` cap running turns (429 `running_turn_limit`).
   Interactive and [scheduled](#scheduler) turns take the same lease and count
   toward the same caps. The session list shows a session as running while its
-  lease is active or stopping.
+  lease is active or stopping. The renewal and the other lease checks of a
+  running turn use the turn control pool, not the app pool
+  ([database pools](data.md#database-pools)).
 - The lease is the only rule for "a turn runs in this session". The local
   registries (`ActiveTurnsRegistry`, the adapter's turn set) only answer
   first on the replica that runs the turn. A session is busy
@@ -350,6 +352,9 @@ teardown.
 - The scheduler worker still runs for the PII scan drain (on by default), the
   retention jobs and the storage cleanup queues (always on;
   `build-scheduler-worker.ts`).
+- Between ticks, the scheduler worker claims PII scan jobs for its free slots
+  every `PII_CLAIM_INTERVAL_MS` (2 seconds, `scheduler-worker.ts`). The
+  recovery of stalled scans stays on the tick ([PII](pii.md#scan-paths)).
 
 | Worker | Code | Runs |
 |---|---|---|

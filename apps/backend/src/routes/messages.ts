@@ -161,6 +161,25 @@ export async function registerMessageRoutes(
 
     const { runtimeAdapter, selectedModel, selectedEffort } = resolution;
 
+    // The rate limit comes before the local turn slot and the lease. A Redis
+    // command waits at most REDIS_COMMAND_TIMEOUT_MS (lib/redis.ts), and its
+    // failure throws RequestLimitsUnavailableError (503) here, while this
+    // request holds nothing. It also comes before the PII evaluation, so an
+    // over-limit user cannot start a PII provider call (an LLM call), and each
+    // probe of the PII filter costs a rate-limit token. The daily turn quota
+    // is consumed only AFTER the PII gate: a blocked turn (or a provider 503
+    // fail-closed) never burns quota for a turn that was never dispatched.
+    const rateLimitError = await stores.limits.consumeRateLimit({
+      resource: "message_turn",
+      userId: request.auth.userId,
+      tenantId: request.auth.tenantId
+    });
+    if (rateLimitError) {
+      reply.code(429);
+      reply.header("retry-after", Math.max(1, Math.ceil(rateLimitError.retryAfterMs / 1000)));
+      return rateLimitError;
+    }
+
     if (stores.activeTurns?.isDraining()) {
       reply.code(503);
       return apiError("server_draining");
@@ -306,22 +325,6 @@ export async function registerMessageRoutes(
         return artifactScope.response;
       }
       const { readyArtifactById, selectedArtifactIds } = artifactScope;
-
-      // The rate limit is consumed BEFORE the PII evaluation so the PII provider
-      // (an LLM call) cannot be triggered by an over-limit user, and so probing
-      // the PII filter costs a rate-limit token per attempt. The daily turn
-      // quota is only consumed AFTER the PII gate: a blocked turn (or a provider
-      // 503 fail-closed) never burns quota for a turn that was never dispatched.
-      const rateLimitError = await stores.limits.consumeRateLimit({
-        resource: "message_turn",
-        userId: request.auth.userId,
-        tenantId: request.auth.tenantId
-      });
-      if (rateLimitError) {
-        reply.code(429);
-        reply.header("retry-after", Math.max(1, Math.ceil(rateLimitError.retryAfterMs / 1000)));
-        return rateLimitError;
-      }
 
       const piiStores = {
         piiProtection: stores.piiProtection,

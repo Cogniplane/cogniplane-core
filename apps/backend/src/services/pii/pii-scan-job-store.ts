@@ -30,8 +30,11 @@ export type PiiScanJobRecord = {
   mode: PiiScanJobMode;
   payload: PiiScanJobPayload;
   status: PiiScanJobStatus;
+  /** Claims so far. Also the fence of the current claim (PiiScanJobClaim). */
   attempts: number;
   maxAttempts: number;
+  /** Claims that ended in a transient storage failure; they do not use `maxAttempts`. */
+  transientRetries: number;
   runAfter: string;
   claimedAt: string | null;
   completedAt: string | null;
@@ -64,6 +67,18 @@ export type StalledUploadOutcome = "requeued" | "failed" | "skipped";
 
 /** Stored on a scan run and an upload that recovery closes without a decision. */
 export const PII_SCAN_INTERRUPTED = "pii_scan_interrupted";
+
+/**
+ * Retries after a transient storage failure (`recordFailure` with
+ * `transient`). Such a failure does not use the scan budget, so it does not
+ * fail a good file while the bucket is down. The retries wait 30 seconds,
+ * then twice as long each time, up to 10 minutes: 30 retries cover about
+ * four and a half hours. After the cap, a transient failure counts as a
+ * normal attempt again, so a storage outage cannot keep a job forever.
+ */
+export const PII_SCAN_TRANSIENT_RETRY_LIMIT = 30;
+const TRANSIENT_RETRY_BASE_MS = 30_000;
+const TRANSIENT_RETRY_MAX_DELAY_MS = 10 * 60_000;
 
 export type CreatePiiScanJobInput = {
   tenantId: string;
@@ -108,6 +123,7 @@ function mapRow(row: Record<string, unknown>): PiiScanJobRecord {
     status: row.status as PiiScanJobStatus,
     attempts: Number(row.attempts ?? 0),
     maxAttempts: Number(row.max_attempts ?? 3),
+    transientRetries: Number(row.transient_retries ?? 0),
     runAfter: isoTimestamp(row.run_after),
     claimedAt: row.claimed_at == null ? null : isoTimestamp(row.claimed_at),
     completedAt: row.completed_at == null ? null : isoTimestamp(row.completed_at),
@@ -170,17 +186,38 @@ export class PiiScanJobStore {
    * `run_after <= NOW()`). Uses `FOR UPDATE SKIP LOCKED` so concurrent workers
    * don't fight over the same row. Runs through `schedulerDb` because the
    * worker does not have a tenant context when polling across tenants.
+   *
+   * Tenants take turns, as in the mail outbox (`mail-outbox-worker.ts`). A
+   * job's turn is its place in its tenant's due queue (oldest first) plus the
+   * jobs of that tenant that are claimed now, on any replica. So a tenant with
+   * a large backlog and running jobs comes after a tenant with one new job,
+   * also when a worker claims one job at a time. Equal turns go oldest first,
+   * then by job id, so the order is stable.
    */
   async claimDueJobs(limit: number): Promise<PiiScanJobRecord[]> {
     const result = await this.schedulerDb.query(
       `
-        WITH due AS (
-          SELECT job_id
+        WITH waiting AS (
+          SELECT tenant_id, job_id, run_after,
+                 row_number() OVER (PARTITION BY tenant_id ORDER BY run_after, job_id) AS turn
           FROM pii_scan_jobs
           WHERE status = 'queued' AND run_after <= NOW()
-          ORDER BY run_after ASC
+        ),
+        running AS (
+          SELECT tenant_id, count(*) AS claimed
+          FROM pii_scan_jobs
+          WHERE status = 'claimed'
+          GROUP BY tenant_id
+        ),
+        due AS (
+          SELECT j.job_id
+          FROM pii_scan_jobs j
+          JOIN waiting w ON w.job_id = j.job_id
+          LEFT JOIN running r ON r.tenant_id = w.tenant_id
+          WHERE j.status = 'queued' AND j.run_after <= NOW()
+          ORDER BY w.turn + COALESCE(r.claimed, 0), w.run_after, w.job_id
           LIMIT $1
-          FOR UPDATE SKIP LOCKED
+          FOR UPDATE OF j SKIP LOCKED
         )
         UPDATE pii_scan_jobs AS j
         SET
@@ -224,29 +261,52 @@ export class PiiScanJobStore {
    * the job is requeued with a backoff `run_after` until `max_attempts`.
    * Only the attempt that `claim` names can record it; for a stale attempt
    * this returns null and changes nothing.
+   *
+   * `transient` (object storage slow or unavailable) requeues the job
+   * without using its budget, until PII_SCAN_TRANSIENT_RETRY_LIMIT. The
+   * claim count (`attempts`) still keeps this claim: the next claim gets a
+   * new, higher fence, so this attempt cannot finish the job after it.
    */
   async recordFailure(
     claim: PiiScanJobClaim,
     errorMessage: string,
-    options: { backoffMs?: number; permanent?: boolean } = {}
+    options: { backoffMs?: number; permanent?: boolean; transient?: boolean } = {}
   ): Promise<PiiScanJobRecord | null> {
     const backoffMs = options.backoffMs ?? 30_000;
     const permanent = options.permanent ?? false;
+    const transient = !permanent && (options.transient ?? false);
     return withTenantScope(this.db, claim.tenantId, async (client) => {
+      // SET reads the old row. A transient failure under its cap requeues
+      // with its own delay; any other failure uses the scan budget.
       const result = await client.query(
         `
-          UPDATE pii_scan_jobs
+          WITH failure AS (
+            SELECT job_id,
+                   $7::boolean AND transient_retries < $8 AS deferred,
+                   NOT ($7::boolean AND transient_retries < $8)
+                     AND ($5::boolean OR attempts - transient_retries >= max_attempts) AS terminal,
+                   LEAST($10::bigint, $9::bigint * power(2, LEAST(transient_retries, 20))::bigint) AS deferred_delay_ms
+            FROM pii_scan_jobs
+            WHERE tenant_id = $1 AND job_id = $2 AND status = 'claimed' AND attempts = $6
+          )
+          UPDATE pii_scan_jobs j
           SET
-            status = CASE WHEN $5::boolean OR attempts >= max_attempts THEN 'failed' ELSE 'queued' END,
-            run_after = CASE WHEN $5::boolean OR attempts >= max_attempts THEN run_after ELSE NOW() + ($3::int * INTERVAL '1 millisecond') END,
+            status = CASE WHEN f.terminal THEN 'failed' ELSE 'queued' END,
+            run_after = CASE
+              WHEN f.terminal THEN j.run_after
+              WHEN f.deferred THEN NOW() + (f.deferred_delay_ms * INTERVAL '1 millisecond')
+              ELSE NOW() + ($3::int * INTERVAL '1 millisecond') END,
+            transient_retries = j.transient_retries + CASE WHEN f.deferred THEN 1 ELSE 0 END,
             claimed_at = NULL,
-            completed_at = CASE WHEN $5::boolean OR attempts >= max_attempts THEN NOW() ELSE NULL END,
+            completed_at = CASE WHEN f.terminal THEN NOW() ELSE NULL END,
             error_message = $4,
             updated_at = NOW()
-          WHERE tenant_id = $1 AND job_id = $2 AND status = 'claimed' AND attempts = $6
-          RETURNING *
+          FROM failure f
+          WHERE j.tenant_id = $1 AND j.job_id = f.job_id AND j.status = 'claimed' AND j.attempts = $6
+          RETURNING j.*
         `,
-        [claim.tenantId, claim.jobId, backoffMs, errorMessage, permanent, claim.attempts]
+        [claim.tenantId, claim.jobId, backoffMs, errorMessage, permanent, claim.attempts,
+          transient, PII_SCAN_TRANSIENT_RETRY_LIMIT, TRANSIENT_RETRY_BASE_MS, TRANSIENT_RETRY_MAX_DELAY_MS]
       );
       if (result.rows.length === 0) return null;
       return mapRow(result.rows[0] as Record<string, unknown>);
@@ -283,10 +343,10 @@ export class PiiScanJobStore {
       `
         UPDATE pii_scan_jobs
         SET
-          status = CASE WHEN attempts >= max_attempts THEN 'failed' ELSE 'queued' END,
-          run_after = CASE WHEN attempts >= max_attempts THEN run_after ELSE NOW() END,
+          status = CASE WHEN attempts - transient_retries >= max_attempts THEN 'failed' ELSE 'queued' END,
+          run_after = CASE WHEN attempts - transient_retries >= max_attempts THEN run_after ELSE NOW() END,
           claimed_at = NULL,
-          completed_at = CASE WHEN attempts >= max_attempts THEN NOW() ELSE NULL END,
+          completed_at = CASE WHEN attempts - transient_retries >= max_attempts THEN NOW() ELSE NULL END,
           error_message = 'claim expired (worker presumed crashed before completion)',
           updated_at = NOW()
         WHERE status = 'claimed'

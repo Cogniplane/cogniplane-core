@@ -1,7 +1,7 @@
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 
-import { withTenantScope } from "../../lib/db.js";
+import { withAdminAggregateScope } from "../../lib/db.js";
 import { apiError } from "../../lib/http-errors.js";
 import { adminIdSchema, withAdmin } from "./admin-route-helpers.js";
 
@@ -106,7 +106,7 @@ export async function registerAdminTokenUsageRoutes(
       }
       const where = conditions.join("\n                AND ");
 
-      const usage = await withTenantScope(app.db, tenantId, async (client) => {
+      const usage = await withAdminAggregateScope(app.db, tenantId, async (client) => {
         const [dailyResult, userResult, modelResult, totalsResult] = await Promise.all([
           client.query(
             `

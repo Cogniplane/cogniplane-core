@@ -194,13 +194,47 @@ test("a full wait queue refuses at once as busy", async () => {
   const gate = new Promise<string>((resolve) => { release = () => resolve("x"); });
   const tools = fakeTools({ pages: ["x"], onTesseract: () => gate });
   const { pdfOcr } = ocr(tools, { maxConcurrent: 1 });
-  // One pass runs and eight wait (the queue holds eight per slot).
-  const running = Array.from({ length: 9 }, () => pdfOcr(Buffer.from("%PDF")));
-  const refused = await pdfOcr(Buffer.from("%PDF"));
+  // One pass runs and eight wait (the queue holds eight per slot), two per
+  // tenant (two per slot per tenant).
+  const running = Array.from({ length: 9 }, (_, index) =>
+    pdfOcr(Buffer.from("%PDF"), undefined, { tenantId: `tenant-${Math.ceil(index / 2)}` }));
+  const refused = await pdfOcr(Buffer.from("%PDF"), undefined, { tenantId: "tenant-5" });
   expect(refused).toMatchObject({ status: "failed", pagesScanned: 0, reason: "busy" });
   release();
   const results = await Promise.all(running);
   expect(results.every((result) => result.status === "complete")).toBe(true);
+});
+
+test("one tenant cannot fill the wait queue, and a free slot goes to the tenants in turn", async () => {
+  const releases: Array<() => void> = [];
+  const order: string[] = [];
+  const tools = fakeTools({
+    pages: ["x"],
+    onTesseract: () => new Promise<string>((resolve) => { releases.push(() => resolve("x")); })
+  });
+  const { pdfOcr } = ocr(tools, { maxConcurrent: 1 });
+  const scan = (tenantId: string, label: string) =>
+    pdfOcr(Buffer.from("%PDF"), undefined, { tenantId }).then((result) => {
+      order.push(label);
+      return result;
+    });
+  const first = scan("tenant-a", "a1");
+  await vi.waitFor(() => expect(releases).toHaveLength(1));
+  // Tenant A may wait for two slots; a third PDF of A is busy at once.
+  const a2 = scan("tenant-a", "a2");
+  const a3 = scan("tenant-a", "a3");
+  expect(await pdfOcr(Buffer.from("%PDF"), undefined, { tenantId: "tenant-a" }))
+    .toMatchObject({ status: "failed", reason: "busy" });
+  // Tenant B arrives after A's backlog and still gets the next slot.
+  const b1 = scan("tenant-b", "b1");
+  for (let index = 0; index < 4; index += 1) {
+    await vi.waitFor(() => expect(releases).toHaveLength(index + 1));
+    releases[index]!();
+  }
+  const results = await Promise.all([first, b1, a2, a3]);
+  expect(results.every((result) => result.status === "complete")).toBe(true);
+  // A's pass ended, so B goes before A's next PDF.
+  expect(order).toEqual(["a1", "b1", "a2", "a3"]);
 });
 
 test("verify checks the tools and each configured language", async () => {

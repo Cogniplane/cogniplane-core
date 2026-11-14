@@ -55,7 +55,10 @@ export function buildStores(
     DATA_ENCRYPTION_SECRET: string;
     MODEL_SPENDING_MONTHLY_LIMIT_USD?: number;
     MODEL_SPENDING_TURN_RESERVATION_USD?: number;
-  }
+  },
+  // `app_user` pool for the checks of a running turn (createTurnControlDatabase).
+  // Tests and tools that do not pass one share `db`.
+  turnControlDb: Pool = db
 ) {
   const sessions = new SessionStore(db, schedulerDb, {
     retentionDays: timers?.SESSION_TRASH_RETENTION_DAYS,
@@ -68,7 +71,7 @@ export function buildStores(
   const piiScanJobs = new PiiScanJobStore(db, schedulerDb);
   const piiAnalytics = new PiiAnalyticsStore(db);
   // One id names this process as the owner of its leases and its runtime rows.
-  const executions = new SessionExecutionStore(db);
+  const executions = new SessionExecutionStore(db, undefined, turnControlDb);
   const runtimeSessions = new RuntimeSessionStore(db, executions.ownerId);
   const skills = new SkillConfigStore(db);
   const skillRevisions = new SkillRevisionStore(db, skills);
@@ -85,7 +88,8 @@ export function buildStores(
   const platformEvents = new PlatformEventStore(db);
   const activationTracker = new ActivationTracker(db, logger);
   const toolEvents = new ToolEventStore(db);
-  const toolContexts = new ToolExecutionContextStore(db);
+  // Every tool call of a running turn checks its context: same pool as the lease.
+  const toolContexts = new ToolExecutionContextStore(turnControlDb);
   const integrationStates = new IntegrationStateStore(db);
   const policyRules = new PolicyRuleStore(db);
   const policyDecisions = new PolicyDecisionStore(db);

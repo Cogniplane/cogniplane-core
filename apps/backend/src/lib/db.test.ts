@@ -8,7 +8,9 @@ import {
   createMaintenanceDatabase,
   createMigrationDatabase,
   createPrivilegedDatabase,
+  createTurnControlDatabase,
   operationalPoolOptions,
+  withAdminAggregateScope,
   type PoolErrorLogger,
   withTenantScope,
   withTransaction
@@ -94,6 +96,23 @@ test("withTenantScope wraps the callback in BEGIN/set_config/COMMIT and commits 
   expect(texts.findIndex((t) => t.includes("set_config"))).toBeLessThan(texts.indexOf(SENTINEL));
 
   expect(releaseCount()).toBe(1);
+});
+
+test("withAdminAggregateScope lowers the statement limit inside the tenant transaction only", async () => {
+  const { pool, queries } = makeRecordingPool();
+
+  await withAdminAggregateScope(pool, "tenant-42", async (client) => {
+    await client.query(SENTINEL);
+  });
+
+  const texts = queries.map((q) => q.text);
+  const limit = texts.findIndex((t) => t.includes("set_config('statement_timeout'"));
+  // set_config(..., true) is SET LOCAL: it ends with the transaction.
+  expect(queries[limit]).toEqual({ text: "SELECT set_config('statement_timeout', $1, true)", values: ["10s"] });
+  expect(texts.findIndex((t) => t.includes("app.current_tenant_id"))).toBeLessThan(limit);
+  expect(limit).toBeLessThan(texts.indexOf(SENTINEL));
+  expect(texts[0]).toBe("BEGIN");
+  expect(texts.at(-1)).toBe("COMMIT");
 });
 
 test("withTenantScope rejects with the same error, issues ROLLBACK (not COMMIT), and releases once", async () => {
@@ -220,6 +239,9 @@ type ServingPool = {
   /** The password in `url`. It must never reach a log line. */
   password: string;
   applicationName: string;
+  /** Pool size and limits, when they differ from the app pool. */
+  max?: number;
+  limits?: typeof OPERATIONAL_LIMITS;
   open(url: string, logger?: PoolErrorLogger): { pool: Pool; close(): Promise<void> };
 };
 
@@ -237,6 +259,17 @@ const SERVING_POOLS: ServingPool[] = [
     password: "app-secret",
     applicationName: "cogniplane-backend",
     open: (url, logger) => plainPool(createDatabase({ DATABASE_URL: url } as AppConfig, logger))
+  },
+  {
+    // Lease renewal and tool-context checks of running turns. Its limits keep
+    // a renewal (wait plus statement) well inside the 10-second minimum lease.
+    name: "turn control",
+    url: "postgres://app_user:control-secret@db.test:5432/cogniplane",
+    password: "control-secret",
+    applicationName: "cogniplane-turn-control",
+    max: 4,
+    limits: { connectionTimeoutMillis: 3_000, statement_timeout: 5_000, idle_in_transaction_session_timeout: 10_000 },
+    open: (url, logger) => plainPool(createTurnControlDatabase({ DATABASE_URL: url }, logger))
   },
   {
     name: "maintenance",
@@ -283,8 +316,8 @@ test.each(SERVING_POOLS)("the $name pool keeps its identity and gets the operati
     expect(pool.options).toMatchObject({
       connectionString: serving.url,
       application_name: serving.applicationName,
-      max: 20,
-      ...OPERATIONAL_LIMITS
+      max: serving.max ?? 20,
+      ...(serving.limits ?? OPERATIONAL_LIMITS)
     });
     for (const limit of Object.keys(OPERATIONAL_LIMITS) as Array<keyof typeof OPERATIONAL_LIMITS>) {
       expect(pool.options[limit]).toBeGreaterThan(0);

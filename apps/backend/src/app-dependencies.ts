@@ -27,12 +27,14 @@ export function buildAppDependencies(input: {
   db: Pool;
   schedulerDb?: Pool;
   privilegedDb?: Pool;
+  /** The turn control pool (`createTurnControlDatabase`). Defaults to `db`. */
+  turnControlDb?: Pool;
   config: AppConfig;
   logger: FastifyBaseLogger;
 }) {
-  const { db, schedulerDb = db, privilegedDb = db, config, logger } = input;
+  const { db, schedulerDb = db, privilegedDb = db, turnControlDb = db, config, logger } = input;
 
-  const stores = buildStores(db, schedulerDb, privilegedDb, logger, config);
+  const stores = buildStores(db, schedulerDb, privilegedDb, logger, config, turnControlDb);
   const { managedToolCatalog, managedToolFactoryRegistry } = buildManagedToolRegistries();
   const mcpConnectionTests = new McpConnectionTestService({
     db,

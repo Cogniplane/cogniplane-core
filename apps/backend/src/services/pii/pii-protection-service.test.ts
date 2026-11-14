@@ -533,6 +533,38 @@ test("evaluateArtifact accepts text/* and a small allowlist of structured format
   }
 });
 
+test("a timeout while the file is read from storage is a storage failure, not a scan verdict", async () => {
+  const service = new PiiProtectionService({
+    policyReader: stubReader(buildSettings({ enabled: true, mode: "detect" })),
+    ruleDetector: new RuleBasedPiiDetector(),
+    timeoutMs: 20
+  });
+  let reading = false;
+  let readSignal: AbortSignal | undefined;
+  const evaluate = (inStorage: boolean) => service.evaluateArtifact({
+    tenantId: "t1",
+    artifact: {
+      artifactId: "art_1",
+      contentType: "text/plain",
+      storageReadInProgress: () => reading,
+      readContent: (signal) => {
+        readSignal = signal;
+        reading = inStorage;
+        // The read aborts and ends the storage phase, as the reader does.
+        signal?.addEventListener("abort", () => { reading = false; });
+        return new Promise<string>(() => {});
+      },
+      entityTypes: []
+    },
+    subject: { kind: "upload" }
+  }).catch((e: unknown) => e);
+
+  // The abort ends the read before the race settles; the error keeps the phase.
+  expect(await evaluate(true)).toMatchObject({ code: "pii_storage_unavailable" });
+  expect(readSignal?.aborted).toBe(true);
+  expect(await evaluate(false)).toMatchObject({ code: "pii_timeout" });
+});
+
 test("evaluateArtifact aborts the content read when its timeout fires", async () => {
   // The read covers PDF text extraction, which must stop with the evaluation.
   const service = new PiiProtectionService({

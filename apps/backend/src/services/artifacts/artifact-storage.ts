@@ -210,12 +210,44 @@ export class BucketArtifactStorage implements ArtifactStorage {
   }
 }
 
-export function createArtifactStorage(config: AppConfig): ArtifactStorage {
-  if (config.ARTIFACT_STORAGE_BACKEND === "local") {
-    return new LocalArtifactStorage(config.ARTIFACT_STORAGE_ROOT);
-  }
+/**
+ * Limits of each bucket request (`@smithy/node-http-handler`). Its defaults
+ * have none: a slow bucket held a socket of the 50 per client, and a PII scan,
+ * until the scan failed.
+ *
+ * - `connectionTimeout`: the TCP and TLS connection.
+ * - `requestTimeout` with `throwOnRequestTimeout`: from the start of the
+ *   request to the response headers, so also the wait for the first byte, and
+ *   for a PUT the time to send the body. Without `throwOnRequestTimeout` the
+ *   handler only logs a warning. The timer stops at the headers: it does not
+ *   bound the body of a GET.
+ * - `socketTimeout`: the longest time with no data on the socket, also while
+ *   the body of a response streams. The handler then destroys the response,
+ *   so a stalled download frees its socket.
+ *
+ * A timeout rejects with `TimeoutError` (`isTransientStorageError`).
+ */
+export type BucketRequestLimits = { connectionTimeout: number; requestTimeout: number; socketTimeout: number };
 
-  const client = new S3Client({
+export const BUCKET_REQUEST_LIMITS: BucketRequestLimits = {
+  connectionTimeout: 5_000,
+  requestTimeout: 30_000,
+  socketTimeout: 30_000
+};
+
+type BucketClientConfig = Pick<
+  AppConfig,
+  | "ARTIFACT_BUCKET_REGION"
+  | "ARTIFACT_BUCKET_ENDPOINT"
+  | "ARTIFACT_BUCKET_FORCE_PATH_STYLE"
+  | "ARTIFACT_BUCKET_ACCESS_KEY_ID"
+  | "ARTIFACT_BUCKET_SECRET_ACCESS_KEY"
+  | "ARTIFACT_BUCKET_SESSION_TOKEN"
+>;
+
+/** The S3 client of artifact and skill bundle storage, with BUCKET_REQUEST_LIMITS. */
+export function createBucketClient(config: BucketClientConfig, limits: BucketRequestLimits = BUCKET_REQUEST_LIMITS): S3Client {
+  return new S3Client({
     region: config.ARTIFACT_BUCKET_REGION,
     endpoint: config.ARTIFACT_BUCKET_ENDPOINT,
     forcePathStyle: config.ARTIFACT_BUCKET_FORCE_PATH_STYLE,
@@ -225,8 +257,18 @@ export function createArtifactStorage(config: AppConfig): ArtifactStorage {
           secretAccessKey: config.ARTIFACT_BUCKET_SECRET_ACCESS_KEY as string,
           sessionToken: config.ARTIFACT_BUCKET_SESSION_TOKEN
         }
-      : undefined
+      : undefined,
+    // The client builds its NodeHttpHandler from these options.
+    requestHandler: { ...limits, throwOnRequestTimeout: true }
   });
+}
+
+export function createArtifactStorage(config: AppConfig): ArtifactStorage {
+  if (config.ARTIFACT_STORAGE_BACKEND === "local") {
+    return new LocalArtifactStorage(config.ARTIFACT_STORAGE_ROOT);
+  }
+
+  const client = createBucketClient(config);
 
   return new BucketArtifactStorage({
     client,

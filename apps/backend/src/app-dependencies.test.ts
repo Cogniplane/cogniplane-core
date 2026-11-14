@@ -207,3 +207,44 @@ test("the PII import scope registry is frozen once the overlays have registered"
   expect(() => deps.piiImportScopes.register({ subjectKind: "late_import", scopeKey: "lateImports", defaultOn: true }))
     .toThrow(/frozen/);
 });
+
+test("the checks of a running turn use the turn control pool; admission and stop stay on the app pool", async () => {
+  const db = new Pool();
+  const turnControlDb = new Pool();
+  pools.push(db, turnControlDb);
+  const deps = buildAppDependencies({ db, turnControlDb, config: createTestConfig(), logger: createSilentLogger() });
+  const used: string[] = [];
+  vi.spyOn(db, "connect").mockImplementation(async () => { used.push("app"); throw new Error("stop here"); });
+  vi.spyOn(turnControlDb, "connect").mockImplementation(async () => { used.push("control"); throw new Error("stop here"); });
+  const execution = {
+    tenantId: "t1", sessionId: "s1", userId: "u1", executionId: "e1", projectId: null, ownerId: deps.executions.ownerId,
+    expiresAt: new Date().toISOString()
+  };
+  const run = async (label: string, call: () => Promise<unknown>) => {
+    used.length = 0;
+    await call().catch(() => undefined);
+    return [label, used.join(",")];
+  };
+
+  expect([
+    await run("heartbeat", () => deps.executions.heartbeat(execution, 30_000)),
+    await run("isCurrent", () => deps.executions.isCurrent(execution)),
+    await run("bindRuntime", () => deps.executions.bindRuntime(execution, "r1")),
+    await run("release", () => deps.executions.release(execution)),
+    await run("isStopped", () => deps.executions.isStopped(execution)),
+    await run("sandboxBinding", () => deps.executions.sandboxBinding(execution)),
+    await run("tool context", () => deps.toolContexts.liveness("t1", "ctx-1")),
+    await run("acquire", () => deps.executions.acquire({ tenantId: "t1", sessionId: "s1", userId: "u1" }, 30_000)),
+    await run("stop", () => deps.executions.stopAndGetOwner({ tenantId: "t1", sessionId: "s1", userId: "u1" }))
+  ]).toEqual([
+    ["heartbeat", "control"],
+    ["isCurrent", "control"],
+    ["bindRuntime", "control"],
+    ["release", "control"],
+    ["isStopped", "control"],
+    ["sandboxBinding", "control"],
+    ["tool context", "control"],
+    ["acquire", "app"],
+    ["stop", "app"]
+  ]);
+});

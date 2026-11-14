@@ -5,7 +5,7 @@ import type { AppDependencies } from "../app-dependencies.js";
 import { notFoundError } from "../lib/http-errors.js";
 import { parseRequestInput } from "../lib/route-validation.js";
 import { messageIdParams } from "../lib/route-schemas.js";
-import { withTenantScope } from "../lib/db.js";
+import { withAdminAggregateScope } from "../lib/db.js";
 import { withAdmin } from "./admin/admin-route-helpers.js";
 import type { MessageStore } from "../services/message-store.js";
 
@@ -94,7 +94,7 @@ export async function registerMessageFeedbackRoutes(
       const { days } = parsed.data;
       const { tenantId } = request.auth;
 
-      const stats = await withTenantScope(app.db, tenantId, async (client) => {
+      const stats = await withAdminAggregateScope(app.db, tenantId, async (client) => {
         const [totalsResult, dailyResult, modelResult] = await Promise.all([
           client.query(
             `

@@ -59,6 +59,9 @@ export function buildPiiServices(input: {
         failureThreshold: config.PII_BREAKER_FAILURE_THRESHOLD,
         windowMs: config.PII_BREAKER_WINDOW_MS,
         cooldownMs: config.PII_BREAKER_COOLDOWN_MS,
+        // A probe call ends at PII_PROVIDER_TIMEOUT_MS; this bounds a probe
+        // whose process stopped before it recorded an outcome.
+        probeTtlMs: config.PII_PROVIDER_TIMEOUT_MS + 10_000,
         logger,
         events: stores.platformEvents
       })

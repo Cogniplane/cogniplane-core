@@ -168,6 +168,8 @@ export function registerAppLifecycle(input: {
   // Wait for aborted scheduled jobs to write their outcome before the pools close.
   schedulerDrainWaitMs?: number;
   privilegedDb?: { end: () => Promise<void> } | null;
+  /** The turn control pool; closed with the other pools. */
+  turnControlDb?: { end: () => Promise<void> } | null;
   schedulerWorker: SchedulerWorker | null;
   /** Sends and cleans email_outbox; null in dev-headers mode. */
   mailWorker?: MailOutboxWorker | null;
@@ -205,6 +207,7 @@ export function registerAppLifecycle(input: {
     turnDrainWaitMs = 5_000,
     schedulerDrainWaitMs = 15_000,
     privilegedDb,
+    turnControlDb,
     schedulerWorker,
     mailWorker,
     staleApprovalSweeper,
@@ -329,6 +332,9 @@ export function registerAppLifecycle(input: {
     await app.db.end();
     if (privilegedDb && privilegedDb !== app.db) {
       await privilegedDb.end();
+    }
+    if (turnControlDb && turnControlDb !== app.db) {
+      await turnControlDb.end();
     }
   });
 }

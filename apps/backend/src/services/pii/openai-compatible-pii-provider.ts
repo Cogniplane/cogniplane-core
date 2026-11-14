@@ -322,22 +322,28 @@ export class OpenAiCompatiblePiiProvider implements PiiProvider {
     externalSignal: AbortSignal | undefined,
     model: string
   ): Promise<TResponse> {
-    if (this.breaker && !(await this.breaker.shouldAllow())) {
+    const admission = this.breaker ? await this.breaker.admit() : null;
+    if (admission && !admission.allowed) {
       throw new OpenAiCompatiblePiiProviderError(
         "breaker_open",
         "PII provider circuit breaker is open; skipping call"
       );
     }
+    const permit = admission?.allowed ? admission.permit : null;
     try {
       const result = await this.doCallChat<TResponse>(messages, externalSignal, model);
-      await this.breaker?.record("success");
+      if (permit) await this.breaker?.record(permit, "success");
       return result;
     } catch (error) {
       // A provider error (timeout, network, 5xx, malformed response) is a provider
-      // failure, except `breaker_open`, which the breaker raises before the call.
-      // Other errors (programmer errors, caller aborts) do not count.
-      if (error instanceof OpenAiCompatiblePiiProviderError && error.code !== "breaker_open") {
-        await this.breaker?.record("failure");
+      // failure. A caller abort or another error says nothing about the provider:
+      // the permit is released, so a probe permit does not block the next probe.
+      if (permit) {
+        if (error instanceof OpenAiCompatiblePiiProviderError && !externalSignal?.aborted) {
+          await this.breaker?.record(permit, "failure");
+        } else {
+          await this.breaker?.release(permit);
+        }
       }
       throw error;
     }
@@ -390,6 +396,29 @@ export class OpenAiCompatiblePiiProvider implements PiiProvider {
           response_format: { type: "json_object" }
         };
 
+    // The timer and the caller's signal stay armed until the body is read:
+    // a provider that sends headers and then stalls must not hold this call
+    // (and a breaker probe) open.
+    try {
+      return await this.readChat<TResponse>(url, headers, body, isOllama, controller, externalSignal);
+    } finally {
+      clearTimeout(timer);
+      if (externalSignal) {
+        externalSignal.removeEventListener("abort", onExternalAbort);
+      }
+    }
+  }
+
+  private async readChat<TResponse>(
+    url: string,
+    headers: Record<string, string>,
+    body: OpenAiChatRequest | OllamaChatRequest,
+    isOllama: boolean,
+    controller: AbortController,
+    externalSignal: AbortSignal | undefined
+  ): Promise<TResponse> {
+    const timedOut = () =>
+      new OpenAiCompatiblePiiProviderError("timeout", `PII model request timed out after ${this.timeoutMs}ms`);
     let response: Response;
     try {
       response = await this.fetchImpl(url, {
@@ -400,19 +429,26 @@ export class OpenAiCompatiblePiiProvider implements PiiProvider {
       });
     } catch (error) {
       if (controller.signal.aborted && !externalSignal?.aborted) {
-        throw new OpenAiCompatiblePiiProviderError("timeout", `PII model request timed out after ${this.timeoutMs}ms`);
+        throw timedOut();
       }
       throw new OpenAiCompatiblePiiProviderError(
         "network_error",
         error instanceof Error ? error.message : String(error)
       );
-    } finally {
-      clearTimeout(timer);
-      if (externalSignal) {
-        externalSignal.removeEventListener("abort", onExternalAbort);
-      }
     }
+    try {
+      return await this.parseChat<TResponse>(response, isOllama);
+    } catch (error) {
+      // Only the timer makes a body read a provider timeout; other errors
+      // keep their type, as before.
+      if (!(error instanceof OpenAiCompatiblePiiProviderError) && controller.signal.aborted && !externalSignal?.aborted) {
+        throw timedOut();
+      }
+      throw error;
+    }
+  }
 
+  private async parseChat<TResponse>(response: Response, isOllama: boolean): Promise<TResponse> {
     if (!response.ok) {
       const text = await response.text().catch(() => "");
       throw new OpenAiCompatiblePiiProviderError(
