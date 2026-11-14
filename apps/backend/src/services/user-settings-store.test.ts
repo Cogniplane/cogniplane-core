@@ -113,163 +113,208 @@ describe("UserSettingsStore – scheduler methods", () => {
   });
 
   describe("claimJob", () => {
-    const isClaim = (sql: string) => sql.includes("UPDATE") && sql.includes("scheduled_jobs");
+    const isLock = (sql: string) => sql.includes("FOR UPDATE");
+    const isState = (sql: string) => sql.includes("clock_timestamp()");
     const isRunInsert = (sql: string) => sql.includes("INSERT") && sql.includes("scheduled_job_runs");
+    const isAdvance = (sql: string) => sql.includes("UPDATE scheduled_jobs") && sql.includes("next_run_at = $3");
+    const due = fakeJobRow({ tenant_id: "tenant-1", next_run_at: new Date("2026-03-18T09:00:00.000Z") });
 
-    it("claims the job and writes its pending run in one tenant transaction", async () => {
-      const claimed = fakeJobRow({
-        tenant_id: "tenant-1",
-        job_id: "job-1",
-        user_id: "user-1",
-        last_run_at: "2026-03-18T09:00:00.000Z",
-        next_run_at: "2026-03-19T09:00:00.000Z"
+    function answer(input: { dbNow: string; busy: boolean; inserted: boolean }) {
+      db.onQuery((sql, params) => {
+        if (isLock(sql)) return { rows: [due], rowCount: 1 };
+        if (isState(sql)) return { rows: [{ db_now: new Date(input.dbNow), busy: input.busy }], rowCount: 1 };
+        if (isRunInsert(sql)) return input.inserted ? { rows: [{ run_id: params[2] }], rowCount: 1 } : { rows: [], rowCount: 0 };
+        if (isAdvance(sql)) return { rows: [{ ...due, next_run_at: params[2] }], rowCount: 1 };
+        return { rows: [], rowCount: 0 };
       });
-      db.onQuery((sql) => (isClaim(sql) ? { rows: [claimed], rowCount: 1 } : { rows: [], rowCount: 0 }));
+    }
 
-      const result = await store.claimJob("tenant-1", "job-1", "2026-03-19T09:00:00.000Z", "run-1");
+    it("claims the slot, writes its pending run and takes the next slot from the database clock", async () => {
+      // The database clock is a day after the slot; a worker clock plays no part.
+      answer({ dbNow: "2026-03-19T09:00:30.000Z", busy: false, inserted: true });
 
-      expect(result).toMatchObject({ jobId: "job-1", nextRunAt: "2026-03-19T09:00:00.000Z", runId: "run-1" });
-      expect(db.calls.map((call) => call.sql.trim().split(/\s+/)[0])).toEqual(["BEGIN", "SELECT", "UPDATE", "INSERT", "COMMIT"]);
+      const result = await store.claimJob("tenant-1", "job-1", "run-1");
+
+      expect(result).toMatchObject({
+        status: "claimed",
+        job: { jobId: "job-1", runId: "run-1", scheduledFor: "2026-03-18T09:00:00.000Z", nextRunAt: "2026-03-20T09:00:00.000Z" }
+      });
+      expect(db.calls.map((call) => call.sql.trim().split(/\s+/)[0])).toEqual(
+        ["BEGIN", "SELECT", "SELECT", "SELECT", "INSERT", "UPDATE", "COMMIT"]
+      );
       expect(db.calls[1]?.params).toEqual(["tenant-1"]);
-      // The run takes its tenant, job and owner from the claimed row.
       const insert = db.calls.find((call) => isRunInsert(call.sql));
-      expect(insert?.sql).toContain("'pending'");
-      expect(insert?.params).toEqual(["tenant-1", "run-1", "job-1", "user-1"]);
+      expect(insert?.sql).toContain("ON CONFLICT (tenant_id, job_id, scheduled_for) DO NOTHING");
+      expect(insert?.params.slice(0, 4)).toEqual(["tenant-1", "job-1", "run-1", "pending"]);
+      // A claimed run records its start.
+      expect(db.calls.find((call) => isAdvance(call.sql))?.params).toEqual(["tenant-1", "job-1", "2026-03-20T09:00:00.000Z", true]);
     });
 
-    it("writes no run when the job was already claimed (no rows)", async () => {
-      db.onQuery(() => ({ rows: [], rowCount: 0 }));
+    it("writes a skipped run for the slot while an earlier run is pending", async () => {
+      answer({ dbNow: "2026-03-18T09:00:30.000Z", busy: true, inserted: true });
 
-      const result = await store.claimJob("tenant-1", "job-1", "2026-03-19T09:00:00.000Z", "run-1");
+      const result = await store.claimJob("tenant-1", "job-1", "run-2");
 
-      expect(result).toBe(null);
-      expect(db.calls.some((call) => isRunInsert(call.sql))).toBe(false);
+      expect(result).toEqual({ status: "skipped", runId: "run-2", scheduledFor: "2026-03-18T09:00:00.000Z" });
+      expect(db.calls.find((call) => isRunInsert(call.sql))?.params.slice(0, 4)).toEqual(["tenant-1", "job-1", "run-2", "skipped"]);
+      // A skipped slot moves next_run_at but is not a run start.
+      expect(db.calls.find((call) => isAdvance(call.sql))?.params).toEqual(["tenant-1", "job-1", "2026-03-19T09:00:00.000Z", false]);
     });
 
-    it("keeps the tenant predicate in the claim and passes jobId + nextRunAt", async () => {
+    it("reports a slot that already has a run and only moves to the next slot", async () => {
+      answer({ dbNow: "2026-03-18T09:00:30.000Z", busy: false, inserted: false });
+
+      const result = await store.claimJob("tenant-1", "job-1", "run-3");
+
+      expect(result).toEqual({ status: "slot_taken", scheduledFor: "2026-03-18T09:00:00.000Z" });
+      expect(db.calls.find((call) => isAdvance(call.sql))?.params).toEqual(["tenant-1", "job-1", "2026-03-19T09:00:00.000Z", false]);
+    });
+
+    it("writes nothing when the job is not due for this claim", async () => {
       db.onQuery(() => ({ rows: [], rowCount: 0 }));
 
-      await store.claimJob("tenant-42", "job-42", "2026-03-20T00:00:00.000Z", "run-42");
-
-      const call = db.calls.find((entry) => isClaim(entry.sql));
-      expect(call).toBeTruthy();
-      expect(call!.sql).toContain("tenant_id = $1");
-      expect(call!.params).toEqual(["tenant-42", "job-42", "2026-03-20T00:00:00.000Z"]);
+      expect(await store.claimJob("tenant-42", "job-42", "run-42")).toEqual({ status: "not_claimed" });
+      const lock = db.calls.find((call) => isLock(call.sql));
+      expect(lock?.sql).toContain("tenant_id = $1");
+      expect(lock?.params).toEqual(["tenant-42", "job-42"]);
+      expect(db.calls.some((call) => isRunInsert(call.sql) || isAdvance(call.sql))).toBe(false);
     });
   });
 
-  describe("parkJob", () => {
-    it("clears next_run_at of the tenant's due job and writes no run", async () => {
-      await store.parkJob("tenant-1", "job-1");
+  describe("parkJob and disableJob", () => {
+    it("parks only the listed revision of the tenant's due job and writes no run", async () => {
+      db.onQuery(() => ({ rows: [], rowCount: 1 }));
+
+      expect(await store.parkJob("tenant-1", "job-1", 4)).toBe(true);
 
       expect(db.calls).toHaveLength(1);
       expect(db.calls[0]?.sql).toContain("next_run_at = NULL");
       expect(db.calls[0]?.sql).toContain("tenant_id = $1");
+      expect(db.calls[0]?.sql).toContain("revision = $3");
       expect(db.calls[0]?.sql).not.toContain("scheduled_job_runs");
-      expect(db.calls[0]?.params).toEqual(["tenant-1", "job-1"]);
+      expect(db.calls[0]?.params).toEqual(["tenant-1", "job-1", 4]);
+    });
+
+    it("disables only an enabled job of the claimed revision", async () => {
+      db.onQuery(() => ({ rows: [], rowCount: 0 }));
+
+      expect(await store.disableJob("tenant-1", "job-1", 2)).toBe(false);
+
+      expect(db.calls[0]?.sql).toContain("enabled = TRUE AND revision = $3");
+      expect(db.calls[0]?.params).toEqual(["tenant-1", "job-1", 2]);
     });
   });
 
-  describe("attachJobRunSession + completeJobRun", () => {
-    it("links the session and maps the completed run", async () => {
+  describe("attachJobRunSession + finishJobRun", () => {
+    const finishInput = {
+      tenantId: "test-tenant",
+      jobId: "job-1",
+      runId: "run-abc",
+      revision: 3,
+      status: "completed" as const,
+      durationMs: 1500,
+      inputTokens: 200,
+      outputTokens: 300,
+      errorMessage: null,
+      summary: "All done",
+      counts: true,
+      disableAtFailures: 3
+    };
+    const isJobLock = (sql: string) => sql.includes("FOR NO KEY UPDATE");
+    const isRunUpdate = (sql: string) => sql.includes("UPDATE scheduled_job_runs");
+    const isJobUpdate = (sql: string) => sql.includes("UPDATE scheduled_jobs");
+
+    /**
+     * A job row lock that finds the job, and a run update that finishes `run`.
+     * With no `run`, the run row exists only when `runExists` is true.
+     */
+    function onFinish(job: Record<string, unknown>, run: Record<string, unknown> | null, runExists = false): void {
       db.onQuery((sql) => {
-        if (sql.includes("SET session_id")) {
-          return { rows: [], rowCount: 1 };
-        }
-        if (sql.includes("UPDATE") && sql.includes("scheduled_job_runs")) {
-          return {
-            rows: [
-              fakeRunRow({
-                run_id: "run-abc",
-                session_id: "sess-1",
-                status: "completed",
-                completed_at: "2026-03-18T09:01:00.000Z",
-                duration_ms: 1500,
-                input_tokens: 200,
-                output_tokens: 300,
-                summary: "All done"
-              })
-            ],
-            rowCount: 1
-          };
-        }
-        return { rows: [], rowCount: 0 };
+        if (isJobLock(sql)) return { rows: [{ enabled: true, revision: 3, consecutive_failures: 0, ...job }], rowCount: 1 };
+        if (isRunUpdate(sql)) return run ? { rows: [run], rowCount: 1 } : { rows: [], rowCount: 0 };
+        if (sql.startsWith("SELECT 1 FROM scheduled_job_runs")) return { rows: runExists ? [{}] : [], rowCount: runExists ? 1 : 0 };
+        return { rows: [], rowCount: isJobUpdate(sql) || sql.includes("SET session_id") ? 1 : 0 };
       });
+    }
+
+    it("locks the job before the run, finishes the pending run and resets the counter", async () => {
+      onFinish({}, fakeRunRow({
+        run_id: "run-abc",
+        session_id: "sess-1",
+        status: "completed",
+        scheduled_for: new Date("2026-03-18T09:00:00.000Z"),
+        completed_at: "2026-03-18T09:01:00.000Z",
+        duration_ms: 1500,
+        input_tokens: 200,
+        output_tokens: 300,
+        summary: "All done"
+      }));
 
       expect(await store.attachJobRunSession({ tenantId: "test-tenant", runId: "run-abc", sessionId: "sess-1" })).toBe(true);
       const attach = db.calls.find((call) => call.sql.includes("SET session_id"));
+      expect(attach?.sql).toContain("status = 'pending'");
       expect(attach?.params).toEqual(["test-tenant", "run-abc", "sess-1"]);
 
-      const completed = await store.completeJobRun({
-        tenantId: "test-tenant",
-        runId: "run-abc",
-        status: "completed",
-        durationMs: 1500,
-        inputTokens: 200,
-        outputTokens: 300,
-        errorMessage: null,
-        summary: "All done"
-      });
+      const finishStart = db.calls.length;
+      const finished = await store.finishJobRun(finishInput);
 
-      expect(completed).toMatchObject({
-        runId: "run-abc",
-        sessionId: "sess-1",
-        status: "completed",
-        durationMs: 1500,
-        inputTokens: 200,
-        outputTokens: 300,
-        summary: "All done"
+      expect(finished).toMatchObject({
+        status: "finished",
+        consecutiveFailures: 0,
+        disabled: false,
+        run: { runId: "run-abc", sessionId: "sess-1", status: "completed", scheduledFor: "2026-03-18T09:00:00.000Z", summary: "All done" }
       });
+      const finishCalls = db.calls.slice(finishStart);
+      const statements = finishCalls.map((call) => call.sql);
+      const lock = statements.findIndex(isJobLock);
+      const runUpdate = statements.findIndex(isRunUpdate);
+      const jobUpdate = statements.findIndex(isJobUpdate);
+      // Job row, then run row: the order of a claim and of a job delete.
+      expect(lock).toBeGreaterThanOrEqual(0);
+      expect(lock).toBeLessThan(runUpdate);
+      expect(runUpdate).toBeLessThan(jobUpdate);
+      expect(statements[runUpdate]).toContain("status = 'pending'");
+      expect(finishCalls[jobUpdate]?.params).toEqual(["test-tenant", "job-1", 0, false]);
     });
 
-    it("reports a missing run row as false and null", async () => {
+    it("disables the job in the write that takes the counter to the limit", async () => {
+      onFinish({ consecutive_failures: 2 }, fakeRunRow({ run_id: "run-abc", status: "failed" }));
+
+      expect(await store.finishJobRun({ ...finishInput, status: "failed", errorMessage: "boom" }))
+        .toMatchObject({ status: "finished", consecutiveFailures: 3, disabled: true });
+      const jobUpdate = db.calls.find((call) => isJobUpdate(call.sql));
+      expect(jobUpdate?.sql).toContain("enabled = CASE WHEN $4::boolean THEN FALSE");
+      expect(jobUpdate?.params).toEqual(["test-tenant", "job-1", 3, true]);
+    });
+
+    it("counts but does not disable a job that is already off", async () => {
+      onFinish({ enabled: false, consecutive_failures: 2 }, fakeRunRow({ run_id: "run-abc", status: "failed" }));
+
+      expect(await store.finishJobRun({ ...finishInput, status: "failed", errorMessage: "boom" }))
+        .toMatchObject({ status: "finished", consecutiveFailures: 3, disabled: false });
+      expect(db.calls.find((call) => isJobUpdate(call.sql))?.params).toEqual(["test-tenant", "job-1", 3, false]);
+    });
+
+    it("tells a run that another writer finished from a deleted job", async () => {
+      onFinish({}, null, true);
+      expect(await store.finishJobRun(finishInput)).toEqual({ status: "already_finished" });
+
       db.onQuery(() => ({ rows: [], rowCount: 0 }));
-
       expect(await store.attachJobRunSession({ tenantId: "test-tenant", runId: "gone", sessionId: "sess-1" })).toBe(false);
-      expect(await store.completeJobRun({
-        tenantId: "test-tenant",
-        runId: "gone",
-        status: "failed",
-        durationMs: 1,
-        inputTokens: 0,
-        outputTokens: 0,
-        errorMessage: "timeout",
-        summary: null
-      })).toBeNull();
+      expect(await store.finishJobRun({ ...finishInput, runId: "gone" })).toEqual({ status: "missing" });
+      // No outcome was written, so the job was not touched.
+      expect(db.calls.some((call) => isJobUpdate(call.sql))).toBe(false);
     });
 
-    it("maps a returned failed run", async () => {
-      db.onQuery((sql) => {
-        if (sql.includes("UPDATE") && sql.includes("scheduled_job_runs")) {
-          return {
-            rows: [
-              fakeRunRow({
-                run_id: "run-err",
-                status: "failed",
-                error_message: "timeout",
-                completed_at: "2026-03-18T09:05:00.000Z",
-                duration_ms: 30000
-              })
-            ],
-            rowCount: 1
-          };
-        }
-        return { rows: [], rowCount: 0 };
-      });
+    it("leaves the job alone for an outcome that does not count, or of an older revision", async () => {
+      onFinish({}, fakeRunRow({ run_id: "run-err", status: "failed", error_message: "timeout" }));
+      const failed = { ...finishInput, runId: "run-err", status: "failed" as const, errorMessage: "timeout" };
 
-      const completed = await store.completeJobRun({
-        tenantId: "test-tenant",
-        runId: "run-err",
-        status: "failed",
-        durationMs: 30000,
-        inputTokens: 0,
-        outputTokens: 0,
-        errorMessage: "timeout",
-        summary: null
-      });
-
-      expect(completed?.status).toBe("failed");
-      expect(completed?.errorMessage).toBe("timeout");
+      expect(await store.finishJobRun({ ...failed, counts: false }))
+        .toMatchObject({ status: "finished", consecutiveFailures: null, disabled: false, run: { status: "failed", errorMessage: "timeout" } });
+      expect(await store.finishJobRun({ ...failed, revision: 2 }))
+        .toMatchObject({ status: "finished", consecutiveFailures: null, disabled: false });
+      expect(db.calls.some((call) => isJobUpdate(call.sql))).toBe(false);
     });
   });
 

@@ -45,8 +45,6 @@ describe.skipIf(!adminDatabaseUrl())("claimJob concurrency", () => {
       tenantId: tenant.tenantId,
       userId: tenant.userId
     });
-    const nextRun = new Date(Date.now() + 60 * 60 * 1000).toISOString();
-
     // The claim runs as app_user in the tenant's scope; the other scheduler
     // methods use the maintenance pool. Each racer gets one connection of each.
     const pools = ["a", "b"].flatMap((racer) => [
@@ -73,15 +71,15 @@ describe.skipIf(!adminDatabaseUrl())("claimJob concurrency", () => {
       const storeB = new UserSettingsStore(appB, maintenanceB);
 
       const [first, second] = await Promise.all([
-        storeA.claimJob(tenant.tenantId, jobId, nextRun, randomUUID()),
-        storeB.claimJob(tenant.tenantId, jobId, nextRun, randomUUID())
+        storeA.claimJob(tenant.tenantId, jobId, randomUUID()),
+        storeB.claimJob(tenant.tenantId, jobId, randomUUID())
       ]);
 
       // Exactly one winner. Which one is nondeterministic, so the assertion is
-      // on the count rather than on a particular side.
-      const winners = [first, second].filter((claim) => claim !== null);
-      expect(winners).toHaveLength(1);
-      expect(winners[0]?.jobId).toBe(jobId);
+      // on the statuses rather than on a particular side.
+      expect([first.status, second.status].sort()).toEqual(["claimed", "not_claimed"]);
+      const winner = first.status === "claimed" ? first : second;
+      expect(winner.status === "claimed" && winner.job.jobId).toBe(jobId);
       // The loser's run insert never ran, so the job has one pending run.
       expect(await runCount(jobId)).toBe(1);
     } finally {
@@ -94,11 +92,12 @@ describe.skipIf(!adminDatabaseUrl())("claimJob concurrency", () => {
     // transaction open forces the second claim to block on the row lock, which
     // is the interleaving the Promise.all version cannot guarantee.
     //
-    // Mechanism, for whoever reads this next: claimJob's WHERE includes
-    // `next_run_at <= NOW()`. Under READ COMMITTED the second updater blocks on
-    // the first's row lock, then re-evaluates its WHERE against the committed
-    // row. The winner set next_run_at into the future, so the predicate is now
-    // false and the loser matches nothing.
+    // Mechanism, for whoever reads this next: claimJob's row lock (SELECT ...
+    // FOR UPDATE) has `next_run_at <= NOW()` in its WHERE. Under READ
+    // COMMITTED the second claim blocks on the first's row lock, then
+    // re-evaluates its WHERE against the committed row. The winner set
+    // next_run_at into the future, so the predicate is now false and the
+    // loser matches nothing.
     const jobId = await seedScheduledJob({
       tenantId: tenant.tenantId,
       userId: tenant.userId
@@ -134,12 +133,7 @@ describe.skipIf(!adminDatabaseUrl())("claimJob concurrency", () => {
       const { rows: [{ pid: loserPid }] } = await loserConnection.query<{ pid: number }>("SELECT pg_backend_pid() AS pid");
       loserConnection.release();
 
-      loser = new UserSettingsStore(loserPool, loserPool).claimJob(
-        tenant.tenantId,
-        jobId,
-        nextRun,
-        randomUUID()
-      );
+      loser = new UserSettingsStore(loserPool, loserPool).claimJob(tenant.tenantId, jobId, randomUUID());
 
       await expect.poll(async () => {
         const { rows: [{ blocked }] } = await superuserPool().query<{ blocked: boolean }>(
@@ -157,7 +151,7 @@ describe.skipIf(!adminDatabaseUrl())("claimJob concurrency", () => {
       );
       await blocker.query("COMMIT");
 
-      expect(await loser).toBeNull();
+      expect(await loser).toEqual({ status: "not_claimed" });
       expect(await runCount(jobId)).toBe(0);
     } finally {
       // Roll back before release: a client returned mid-transaction would carry
@@ -177,10 +171,9 @@ describe.skipIf(!adminDatabaseUrl())("claimJob concurrency", () => {
       tenantId: tenant.tenantId,
       userId: tenant.userId
     });
-    const nextRun = new Date(Date.now() + 60 * 60 * 1000).toISOString();
 
-    expect((await store.claimJob(tenant.tenantId, jobId, nextRun, randomUUID()))?.jobId).toBe(jobId);
-    expect(await store.claimJob(tenant.tenantId, jobId, nextRun, randomUUID())).toBeNull();
+    expect(await store.claimJob(tenant.tenantId, jobId, randomUUID())).toMatchObject({ status: "claimed", job: { jobId } });
+    expect(await store.claimJob(tenant.tenantId, jobId, randomUUID())).toEqual({ status: "not_claimed" });
     expect(await runCount(jobId)).toBe(1);
   });
 
@@ -201,7 +194,7 @@ describe.skipIf(!adminDatabaseUrl())("claimJob concurrency", () => {
       [departing.tenantId, departing.userId]
     );
 
-    expect(await store.claimJob(departing.tenantId, jobId, null, randomUUID())).toBeNull();
+    expect(await store.claimJob(departing.tenantId, jobId, randomUUID())).toEqual({ status: "not_claimed" });
     expect(await runCount(jobId)).toBe(0);
   });
 });

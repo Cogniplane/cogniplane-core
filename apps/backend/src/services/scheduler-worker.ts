@@ -24,7 +24,14 @@ import {
   type TurnOutcome,
   type TurnTranscriptMessages
 } from "./turn-transcript.js";
-import type { ClaimedScheduledJob, ScheduledJobRecord, UserSettingsStore } from "./user-settings-store.js";
+import type {
+  ClaimJobResult,
+  ClaimedScheduledJob,
+  DueScheduledJob,
+  FinishJobRunResult,
+  ScheduledJobRecord,
+  UserSettingsStore
+} from "./user-settings-store.js";
 
 /** The text a scheduled job sends to the model. */
 export function scheduledJobPrompt(input: ScheduledJobRecord["input"]): string {
@@ -114,8 +121,7 @@ export type SchedulerWorkerDeps = {
     | "claimJob"
     | "parkJob"
     | "attachJobRunSession"
-    | "completeJobRun"
-    | "recordJobRunOutcome"
+    | "finishJobRun"
     | "sweepStaleJobRuns"
     | "pauseJobForSecurityChange"
     | "getOwnerSecurityVersion"
@@ -153,13 +159,14 @@ export type SchedulerWorkerDeps = {
   sessionStorage?: Pick<ArtifactStorage, "delete">;
   /**
    * Disables a job (sets enabled = FALSE) so it permanently leaves the
-   * `listDueJobs` query. Used for poison jobs whose cron is invalid or which
-   * have failed repeatedly. Optional only because the SQL backing it
-   * (`UserSettingsStore.disableJob`) and its bootstrap wiring live outside this
-   * file; when absent the worker degrades to leaving the job dormant
-   * (next_run_at = NULL) and still emits the audit trail.
+   * `listDueJobs` query. Used for a job whose cron is invalid; `finishJobRun`
+   * disables a job that failed repeatedly. Returns true when this call
+   * disabled the job; it changes nothing for a job that is off or that the
+   * owner saved after `revision` (`UserSettingsStore.disableJob`). Optional
+   * only because the SQL backing it and its bootstrap wiring live outside
+   * this file; when absent the worker parks the job (next_run_at = NULL).
    */
-  disableJob?: (input: { tenantId: string; jobId: string }) => Promise<void>;
+  disableJob?: (input: { tenantId: string; jobId: string; revision: number }) => Promise<boolean>;
   logger: {
     error(payload: unknown, message: string): void;
     warn(payload: unknown, message: string): void;
@@ -186,7 +193,8 @@ export type SchedulerWorkerOptions = {
   /**
    * Auto-disable a job once it has failed this many times in a row (reset on any
    * success). Undefined/0 disables the poison guard. The job's running count
-   * lives in `scheduled_jobs.consecutive_failures`.
+   * lives in `scheduled_jobs.consecutive_failures`, and `finishJobRun` disables
+   * the job in the write that reaches the limit.
    */
   maxConsecutiveFailures?: number;
   /** Max time to wait for an aborted, timed-out turn to settle before releasing
@@ -341,9 +349,10 @@ export class SchedulerWorker {
       const dueJobs = await this.deps.settings.listDueJobs(available);
 
       for (const job of dueJobs) {
-        let nextRunAt: string | null;
         try {
-          nextRunAt = computeNextCronRunAt(job.cronExpression, job.timeZone);
+          // Only a check that the cron parses. The claim computes the next run
+          // from the database clock.
+          computeNextCronRunAt(job.cronExpression, job.timeZone);
         } catch (error) {
           // An invalid cron can never produce a future run. Disable the job so
           // it leaves the due-job query for good instead of lingering as an
@@ -366,16 +375,30 @@ export class SchedulerWorker {
           break;
         }
         this.activeCount += 1;
-        let claimed: ClaimedScheduledJob | null = null;
+        let claim: ClaimJobResult;
         try {
-          // The claim also writes the pending run with this id.
-          claimed = await this.deps.settings.claimJob(job.tenantId, job.jobId, nextRunAt, uuidv7());
-        } finally {
-          if (!claimed) {
-            this.activeCount -= 1;
-          }
+          // The claim also writes the run with this id.
+          claim = await this.deps.settings.claimJob(job.tenantId, job.jobId, uuidv7());
+        } catch (error) {
+          this.activeCount -= 1;
+          throw error;
         }
-        if (!claimed) {
+        if (claim.status !== "claimed") this.activeCount -= 1;
+        if (claim.status === "skipped") {
+          this.deps.logger.warn(
+            { jobId: job.jobId, tenantId: job.tenantId, runId: claim.runId, scheduledFor: claim.scheduledFor },
+            "Scheduled job slot skipped: the previous run is still pending"
+          );
+          continue;
+        }
+        if (claim.status === "slot_taken") {
+          this.deps.logger.warn(
+            { jobId: job.jobId, tenantId: job.tenantId, scheduledFor: claim.scheduledFor },
+            "Scheduled job slot already has a run; moved to the next slot"
+          );
+          continue;
+        }
+        if (claim.status === "not_claimed") {
           // The claim also refuses a job whose owner had a security change
           // since the job was saved. Pause such a job, so it leaves the due
           // query. After a claim that another worker won, this changes nothing.
@@ -384,7 +407,7 @@ export class SchedulerWorker {
         }
 
         executions.push(
-          this.executeJobWithTimeout(claimed).finally(() => {
+          this.executeJobWithTimeout(claim.job).finally(() => {
             this.activeCount -= 1;
           })
         );
@@ -518,24 +541,22 @@ export class SchedulerWorker {
    * A job whose cron expression can't be parsed will never produce a future
    * run. Disable it (preferred) or, if no disable capability is wired, park it
    * with next_run_at = NULL so it goes dormant. Parking is not a claim, so it
-   * writes no run. Either way an audit event is written so the
-   * disable/dormancy is traceable.
+   * writes no run. Both apply only to the listed revision of the job. The
+   * audit event is written only when this call changed the job, so several
+   * replicas that list the same job write one event.
    */
-  private async handleInvalidCronJob(job: ScheduledJobRecord, error: unknown): Promise<void> {
+  private async handleInvalidCronJob(job: DueScheduledJob, error: unknown): Promise<void> {
     const reason = error instanceof Error ? error.message : String(error);
     this.deps.logger.error(
       { error, jobId: job.jobId, cronExpression: job.cronExpression, timeZone: job.timeZone },
       "Scheduled job has invalid cron expression; disabling"
     );
 
-    let disabled = false;
+    // Undefined: the disable is not wired or failed, so park the job.
+    let disabled: boolean | undefined;
     if (this.deps.disableJob) {
       try {
-        await this.deps.disableJob({
-          tenantId: job.tenantId,
-          jobId: job.jobId
-        });
-        disabled = true;
+        disabled = await this.deps.disableJob({ tenantId: job.tenantId, jobId: job.jobId, revision: job.revision });
       } catch (disableError) {
         this.deps.logger.error(
           { error: disableError, jobId: job.jobId },
@@ -546,9 +567,10 @@ export class SchedulerWorker {
 
     // Fallback: take the job out of the due query by clearing next_run_at so a
     // per-minute invalid-cron job doesn't re-fire this branch every tick.
-    if (!disabled) {
+    let parked = false;
+    if (disabled === undefined) {
       try {
-        await this.deps.settings.parkJob(job.tenantId, job.jobId);
+        parked = await this.deps.settings.parkJob(job.tenantId, job.jobId, job.revision);
       } catch (parkError) {
         this.deps.logger.error(
           { error: parkError, jobId: job.jobId },
@@ -556,6 +578,9 @@ export class SchedulerWorker {
         );
       }
     }
+
+    // Another replica, or an owner edit, changed the job first.
+    if (!disabled && !parked) return;
 
     try {
       await this.deps.auditEvents.create({
@@ -569,7 +594,7 @@ export class SchedulerWorker {
           cronExpression: job.cronExpression,
           timeZone: job.timeZone,
           errorMessage: reason,
-          disabled
+          disabled: disabled === true
         }
       });
     } catch (auditError) {
@@ -586,8 +611,10 @@ export class SchedulerWorker {
    * of that claim completes it, so a process crash/restart after the claim
    * strands its row forever without this. The cutoff is strictly longer than
    * the watchdog's worst case (timeout + abort-settle grace) plus a buffer, so
-   * live runs are never swept. Best-effort: a sweep failure must not break the tick, and the
-   * poison counter is NOT touched — a crash is not the job's fault.
+   * live runs are never swept. A pending run also stops the next claim of its
+   * job (`claimJob` skips the slot), so the sweep frees the job too.
+   * Best-effort: a sweep failure must not break the tick, and the poison
+   * counter does not change, because a crash is not the job's fault.
    */
   private async sweepStaleJobRuns(): Promise<void> {
     const cutoffMs =
@@ -753,7 +780,7 @@ export class SchedulerWorker {
     // timeout we abort the runtime session. That ends the AG-UI turn and
     // unblocks the `for await` loop, so the same promise settles with
     // status="failed" and records the outcome. We therefore never need to
-    // invent a second completeJobRun here.
+    // invent a second finishJobRun here.
     const turn: ScheduledTurnHandle = {
       sessionId: null, adapter: null, timedOut: false,
       execution: null, stopHeartbeat: null, releaseLease: null
@@ -840,9 +867,14 @@ export class SchedulerWorker {
     // final transcript exactly as the interactive writer does.
     let transcript: TurnTranscript | null = null;
     let failure: TurnOutcome | undefined;
-    // False only for a PII provider outage: it is not the job's fault, and
-    // counting it would disable every job during a long outage.
+    // False when the failure is not the job's fault: a PII provider outage
+    // (counting it would disable every job during a long outage), a turn
+    // limit, an owner security change. See also the shutdown and timeout rules
+    // after the turn.
     let countsTowardDisable = true;
+    // Set when the runtime turn starts. A timeout before it is slow
+    // preparation, not the job's prompt.
+    let turnStarted = false;
     // A watchdog timeout wins over the stream's own terminal event, because
     // the abort race can let a stray event look like success. The transcript
     // reads it until finalization ends, so the row and the run agree. A
@@ -1035,6 +1067,7 @@ export class SchedulerWorker {
       // Center still receives the scheduled turn context through the tool
       // execution metadata above.
       await admitTurn();
+      turnStarted = true;
       const stream = runtime.runMessageAGUI(runtimeSession, {
         prompt,
         toolContextId: toolContext.toolContextId,
@@ -1062,6 +1095,9 @@ export class SchedulerWorker {
       this.deps.logger.error({ error, jobId: job.jobId }, "Scheduled job execution failed");
     }
 
+    // A timeout before the turn started is slow preparation (session, lease,
+    // PII check, runtime start), not the job's fault.
+    if (turn.timedOut && !turnStarted) countsTowardDisable = false;
     let outcome: TurnOutcome = timeoutFailure() ?? failure ?? { status: "error", message: GENERIC_TURN_FAILURE };
     let responseText = "";
     let inputTokens = 0;
@@ -1081,6 +1117,13 @@ export class SchedulerWorker {
     } finally {
       await turn.releaseLease?.();
     }
+
+    // A shutdown refuses new turns and then closes the runtimes, so a run
+    // that fails after it began failed because of the deploy, not the job.
+    if (this.turnsRefused && outcome.status !== "completed") countsTowardDisable = false;
+    // An owner security change stopped the turn. The next claim pauses the
+    // job for review; a failure-limit disable must not take its place.
+    if (outcome.status === "interrupted" && outcome.reason === "security_change") countsTowardDisable = false;
 
     const durationMs = Date.now() - startTime;
     // The job owner reads the summary from the run ledger. Redact the full
@@ -1263,8 +1306,17 @@ export class SchedulerWorker {
     }
   }
 
+  /**
+   * Writes the run's outcome, its failure count and a failure-limit disable in
+   * one guarded write, then the audit events. The run event is written only
+   * when this call finished the run. Another writer can have finished it
+   * first: the stale-run sweep writes the event of a run that it fails, and
+   * then the owner can delete the job, so a missing run can already have its
+   * event. So each run has at most one terminal audit event, and a run whose
+   * job was deleted before it finished has none.
+   */
   private async recordJobOutcome(
-    job: ScheduledJobRecord,
+    job: ClaimedScheduledJob,
     outcome: {
       runId: string;
       sessionId: string | null;
@@ -1279,24 +1331,43 @@ export class SchedulerWorker {
   ): Promise<void> {
     const { runId, sessionId, status, durationMs, errorMessage, summary, inputTokens, outputTokens } =
       outcome;
+    const threshold = this.options.maxConsecutiveFailures ?? 0;
 
+    let finished: FinishJobRunResult;
     try {
-      const completed = await this.deps.settings.completeJobRun({
+      finished = await this.deps.settings.finishJobRun({
         tenantId: job.tenantId,
+        jobId: job.jobId,
         runId,
+        revision: job.revision,
         status,
         durationMs,
         inputTokens,
         outputTokens,
         errorMessage,
-        summary
+        summary,
+        counts: status === "completed" || outcome.countsTowardDisable,
+        disableAtFailures: threshold
       });
-      // The run row goes with its job, so a job deleted during the run has none.
-      if (!completed) {
-        this.deps.logger.warn({ runId, jobId: job.jobId }, "Scheduled job run record is missing; outcome not saved");
-      }
     } catch (error) {
+      // The run stays pending, so the stale-run sweep fails it and writes its
+      // audit event.
       this.deps.logger.error({ error, runId }, "Failed to complete job run record");
+      return;
+    }
+    if (finished.status === "already_finished") {
+      this.deps.logger.warn(
+        { runId, jobId: job.jobId, status },
+        "Scheduled job run was already finished, by the stale-run sweep; outcome not saved"
+      );
+      return;
+    }
+    if (finished.status === "missing") {
+      this.deps.logger.warn(
+        { runId, jobId: job.jobId, status },
+        "Scheduled job was deleted during the run; outcome not saved"
+      );
+      return;
     }
 
     try {
@@ -1308,6 +1379,7 @@ export class SchedulerWorker {
         payload: {
           jobId: job.jobId,
           runId,
+          scheduledFor: job.scheduledFor,
           durationMs,
           ...(errorMessage ? { errorMessage } : {})
         }
@@ -1316,57 +1388,15 @@ export class SchedulerWorker {
       this.deps.logger.error({ error, runId }, "Failed to create audit event for scheduled job");
     }
 
-    // Poison-job guard: update the consecutive-failure counter (reset on
-    // success) and auto-disable a job that has failed too many times in a row,
-    // so a perpetually-failing per-minute cron can't re-fire every tick forever.
-    if (status === "completed" || outcome.countsTowardDisable) {
-      await this.updatePoisonState(job, status === "completed");
-    }
-  }
-
-  /**
-   * Increment/reset the job's consecutive-failure counter and disable it once it
-   * crosses `maxConsecutiveFailures`. Best-effort — a failure here only loses the
-   * poison guard for one tick, so it must never throw into the run loop.
-   */
-  private async updatePoisonState(job: ScheduledJobRecord, succeeded: boolean): Promise<void> {
-    let failures: number;
-    try {
-      failures = await this.deps.settings.recordJobRunOutcome(job.tenantId, job.jobId, succeeded);
-    } catch (error) {
-      this.deps.logger.error(
-        { error, jobId: job.jobId },
-        "Failed to update scheduled-job failure counter"
-      );
-      return;
-    }
-
-    const threshold = this.options.maxConsecutiveFailures ?? 0;
-    if (succeeded || threshold <= 0 || failures < threshold) {
-      return;
-    }
-
+    // Poison-job guard: the finish disabled a job that failed too many times
+    // in a row, so a perpetually-failing per-minute cron can't re-fire every
+    // tick forever.
+    if (!finished.disabled) return;
+    const failures = finished.consecutiveFailures;
     this.deps.logger.error(
       { jobId: job.jobId, failures, threshold },
-      "Scheduled job hit the consecutive-failure limit; disabling"
+      "Scheduled job hit the consecutive-failure limit; disabled"
     );
-
-    let disabled = false;
-    if (this.deps.disableJob) {
-      try {
-        await this.deps.disableJob({
-          tenantId: job.tenantId,
-          jobId: job.jobId
-        });
-        disabled = true;
-      } catch (error) {
-        this.deps.logger.error(
-          { error, jobId: job.jobId },
-          "Failed to disable repeatedly-failing scheduled job"
-        );
-      }
-    }
-
     try {
       await this.deps.auditEvents.create({
         tenantId: job.tenantId,
@@ -1378,7 +1408,7 @@ export class SchedulerWorker {
           reason: "repeated_failures",
           consecutiveFailures: failures,
           threshold,
-          disabled
+          disabled: true
         }
       });
     } catch (error) {

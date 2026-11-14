@@ -402,8 +402,8 @@ describe.skipIf(!adminDatabaseUrl())("privileged pool tenant predicates", () => 
         tenantId: tenantA.tenantId,
         userId: tenantA.userId
       });
-      const claimed = await store().claimJob(tenantA.tenantId, jobId, null, randomUUID());
-      expect(claimed?.jobId).toBe(jobId);
+      const claimed = await store().claimJob(tenantA.tenantId, jobId, randomUUID());
+      expect(claimed).toMatchObject({ status: "claimed", job: { jobId } });
     });
 
     test("claimJob refuses another tenant's job", async () => {
@@ -411,14 +411,14 @@ describe.skipIf(!adminDatabaseUrl())("privileged pool tenant predicates", () => 
         tenantId: tenantA.tenantId,
         userId: tenantA.userId
       });
-      expect(await store().claimJob(tenantB.tenantId, jobId, null, randomUUID())).toBeNull();
+      expect(await store().claimJob(tenantB.tenantId, jobId, randomUUID())).toEqual({ status: "not_claimed" });
 
       // And the job is still claimable by its owner, so the refusal did not
       // half-apply.
-      expect((await store().claimJob(tenantA.tenantId, jobId, null, randomUUID()))?.jobId).toBe(jobId);
+      expect(await store().claimJob(tenantA.tenantId, jobId, randomUUID())).toMatchObject({ status: "claimed", job: { jobId } });
     });
 
-    test("recordJobRunOutcome does not touch another tenant's failure counter", async () => {
+    test("finishJobRun does not touch another tenant's run or failure counter", async () => {
       // Seeded NONZERO on purpose. Against a default of 0, "the counter did not
       // change" would be true whether or not the predicate worked.
       const jobId = await seedScheduledJob({
@@ -426,8 +426,13 @@ describe.skipIf(!adminDatabaseUrl())("privileged pool tenant predicates", () => 
         userId: tenantA.userId,
         consecutiveFailures: 3
       });
+      const runId = await seedScheduledJobRun({ tenantId: tenantA.tenantId, userId: tenantA.userId, jobId, ageMs: 0 });
+      const finish = (tenantId: string) => store().finishJobRun({
+        tenantId, jobId, runId, revision: 0, status: "completed", durationMs: 1, inputTokens: 0,
+        outputTokens: 0, errorMessage: null, summary: null, counts: true, disableAtFailures: 0
+      });
 
-      await store().recordJobRunOutcome(tenantB.tenantId, jobId, true);
+      expect(await finish(tenantB.tenantId)).toEqual({ status: "missing" });
 
       const { rows } = await superuserPool().query<{ consecutive_failures: number }>(
         `SELECT consecutive_failures FROM scheduled_jobs WHERE job_id = $1`,
@@ -436,7 +441,7 @@ describe.skipIf(!adminDatabaseUrl())("privileged pool tenant predicates", () => 
       expect(rows[0]?.consecutive_failures).toBe(3);
 
       // Positive control: the owning tenant CAN reset it.
-      await store().recordJobRunOutcome(tenantA.tenantId, jobId, true);
+      expect(await finish(tenantA.tenantId)).toMatchObject({ status: "finished", consecutiveFailures: 0 });
       const { rows: after } = await superuserPool().query<{ consecutive_failures: number }>(
         `SELECT consecutive_failures FROM scheduled_jobs WHERE job_id = $1`,
         [jobId]
@@ -450,14 +455,14 @@ describe.skipIf(!adminDatabaseUrl())("privileged pool tenant predicates", () => 
         userId: tenantA.userId
       });
 
-      await store().disableJob(tenantB.tenantId, jobId);
+      expect(await store().disableJob(tenantB.tenantId, jobId, 0)).toBe(false);
       const { rows } = await superuserPool().query<{ enabled: boolean }>(
         `SELECT enabled FROM scheduled_jobs WHERE job_id = $1`,
         [jobId]
       );
       expect(rows[0]?.enabled).toBe(true);
 
-      await store().disableJob(tenantA.tenantId, jobId);
+      expect(await store().disableJob(tenantA.tenantId, jobId, 0)).toBe(true);
       const { rows: after } = await superuserPool().query<{ enabled: boolean }>(
         `SELECT enabled FROM scheduled_jobs WHERE job_id = $1`,
         [jobId]
@@ -475,10 +480,10 @@ describe.skipIf(!adminDatabaseUrl())("privileged pool tenant predicates", () => 
         [jobId]
       )).rows[0]?.next_run_at;
 
-      await store().parkJob(tenantB.tenantId, jobId);
+      expect(await store().parkJob(tenantB.tenantId, jobId, 0)).toBe(false);
       expect(await nextRunAt()).toBeInstanceOf(Date);
 
-      await store().parkJob(tenantA.tenantId, jobId);
+      expect(await store().parkJob(tenantA.tenantId, jobId, 0)).toBe(true);
       expect(await nextRunAt()).toBeNull();
     });
   });

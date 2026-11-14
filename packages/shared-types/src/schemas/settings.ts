@@ -166,7 +166,10 @@ export const ScheduledJobRunSchema = z.object({
   jobId: z.string(),
   userId: z.string(),
   sessionId: z.string().nullable(),
-  status: z.enum(["pending", "running", "completed", "failed"]),
+  // skipped: the slot came due while the previous run was still running.
+  status: z.enum(["pending", "running", "completed", "failed", "skipped"]),
+  // The scheduled time of the run. Null for runs saved before it was kept.
+  scheduledFor: IsoDateSchema.nullable(),
   startedAt: IsoDateSchema,
   completedAt: IsoDateSchema.nullable(),
   durationMs: z.number().nullable(),

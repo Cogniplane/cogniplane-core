@@ -216,7 +216,11 @@ export async function seedAgentMemory(tenantId: string, userId: string): Promise
 export async function seedScheduledJob(input: {
   tenantId: string;
   userId: string;
-  /** Due now by default, so `listDueJobs` / `claimJob` match it. */
+  /**
+   * Due now by default, so `listDueJobs` / `claimJob` match it. The cron
+   * fires once a year, so the next slot that a claim takes from the database
+   * clock is not due again during a test.
+   */
   due?: boolean;
   consecutiveFailures?: number;
 }): Promise<string> {
@@ -226,7 +230,7 @@ export async function seedScheduledJob(input: {
       INSERT INTO scheduled_jobs
         (job_id, tenant_id, user_id, job_name, cron_expression, time_zone,
          enabled, consecutive_failures, next_run_at)
-      VALUES ($1, $2, $3, 'integration job', '0 * * * *', 'UTC', TRUE, $4,
+      VALUES ($1, $2, $3, 'integration job', '0 0 1 1 *', 'UTC', TRUE, $4,
               CASE WHEN $5::boolean THEN NOW() - INTERVAL '1 minute' ELSE NOW() + INTERVAL '1 day' END)
     `,
     [jobId, input.tenantId, input.userId, input.consecutiveFailures ?? 0, input.due ?? true]

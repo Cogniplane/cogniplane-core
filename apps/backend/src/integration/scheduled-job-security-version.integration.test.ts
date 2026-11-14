@@ -167,8 +167,7 @@ function scopedWorker(tenantId: string, options: {
       claimJob: settings.claimJob.bind(settings),
       parkJob: settings.parkJob.bind(settings),
       attachJobRunSession: settings.attachJobRunSession.bind(settings),
-      completeJobRun: settings.completeJobRun.bind(settings),
-      recordJobRunOutcome: settings.recordJobRunOutcome.bind(settings),
+      finishJobRun: settings.finishJobRun.bind(settings),
       sweepStaleJobRuns: async () => [],
       pauseJobForSecurityChange: settings.pauseJobForSecurityChange.bind(settings),
       getOwnerSecurityVersion: settings.getOwnerSecurityVersion.bind(settings)
@@ -516,10 +515,12 @@ describe.skipIf(!adminDatabaseUrl())("migration 080: scheduled job owner securit
         .toEqual({ offBefore: "security_change", workosOff: null, savedBefore: null });
 
       // Jobs saved after the change and WorkOS jobs keep running. The others
-      // are not claimed, so the worker pauses them for a review.
+      // are not claimed, so the worker pauses them for a review. The current
+      // store needs the later migrations too.
+      await migrate((file) => Number.parseInt(file, 10) > 80);
       const migrated = new UserSettingsStore(db, db);
       const claimable = async (owner: { tenantId: string }, jobId: string) =>
-        (await migrated.claimJob(owner.tenantId, jobId, null, randomUUID())) !== null;
+        (await migrated.claimJob(owner.tenantId, jobId, randomUUID())).status === "claimed";
       expect({
         savedBefore: await claimable(boot, savedBefore), ranAfter: await claimable(boot, ranAfter),
         editedAfter: await claimable(boot, editedAfter), editedBefore: await claimable(boot, editedBefore),
@@ -529,7 +530,7 @@ describe.skipIf(!adminDatabaseUrl())("migration 080: scheduled job owner securit
       // A failure disable clears a pause reason that a job left on (older
       // code during a rollback), so the job does not show a security pause.
       await db.query("UPDATE scheduled_jobs SET paused_reason = 'security_change' WHERE job_id = $1", [createdAfter]);
-      await migrated.disableJob(boot.tenantId, createdAfter);
+      expect(await migrated.disableJob(boot.tenantId, createdAfter, 0)).toBe(true);
       const disabled = await db.query<{ enabled: boolean; paused_reason: string | null }>(
         "SELECT enabled, paused_reason FROM scheduled_jobs WHERE job_id = $1", [createdAfter]
       );

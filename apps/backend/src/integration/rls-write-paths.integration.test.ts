@@ -1306,8 +1306,8 @@ const WRITE_PATHS: Record<string, WritePath> = {
       }, { maxActive: 0 });
       if (created.status !== "created") throw new Error("createScheduledJob did not create the job");
       const runId = randomUUID();
-      const claimed = await settings.claimJob(owner.tenantId, jobId, FAR_FUTURE().toISOString(), runId);
-      if (!claimed) throw new Error("claimJob did not claim the job");
+      const claimed = await settings.claimJob(owner.tenantId, jobId, runId);
+      if (claimed.status !== "claimed") throw new Error("claimJob did not claim the job");
       return { run_id: runId };
     }
   },

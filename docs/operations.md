@@ -17,7 +17,9 @@ Shutdown (`server.ts`, `app-bootstrap.ts`): on `SIGTERM` the backend refuses new
 turns (503 `server_draining`), stops the scheduler and mail workers, lets
 running turns finish for a few seconds, then interrupts the rest (saved as
 `interrupted`). Scheduled jobs get the same wait, then their runtimes close and
-a second, longer wait lets them write their outcome. After
+a second, longer wait lets them write their outcome. A scheduled run that fails
+because of the shutdown does not count toward the auto-disable of a failing job
+([scheduler](architecture/runtime.md#scheduler)). After
 `SHUTDOWN_DEADLINE_MS` (35 seconds) the process exits. Give each backend a
 termination grace of at least 40 seconds; Docker's default is 10 seconds, and
 the Compose stack sets `stop_grace_period: 40s`. Check a rolling restart: start

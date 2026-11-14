@@ -30,7 +30,6 @@ const MINUTE = 60_000;
 const minutesAgo = (minutes: number) => new Date(Date.now() - minutes * MINUTE);
 // The next run that a test claim stores. An hour ahead, so a job that ran is
 // not due again while the test runs.
-const nextHour = () => new Date(Date.now() + 60 * MINUTE).toISOString();
 
 // listDueJobs reads the due jobs of all tenants, and the suite database holds
 // due jobs of other test files. Each test moves those out of the due window
@@ -99,6 +98,7 @@ async function localMember(securityVersion: number): Promise<{ tenantId: string;
   return { tenantId, userId };
 }
 
+// The cron fires once a year, so a claimed job is not due again during a test.
 async function seedJob(input: {
   tenantId: string;
   userId: string;
@@ -111,7 +111,7 @@ async function seedJob(input: {
     `INSERT INTO scheduled_jobs
        (job_id, tenant_id, user_id, job_name, cron_expression, time_zone, input_json,
         enabled, next_run_at, last_run_at, owner_security_version)
-     VALUES ($1, $2, $3, 'fairness job', '* * * * *', 'UTC', '{"prompt":"Check the queue."}',
+     VALUES ($1, $2, $3, 'fairness job', '0 0 1 1 *', 'UTC', '{"prompt":"Check the queue."}',
              TRUE, $4, $5, $6)`,
     [jobId, input.tenantId, input.userId, input.nextRunAt, input.lastRunAt, input.ownerSecurityVersion ?? null]
   );
@@ -150,8 +150,8 @@ function store(schedulerDb: pg.Pool = maintenancePool()): UserSettingsStore {
 async function claimTick(settings: UserSettingsStore, slots = 1): Promise<ScheduledJobRecord[]> {
   const claimed: ScheduledJobRecord[] = [];
   for (const job of await settings.listDueJobs(slots)) {
-    const won = await settings.claimJob(job.tenantId, job.jobId, nextHour(), randomUUID());
-    if (won) claimed.push(won);
+    const won = await settings.claimJob(job.tenantId, job.jobId, randomUUID());
+    if (won.status === "claimed") claimed.push(won.job);
   }
   return claimed;
 }
@@ -219,8 +219,7 @@ function worker(options: { maxConcurrentJobs: number; schedulerDb?: pg.Pool; hol
       claimJob: settings.claimJob.bind(settings),
       parkJob: settings.parkJob.bind(settings),
       attachJobRunSession: settings.attachJobRunSession.bind(settings),
-      completeJobRun: settings.completeJobRun.bind(settings),
-      recordJobRunOutcome: settings.recordJobRunOutcome.bind(settings),
+      finishJobRun: settings.finishJobRun.bind(settings),
       // The suite database holds pending runs of other test files.
       sweepStaleJobRuns: async () => [],
       pauseJobForSecurityChange: settings.pauseJobForSecurityChange.bind(settings),
@@ -362,12 +361,12 @@ describe.skipIf(!adminDatabaseUrl())("scheduler fairness across tenants and memb
       expect(listA.map((job) => job.jobId)).toEqual([quietJob]);
       expect(listB.map((job) => job.jobId)).toEqual([quietJob]);
 
-      const nextRunAt = nextHour();
       const claims = await Promise.all([
-        replicaA.claimJob(quietTenant, quietJob, nextRunAt, randomUUID()),
-        replicaB.claimJob(quietTenant, quietJob, nextRunAt, randomUUID())
+        replicaA.claimJob(quietTenant, quietJob, randomUUID()),
+        replicaB.claimJob(quietTenant, quietJob, randomUUID())
       ]);
-      expect(claims.filter((claim) => claim !== null).map((claim) => claim?.jobId)).toEqual([quietJob]);
+      expect(claims.flatMap((claim) => (claim.status === "claimed" ? [claim.job.jobId] : []))).toEqual([quietJob]);
+      const nextRunAt = claims.find((claim) => claim.status === "claimed")?.job.nextRunAt;
 
       // Only the claimed job changed.
       const after = await jobStates([busyTenant, quietTenant]);
