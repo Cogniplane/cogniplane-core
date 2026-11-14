@@ -14,7 +14,7 @@ import type {
   PiiSubject
 } from "./pii-protection-service.js";
 import { PII_POLICY_INVALID_CODE } from "./pii-policy.js";
-import { PiiProtectionServiceError } from "./pii-protection-service.js";
+import { PII_STORAGE_UNAVAILABLE_CODE, PiiProtectionServiceError } from "./pii-protection-service.js";
 import type {
   PiiScanArtifactInput
 } from "./pii-provider.js";
@@ -48,7 +48,7 @@ type PiiScanJobStoreCapability = {
   recordFailure(
     claim: PiiScanJobClaim,
     error: string,
-    options?: { backoffMs?: number; permanent?: boolean }
+    options?: { backoffMs?: number; permanent?: boolean; transient?: boolean }
   ): Promise<{ status: PiiScanJobRecord["status"] } | null>;
 };
 
@@ -141,6 +141,9 @@ export class PiiScanJobHandler {
       const errorCode =
         error instanceof PiiProtectionServiceError ? error.code : "pii_job_failed";
       const permanent = isPermanentFailure(error, errorCode);
+      // Object storage was slow or down: says nothing about the file, so the
+      // retry does not use the scan budget (PiiScanJobStore.recordFailure).
+      const transient = errorCode === PII_STORAGE_UNAVAILABLE_CODE;
       if (errorCode === PII_POLICY_INVALID_CODE) {
         // Not a finding: the job stays retryable and keeps the subject. The
         // audit event is the record that a configuration error stopped it,
@@ -156,7 +159,7 @@ export class PiiScanJobHandler {
       }
 
       this.deps.logger.error(
-        { err: error, jobId: job.jobId, tenantId: job.tenantId, permanent },
+        { err: error, jobId: job.jobId, tenantId: job.tenantId, permanent, transient },
         "PiiScanJobHandler execution failed"
       );
 
@@ -165,7 +168,7 @@ export class PiiScanJobHandler {
       const updated = await this.deps.piiScanJobs.recordFailure(
         job,
         `${errorCode}: ${message}`,
-        { permanent }
+        { permanent, transient }
       );
 
       // On terminal failure (permanent OR no attempts left), mirror the state

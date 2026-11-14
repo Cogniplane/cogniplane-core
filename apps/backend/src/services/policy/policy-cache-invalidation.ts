@@ -17,6 +17,8 @@ export class RedisPolicyInvalidationBus implements PolicyInvalidationBus {
     private readonly publisher: Redis,
     private readonly logger: Pick<FastifyBaseLogger, "warn">
   ) {
+    // Subscriber mode: the copied command limit (lib/redis.ts) applies to
+    // SUBSCRIBE and UNSUBSCRIBE, not to the wait for messages.
     this.subscriber = publisher.duplicate();
     this.subscriber.on("error", (err) => {
       this.logger.warn({ err }, "policy cache invalidation subscriber error");

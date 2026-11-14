@@ -66,6 +66,16 @@ deadlock with a tenant deletion that runs at the same time, rolls the file back
 with no change; run it again. Do not run it while a backend of the earlier
 release still runs: those backends take no lock and do not check the records.
 
+### Upgrade to PII storage retries and the probe breaker
+
+- Migration `096` adds `pii_scan_jobs.transient_retries`. It is additive.
+  During a rolling upgrade, an older backend counts a storage retry of a new
+  backend as a used attempt, so it can fail such a job early.
+- The Redis PII breaker uses new keys (`pii:breaker:{<name>}:state` and
+  `:failures`). Older and newer backends keep separate breaker state during the
+  rollout. The old keys (`pii:breaker:<name>:state`, `:openedAt`, `:failures`)
+  are not read after it; you can delete them.
+
 ### Upgrade to execution stopping and the checkpoint fence
 
 Migration `093` adds the lease state `stopping`, the owner columns of
@@ -132,8 +142,9 @@ request:
   types](architecture/runtime.md#session-types). Files that existed only in an
   expired or replaced sandbox are lost.
 - Sticky sessions are not required.
-- Database connections: each replica opens up to three pools (`db` and
-  `privilegedDb`: `POOL_MAX` each in `lib/db.ts`; checkpointer:
+- Database connections: each replica opens up to four pools (`db` and
+  `privilegedDb`: `POOL_MAX` each in `lib/db.ts`; the turn control pool:
+  `TURN_CONTROL_POOL_MAX` in `lib/db.ts`; checkpointer:
   `CHECKPOINTER_POOL_MAX` in
   `services/deep-agents/deep-agents-checkpointer.ts`). Size PostgreSQL
   `max_connections` for their sum per replica plus the migration job (two

@@ -56,6 +56,24 @@ test("shutdown aborts a live hijacked SSE connection before waiting for server c
   }
 });
 
+test("shutdown closes the app, maintenance and turn control pools", async () => {
+  const app = Fastify();
+  const closed: string[] = [];
+  app.decorate("db", { end: async () => { closed.push("app"); } } as unknown as Pool);
+  registerAppLifecycle({
+    app,
+    config: createTestConfig(),
+    limits: { sweepExpired: () => {} } as AppDependencies["limits"],
+    policyService: { close: async () => {} } as AppDependencies["policyService"],
+    runtimeAdapter: { close: async () => {} } as AppDependencies["runtimeAdapter"],
+    privilegedDb: { end: async () => { closed.push("maintenance"); } },
+    turnControlDb: { end: async () => { closed.push("turn control"); } },
+    schedulerWorker: null
+  });
+  await app.close();
+  expect(closed).toEqual(["app", "maintenance", "turn control"]);
+});
+
 test("shutdown refuses new turns, interrupts a stuck turn, and saves its status before closing the database", async () => {
   const app = Fastify();
   const events: string[] = [];

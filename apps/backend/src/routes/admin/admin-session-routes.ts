@@ -2,7 +2,7 @@ import type { FastifyInstance } from "fastify";
 
 import { AdminSessionsListResponseSchema } from "@cogniplane/shared-types";
 
-import { withTenantScope } from "../../lib/db.js";
+import { withAdminAggregateScope } from "../../lib/db.js";
 import { utcMicrosText } from "../../lib/db-mappers.js";
 import { apiError } from "../../lib/http-errors.js";
 import { parseRequestInput } from "../../lib/route-validation.js";
@@ -77,7 +77,7 @@ export async function registerAdminSessionRoutes(app: FastifyInstance): Promise<
 
       const { tenantId } = request.auth;
 
-      const { rows, alerts, usage } = await withTenantScope(app.db, tenantId, async (client) => {
+      const { rows, alerts, usage } = await withAdminAggregateScope(app.db, tenantId, async (client) => {
         const alertKinds = alert ?? [];
         const result = await client.query(
           `

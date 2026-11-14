@@ -39,8 +39,14 @@ class CaptureDatabase {
     if (trimmed.startsWith("INSERT INTO pii_scan_jobs")) {
       return { rows: this.insertReturn ? [this.insertReturn] : [], rowCount: 1 };
     }
-    if (trimmed.startsWith("WITH due")) {
+    if (trimmed.startsWith("WITH waiting")) {
       return { rows: this.claimReturn, rowCount: this.claimReturn.length };
+    }
+    if (trimmed.startsWith("WITH failure")) {
+      return {
+        rows: this.updateReturn ? [this.updateReturn] : [],
+        rowCount: this.updateReturn ? 1 : 0
+      };
     }
     if (trimmed.startsWith("UPDATE pii_scan_jobs")) {
       return {
@@ -121,8 +127,10 @@ test("PiiScanJobStore.claimDueJobs returns mapped rows and uses SKIP LOCKED quer
   expect(db.lastQuery).toBeTruthy();
   // FOR UPDATE SKIP LOCKED is the load-bearing concurrency contract (atomic
   // claim across competing workers), and the claim flips status to 'claimed'.
-  expect(db.lastQuery!.text).toMatch(/FOR UPDATE SKIP LOCKED/);
+  expect(db.lastQuery!.text).toMatch(/FOR UPDATE OF j SKIP LOCKED/);
   expect(db.lastQuery!.text).toMatch(/status\s*=\s*'claimed'/);
+  // Tenants take turns (the integration suite runs the order on a database).
+  expect(db.lastQuery!.text).toMatch(/row_number\(\) OVER \(PARTITION BY tenant_id/);
   expect(db.lastQuery!.values).toContain(5);
   expect(claimed.length).toBe(1);
   expect(claimed[0].status).toBe("claimed");
@@ -154,10 +162,10 @@ test("PiiScanJobStore.recordFailure requeues and stores the error message", asyn
   });
 
   expect(db.lastQuery).toBeTruthy();
-  // The retry guard (`attempts >= max_attempts`) is the load-bearing contract:
-  // it decides requeue vs. terminal-failure. Assert its presence, not bind nums.
-  expect(db.lastQuery!.text).toMatch(/attempts\s*>=\s*max_attempts/);
-  expect(db.lastQuery!.text).toMatch(/status = 'claimed' AND attempts = \$6/);
+  // The retry guard is the load-bearing contract: it decides requeue vs.
+  // terminal-failure. Transient storage retries do not count toward it.
+  expect(db.lastQuery!.text).toMatch(/attempts - transient_retries >= max_attempts/);
+  expect(db.lastQuery!.text).toMatch(/j\.status = 'claimed' AND j\.attempts = \$6/);
   // Scope, backoff, error, and the permanent flag all reach the query as
   // bound values. Transient default → permanent flag is false.
   expect(db.lastQuery!.values).toContain("tenant-1");
@@ -211,7 +219,7 @@ test("PiiScanJobStore.sweepStaleClaims requeues/fails claimed rows past the cuto
   expect(db.lastQuery!.text).toMatch(/status\s*=\s*'claimed'/);
   expect(db.lastQuery!.text).toMatch(/claimed_at\s*<\s*NOW\(\)/);
   // The retry guard decides requeue vs. terminal failure, mirroring recordFailure.
-  expect(db.lastQuery!.text).toMatch(/attempts\s*>=\s*max_attempts/);
+  expect(db.lastQuery!.text).toMatch(/attempts - transient_retries >= max_attempts/);
   // The cutoff reaches the query as a bound value (ms → interval).
   expect(db.lastQuery!.values).toContain(120_000);
   expect(swept).toBe(1);

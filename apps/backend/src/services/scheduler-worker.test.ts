@@ -22,6 +22,7 @@ import {
   SCHEDULER_STOPPED_RUN_ERROR,
   TURN_LIMITS_UNAVAILABLE_RUN_ERROR,
   TURN_QUOTA_RUN_ERROR,
+  PII_CLAIM_INTERVAL_MS,
   SchedulerWorker,
   type SchedulerRuntimeResolution,
   type SchedulerRuntimeAdapter,
@@ -1858,6 +1859,7 @@ describe("SchedulerWorker", () => {
       status: "queued" as const,
       attempts: 0,
       maxAttempts: 3,
+      transientRetries: 0,
       runAfter: now,
       claimedAt: null,
       completedAt: null,
@@ -1931,7 +1933,7 @@ describe("SchedulerWorker", () => {
     const failedJob = (jobId: string) => ({
       tenantId: "test-tenant", jobId, scanRunId: `scan-${jobId}`, subjectType: "artifact" as const,
       subjectId: `art-${jobId}`, sourceSessionId: null, sourceUserId: "user-1", mode: "detect" as const,
-      payload: {}, status: "failed" as const, attempts: 3, maxAttempts: 3, runAfter: now, claimedAt: null,
+      payload: {}, status: "failed" as const, attempts: 3, maxAttempts: 3, transientRetries: 0, runAfter: now, claimedAt: null,
       completedAt: now, errorMessage: "claim expired", createdAt: now, updatedAt: now
     });
     const finished: string[] = [];
@@ -2037,6 +2039,7 @@ describe("SchedulerWorker", () => {
       status: "queued" as const,
       attempts: 0,
       maxAttempts: 3,
+      transientRetries: 0,
       runAfter: now,
       claimedAt: null,
       completedAt: null,
@@ -2101,6 +2104,7 @@ describe("SchedulerWorker", () => {
       status: "queued" as const,
       attempts: 0,
       maxAttempts: 3,
+      transientRetries: 0,
       runAfter: now,
       claimedAt: null,
       completedAt: null,
@@ -2165,6 +2169,7 @@ describe("SchedulerWorker", () => {
       status: "queued" as const,
       attempts: 0,
       maxAttempts: 3,
+      transientRetries: 0,
       runAfter: now,
       claimedAt: null,
       completedAt: null,
@@ -3250,5 +3255,50 @@ describe("SchedulerWorker retention cleanup", () => {
 
     await vi.waitFor(() => expect(cleanupExpired).toHaveBeenCalledTimes(1));
     expect(listDueJobs).not.toHaveBeenCalled();
+  });
+});
+
+describe("SchedulerWorker PII claim interval", () => {
+  test("a started worker claims PII jobs every two seconds without its tick, logs a failing claim once a minute, and stops", async () => {
+    vi.useFakeTimers();
+    try {
+      const { deps } = createFakeDeps({ dueJobs: [] });
+      const logger = { warn: vi.fn(), error: vi.fn(), info: vi.fn() };
+      deps.logger = logger;
+      const claims: number[] = [];
+      let failing = false;
+      const sweeps = vi.fn(async () => 0);
+      deps.piiScanJobs = {
+        listStalledUploads: async () => [],
+        recoverStalledUpload: async () => "skipped" as const,
+        sweepStaleClaims: sweeps,
+        listUnfinishedFailures: async () => [],
+        async claimDueJobs(limit: number) {
+          claims.push(limit);
+          if (failing) throw new Error("database unavailable");
+          return [];
+        }
+      };
+      deps.piiScanJobHandler = { async finishFailedJob() {}, async execute() {} };
+      const worker = new SchedulerWorker(deps, { maxConcurrentJobs: 1, maxConcurrentPiiJobs: 2, jobTimeoutMs: 60_000 });
+      worker.start(10 * 60_000);
+
+      await vi.advanceTimersByTimeAsync(PII_CLAIM_INTERVAL_MS);
+      expect(claims).toEqual([2]);
+      // The interval only claims; recovery stays on the tick.
+      expect(sweeps).not.toHaveBeenCalled();
+
+      failing = true;
+      await vi.advanceTimersByTimeAsync(PII_CLAIM_INTERVAL_MS * 10);
+      expect(claims).toHaveLength(11);
+      expect(logger.error.mock.calls.filter(([, message]) => message === "SchedulerWorker failed to claim PII scan jobs"))
+        .toHaveLength(1);
+
+      worker.stop();
+      await vi.advanceTimersByTimeAsync(PII_CLAIM_INTERVAL_MS * 5);
+      expect(claims).toHaveLength(11);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

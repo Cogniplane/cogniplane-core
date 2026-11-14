@@ -8,7 +8,7 @@ import {
 import type { ArtifactRecord } from "../artifacts/artifact-store.js";
 import { PiiImportScopeRegistry } from "./pii-import-scopes.js";
 import type { PiiAppliedPolicy, PiiDecision, PiiSubject } from "./pii-protection-service.js";
-import { PiiProtectionServiceError } from "./pii-protection-service.js";
+import { PiiProtectionServiceError, piiStorageUnavailableError } from "./pii-protection-service.js";
 import type { PiiScanJobClaim, PiiScanJobRecord } from "./pii-scan-job-store.js";
 import type { PiiScanRunDecision, PiiScanRunRecord } from "./pii-scan-run-store.js";
 
@@ -23,6 +23,19 @@ test("missing deployment KEK remains retryable and can complete after configurat
   overrides.evaluateThrows = undefined;
   await handler.execute(sampleJob({ attempts: 2 }));
   expect(h.completedCalls).toHaveLength(1);
+});
+
+test("a storage failure is retried as transient and does not close the subject", async () => {
+  const h = buildDeps({ evaluateThrows: piiStorageUnavailableError() });
+  await new PiiScanJobHandler(h.deps).execute(sampleJob());
+  expect(h.failureCalls).toEqual([expect.objectContaining({
+    attempts: 1, permanent: false, transient: true, error: expect.stringMatching(/^pii_storage_unavailable: /)
+  })]);
+  expect(h.artifactPiiCalls).toEqual([]);
+  // Other failures keep using the scan budget.
+  const provider = buildDeps({ evaluateThrows: new Error("provider timeout") });
+  await new PiiScanJobHandler(provider.deps).execute(sampleJob());
+  expect(provider.failureCalls).toEqual([expect.objectContaining({ permanent: false, transient: false })]);
 });
 
 test("the handler finishes a job only as the attempt that it claimed", async () => {
@@ -167,7 +180,7 @@ function buildDeps(overrides: {
   const messagePiiCalls: SetMessagePiiCall[] = [];
   const artifactPiiCalls: SetArtifactPiiCall[] = [];
   const completedCalls: Array<{ tenantId: string; jobId: string; attempts: number }> = [];
-  const failureCalls: Array<{ tenantId: string; jobId: string; attempts: number; error: string; permanent: boolean }> = [];
+  const failureCalls: Array<{ tenantId: string; jobId: string; attempts: number; error: string; permanent: boolean; transient: boolean }> = [];
   const auditCalls: Array<Record<string, unknown>> = [];
   const deleteCalls: string[] = [];
   const evaluateCalls: string[] = [];
@@ -271,9 +284,11 @@ function buildDeps(overrides: {
         async recordFailure(
           { tenantId, jobId, attempts }: PiiScanJobClaim,
           error: string,
-          options: { backoffMs?: number; permanent?: boolean } = {}
+          options: { backoffMs?: number; permanent?: boolean; transient?: boolean } = {}
         ) {
-          failureCalls.push({ tenantId, jobId, attempts, error, permanent: options.permanent ?? false });
+          failureCalls.push({
+            tenantId, jobId, attempts, error, permanent: options.permanent ?? false, transient: options.transient ?? false
+          });
           return failureReturn;
         }
       },
@@ -352,6 +367,7 @@ function sampleJob(overrides: Partial<PiiScanJobRecord> = {}): PiiScanJobRecord 
     status: "claimed",
     attempts: 1,
     maxAttempts: 3,
+    transientRetries: 0,
     runAfter: now,
     claimedAt: now,
     completedAt: null,

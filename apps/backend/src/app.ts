@@ -18,10 +18,12 @@ import { MailOutbox } from "./services/mail/mail-outbox.js";
 import { DataRouteControl } from "./services/data-route-control.js";
 import { createRefreshTokenRotationService } from "./routes/auth-session.js";
 import { CORS_ALLOWED_METHODS, isCorsOriginAllowed } from "./lib/cors.js";
-import { createDatabase, createMaintenanceDatabase } from "./lib/db.js";
+import { createDatabase, createMaintenanceDatabase, createTurnControlDatabase } from "./lib/db.js";
 import { assertApplicationRole, assertMaintenanceRole } from "./lib/maintenance-db.js";
 import { getRedis } from "./lib/redis.js";
 import { sanitizeUrl } from "./lib/sanitize-url.js";
+import { apiError } from "./lib/http-errors.js";
+import { registerTenantInFlightLimit, TenantInFlightLimiter } from "./lib/tenant-in-flight-limiter.js";
 import { registerSecurityHeaders } from "./lib/security-headers.js";
 import { registerAuthRoutes } from "./routes/auth.js";
 import { registerTenantRoutes } from "./routes/tenant.js";
@@ -135,6 +137,17 @@ export function registerTrustProxyWarnings(
   }
 }
 
+/**
+ * Admin requests of one tenant that run at the same time, per process, and
+ * how many more wait. The PII dashboard runs six queries on six connections
+ * per request, so three requests of one tenant can hold 18 of the 20 app
+ * connections for at most the aggregate statement limit. The admin overview
+ * sends about eight requests at once: the rest wait, they are not refused.
+ */
+const ADMIN_IN_FLIGHT_LIMITS = { maxActivePerTenant: 3, maxWaitingPerTenant: 32, maxWaitMs: 15_000 };
+// After a disconnect, the longest wait for a route that never sends its reply.
+const ADMIN_ABANDONED_REQUEST_GRACE_MS = 60_000;
+
 function requireRedis(app: FastifyInstance) {
   if (!app.redis) throw new Error("Redis is required for local login.");
   return app.redis;
@@ -206,11 +219,15 @@ export async function buildApp() {
   app.decorate("db", createDatabase(config, app.log));
 
   const privilegedDb = createMaintenanceDatabase(config.MAINTENANCE_DATABASE_URL, app.log);
+  // Lease renewal and tool-context checks of running turns: same role as the
+  // app pool, own connections (createTurnControlDatabase).
+  const turnControlDb = createTurnControlDatabase(config, app.log);
   try {
     await assertApplicationRole(app.db);
+    await assertApplicationRole(turnControlDb);
     await assertMaintenanceRole(privilegedDb);
   } catch (error) {
-    await Promise.all([privilegedDb.end(), app.db.end()]);
+    await Promise.all([privilegedDb.end(), turnControlDb.end(), app.db.end()]);
     throw error;
   }
 
@@ -239,6 +256,7 @@ export async function buildApp() {
     db: app.db,
     schedulerDb: privilegedDb,
     privilegedDb,
+    turnControlDb,
     config,
     logger: app.log
   });
@@ -336,6 +354,17 @@ export async function buildApp() {
       return reply.send(limitError);
     });
   }
+  // The rate limit counts requests per window; this caps the admin requests
+  // of each tenant that run at the same time. It is in memory, so it applies
+  // also without Redis, and one tenant cannot use the slots of another.
+  registerTenantInFlightLimit(app, {
+    limiter: new TenantInFlightLimiter(ADMIN_IN_FLIGHT_LIMITS),
+    matches: (request) => request.url.startsWith("/admin/"),
+    abandonedGraceMs: ADMIN_ABANDONED_REQUEST_GRACE_MS,
+    busy: (reply) => reply.code(429).header("retry-after", "2").send(
+      apiError("admin_queries_busy", "Too many admin requests of this organization are running. Try again in a moment.")
+    )
+  });
 
   await registerAuthRoutes(app, {
     db: config.AUTH_MODE === "jwt" ? privilegedDb : app.db,
@@ -386,6 +415,7 @@ export async function buildApp() {
     runtimeOwners: new RuntimeSessionStore(privilegedDb, deps.runtimeSessions.ownerId),
     messages: deps.messages,
     privilegedDb,
+    turnControlDb,
     schedulerWorker,
     // Cross-tenant mail queue: the maintenance pool sees every tenant's
     // outbox. Runs in jwt mode even when email is off, to clean up.

@@ -144,6 +144,21 @@ export class PiiProtectionServiceError extends Error {
   }
 }
 
+/**
+ * Object storage did not give the file of a scan in time, or failed in a way
+ * that a retry can fix. It is not a verdict on the file: a queued scan runs
+ * again later and this failure does not use its scan budget
+ * (`PiiScanJobStore.recordFailure` with `transient`).
+ */
+export const PII_STORAGE_UNAVAILABLE_CODE = "pii_storage_unavailable";
+
+export function piiStorageUnavailableError(): PiiProtectionServiceError {
+  return new PiiProtectionServiceError(
+    PII_STORAGE_UNAVAILABLE_CODE,
+    "File storage did not return the file for the PII scan in time."
+  );
+}
+
 /** One read of the stored policy: the tenant, the resolved policy, and the revision of its row. */
 export type PiiPolicyRead = { tenantId: string; policy: ResolvedPiiPolicy; revision: number };
 
@@ -205,7 +220,10 @@ export class PiiProtectionService {
   private async withTimeout<T>(
     op: string,
     run: (signal: AbortSignal | undefined) => Promise<T>,
-    extraMs = 0
+    extraMs = 0,
+    // Called when the budget ends. An error it returns replaces `pii_timeout`.
+    // It reads the state before the abort, so the abort cannot hide it.
+    timeoutError?: () => PiiProtectionServiceError | undefined
   ): Promise<T> {
     const budget = this.options.timeoutMs > 0 ? this.options.timeoutMs + extraMs : this.options.timeoutMs;
     if (!budget || budget <= 0) {
@@ -215,13 +233,12 @@ export class PiiProtectionService {
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timeout = new Promise<never>((_resolve, reject) => {
       timer = setTimeout(() => {
-        controller.abort(new DOMException(`PII ${op} timeout`, "AbortError"));
-        reject(
-          new PiiProtectionServiceError(
-            "pii_timeout",
-            `PII ${op} exceeded the ${budget}ms timeout budget`
-          )
+        const error = timeoutError?.() ?? new PiiProtectionServiceError(
+          "pii_timeout",
+          `PII ${op} exceeded the ${budget}ms timeout budget`
         );
+        controller.abort(new DOMException(`PII ${op} timeout`, "AbortError"));
+        reject(error);
       }, budget);
     });
     try {
@@ -367,7 +384,7 @@ export class PiiProtectionService {
       const policyRead = read ?? (await this.readPolicy(input.tenantId));
       assertReadForTenant(policyRead, input.tenantId);
       return evaluation(policyRead, await this.decideArtifact(policyRead, input, signal));
-    }, ocrBudgetMs);
+    }, ocrBudgetMs, () => (input.artifact.storageReadInProgress?.() ? piiStorageUnavailableError() : undefined));
   }
 
   private async decideArtifact(

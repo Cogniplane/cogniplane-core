@@ -53,6 +53,14 @@ The SQL in `apps/backend/db/migrations/` is authoritative for the schema.
 ## Database pools
 
 - `db` (`app_user`, under RLS) serves all normal requests.
+- The turn control pool (`app_user`, under RLS, `createTurnControlDatabase`)
+  serves the checks of a running turn: lease renewal, dispatch checks, the
+  sandbox record and release in `SessionExecutionStore`, and the tool contexts
+  (`ToolExecutionContextStore`). Slow tenant queries that hold all connections
+  of `db` then do not stop the turns of other tenants. It has four connections;
+  a check waits at most 3 seconds for one and runs at most 5 seconds, so a
+  failed renewal leaves time for the next one before the lease ends. Turn
+  admission (`acquire`) and the stop route use `db`.
 - `privilegedDb` (`maintenance_user`, BYPASSRLS) is for work that RLS cannot
   authorize: sign-in lookups before the tenant is known, worker claims,
   recovery, download tokens, retention. Rules: [tenant data
@@ -285,6 +293,15 @@ environment its own Redis database: `tenant:delete --flush-redis` flushes it
 | Turn event streams and stop signals | `services/turn-coordination-bus.ts` | Another replica cannot replay a running turn. A stop still takes effect: the database fences the turn at once, and the owner replica aborts it at its next heartbeat ([reconnect and stop](runtime.md#reconnect-and-stop)) |
 | Policy rule cache invalidation (pub/sub) | `services/policy/policy-cache-invalidation.ts` | Other replicas keep cached rules until `ruleCacheTtlMs` |
 
+A command of the shared client (`lib/redis.ts`) waits at most
+`REDIS_COMMAND_TIMEOUT_MS` (2 seconds), also while it waits for a reconnect.
+Without this limit, a half-open connection after a failover kept each command
+waiting until the kernel closed the socket. A rate limit or quota whose command
+fails answers 503 (`request_limits_unavailable`). The turn event reader
+(`TurnCoordinationBus.reader`) blocks on `XREAD` for 10 seconds, so its own
+client waits up to 12 seconds. Subscriber clients keep the 2 seconds: the limit
+applies to `SUBSCRIBE`, not to the wait for messages.
+
 Running-turn caps ([sessions and turns](runtime.md#sessions-and-turns)) do not
 use Redis: they count in process and through the `session_executions` lease.
 Scheduled turns count only through the lease.
@@ -299,7 +316,21 @@ Scheduled turns count only through the lease.
   rules](../configuration.md#startup-rules).
 - The daily turn quota counts interactive and scheduled turns
   ([scheduler](runtime.md#scheduler)). The `message_turn` rate limit counts
-  `POST /messages` requests only.
+  `POST /messages` requests only. It runs after the session and model checks
+  and before the turn slot and the lease, so a slow limit store holds no slot.
+  A request that then gets `session_busy`, `running_turn_limit` or an artifact
+  error also counts.
+- Admin requests (`/admin/*`, the `onRequest` hooks in `app.ts`): the
+  `admin_query` rate limit, then an in-memory cap on the requests of each
+  tenant that run at the same time in each process (`ADMIN_IN_FLIGHT_LIMITS`:
+  three; up to 32 more wait for at most 15 seconds, in arrival order). A
+  request over it gets 429 `admin_queries_busy`. The cap works without Redis,
+  and each tenant has its own count. A request gives back its slot when its
+  route has a reply, also an error; a client that disconnects keeps the slot
+  until its route ends (`lib/tenant-in-flight-limiter.ts`).
+- Heavy admin reports run with a 10-second statement limit for their own
+  transaction (`withAdminAggregateScope`, `lib/db.ts`): the session list and
+  detail, token usage, message feedback, history and the PII dashboard.
 - A refusal returns `LimitExceededErrorPayload` with `retryAfterMs` and
   `resetAt`. Auth routes also send `Retry-After` in seconds
   (`services/rate-limit-reply.ts`).

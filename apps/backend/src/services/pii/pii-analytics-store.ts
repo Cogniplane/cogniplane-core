@@ -10,7 +10,7 @@
 // counts rather than raise. The predicate makes that failure return nothing
 // instead of leaking.
 
-import { type Pool, withTenantScope } from "../../lib/db.js";
+import { type Pool, withAdminAggregateScope } from "../../lib/db.js";
 
 import type {
   ConfidenceRow,
@@ -90,7 +90,7 @@ export class PiiAnalyticsStore {
   constructor(private readonly db: Pool) {}
 
   async getKpis(tenantId: string, from: Date, to: Date): Promise<KpiRow> {
-    return withTenantScope(this.db, tenantId, async (client) => {
+    return withAdminAggregateScope(this.db, tenantId, async (client) => {
       const result = await client.query(
         `
           SELECT
@@ -116,7 +116,7 @@ export class PiiAnalyticsStore {
   }
 
   async getTimeSeries(tenantId: string, range: ResolvedRange): Promise<TimeSeriesPoint[]> {
-    return withTenantScope(this.db, tenantId, async (client) => {
+    return withAdminAggregateScope(this.db, tenantId, async (client) => {
       // generate_series gives us zero-filled buckets so the frontend chart
       // doesn't need to gap-fill. action_taken is NULL for status='failed'
       // (failed scans never reach a decision), so we count them separately.
@@ -166,7 +166,7 @@ export class PiiAnalyticsStore {
   }
 
   async getByEntityType(tenantId: string, from: Date, to: Date): Promise<EntityCount[]> {
-    return withTenantScope(this.db, tenantId, async (client) => {
+    return withAdminAggregateScope(this.db, tenantId, async (client) => {
       const result = await client.query(
         `
           SELECT
@@ -189,7 +189,7 @@ export class PiiAnalyticsStore {
   }
 
   async getByConfidence(tenantId: string, from: Date, to: Date): Promise<ConfidenceRow[]> {
-    return withTenantScope(this.db, tenantId, async (client) => {
+    return withAdminAggregateScope(this.db, tenantId, async (client) => {
       const result = await client.query(
         `
           WITH confidence_counts AS (
@@ -227,7 +227,7 @@ export class PiiAnalyticsStore {
   }
 
   async getBySubjectType(tenantId: string, from: Date, to: Date): Promise<SubjectRow[]> {
-    return withTenantScope(this.db, tenantId, async (client) => {
+    return withAdminAggregateScope(this.db, tenantId, async (client) => {
       const result = await client.query(
         `
           SELECT subject_type, COUNT(*)::int AS count
@@ -255,7 +255,7 @@ export class PiiAnalyticsStore {
     to: Date,
     limit: number
   ): Promise<TopUserRow[]> {
-    return withTenantScope(this.db, tenantId, async (client) => {
+    return withAdminAggregateScope(this.db, tenantId, async (client) => {
       const result = await client.query(
         `
           SELECT
@@ -297,7 +297,7 @@ export class PiiAnalyticsStore {
     to: Date,
     limit: number
   ): Promise<TopSessionRow[]> {
-    return withTenantScope(this.db, tenantId, async (client) => {
+    return withAdminAggregateScope(this.db, tenantId, async (client) => {
       const result = await client.query(
         `
           SELECT
@@ -347,7 +347,7 @@ export class PiiAnalyticsStore {
     actions: RecentActionToken[],
     limit: number
   ): Promise<RecentActivityRow[]> {
-    return withTenantScope(this.db, tenantId, async (client) => {
+    return withAdminAggregateScope(this.db, tenantId, async (client) => {
       // Recent feed has no native "action filter" in the schema —
       // action_taken is `allow|report|block|transform` and `failed` is a
       // status. We pass two arrays so the WHERE clause can OR them: rows
@@ -436,7 +436,7 @@ export class PiiAnalyticsStore {
   // what's queued NOW, not "what was queued in the last 7 days." That's why
   // this method takes no range argument.
   async getQueueStats(tenantId: string): Promise<QueueStats> {
-    return withTenantScope(this.db, tenantId, async (client) => {
+    return withAdminAggregateScope(this.db, tenantId, async (client) => {
       const result = await client.query(
         `
           SELECT
@@ -445,7 +445,7 @@ export class PiiAnalyticsStore {
             COUNT(*) FILTER (WHERE status = 'completed')::int AS completed,
             COUNT(*) FILTER (WHERE status = 'failed')::int    AS failed,
             MIN(created_at) FILTER (WHERE status = 'queued')  AS oldest_queued_at,
-            COUNT(*) FILTER (WHERE attempts >= max_attempts)::int AS max_attempts_hit
+            COUNT(*) FILTER (WHERE attempts - transient_retries >= max_attempts)::int AS max_attempts_hit
           FROM pii_scan_jobs
           WHERE tenant_id = $1
         `,
@@ -468,7 +468,7 @@ export class PiiAnalyticsStore {
     from: Date,
     to: Date
   ): Promise<LatencyPercentilesRow[]> {
-    return withTenantScope(this.db, tenantId, async (client) => {
+    return withAdminAggregateScope(this.db, tenantId, async (client) => {
       // percentile_cont over (completed_at - created_at) milliseconds, split
       // by subject type. Include every terminal state that represents a real
       // end-to-end measurement: 'completed' (allow / report), 'blocked', and
@@ -512,7 +512,7 @@ export class PiiAnalyticsStore {
   }
 
   async getTopErrors(tenantId: string, from: Date, to: Date): Promise<TopErrorRow[]> {
-    return withTenantScope(this.db, tenantId, async (client) => {
+    return withAdminAggregateScope(this.db, tenantId, async (client) => {
       // Group on the trimmed message — provider exceptions often differ in
       // IDs / timestamps and would otherwise bucket as separate errors.
       // Truncating to 200 chars matches the trade-off the rest of the

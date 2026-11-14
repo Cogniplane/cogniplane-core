@@ -15,6 +15,7 @@ import { Upload } from "@aws-sdk/lib-storage";
 import * as tar from "tar";
 
 import type { AppConfig } from "../../config.js";
+import { createBucketClient } from "../artifacts/artifact-storage.js";
 
 export type StoreBundleInput = {
   tenantId: string;
@@ -392,18 +393,8 @@ export function createSkillBundleStorage(config: AppConfig): SkillBundleStorage 
     return new LocalSkillBundleStorage(config.SKILL_BUNDLE_STORAGE_ROOT);
   }
 
-  const client = new S3Client({
-    region: config.ARTIFACT_BUCKET_REGION,
-    endpoint: config.ARTIFACT_BUCKET_ENDPOINT,
-    forcePathStyle: config.ARTIFACT_BUCKET_FORCE_PATH_STYLE,
-    credentials: config.ARTIFACT_BUCKET_ACCESS_KEY_ID
-      ? {
-          accessKeyId: config.ARTIFACT_BUCKET_ACCESS_KEY_ID,
-          secretAccessKey: config.ARTIFACT_BUCKET_SECRET_ACCESS_KEY as string,
-          sessionToken: config.ARTIFACT_BUCKET_SESSION_TOKEN
-        }
-      : undefined
-  });
+  // Same client and request limits as artifact storage.
+  const client = createBucketClient(config);
 
   return new BucketSkillBundleStorage({
     client,
