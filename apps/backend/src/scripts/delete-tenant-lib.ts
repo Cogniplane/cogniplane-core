@@ -5,7 +5,11 @@ import { createPrivilegedDatabase } from "../lib/db.js";
 import { createArtifactStorage } from "../services/artifacts/artifact-storage.js";
 import { createDeepAgentsCheckpointer } from "../services/deep-agents/deep-agents-checkpointer.js";
 import { createSkillBundleStorage } from "../services/skills/skill-bundle-storage.js";
-import { REDIS_DISPOSITION, TenantDeletionService } from "../services/tenant-deletion-service.js";
+import {
+  REDIS_DISPOSITION,
+  TenantDeletionService,
+  type TenantDeletionReceipt
+} from "../services/tenant-deletion-service.js";
 
 export type DeleteTenantArguments = {
   tenantId: string;
@@ -92,6 +96,26 @@ export type DeleteTenantOptions = {
   warn?: (text: string) => void;
 };
 
+/**
+ * The stderr note about `externalResources` in a receipt, or null when every
+ * count is zero. The command deletes only the database rows of these
+ * resources, so a completed receipt does not mean that they are gone.
+ */
+export function externalResourceNotice(receipt: Pick<TenantDeletionReceipt, "externalResources">): string | null {
+  const inventory = receipt.externalResources;
+  if (!inventory) {
+    return "externalResources is null: this receipt is older than the external resource counts, so the counts " +
+      "were not recorded. thirdPartyDisposition is the only record of resources outside the database.";
+  }
+  const { oauthConnections: oauth, jira } = inventory;
+  const total = inventory.e2bSandboxes + jira.externalUserIds + jira.pendingCleanups +
+    oauth.github + oauth.notion + oauth.microsoft + inventory.personalMcpCredentials;
+  if (total === 0) return null;
+  return "The tenant had resources outside the database (externalResources in the receipt). tenant:delete " +
+    "deleted only their database rows: it killed no E2B sandbox and revoked no Pipedream account, OAuth grant " +
+    "or MCP credential. Check each nonzero count at its provider and compare it with thirdPartyDisposition.";
+}
+
 function connectRedis(url: string): RedisFlushClient {
   return new Redis(url, { maxRetriesPerRequest: 3, lazyConnect: true });
 }
@@ -153,6 +177,8 @@ export async function runDeleteTenant(
       backupDisposition: args.backupDisposition
     });
     print(JSON.stringify(receipt, null, 2));
+    const notice = externalResourceNotice(receipt);
+    if (notice) warn(notice);
     if (args.flushRedis && !flushStarted) {
       warn(
         `--flush-redis did nothing: request ${args.requestId} has no queued Redis flush, so Redis was not flushed. ` +
