@@ -489,21 +489,15 @@ async function registerScopedSessionRoutes(
       const { tenantId, userId } = request.auth;
       const { sessionId } = params.value;
       if (action === "restore") {
-        const restored = await stores.sessions.restoreDeleted(tenantId, sessionId, userId);
-        if (restored) {
-          try {
-            await stores.auditEvents.create({
-              tenantId,
-              sessionId,
-              userId,
-              type: "session.restored",
-              payload: { status: restored.status, fromTrash: true }
-            });
-          } catch (error) {
-            request.log.warn({ error, sessionId }, "Failed to record session restore activity");
-          }
-          return serialize(SessionEnvelopeSchema, { session: restored });
-        }
+        // The event commits with the restore: when it fails, the session stays in the trash.
+        const restored = await stores.sessions.restoreDeleted(tenantId, sessionId, userId, (transition) => ({
+          tenantId,
+          sessionId,
+          userId,
+          type: "session.restored",
+          payload: { previousStatus: transition.previousStatus, status: transition.status, fromTrash: true }
+        }));
+        if (restored) return serialize(SessionEnvelopeSchema, { session: restored });
       }
       const session = await stores.sessions.getReadable(tenantId, sessionId, userId);
       if (!session || session.status === "deleted") {
@@ -527,27 +521,23 @@ async function registerScopedSessionRoutes(
         return apiError("session_busy", "Wait for the current turn to finish before archiving or restoring this session.");
       }
       try {
-        const changed = await stores.sessions.setArchived(tenantId, sessionId, userId, archived);
+        // The store writes the event in the transaction of the status change, and
+        // only when the status changes: a retry of a shared session writes none.
+        // When the event fails, the status and the saved sandbox stay as they were.
+        const changed = await stores.sessions.setArchived(tenantId, sessionId, userId, archived, (transition) => ({
+          tenantId,
+          sessionId,
+          userId,
+          type: archived ? "session.archived" : "session.restored",
+          payload: { previousStatus: transition.previousStatus, status: transition.status, purpose: transition.purpose }
+        }));
         if (!changed) {
           reply.code(409);
           return apiError("session_archive_conflict", "The session changed or has a pending approval. Refresh and try again.");
         }
-        const updated = changed.session;
-        // A warm runtime of the session stays: no turn runs, and its next use reads the empty record.
+        // After the commit. A warm runtime of the session stays: no turn runs, and its next use reads the empty record.
         await destroyReleasedSandbox(stores, request, { tenantId, sessionId, sandboxId: changed.releasedSandboxId });
-        // Match interrupt telemetry: an audit failure does not undo a completed transition.
-        try {
-          await stores.auditEvents.create({
-            tenantId,
-            sessionId,
-            userId,
-            type: archived ? "session.archived" : "session.restored",
-            payload: { previousStatus: session.status, status: updated.status, purpose: updated.purpose ?? "normal" }
-          });
-        } catch (err) {
-          request.log.warn({ err, sessionId, action }, "Failed to record session lifecycle audit event");
-        }
-        return serialize(SessionEnvelopeSchema, { session: updated });
+        return serialize(SessionEnvelopeSchema, { session: changed.session });
       } finally {
         releaseMutation?.();
       }
@@ -652,7 +642,15 @@ async function registerScopedSessionRoutes(
 
     const { userId, tenantId } = request.auth;
     const { sessionId } = paramsResult.value;
-    const removed = await stores.sessions.remove(tenantId, sessionId, userId);
+    // The event commits with the delete: when it fails, the session keeps its
+    // status and its saved sandbox, and the route kills nothing.
+    const removed = await stores.sessions.remove(tenantId, sessionId, userId, (transition) => ({
+      tenantId,
+      sessionId,
+      userId,
+      type: "session.deleted",
+      payload: { previousStatus: transition.previousStatus, fromTrash: true }
+    }));
 
     if (!removed) {
       reply.code(404);
@@ -679,18 +677,6 @@ async function registerScopedSessionRoutes(
 
     // Keep the conversation and its durable runtime state during the
     // configured recovery period. The retention worker purges them after expiry.
-    try {
-      await stores.auditEvents.create({
-        tenantId,
-        sessionId,
-        userId,
-        type: "session.deleted",
-        payload: { fromTrash: true }
-      });
-    } catch (error) {
-      request.log.warn({ error, sessionId }, "Failed to record session deletion activity");
-    }
-
     reply.code(204);
     return null;
   });

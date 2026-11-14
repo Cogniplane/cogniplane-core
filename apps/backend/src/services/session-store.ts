@@ -8,6 +8,7 @@ import { SessionExecutionError, sessionBusySql, sessionExecutionBusySql } from "
 import type { PoolClient } from "pg";
 import { sessionReadAccessSql, sessionTrashAccessSql } from "./session-access.js";
 import type { ArtifactStorage } from "./artifacts/artifact-storage.js";
+import { AuditEventStore, type AuditEventInput } from "./audit-event-store.js";
 import { uuidv7 } from "../lib/uuid.js";
 import { isoTimestamp, utcMicrosText } from "../lib/db-mappers.js";
 import {
@@ -109,6 +110,24 @@ export type SessionCleanupResult = { deletedSessions: number; deletedObjects: nu
  * The caller kills `releasedSandboxId` after the commit; null means there is nothing to kill.
  */
 export type SessionSandboxRelease = { releasedSandboxId: string | null };
+
+/**
+ * A status change of archive, restore, delete or restore from the trash.
+ * `previousStatus` is the status read under the session row lock.
+ */
+export type SessionLifecycleTransition = {
+  previousStatus: SessionRecord["status"];
+  status: SessionRecord["status"];
+  purpose: string;
+};
+
+/**
+ * Builds the audit event of a lifecycle transition. The store calls it only when
+ * the status changes, and writes the event in the transaction of the change: when
+ * the event fails, the status, the saved sandbox and the execution lease stay as
+ * they were.
+ */
+export type SessionLifecycleAudit = (transition: SessionLifecycleTransition) => AuditEventInput;
 
 type SessionStorageGcRow = {
   tenant_id: string;
@@ -580,7 +599,7 @@ export class SessionStore {
    * restored session starts a new sandbox at its next shell or file call.
    */
   async setArchived(
-    tenantId: string, sessionId: string, userId: string, archived: boolean
+    tenantId: string, sessionId: string, userId: string, archived: boolean, audit?: SessionLifecycleAudit
   ): Promise<({ session: SessionRecord } & SessionSandboxRelease) | null> {
     return withTenantScope(this.db, tenantId, async (client) => {
       const locked = await this.lockLifecycleSession(client, tenantId, sessionId, userId, { checkBusy: false, active: false });
@@ -612,7 +631,12 @@ export class SessionStore {
         [tenantId, sessionId, userId, archived ? "archived" : "active", archived ? "active" : "archived"]
       );
       if (!result.rows[0]) return null;
-      return { session: mapSession(result.rows[0]), releasedSandboxId: archived ? locked.sandboxId : null };
+      const session = mapSession(result.rows[0]);
+      if (audit) {
+        await AuditEventStore.createInTransaction(client,
+          audit({ previousStatus: locked.status, status: session.status, purpose: session.purpose ?? "normal" }));
+      }
+      return { session, releasedSandboxId: archived ? locked.sandboxId : null };
     });
   }
 
@@ -625,7 +649,9 @@ export class SessionStore {
    * (`SessionExecutionStore.bindSandboxId`). A project chat has none, except a chat that
    * moved into a project: it keeps the sandbox of its normal chat, and no project turn loads it.
    */
-  async remove(tenantId: string, sessionId: string, userId: string): Promise<SessionSandboxRelease | null> {
+  async remove(
+    tenantId: string, sessionId: string, userId: string, audit?: SessionLifecycleAudit
+  ): Promise<SessionSandboxRelease | null> {
     return withTenantScope(this.db, tenantId, async (client) => {
       const locked = await this.lockLifecycleSession(client, tenantId, sessionId, userId);
       if (!locked) return null;
@@ -639,11 +665,18 @@ export class SessionStore {
         `,
         [tenantId, sessionId, userId]
       );
-      return (removalUpdate.rowCount ?? 0) > 0 ? { releasedSandboxId: locked.sandboxId } : null;
+      if ((removalUpdate.rowCount ?? 0) === 0) return null;
+      if (audit) {
+        await AuditEventStore.createInTransaction(client,
+          audit({ previousStatus: locked.status, status: "deleted", purpose: locked.purpose }));
+      }
+      return { releasedSandboxId: locked.sandboxId };
     });
   }
 
-  async restoreDeleted(tenantId: string, sessionId: string, userId: string): Promise<SessionRecord | null> {
+  async restoreDeleted(
+    tenantId: string, sessionId: string, userId: string, audit?: SessionLifecycleAudit
+  ): Promise<SessionRecord | null> {
     return withTenantScope(this.db, tenantId, async (client) => {
       if (this.retentionDays === 0) return null;
       const locked = await this.lockLifecycleSession(client, tenantId, sessionId, userId, {
@@ -659,7 +692,13 @@ export class SessionStore {
          RETURNING ${SESSION_COLUMNS}`,
         [tenantId, sessionId, this.retentionDays],
       );
-      return restored.rows[0] ? mapSession(restored.rows[0]) : null;
+      if (!restored.rows[0]) return null;
+      const session = mapSession(restored.rows[0]);
+      if (audit) {
+        await AuditEventStore.createInTransaction(client,
+          audit({ previousStatus: locked.status, status: session.status, purpose: session.purpose ?? "normal" }));
+      }
+      return session;
     });
   }
 

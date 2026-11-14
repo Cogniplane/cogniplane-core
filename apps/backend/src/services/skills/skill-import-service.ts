@@ -614,6 +614,8 @@ function isSingleFileSkillBundle(
 }
 
 type SkillRevisionImporter = Pick<SkillRevisionStore, "importSkillBundle">;
+/** Builds the import's audit event. It commits in the import's transaction. */
+export type SkillImportAudit = NonNullable<Parameters<SkillRevisionStore["importSkillBundle"]>[1]["audit"]>;
 type SkillBundleWriter = Pick<SkillBundleStorage, "storeBundle" | "deleteBundle">;
 
 function buildSkillImportPayload(input: {
@@ -692,6 +694,7 @@ export async function importSkillBundleFromZip(input: {
   archiveBuffer: Buffer;
   originalFileName: string;
   actorUserId: string;
+  audit?: SkillImportAudit;
 }): Promise<{ skill: AdminSkillRecord; revision: AdminSkillRevisionRecord }> {
   assertArchiveWithinLimit(input.archiveBuffer, input.config.ARTIFACT_MAX_UPLOAD_BYTES);
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), "cogniplane-skill-import-"));
@@ -703,9 +706,8 @@ export async function importSkillBundleFromZip(input: {
     const bundleRootPath = path.join(tempRoot, ...locateSingleSkillBundleFolder(entries));
     const validation = await validateSkillBundleOrThrow(bundleRootPath);
 
-    return await input.skillRevisions.importSkillBundle(
-      input.tenantId,
-      buildSkillImportPayload({
+    return await input.skillRevisions.importSkillBundle(input.tenantId, {
+      ...buildSkillImportPayload({
         tenantId: input.tenantId,
         validation,
         bundleLocalPath: bundleRootPath,
@@ -716,8 +718,9 @@ export async function importSkillBundleFromZip(input: {
         extraMetadata: {
           importedFromFileName: input.originalFileName
         }
-      })
-    );
+      }),
+      audit: input.audit
+    });
   } finally {
     await rm(tempRoot, { recursive: true, force: true });
   }
@@ -746,6 +749,7 @@ export async function importSkillBundleFromInline(input: {
   description: string;
   instructions: string;
   actorUserId: string;
+  audit?: SkillImportAudit;
 }): Promise<{ skill: AdminSkillRecord; revision: AdminSkillRevisionRecord }> {
   const skillId = input.skillId.trim();
   if (!skillIdPattern.test(skillId) || skillId.length > 64) {
@@ -804,7 +808,8 @@ export async function importSkillBundleFromInline(input: {
         files: validation.bundle.files
       },
       createdBy: input.actorUserId,
-      storeBundle: async () => ({ storageUri: null })
+      storeBundle: async () => ({ storageUri: null }),
+      audit: input.audit
     });
   } finally {
     await rm(tempRoot, { recursive: true, force: true });
@@ -822,6 +827,7 @@ export async function importSkillBundleFromGithub(input: {
   actorUserId: string;
   githubToken?: string;
   fetchFn?: typeof undiciFetch;
+  audit?: SkillImportAudit;
 }): Promise<{ skill: AdminSkillRecord; revision: AdminSkillRevisionRecord }> {
   const fetchFn = input.fetchFn ?? undiciFetch;
   const source = parseGitHubSkillSource({
@@ -866,9 +872,8 @@ export async function importSkillBundleFromGithub(input: {
     const bundleRootPath = path.join(tempRoot, ...bundleFolder);
     const validation = await validateSkillBundleOrThrow(bundleRootPath);
 
-    return await input.skillRevisions.importSkillBundle(
-      input.tenantId,
-      buildSkillImportPayload({
+    return await input.skillRevisions.importSkillBundle(input.tenantId, {
+      ...buildSkillImportPayload({
         tenantId: input.tenantId,
         validation,
         bundleLocalPath: bundleRootPath,
@@ -885,8 +890,9 @@ export async function importSkillBundleFromGithub(input: {
             subdirectory: source.subdirectory
           }
         }
-      })
-    );
+      }),
+      audit: input.audit
+    });
   } finally {
     await rm(tempRoot, { recursive: true, force: true });
   }

@@ -80,7 +80,9 @@ deletes only revisions older than `SKILL_BUNDLE_RETENTION_DAYS` that are not
 active, not the latest of their skill, and not used by an active runtime
 (`domain/skill-cleanup-policy.ts`), and deletes a bundle only when no other
 revision points to it. No scheduler runs it. Every lifecycle action writes an
-audit event.
+audit event in the action's transaction. The cleanup report is the exception:
+the cleanup is many transactions and storage deletes, so its event is written
+after them.
 
 ## Bundle storage
 

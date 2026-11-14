@@ -29,7 +29,14 @@ approval proof is in [approvals](approvals.md#policy-center-approval-proof).
 
 - `tenant_settings.policy_enforcement_mode`: `monitor` records matches only;
   `enforce` applies effects. The mode is in the turn's policy snapshot.
-- Only matched rules write `policy_decision` evidence rows.
+- Only matched rules write `policy_decision` evidence rows. The row and its
+  audit event (`policy.decision.recorded` or `policy.decision.enforced`) commit
+  in one transaction (`PolicyDecisionStore.record`).
+- When the evidence cannot be written, an outcome that does not gate (allow,
+  monitor mode) runs and the failure is logged. An enforced block or denial is
+  refused as usual. An enforced `require_approval` with an approval is refused
+  with fixed text (`POLICY_EVIDENCE_UNAVAILABLE`), so no gated action runs
+  without evidence. The approval stays used.
 - Rule cache: `PolicyService` caches each tenant's rules for `ruleCacheTtlMs`. A
   rule change clears the cache on this replica, and with Redis on the others. If
   that message fails, the cache expires after the TTL. The enforcement mode is

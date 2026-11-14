@@ -517,7 +517,8 @@ test("skill activation passes the selected audience to the transaction and audit
   const dynamicConfig = createFakeDynamicConfig();
   const calls: unknown[] = [];
   dynamicConfig.activateSkillRevision = async (tenantId, input) => {
-    calls.push({ tenantId, ...input });
+    const { audit: _audit, alsoInTransaction: _notice, ...rest } = input;
+    calls.push({ tenantId, ...rest });
     return {
       skill: { ...makeSkillRecord(), enabled: true, isPublished: input.audience === "members" },
       revision: { ...makeRevisionRecord("test-skill"), reviewStatus: "active" },
@@ -525,6 +526,14 @@ test("skill activation passes the selected audience to the transaction and audit
     };
   };
   const auditEvents = new InMemoryAuditEventStore();
+  const transactionAudits = new InMemoryAuditEventStore();
+  const activate = dynamicConfig.activateSkillRevision;
+  // Like the store: the audit events and the owner notice run in the activation's transaction.
+  dynamicConfig.activateSkillRevision = async (tenantId, input) => {
+    const activated = await activate(tenantId, input);
+    for (const event of activated ? input.audit?.(activated) ?? [] : []) await transactionAudits.create(event);
+    return activated;
+  };
   await registerAdminSkillRoutes(app, { dataRoutes: devDataRoutes(),
     dynamicConfig, auditEvents, skillMarketplace: createFakeMarketplace(), skillBundleStorage: noopSkillBundleStorage
   });
@@ -539,7 +548,8 @@ test("skill activation passes the selected audience to the transaction and audit
       tenantId: "tenant-1", skillId: "test-skill", skillRevisionId: 1,
       actorUserId: "admin-user", reviewNotes: "Approved", audience, expectedSnapshot
     });
-    expect(auditEvents.events.at(-1)?.payload).toMatchObject({ audience, isPublished: audience === "members", enabled: true });
+    expect(transactionAudits.events.at(-1)?.payload).toMatchObject({ audience, isPublished: audience === "members", enabled: true });
+    expect(auditEvents.events).toEqual([]);
   }
   const invalid = await app.inject({
     method: "POST", url: "/admin/skills/test-skill/revisions/1/activate", payload: { audience: "anyone", expectedSnapshot }
@@ -558,5 +568,7 @@ test("skill activation passes the selected audience to the transaction and audit
     method: "POST", url: "/admin/skills/test-skill/revisions/1/activate", payload: { audience: "members", expectedSnapshot }
   });
   expect(missing.statusCode).toBe(404);
-  expect(auditEvents.events).toHaveLength(4);
+  // Two activations, two events each (reviewed, activated), all in the activation's transaction.
+  expect(transactionAudits.events).toHaveLength(4);
+  expect(auditEvents.events).toEqual([]);
 });

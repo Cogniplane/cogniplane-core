@@ -25,15 +25,25 @@ function record(overrides: Partial<MemoryRecord> = {}): MemoryRecord {
 async function setup(auth = scope) {
   const app = Fastify(); apps.push(app);
   app.addHook("preHandler", async (request) => { request.auth = { ...auth, role: "member", isAdmin: false }; });
+  // The events that the store writes in the change's transaction.
+  const transactionAudits = vi.fn((_event: unknown) => undefined);
   const memories = {
     list: vi.fn(async () => ({ memories: [record()], total: 1 })),
-    updateByUser: vi.fn(async (_t: string, _u: string, _id: string, input: { content: string }) =>
-      record({ content: input.content, provenance: "user_authored", version: 3, sourceSessionId: null })),
-    removeById: vi.fn(async () => ({ slug: "units" }) as { slug: string } | null)
+    updateByUser: vi.fn(async (_t: string, _u: string, _id: string, input: { content: string },
+      audit?: (memory: MemoryRecord) => unknown) => {
+      const updated = record({ content: input.content, provenance: "user_authored", version: 3, sourceSessionId: null });
+      if (audit) transactionAudits(audit(updated));
+      return updated;
+    }),
+    removeById: vi.fn(async (_t: string, _u: string, _id: string, audit?: (removed: { slug: string }) => unknown) => {
+      const removed = { slug: "units" };
+      if (audit) transactionAudits(audit(removed));
+      return removed as { slug: string } | null;
+    })
   };
   const auditEvents = { create: vi.fn(async () => null as never) };
   await registerMemoryRoutes(app, { memories, auditEvents } as unknown as MemoryRouteStores);
-  return { app, memories, auditEvents };
+  return { app, memories, auditEvents, transactionAudits };
 }
 
 test("lists the signed-in user's memories as private data, without the source session or the approver", async () => {
@@ -57,21 +67,22 @@ test("lists the signed-in user's memories as private data, without the source se
 });
 
 test("an edit sends the version the user saw, records the user as author and writes an audit event", async () => {
-  const { app, memories, auditEvents } = await setup();
+  const { app, memories, auditEvents, transactionAudits } = await setup();
 
   const response = await app.inject({ method: "PUT", url: "/me/memories/m1",
     payload: { scope, content: "User prefers metric units and 24-hour time.", version: 2 } });
 
   expect(response.statusCode).toBe(200);
   expect(memories.updateByUser).toHaveBeenCalledWith("tenant-a", "member-1", "m1",
-    { content: "User prefers metric units and 24-hour time.", expectedVersion: 2 });
+    { content: "User prefers metric units and 24-hour time.", expectedVersion: 2 }, expect.any(Function));
   expect(response.json()).toMatchObject({ scope, memory: { name: "units", provenance: "user_authored", version: 3 } });
-  expect(auditEvents.create).toHaveBeenCalledWith({
+  expect(transactionAudits).toHaveBeenCalledWith({
     tenantId: "tenant-a", sessionId: null, userId: "member-1", type: "user.memory.updated",
     payload: { memoryId: "m1", name: "units", version: 3 }
   });
+  expect(auditEvents.create).not.toHaveBeenCalled();
   // The audit event names the memory and never carries its text.
-  expect(JSON.stringify(auditEvents.create.mock.calls)).not.toContain("24-hour");
+  expect(JSON.stringify(transactionAudits.mock.calls)).not.toContain("24-hour");
 });
 
 test("an edit of a changed memory is a conflict and of a missing one is not found", async () => {
@@ -127,13 +138,13 @@ test("a memory with the longest valid name can still be edited and deleted, beca
 });
 
 test("a delete removes only the signed-in user's memory and writes an audit event", async () => {
-  const { app, memories, auditEvents } = await setup();
+  const { app, memories, auditEvents, transactionAudits } = await setup();
 
   const response = await app.inject({ method: "DELETE", url: "/me/memories/m1", payload: { scope } });
 
   expect(response.statusCode).toBe(204);
-  expect(memories.removeById).toHaveBeenCalledWith("tenant-a", "member-1", "m1");
-  expect(auditEvents.create).toHaveBeenCalledWith({
+  expect(memories.removeById).toHaveBeenCalledWith("tenant-a", "member-1", "m1", expect.any(Function));
+  expect(transactionAudits).toHaveBeenCalledWith({
     tenantId: "tenant-a", sessionId: null, userId: "member-1", type: "user.memory.deleted",
     payload: { memoryId: "m1", name: "units" }
   });
@@ -141,7 +152,8 @@ test("a delete removes only the signed-in user's memory and writes an audit even
   memories.removeById.mockResolvedValueOnce(null);
   const missing = await app.inject({ method: "DELETE", url: "/me/memories/m1", payload: { scope } });
   expect(missing.statusCode).toBe(404);
-  expect(auditEvents.create).toHaveBeenCalledTimes(1);
+  expect(transactionAudits).toHaveBeenCalledTimes(1);
+  expect(auditEvents.create).not.toHaveBeenCalled();
 });
 
 test("a write from a tab that belongs to another organization or user is refused before it touches a memory", async () => {

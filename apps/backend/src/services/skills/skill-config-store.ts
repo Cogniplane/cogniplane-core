@@ -6,6 +6,7 @@ import { lockOrganizationSkillNames } from "./organization-skill-name-lock.js";
 import { type Pool, withTenantScope } from "../../lib/db.js";
 
 import type { AdminSkillRecord } from "../admin-config-records.js";
+import { AuditEventStore, type AuditEventInput } from "../audit-event-store.js";
 import { mapSkill } from "../admin-config-store-mappers.js";
 
 const skillSelectSql = `
@@ -122,8 +123,10 @@ export class SkillConfigStore {
     return client ? read(client) : withTenantScope(this.db, tenantId, read);
   }
 
+  /** `audit` builds the change's audit event, which commits in the change's transaction. */
   async disableSkill(tenantId: string, skillId: string,
-    expectedSnapshot?: AdminSkillReleaseSnapshot): Promise<AdminSkillRecord | null> {
+    expectedSnapshot?: AdminSkillReleaseSnapshot,
+    options: { audit?: (skill: AdminSkillRecord) => AuditEventInput } = {}): Promise<AdminSkillRecord | null> {
     return withTenantScope(this.db, tenantId, async (client) => {
       await checkReleaseSnapshot(client,tenantId,skillId,expectedSnapshot);
       const result = await client.query(
@@ -137,7 +140,10 @@ export class SkillConfigStore {
       );
 
       // admin_skills has no instructions or content hash; read them from the active revision.
-      return result.rowCount ? this.getSkill(tenantId, skillId, client) : null;
+      if (!result.rowCount) return null;
+      const skill = await this.getSkill(tenantId, skillId, client);
+      if (skill && options.audit) await AuditEventStore.createInTransaction(client, options.audit(skill));
+      return skill;
     });
   }
 
@@ -163,10 +169,16 @@ export class SkillConfigStore {
     });
   }
 
-  /** `alsoInTransaction` runs in the change's transaction after the change: the owner notice of a release. */
+  /**
+   * `audit` builds the change's audit event, and `alsoInTransaction` writes the
+   * owner notice of a release. Both run in the change's transaction.
+   */
   async setSkillPublished(tenantId: string, skillId: string, isPublished: boolean,
     expectedSnapshot?: AdminSkillReleaseSnapshot,
-    options: { alsoInTransaction?: (client: PoolClient) => Promise<void> } = {}): Promise<AdminSkillRecord | null> {
+    options: {
+      audit?: (skill: AdminSkillRecord) => AuditEventInput;
+      alsoInTransaction?: (client: PoolClient) => Promise<void>;
+    } = {}): Promise<AdminSkillRecord | null> {
     return withTenantScope(this.db, tenantId, async (client) => {
       await checkReleaseSnapshot(client,tenantId,skillId,expectedSnapshot);
       const result = await client.query(
@@ -180,8 +192,10 @@ export class SkillConfigStore {
       );
 
       if (!result.rowCount) return null;
+      const skill = await this.getSkill(tenantId, skillId, client);
+      if (skill && options.audit) await AuditEventStore.createInTransaction(client, options.audit(skill));
       if (options.alsoInTransaction) await options.alsoInTransaction(client);
-      return this.getSkill(tenantId, skillId, client);
+      return skill;
     });
   }
 }

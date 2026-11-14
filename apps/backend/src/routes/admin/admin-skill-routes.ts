@@ -24,7 +24,7 @@ import {
 import {
   adminIdSchema,
   configError,
-  createAdminAuditEvent,
+  adminAuditEvent,
   respondAdminMutationError,
   respondAdminNotFound,
   withAdmin
@@ -198,22 +198,13 @@ export async function registerAdminSkillRoutes(
 
     try {
       const skill = await stores.dynamicConfig.disableSkill(request.auth.tenantId, paramsResult.value.skillId,
-        bodyResult.value.expectedSnapshot);
+        bodyResult.value.expectedSnapshot, {
+          audit: (disabled) => adminAuditEvent(request, "admin.skill.disabled",
+            { skillId: disabled.skillId, version: disabled.version })
+        });
       if (!skill) {
         return respondAdminNotFound(reply, "skill_not_found");
       }
-
-      await createAdminAuditEvent(stores.auditEvents, {
-        tenantId: request.auth.tenantId,
-        userId: request.auth.userId,
-        type: "admin.skill.disabled",
-        payload: {
-          skillId: skill.skillId,
-          version: skill.version
-        },
-        ipAddress: request.ip,
-        userAgent: request.headers["user-agent"]
-      });
 
       return serialize(AdminSkillEnvelopeSchema, { skill });
     } catch (error) {
@@ -466,20 +457,13 @@ export async function registerAdminSkillRoutes(
       // The owner notice commits with the release.
       const skill = await stores.dynamicConfig.setSkillPublished(request.auth.tenantId, skillId, true,
         bodyResult.value.expectedSnapshot, {
+          audit: (published) => adminAuditEvent(request, "admin.skill.published",
+            { skillId: published.skillId, version: published.version }),
           alsoInTransaction: stores.dataRoutes.ownerNotice(request, { setting: "skill_release", skillId, change: "published", audience: "members" })
         });
       if (!skill) {
         return respondAdminNotFound(reply, "skill_not_found");
       }
-
-      await createAdminAuditEvent(stores.auditEvents, {
-        tenantId: request.auth.tenantId,
-        userId: request.auth.userId,
-        type: "admin.skill.published",
-        payload: { skillId: skill.skillId, version: skill.version },
-        ipAddress: request.ip,
-        userAgent: request.headers["user-agent"]
-      });
 
       return serialize(AdminSkillEnvelopeSchema, { skill });
     } catch (error) {
@@ -498,19 +482,13 @@ export async function registerAdminSkillRoutes(
 
     try {
       const skill = await stores.dynamicConfig.setSkillPublished(request.auth.tenantId, paramsResult.value.skillId, false,
-        bodyResult.value.expectedSnapshot);
+        bodyResult.value.expectedSnapshot, {
+          audit: (unpublished) => adminAuditEvent(request, "admin.skill.unpublished",
+            { skillId: unpublished.skillId, version: unpublished.version })
+        });
       if (!skill) {
         return respondAdminNotFound(reply, "skill_not_found");
       }
-
-      await createAdminAuditEvent(stores.auditEvents, {
-        tenantId: request.auth.tenantId,
-        userId: request.auth.userId,
-        type: "admin.skill.unpublished",
-        payload: { skillId: skill.skillId, version: skill.version },
-        ipAddress: request.ip,
-        userAgent: request.headers["user-agent"]
-      });
 
       return serialize(AdminSkillEnvelopeSchema, { skill });
     } catch (error) {

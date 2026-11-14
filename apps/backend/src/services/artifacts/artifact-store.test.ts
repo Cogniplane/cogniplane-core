@@ -72,6 +72,11 @@ class GeneratedCreateDatabase extends CaptureDatabase {
   }
 }
 
+const downloadAudit = (token: { tenantId: string; sessionId: string; userId: string }) => ({
+  tenantId: token.tenantId, sessionId: token.sessionId, userId: token.userId,
+  type: "artifact_downloaded" as const, payload: {}
+});
+
 function artifactRow(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     id: 1,
@@ -121,7 +126,7 @@ test("ArtifactStore.setPiiDetail binds the full PII detail as the JSON patch, sc
   });
 });
 
-test("ArtifactStore.createGenerated rechecks session upload access before inserting", async () => {
+test("ArtifactStore.createGenerated rechecks session upload access and writes its audit event in the insert's transaction", async () => {
   const db = new GeneratedCreateDatabase();
   const store = new ArtifactStore(db as unknown as Pool);
 
@@ -138,10 +143,17 @@ test("ArtifactStore.createGenerated rechecks session upload access before insert
     checksumSha256: "checksum",
     status: "ready",
     createdByType: "tool"
-  });
+  }, (created) => ({
+    tenantId: "test-tenant", sessionId: "session-1", userId: "user-1",
+    type: "artifact_generated", payload: { artifactId: created.artifactId }
+  }));
 
   expect(artifact.artifactId).toBe("artifact-1");
   expect(db.seenQueries.some((query) => query.includes("upload_project.archived_at IS NULL"))).toBe(true);
+  const insertAt = db.seenQueries.findIndex((query) => query.includes("INSERT INTO artifacts"));
+  const auditAt = db.seenQueries.findIndex((query) => query.includes("INSERT INTO audit_events"));
+  expect(auditAt).toBeGreaterThan(insertAt);
+  expect(auditAt).toBeLessThan(db.seenQueries.indexOf("COMMIT"));
 });
 
 test("ArtifactStore.setPiiDetail sends only the caller's partial fields as the patch (server-side merge owns the rest)", async () => {
@@ -162,7 +174,7 @@ test("ArtifactStore.consumeDownloadToken binds only the token and gates on token
   const db = new CaptureDatabase();
   const store = new ArtifactStore({} as Pool, db as unknown as Pool);
 
-  await store.consumeDownloadToken({ token: "tok-123" });
+  await store.consumeDownloadToken({ token: "tok-123", audit: downloadAudit });
 
   expect(db.lastQuery).toBeTruthy();
   // The token is the credential: identity comes from the token row, so the
@@ -200,7 +212,7 @@ test("ArtifactStore peek and consume both gate on the shared download eligibilit
   const peekDb = new CaptureDatabase();
   await new ArtifactStore({} as Pool, peekDb as unknown as Pool).peekDownloadToken({ token: "tok-123" });
   const consumeDb = new CaptureDatabase();
-  await new ArtifactStore({} as Pool, consumeDb as unknown as Pool).consumeDownloadToken({ token: "tok-123" });
+  await new ArtifactStore({} as Pool, consumeDb as unknown as Pool).consumeDownloadToken({ token: "tok-123", audit: downloadAudit });
 
   // Redemption re-checks eligibility, so a token minted before a later PII block
   // stops working. Peek and consume share one clause, so a refused request never

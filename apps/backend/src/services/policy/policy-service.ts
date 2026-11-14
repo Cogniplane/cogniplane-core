@@ -4,7 +4,6 @@ import type {
   PolicyTurnContext
 } from "@cogniplane/shared-types";
 
-import type { AuditEventStore } from "../audit-event-store.js";
 import { redactSecrets } from "../redact-secrets.js";
 
 import {
@@ -33,6 +32,10 @@ export class PolicyBlockedError extends Error {
     this.matchedRuleId = matchedRuleId;
   }
 }
+
+/** The refusal of an approved, enforced action whose evidence could not be saved. Fixed text: no database error reaches the model. */
+export const POLICY_EVIDENCE_UNAVAILABLE =
+  "The policy decision for this action could not be recorded, so the action was denied. Try again.";
 
 export type PolicyEvaluationInput = {
   tenantId: string;
@@ -75,10 +78,9 @@ export class PolicyService {
   private readonly ruleCache = new Map<string, { rules: EvaluableRule[]; expiresAt: number }>();
 
   private readonly rules: PolicyRuleStore;
-  private readonly decisions: PolicyDecisionStore;
-  private readonly auditEvents: AuditEventStore;
-  // Persisting a decision is best-effort evidence — a write failure must not
-  // change whether the action is gated. Failures are logged, never thrown.
+  private readonly decisions: Pick<PolicyDecisionStore, "record">;
+  // Evidence failures are logged. They never let a gated action run: see
+  // recordEvidence.
   private readonly logger: { warn: (msg: string, meta?: unknown) => void };
   private readonly ruleCacheTtlMs: number;
   private readonly invalidationBus?: PolicyInvalidationBus;
@@ -86,15 +88,13 @@ export class PolicyService {
 
   constructor(options: {
     rules: PolicyRuleStore;
-    decisions: PolicyDecisionStore;
-    auditEvents: AuditEventStore;
+    decisions: Pick<PolicyDecisionStore, "record">;
     logger?: { warn: (msg: string, meta?: unknown) => void };
     ruleCacheTtlMs?: number;
     invalidationBus?: PolicyInvalidationBus;
   }) {
     this.rules = options.rules;
     this.decisions = options.decisions;
-    this.auditEvents = options.auditEvents;
     this.logger = options.logger ?? { warn: (msg, meta) => console.warn(msg, meta) };
     this.ruleCacheTtlMs = options.ruleCacheTtlMs ?? 5_000;
     this.invalidationBus = options.invalidationBus;
@@ -178,9 +178,10 @@ export class PolicyService {
 
     // Non-enforcing outcomes (no match, monitor mode, allow) proceed untouched.
     // Record evidence when a rule matched; never for a default-allow no-match
-    // (that would write a row per tool call and drown the table). Evidence is
-    // best-effort — a write failure is logged, never thrown, so an unwritable
-    // table can't turn a monitor rule into an outage.
+    // (that would write a row per tool call and drown the table). An outcome
+    // that does not gate proceeds when its evidence cannot be written: the
+    // failure is logged, so an unwritable table can't turn a monitor rule into
+    // an outage.
     if (!enforced) {
       if (evaluation.matchedRuleId !== null) {
         await this.recordEvidence(input, evaluation, enforced, null);
@@ -213,8 +214,13 @@ export class PolicyService {
         );
       }
       const disposition = input.approvalDisposition ?? "reject";
-      await this.recordEvidence(input, evaluation, enforced, disposition);
+      const recorded = await this.recordEvidence(input, evaluation, enforced, disposition);
       if (disposition === "approve") {
+        // Fail closed: an approved action that the rule gates runs only with
+        // its evidence committed.
+        if (!recorded) {
+          throw new PolicyBlockedError(POLICY_EVIDENCE_UNAVAILABLE, evaluation.matchedRuleId);
+        }
         return { evaluation, enforced };
       }
       const why =
@@ -254,13 +260,23 @@ export class PolicyService {
     return { evaluation, enforced };
   }
 
+  /**
+   * Saves the decision row and its audit event in one transaction
+   * (`PolicyDecisionStore.record`). Returns false when they could not be
+   * saved; the failure is logged, never thrown. The caller decides:
+   *
+   * - an outcome that does not gate (allow, monitor mode) proceeds;
+   * - an enforced block or denial is refused anyway;
+   * - an enforced `require_approval` with an approval is refused
+   *   (`POLICY_EVIDENCE_UNAVAILABLE`), so no gated action runs without evidence.
+   */
   private async recordEvidence(
     input: PolicyEvaluationInput,
     evaluation: PolicyEvaluation,
     enforced: boolean,
     // For require_approval: the resolved human decision. Null otherwise.
     disposition: PolicyApprovalDisposition | null
-  ): Promise<void> {
+  ): Promise<boolean> {
     try {
       const snapshot: Record<string, unknown> = redactSecrets({
         toolName: input.toolName,
@@ -272,7 +288,7 @@ export class PolicyService {
         ...(input.actionSnapshot ?? {})
       });
 
-      const decision = await this.decisions.record(input.tenantId, {
+      await this.decisions.record(input.tenantId, {
         sessionId: input.sessionId,
         userId: input.userId,
         runtimeId: input.runtimeId,
@@ -285,12 +301,9 @@ export class PolicyService {
         enforced,
         explanation: evaluation.explanation,
         actionSnapshot: snapshot
-      });
-
-      await this.auditEvents.create({
+      }, (decision) => ({
         tenantId: input.tenantId,
         sessionId: input.sessionId,
-        userId: input.userId ?? "system",
         type: enforced ? "policy.decision.enforced" : "policy.decision.recorded",
         payload: {
           decisionId: decision.decisionId,
@@ -301,14 +314,17 @@ export class PolicyService {
           enforced,
           ...(disposition ? { approvalDisposition: disposition } : {})
         }
-      });
+      }));
+      return true;
     } catch (error) {
-      this.logger.warn("policy: failed to persist decision evidence (action not affected)", {
+      this.logger.warn("policy: failed to persist decision evidence", {
         tenantId: input.tenantId,
         toolName: input.toolName,
         matchedRuleId: evaluation.matchedRuleId,
+        enforced,
         error: error instanceof Error ? error.message : String(error)
       });
+      return false;
     }
   }
 }

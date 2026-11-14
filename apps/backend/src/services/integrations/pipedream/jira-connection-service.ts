@@ -3,7 +3,7 @@ import { createHmac } from "node:crypto";
 import { z } from "zod";
 
 import type { AppConfig } from "../../../config.js";
-import type { AuditEventStore } from "../../audit-event-store.js";
+import type { AuditEventInput, AuditEventStore } from "../../audit-event-store.js";
 import type { AuditEventType } from "../../audit-event-types.js";
 import type { RuntimeInvalidator } from "../contracts.js";
 import { buildIntegrationRedirectUrl } from "../integration-oauth-helpers.js";
@@ -338,11 +338,11 @@ export class JiraConnectionService {
         siteName: site.name,
         siteUrl: site.url,
         ownerSecurityVersion
-      }, identity);
+      }, identity, () => this.auditEvent(tenantId, userId, "user.jira.connected",
+        { accountId: account.id, siteId: site.siteId }));
     } catch (error) {
       throw this.lifecycleError(error);
     }
-    await this.audit(tenantId, userId, "user.jira.connected", { accountId: account.id, siteId: site.siteId });
     await this.invalidate(tenantId, userId);
     return toSummary(record);
   }
@@ -358,12 +358,12 @@ export class JiraConnectionService {
    * not prove that Atlassian revoked the grant.
    */
   async disconnect(tenantId: string, userId: string): Promise<boolean> {
-    const retired = await this.store.retire(tenantId, userId, "user_disconnect", this.binding);
+    const retired = await this.store.retire(tenantId, userId, "user_disconnect", this.binding,
+      (cleanup) => this.auditEvent(tenantId, userId, "user.jira.disconnected", {
+        accountId: cleanup.accountId,
+        cleanupId: cleanup.cleanupId
+      }));
     if (retired) {
-      await this.audit(tenantId, userId, "user.jira.disconnected", {
-        accountId: retired.accountId,
-        cleanupId: retired.cleanupId
-      });
       await this.invalidate(tenantId, userId);
     }
     const outcome = await this.runMemberCleanups(tenantId, userId);
@@ -474,12 +474,12 @@ export class JiraConnectionService {
    */
   private async runCleanup(cleanup: JiraCleanupRecord): Promise<JiraCleanupOutcome> {
     const fail = async (error: string): Promise<JiraCleanupOutcome> => {
-      const updated = await this.store.recordCleanupFailure(cleanup.tenantId, cleanup.cleanupId, error);
-      await this.audit(cleanup.tenantId, cleanup.userId, "user.jira.cleanup_failed", {
-        cleanupId: cleanup.cleanupId,
-        reason: cleanup.reason,
-        error
-      });
+      const updated = await this.store.recordCleanupFailure(cleanup.tenantId, cleanup.cleanupId, error,
+        this.auditEvent(cleanup.tenantId, cleanup.userId, "user.jira.cleanup_failed", {
+          cleanupId: cleanup.cleanupId,
+          reason: cleanup.reason,
+          error
+        }));
       return { status: "failed", cleanup: toCleanupView(updated ?? { ...cleanup, lastError: error }) };
     };
     const client = this.client;
@@ -502,12 +502,12 @@ export class JiraConnectionService {
       if (error instanceof JiraConnectionError && error.code === "cleanup_incomplete") return fail(error.message);
       throw error;
     }
-    await this.store.completeCleanup(cleanup.tenantId, cleanup.cleanupId);
-    await this.audit(cleanup.tenantId, cleanup.userId, "user.jira.cleanup_completed", {
-      cleanupId: cleanup.cleanupId,
-      reason: cleanup.reason,
-      remoteAccountsDeleted: deleted
-    });
+    await this.store.completeCleanup(cleanup.tenantId, cleanup.cleanupId,
+      this.auditEvent(cleanup.tenantId, cleanup.userId, "user.jira.cleanup_completed", {
+        cleanupId: cleanup.cleanupId,
+        reason: cleanup.reason,
+        remoteAccountsDeleted: deleted
+      }));
     return { status: "completed", remoteAccountsDeleted: deleted };
   }
 
@@ -596,12 +596,10 @@ export class JiraConnectionService {
     }
   }
 
-  private async audit(tenantId: string, userId: string, type: AuditEventType, payload: Record<string, unknown>): Promise<void> {
-    try {
-      await this.auditEvents?.create({ tenantId, sessionId: null, userId, type, payload });
-    } catch (err) {
-      this.logger.warn({ err }, "Failed to audit Jira connection change");
-    }
+  /** A Jira lifecycle event. The store writes it in the change's transaction. */
+  private auditEvent(tenantId: string, userId: string, type: AuditEventType,
+    payload: Record<string, unknown>): AuditEventInput {
+    return { tenantId, sessionId: null, userId, type, payload };
   }
 
   private async invalidate(tenantId: string, userId: string): Promise<void> {

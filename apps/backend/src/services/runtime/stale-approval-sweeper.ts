@@ -1,7 +1,6 @@
 import type { FastifyBaseLogger } from "fastify";
 
 import type { ApprovalStore } from "../auth/approval-store.js";
-import type { AuditEventStore } from "../audit-event-store.js";
 
 export type StaleApprovalSweeperDeps = {
   /**
@@ -10,7 +9,6 @@ export type StaleApprovalSweeperDeps = {
    * the tenant whose context happens to be set (i.e. none, here).
    */
   approvals: Pick<ApprovalStore, "sweepExpired">;
-  auditEvents: Pick<AuditEventStore, "create">;
   logger: Pick<FastifyBaseLogger, "info" | "warn" | "error">;
 };
 
@@ -22,7 +20,9 @@ export type StaleApprovalSweeperDeps = {
  *
  * Idempotent and safe to run repeatedly: `sweepExpired` only touches rows still
  * `pending` and past deadline, using `FOR UPDATE SKIP LOCKED`, so concurrent
- * sweeps (or a sweep racing a live timer) never double-expire or block.
+ * sweeps (or a sweep racing a live timer) never double-expire or block. Each
+ * batch writes its `approval.expired` events in its own transaction. A failed
+ * batch throws and stays `pending` for the next sweep.
  */
 export async function sweepStaleApprovals(
   deps: StaleApprovalSweeperDeps,
@@ -33,23 +33,6 @@ export async function sweepStaleApprovals(
   // outage) is drained without a single oversized UPDATE/audit burst.
   for (;;) {
     const expired = await deps.approvals.sweepExpired(batchSize);
-    for (const row of expired) {
-      try {
-        await deps.auditEvents.create({
-          tenantId: row.tenantId,
-          sessionId: row.sessionId,
-          userId: row.userId,
-          approvalId: row.approvalId,
-          type: "approval.expired",
-          payload: { itemId: row.itemId, kind: row.kind, reason: "stale_on_sweep" }
-        });
-      } catch (err) {
-        deps.logger.error(
-          { err, approvalId: row.approvalId, sessionId: row.sessionId },
-          "Failed to write approval.expired audit event during stale sweep"
-        );
-      }
-    }
     total += expired.length;
     if (expired.length < batchSize) break;
   }

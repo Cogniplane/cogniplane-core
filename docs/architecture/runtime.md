@@ -259,8 +259,9 @@ delete). Limits: `SCHEDULED_JOB_CREATE_LIMIT_*` and
   `pending` run (`attachJobRunSession`, `finishJobRun`). After a crash, the
   stale-run sweep marks the run `failed`. A late writer after the sweep changes
   nothing and writes no audit event, so each run has at most one
-  `scheduler.job.run.*` event. A write that fails leaves the run `pending` for
-  the sweep.
+  `scheduler.job.run.*` event. The outcome, a failure-limit disable and their
+  audit events commit together; the sweep writes each batch and its events in
+  one transaction. A write that fails leaves the run `pending` for the sweep.
 - A job delete removes its runs. The outcome of a run whose job was deleted is
   not saved and gets no `scheduler.job.run.*` event: the sweep can have written
   that run's event before the delete. So a run that was still running when its

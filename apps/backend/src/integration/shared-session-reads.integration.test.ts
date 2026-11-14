@@ -19,6 +19,7 @@ import { registerSessionRoutes, type SessionRouteStores } from "../routes/sessio
 import { createTestConfig } from "../test-helpers/test-config.js";
 import { appPool, superuserPool, adminDatabaseUrl } from "./support/database.js";
 import { seedTenant, seedUser, seedMembership } from "./support/fixtures.js";
+import { downloadAudit } from "../test-helpers/download-audit.js";
 
 async function setup() {
   const tenantId = await seedTenant(), userId = await seedUser();
@@ -50,7 +51,7 @@ async function setup() {
   app.addHook("preHandler", async request => { request.auth = auth; });
   const openReadStream = vi.fn(async (_key: string) => ({ stream: Readable.from(["data"]), fileSizeBytes: 4 }));
   const extractArtifactText = vi.fn(async () => "PDF text");
-  await registerArtifactRoutes(app, { sessions, artifacts, auditEvents: new AuditEventStore(appPool()),
+  await registerArtifactRoutes(app, { sessions, artifacts,
     storage: { openReadStream, put: vi.fn(), delete: vi.fn() }, processor: { extractArtifactText },
     limits: { consumeRateLimit: async () => null } });
   await registerSessionCapabilityRoutes(app, {
@@ -58,7 +59,7 @@ async function setup() {
     tenantMembers: { isUserBetaTester: async () => false },
     dynamicConfig: { compileProjectCatalog: async () => ({ skills: [], mcpServers: [] }), compileRuntimeConfig: async () => ({ skills: [], mcpServers: [] }), listMcpServers: async () => [] },
   } as unknown as SessionCapabilityStores);
-  await registerAdminArtifactRoutes(app, { auditEvents: new AuditEventStore(appPool()) });
+  await registerAdminArtifactRoutes(app);
   await registerSessionRoutes(app, { sessions, messages } as unknown as SessionRouteStores);
   await registerProjectRoutes(app, {
     projects,
@@ -172,7 +173,7 @@ describe.skipIf(!adminDatabaseUrl())("shared session reads", () => {
     await h.members.setMember(h.actor, h.userId, null, { confirmNoOwner: true });
     expect((await h.app.inject(`/projects/${h.actor.projectId}`)).statusCode).toBe(200);
     expect((await h.app.inject(`/sessions/${h.sessionId}/messages`)).statusCode).toBe(200);
-    const consume = () => h.artifacts.consumeDownloadToken({ token });
+    const consume = () => h.artifacts.consumeDownloadToken({ token, audit: downloadAudit });
     const results = await Promise.all([consume(), consume()]);
     expect(results.filter(Boolean)).toHaveLength(1);
     expect(results.filter(result => result === null)).toHaveLength(1);
