@@ -1,6 +1,6 @@
 import { describe, expect, test, vi } from "vitest";
 
-import { parseDeleteTenantArguments, runDeleteTenant } from "./delete-tenant-lib.js";
+import { externalResourceNotice, parseDeleteTenantArguments, runDeleteTenant } from "./delete-tenant-lib.js";
 
 const complete = [
   "--tenant-id", "t1",
@@ -90,5 +90,41 @@ describe("runDeleteTenant", () => {
     );
     expect(connectRedis).not.toHaveBeenCalled();
     expect(print).not.toHaveBeenCalled();
+  });
+});
+
+describe("externalResourceNotice", () => {
+  const none = {
+    e2bSandboxes: 0,
+    jira: {
+      externalUserIds: 0,
+      activeExternalUserIds: 0,
+      activeExternalUserIdsWithoutSelectedAccount: 0,
+      selectedAccounts: 0,
+      retiredExternalUserIdsPendingCleanup: 0,
+      pendingCleanups: 0
+    },
+    oauthConnections: { github: 0, notion: 0, microsoft: 0 },
+    personalMcpCredentials: 0
+  };
+
+  test("prints nothing when the tenant had no resource outside the database", () => {
+    expect(externalResourceNotice({ externalResources: none })).toBeNull();
+  });
+
+  test.each([
+    ["a sandbox", { ...none, e2bSandboxes: 1 }],
+    ["a Pipedream external user id", { ...none, jira: { ...none.jira, externalUserIds: 1 } }],
+    ["a pending Jira cleanup", { ...none, jira: { ...none.jira, pendingCleanups: 1 } }],
+    ["a GitHub connection", { ...none, oauthConnections: { ...none.oauthConnections, github: 1 } }],
+    ["a Notion connection", { ...none, oauthConnections: { ...none.oauthConnections, notion: 1 } }],
+    ["a Microsoft connection", { ...none, oauthConnections: { ...none.oauthConnections, microsoft: 1 } }],
+    ["a personal MCP credential", { ...none, personalMcpCredentials: 1 }]
+  ])("says that the command did not revoke %s", (_case, externalResources) => {
+    expect(externalResourceNotice({ externalResources })).toMatch(/deleted only their database rows: it killed no E2B sandbox/);
+  });
+
+  test("says that a receipt without counts has no record of them", () => {
+    expect(externalResourceNotice({ externalResources: null })).toMatch(/^externalResources is null: .*not recorded/);
   });
 });
