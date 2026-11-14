@@ -198,6 +198,7 @@ export class SkillLifecycleService {
         dryRun: report.dryRun,
         deletedRevisionCount: report.deletedRevisionIds.length,
         deletedBundleCount: report.deletedBundleStorageUris.length,
+        pendingBundleCount: report.pendingBundleStorageUris.length,
         failureCount: report.failures.length,
         keptCount: report.keptRevisionDecisions.length,
         report

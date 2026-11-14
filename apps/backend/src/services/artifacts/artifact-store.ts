@@ -8,6 +8,7 @@ import { uuidv7 } from "../../lib/uuid.js";
 import { escapeLikePattern, type Pool, withTenantScope } from "../../lib/db.js";
 import { isoTimestamp } from "../../lib/db-mappers.js";
 import { AuditEventStore, type AuditEventInput } from "../audit-event-store.js";
+import { enqueueSessionStorageGc } from "../storage/storage-gc.js";
 
 // Persisted metadata key shared by copy creation and scan completion.
 export const PROJECT_COPY_SOURCE_KEY = "reusedFromArtifactId";
@@ -775,6 +776,52 @@ export class ArtifactStore {
     pii: ArtifactPiiDetail
   ): Promise<void> {
     await withTenantScope(this.db, tenantId, (client) => writeArtifactPiiDetail(client, tenantId, artifactId, pii));
+  }
+
+  /**
+   * A PII rejection that gives up the stored object (a block, or a permanent
+   * scan error), in one tenant transaction:
+   *
+   * - writes the PII detail, and `status` when given;
+   * - marks the row released (`storage_released_at`): the row keeps its
+   *   verdict, but it no longer keeps the object
+   *   (`storage/storage-references.ts`);
+   * - queues the key that the row holds now in `session_storage_gc`, with a
+   *   lease for the caller.
+   *
+   * The caller deletes the object after the commit (`StorageGc`). A failed
+   * delete stays queued for the worker. Returns the queued key, or null when
+   * the row is gone or deleted (session purge owns its objects).
+   */
+  async rejectStoredObject(
+    tenantId: string,
+    artifactId: string,
+    input: { pii: ArtifactPiiDetail; status?: "failed" }
+  ): Promise<{ sessionId: string; storageKey: string } | null> {
+    return withTenantScope(this.db, tenantId, async (client) => {
+      // Read the key in this transaction, not from a job payload: a change of
+      // the row must not queue an object that the row no longer holds.
+      const current = await client.query<{ session_id: string; storage_key: string }>(
+        `SELECT session_id, storage_key FROM artifacts
+         WHERE tenant_id = $1 AND artifact_id = $2 AND status <> 'deleted'
+         FOR UPDATE`,
+        [tenantId, artifactId]
+      );
+      const row = current.rows[0];
+      if (!row) return null;
+      await writeArtifactPiiDetail(client, tenantId, artifactId, input.pii);
+      await client.query(
+        `UPDATE artifacts
+         SET status = COALESCE($3, status),
+             storage_released_at = COALESCE(storage_released_at, NOW()),
+             updated_at = NOW()
+         WHERE tenant_id = $1 AND artifact_id = $2`,
+        [tenantId, artifactId, input.status ?? null]
+      );
+      const released = { sessionId: String(row.session_id), storageKey: String(row.storage_key) };
+      await enqueueSessionStorageGc(client, { tenantId, ...released, leased: true });
+      return released;
+    });
   }
 
   async createDownloadToken(input: {

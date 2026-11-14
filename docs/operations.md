@@ -237,6 +237,12 @@ queued in `tenant_deletion_cleanup`. It does not change Redis unless you add
 sandbox: a sandbox of the tenant runs until E2B expires it
 (`E2B_SANDBOX_TIMEOUT_MS` after its last turn start).
 
+Objects: the queue gets the tenant's live storage locators and its storage
+cleanup queues ([stored objects](architecture/data.md#stored-objects)). An
+object that a live row of another tenant names stays
+(`retainedSharedObjectCount`); a cleanup queue row of another tenant does not
+keep it.
+
 User rows: the transaction finds each user that a row of the tenant names,
 also a former member with no membership left, and locks these `users` rows.
 After the tenant's rows are deleted, it deletes each of these users that no

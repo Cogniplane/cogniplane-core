@@ -2,12 +2,18 @@ import { test, expect } from "vitest";
 
 import type { AdminSkillRecord, AdminSkillRevisionRecord } from "../admin-config-records.js";
 
+import type { StorageGcOutcome } from "../storage/storage-gc.js";
 import { cleanupInactiveSkillRevisions } from "./skill-revision-cleanup-service.js";
 
 type CleanupInput = Parameters<typeof cleanupInactiveSkillRevisions>[0];
-type CapturedStores = Pick<CleanupInput, "skills" | "skillRevisions" | "skillBundleStorage"> & {
+type CapturedStores = Pick<CleanupInput, "skills" | "skillRevisions" | "bundleGc"> & {
   deletedRevisions: number[];
   deletedBundles: string[];
+  /** The outcome of the queued bundle delete, by URI; "deleted" when absent. */
+  bundleOutcomes: Map<string, StorageGcOutcome>;
+  /** Bundles that an earlier cleanup queued: the retry outcome by URI. */
+  queuedBundles: Map<string, StorageGcOutcome>;
+  calls: string[];
 };
 
 function rev(o: Partial<AdminSkillRevisionRecord>): AdminSkillRevisionRecord {
@@ -66,9 +72,15 @@ const config = {
 function captureStores(): CapturedStores {
   const deletedRevisions: number[] = [];
   const deletedBundles: string[] = [];
+  const bundleOutcomes = new Map<string, StorageGcOutcome>();
+  const queuedBundles = new Map<string, StorageGcOutcome>();
+  const calls: string[] = [];
   return {
     deletedRevisions,
     deletedBundles,
+    bundleOutcomes,
+    queuedBundles,
+    calls,
     skills: {
       async listSkills() {
         return [skill({ activeRevisionId: 1 })];
@@ -81,17 +93,26 @@ function captureStores(): CapturedStores {
       async listActiveRuntimeSkillReferences() {
         return [];
       },
+      async listAcceptedSubmissionRevisions() {
+        return [];
+      },
       async deleteSkillRevision(_t: string, _s: string, id: number) {
+        calls.push(`delete:${id}`);
         deletedRevisions.push(id);
         return rev({ skillRevisionId: id, bundleStorageUri: `s3://bkt/sk1/v${id}` });
-      },
-      async countSkillRevisionsByBundleStorageUri() {
-        return 0;
       }
     },
-    skillBundleStorage: {
-      async deleteBundle(uri: string) {
-        deletedBundles.push(uri);
+    bundleGc: {
+      async retryTenantSkillBundles() {
+        calls.push("retry");
+        for (const [uri, outcome] of queuedBundles) if (outcome === "deleted") deletedBundles.push(uri);
+        return new Map(queuedBundles);
+      },
+      async collectSkillBundle(row: { storageUri: string }) {
+        calls.push(`collect:${row.storageUri}`);
+        const outcome = bundleOutcomes.get(row.storageUri) ?? "deleted";
+        if (outcome === "deleted") deletedBundles.push(row.storageUri);
+        return outcome;
       }
     }
   };
@@ -113,7 +134,7 @@ test("cleanupInactiveSkillRevisions: dry-run reports candidate deletions without
     config,
     skills: stores.skills,
     skillRevisions: stores.skillRevisions,
-    skillBundleStorage: stores.skillBundleStorage,
+    bundleGc: stores.bundleGc,
     dryRun: true
   });
   expect(report.dryRun).toBe(true);
@@ -122,6 +143,9 @@ test("cleanupInactiveSkillRevisions: dry-run reports candidate deletions without
   // Bundles listed for tracking but no real deletion
   expect(stores.deletedRevisions.length).toBe(0);
   expect(stores.deletedBundles.length).toBe(0);
+  // A dry run does not retry queued bundles either.
+  expect(stores.calls).toEqual([]);
+  expect(report.pendingBundleStorageUris).toEqual([]);
 });
 
 test("cleanupInactiveSkillRevisions: keeps the active revision", async () => {
@@ -136,7 +160,7 @@ test("cleanupInactiveSkillRevisions: keeps the active revision", async () => {
     config,
     skills: stores.skills,
     skillRevisions: stores.skillRevisions,
-    skillBundleStorage: stores.skillBundleStorage,
+    bundleGc: stores.bundleGc,
     dryRun: false
   });
   expect(report.deletedRevisionIds).toEqual([]);
@@ -160,7 +184,7 @@ test("cleanupInactiveSkillRevisions: deletes inactive revision and removes bundl
     config,
     skills: stores.skills,
     skillRevisions: stores.skillRevisions,
-    skillBundleStorage: stores.skillBundleStorage,
+    bundleGc: stores.bundleGc,
     dryRun: false
   });
   // rev 6 is latest, retained. rev 5 deleted.
@@ -176,14 +200,15 @@ test("cleanupInactiveSkillRevisions: keeps bundle when other revisions still ref
     rev({ skillRevisionId: 5, revisionNumber: 1, bundleStorageUri: "s3://bkt/shared" }),
     rev({ skillRevisionId: 6, revisionNumber: 2, bundleStorageUri: "s3://bkt/v6" })
   ];
-  stores.skillRevisions.countSkillRevisionsByBundleStorageUri = async () => 2;
+  // The collector finds the other revision that names the bundle.
+  stores.bundleOutcomes.set("s3://bkt/sk1/v5", "retained");
 
   const report = await cleanupInactiveSkillRevisions({
     tenantId: "t",
     config,
     skills: stores.skills,
     skillRevisions: stores.skillRevisions,
-    skillBundleStorage: stores.skillBundleStorage,
+    bundleGc: stores.bundleGc,
     dryRun: false
   });
   expect(stores.deletedRevisions).toEqual([5]);
@@ -206,7 +231,7 @@ test("cleanupInactiveSkillRevisions: records failure when deletion returns null"
     config,
     skills: stores.skills,
     skillRevisions: stores.skillRevisions,
-    skillBundleStorage: stores.skillBundleStorage,
+    bundleGc: stores.bundleGc,
     dryRun: false
   });
   expect(report.deletedRevisionIds).toEqual([]);
@@ -230,7 +255,7 @@ test("cleanupInactiveSkillRevisions: catches and reports thrown errors", async (
     config,
     skills: stores.skills,
     skillRevisions: stores.skillRevisions,
-    skillBundleStorage: stores.skillBundleStorage,
+    bundleGc: stores.bundleGc,
     dryRun: false
   });
   expect(report.failures.length).toBe(1);
@@ -258,7 +283,7 @@ test("cleanupInactiveSkillRevisions: deletedBundleStorageUris are deduped and so
     config,
     skills: stores.skills,
     skillRevisions: stores.skillRevisions,
-    skillBundleStorage: stores.skillBundleStorage,
+    bundleGc: stores.bundleGc,
     dryRun: false
   });
   expect(report.deletedBundleStorageUris).toEqual(["s3://bkt/a", "s3://bkt/b"]);
@@ -281,4 +306,59 @@ test("cleanupInactiveSkillRevisions keeps an old revision used only by a running
   });
   expect(stores.deletedRevisions).toEqual([]);
   expect(stores.deletedBundles).toEqual([]);
+});
+
+test("cleanupInactiveSkillRevisions keeps a revision that an accepted submission names", async () => {
+  const stores = captureStores();
+  stores.skills.listSkills = async () => [skill({ activeRevisionId: 99 })];
+  stores.skillRevisions.listAllSkillRevisions = async () => [
+    rev({ skillRevisionId: 1, revisionNumber: 1 }),
+    rev({ skillRevisionId: 2, revisionNumber: 2, bundleStorageUri: null })
+  ];
+  stores.skillRevisions.listAcceptedSubmissionRevisions = async () => [
+    { revisionId: 1, submissionId: "sub-b" },
+    { revisionId: 1, submissionId: "sub-a" }
+  ];
+
+  const report = await cleanupInactiveSkillRevisions({ tenantId: "t", config, ...stores, dryRun: false });
+
+  expect(report.keptRevisionDecisions).toContainEqual({
+    skillRevisionId: 1, reason: "accepted_submission_reference:sub-b,sub-a"
+  });
+  expect(report.deletedRevisionIds).toEqual([]);
+  expect(stores.deletedRevisions).toEqual([]);
+});
+
+test("cleanupInactiveSkillRevisions reports a failed bundle delete as pending, not as a failed revision", async () => {
+  const stores = captureStores();
+  stores.skills.listSkills = async () => [skill({ activeRevisionId: 99 })];
+  stores.skillRevisions.listAllSkillRevisions = async () => [
+    rev({ skillRevisionId: 5, revisionNumber: 1 }),
+    rev({ skillRevisionId: 6, revisionNumber: 2 })
+  ];
+  stores.bundleOutcomes.set("s3://bkt/sk1/v5", "pending");
+
+  const report = await cleanupInactiveSkillRevisions({ tenantId: "t", config, ...stores, dryRun: false });
+
+  expect(report.deletedRevisionIds).toEqual([5]);
+  expect(report.deletedBundleStorageUris).toEqual([]);
+  expect(report.pendingBundleStorageUris).toEqual(["s3://bkt/sk1/v5"]);
+  expect(report.failures).toEqual([]);
+});
+
+test("cleanupInactiveSkillRevisions retries the queued bundles before it deletes new revisions", async () => {
+  const stores = captureStores();
+  stores.skills.listSkills = async () => [skill({ activeRevisionId: 99 })];
+  stores.skillRevisions.listAllSkillRevisions = async () => [
+    rev({ skillRevisionId: 5, revisionNumber: 1 }),
+    rev({ skillRevisionId: 6, revisionNumber: 2 })
+  ];
+  stores.queuedBundles.set("s3://bkt/earlier", "deleted");
+  stores.queuedBundles.set("s3://bkt/still-failing", "pending");
+
+  const report = await cleanupInactiveSkillRevisions({ tenantId: "t", config, ...stores, dryRun: false });
+
+  expect(stores.calls).toEqual(["retry", "delete:5", "collect:s3://bkt/sk1/v5"]);
+  expect(report.deletedBundleStorageUris).toEqual(["s3://bkt/earlier", "s3://bkt/sk1/v5"]);
+  expect(report.pendingBundleStorageUris).toEqual(["s3://bkt/still-failing"]);
 });

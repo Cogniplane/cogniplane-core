@@ -74,6 +74,8 @@ import { SessionExecutionStore } from "../services/session-execution-store.js";
 import { SessionStore } from "../services/session-store.js";
 import { OrganizationSkillSubmissionStore } from "../services/skills/organization-skill-submission-store.js";
 import { PersonalSkillStore } from "../services/skills/personal-skill-store.js";
+import { SkillConfigStore } from "../services/skills/skill-config-store.js";
+import { SkillRevisionStore } from "../services/skills/skill-revision-store.js";
 import { ProjectSkillStore } from "../services/skills/project-skill-store.js";
 import { TenantOrgSettingsStore } from "../services/tenant-org-settings-store.js";
 import { TenantSettingsStore } from "../services/tenant-settings-store.js";
@@ -912,7 +914,9 @@ const WRITE_PATHS: Record<string, WritePath> = {
     writer: "maintenance",
     reason:
       "The retention job selects expired sessions across every tenant, so production runs it on the " +
-      "maintenance pool (scheduler worker). On the application pool it purges nothing; see below.",
+      "maintenance pool (scheduler worker). On the application pool it purges nothing; see below. " +
+      "A PII rejection (ArtifactStore.rejectStoredObject) also writes it, as app_user in the tenant " +
+      "scope: storage-references.integration.test.ts runs that path.",
     write: async () => {
       const { sessionId, storageKey } = await sessionCleanup();
       return { session_id: sessionId, storage_key: storageKey };
@@ -1041,6 +1045,25 @@ const WRITE_PATHS: Record<string, WritePath> = {
     path: "OrganizationSkillSubmissionStore.decide (accept)",
     writer: "app",
     write: async () => ({ skill_id: await acceptedSkillId(), revision_number: 1 })
+  },
+  skill_bundle_storage_gc: {
+    path: "SkillRevisionStore.deleteSkillRevision (revision cleanup)",
+    writer: "app",
+    write: async () => {
+      const { owner } = await people();
+      const revisions = new SkillRevisionStore(appPool(), new SkillConfigStore(appPool()));
+      const skillId = unique("bundle-gc");
+      const storageUri = `file:///write-paths/${randomUUID()}`;
+      const imported = await revisions.importSkillBundle(owner.tenantId, {
+        skillId, skillName: skillId, description: "Bundle queue", instructions: "Unused.",
+        sourceType: "zip", sourceLabel: "write paths", bundleName: skillId, bundleHash: "d".repeat(64),
+        validationStatus: "validated", validationMessages: [], metadata: {}, createdBy: owner.userId,
+        storeBundle: async () => ({ storageUri })
+      });
+      const deleted = await revisions.deleteSkillRevision(owner.tenantId, skillId, imported.revision.skillRevisionId);
+      if (!deleted) throw new Error("SkillRevisionStore.deleteSkillRevision deleted nothing");
+      return { storage_uri: storageUri };
+    }
   },
   personal_capability_defaults: {
     path: "PersonalCapabilityStore.save",
@@ -1483,7 +1506,7 @@ describe.skipIf(!adminDatabaseUrl())("RLS through production write paths", () =>
     // The GC rows stay due for the retention jobs. Remove them so a later
     // file's cleanup run does not count them as its own work.
     const { owner } = await people();
-    for (const table of ["session_storage_gc", "session_runtime_gc", "project_file_storage_gc"]) {
+    for (const table of ["session_storage_gc", "session_runtime_gc", "project_file_storage_gc", "skill_bundle_storage_gc"]) {
       await superuserPool().query(`DELETE FROM ${table} WHERE tenant_id = $1`, [owner.tenantId]);
     }
   });

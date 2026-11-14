@@ -386,6 +386,7 @@ class InMemoryAdminConfig implements AdminDynamicConfig {
       dryRun: input.dryRun ?? false,
       deletedRevisionIds: input.dryRun ? [] : [2],
       deletedBundleStorageUris: input.dryRun ? [] : ["file:///tmp/pdf-processing-old"],
+      pendingBundleStorageUris: [],
       keptRevisionDecisions: [{ skillRevisionId: 3, reason: "active_registry_revision" }],
       failures: []
     };

@@ -61,7 +61,7 @@ function makeStores(overrides: DynamicConfigStoreOverrides = {}): DynamicConfigS
       async listAllSkillRevisions() { return []; },
       async listActiveRuntimeSkillReferences() { return []; },
       async deleteSkillRevision() { return null; },
-      async countSkillRevisionsByBundleStorageUri() { return 0; },
+      async listAcceptedSubmissionRevisions() { return []; },
       async importSkillBundle() {
         throw new Error("importSkillBundle should not be called");
       },
@@ -83,7 +83,8 @@ function makeStores(overrides: DynamicConfigStoreOverrides = {}): DynamicConfigS
       async upsert() { throw new Error("upsert should not be called"); },
       async setMcpServerAllowed() { throw new Error("setMcpServerAllowed should not be called"); },
       ...overrides.tenantSettings
-    }
+    },
+    ...(overrides.storageGc ? { storageGc: overrides.storageGc as DynamicConfigStores["storageGc"] } : {})
   };
 }
 
@@ -604,11 +605,16 @@ test("DynamicConfigService cleans up inactive skill revisions after the retentio
             activatedAt: new Date().toISOString()
           };
         },
-        async countSkillRevisionsByBundleStorageUri() {
-          return 0;
-        },
         async importSkillBundle() {
           throw new Error("importSkillBundle should not be called");
+        }
+      },
+      // The queue the delete wrote: the cleanup deletes the bundle through it.
+      storageGc: {
+        async retryTenantSkillBundles() { return new Map(); },
+        async collectSkillBundle(row: { storageUri: string }) {
+          deletedBundles.push(row.storageUri);
+          return "deleted" as const;
         }
       }
     }),
@@ -616,8 +622,8 @@ test("DynamicConfigService cleans up inactive skill revisions after the retentio
       async storeBundle() {
         throw new Error("storeBundle should not be called");
       },
-      async deleteBundle(bundlePath: string) {
-        deletedBundles.push(bundlePath);
+      async deleteBundle() {
+        throw new Error("cleanup deletes bundles through the storage queue");
       }
     },
     makeManagedToolCatalog()

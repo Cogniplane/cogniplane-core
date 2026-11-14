@@ -20,6 +20,7 @@ import type { ToolExecutionContextStore } from "./auth/tool-execution-context-st
 import type { UserSettingsStore } from "./user-settings-store.js";
 import type { ProjectFileStore } from "./project-file-store.js";
 import type { ArtifactStorage } from "./artifacts/artifact-storage.js";
+import type { StorageGc } from "./storage/storage-gc.js";
 
 /**
  * Resolve the runtime and model for a scheduled turn the way an interactive
@@ -100,12 +101,14 @@ export function buildSchedulerWorker(
     sessionTrash?: Pick<SessionStore, "cleanupExpired">;
     scheduledSessions?: Pick<SessionStore, "cleanupExpiredScheduled">;
     sessionStorage?: Pick<ArtifactStorage, "delete">;
+    storageGc?: Pick<StorageGc, "drain">;
     logger: FastifyBaseLogger;
   }
 ) {
   // The worker drives independent workloads: the cron scheduler, the async
-  // PII scan-job drain, project-file retention, session Trash retention, and
-  // scheduled session retention. Any one alone is reason enough to run it.
+  // PII scan-job drain, project-file retention, session Trash retention,
+  // scheduled session retention, and the storage cleanup queues. Any one
+  // alone is reason enough to run it.
   //
   // The PII drain runs whenever its deps exist. The rule detector queues
   // artifact scans without the remote provider, so gating on
@@ -123,12 +126,16 @@ export function buildSchedulerWorker(
   const scheduledSessionRetentionEnabled =
     config.SCHEDULED_SESSION_RETENTION_ENABLED &&
     Boolean(input.scheduledSessions && input.sessionStorage);
+  // No setting turns it off: a failed object delete stays queued only if a
+  // worker retries it.
+  const storageGcEnabled = Boolean(input.storageGc);
   if (
     !config.SCHEDULER_ENABLED &&
     !piiDrainEnabled &&
     !projectRetentionEnabled &&
     !sessionRetentionEnabled &&
-    !scheduledSessionRetentionEnabled
+    !scheduledSessionRetentionEnabled &&
+    !storageGcEnabled
   ) {
     return null;
   }
@@ -161,6 +168,7 @@ export function buildSchedulerWorker(
       sessionTrash: sessionRetentionEnabled ? input.sessionTrash : undefined,
       scheduledSessions: scheduledSessionRetentionEnabled ? input.scheduledSessions : undefined,
       sessionStorage: sessionRetentionEnabled || scheduledSessionRetentionEnabled ? input.sessionStorage : undefined,
+      storageGc: input.storageGc,
       runtimeAdapter: input.runtimeAdapter,
       // Poison-job disable is backed by UserSettingsStore.disableJob; thread it
       // in so the worker can permanently drop invalid-cron / repeatedly-failing

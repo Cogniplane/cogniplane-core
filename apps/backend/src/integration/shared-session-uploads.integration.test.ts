@@ -19,11 +19,12 @@ import { PiiArtifactScanEnqueuer } from "../services/pii/pii-artifact-scan-enque
 import { PiiScanRunStore } from "../services/pii/pii-scan-run-store.js";
 import { PiiScanJobStore } from "../services/pii/pii-scan-job-store.js";
 import { PiiScanJobHandler } from "../services/pii/pii-scan-job-handler.js";
+import { StorageGc } from "../services/storage/storage-gc.js";
 import type { PiiDecision } from "../services/pii/pii-protection-service.js";
 import * as uploadAccess from "../services/session-upload-access.js";
 import * as projectAccess from "../services/project-access.js";
 import { createTestConfig } from "../test-helpers/test-config.js";
-import { appPool, superuserPool, adminDatabaseUrl } from "./support/database.js";
+import { appPool, maintenancePool, superuserPool, adminDatabaseUrl } from "./support/database.js";
 import { seedTenant, seedUser, seedMembership } from "./support/fixtures.js";
 import { PiiImportScopeRegistry } from "../services/pii/pii-import-scopes.js";
 import { resolvePiiPolicy } from "../services/pii/pii-policy.js";
@@ -77,7 +78,12 @@ async function setup(mode: PiiProtectionSettings["mode"] = "off") {
       } };
     },
   };
-  const scanDeps = { artifacts, storage, piiScanRuns, piiScanJobs, subjectReader, auditEvents,
+  const storageGc = new StorageGc({
+    maintenanceDb: maintenancePool(),
+    artifactStorage: storage,
+    skillBundleStorage: { deleteBundle: async () => { throw new Error("no bundle in this test"); } }
+  });
+  const scanDeps = { artifacts, storageGc, piiScanRuns, piiScanJobs, subjectReader, auditEvents,
     piiProtection: { readPolicy, isSubjectInScope,
       evaluateArtifactWithPolicy: async () => ({ decision: await evaluateArtifact(), appliedPolicy: { mode, revision: 1 } }),
       evaluateTextWithPolicy: async () => ({

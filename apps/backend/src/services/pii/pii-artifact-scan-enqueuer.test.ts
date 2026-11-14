@@ -34,7 +34,13 @@ function buildDeps(overrides: {
   enqueueThrows?: Error;
   scanRunUpdateThrows?: Error;
   recordDecisionReturns?: boolean;
-  storageDeleteThrows?: Error;
+  // The object delete fails: the key stays queued.
+  storageDeleteFails?: boolean;
+  // The key that the artifact row holds when the rejection reads it.
+  currentStorageKey?: string;
+  // The artifact row is gone or deleted when the rejection reads it.
+  rejectedRowGone?: boolean;
+  rejectThrows?: Error;
   withAuditEvents?: boolean;
 } = {}) {
   const settings: PiiProtectionSettings = {
@@ -53,6 +59,7 @@ function buildDeps(overrides: {
   const logErrorCalls: Array<{ payload: unknown; message: string }> = [];
   const auditCalls: Array<Record<string, unknown>> = [];
   const deleteCalls: string[] = [];
+  const collectCalls: Array<Record<string, unknown>> = [];
   const recordDecisionCalls: Array<{ scanRunId: string; decision: Record<string, unknown> }> = [];
   // The order of the writes that matter for recovery.
   const order: string[] = [];
@@ -122,13 +129,24 @@ function buildDeps(overrides: {
       async update(tenantId: string, artifactId: string, input: Record<string, unknown>) {
         artifactUpdateCalls.push({ tenantId, artifactId, input });
         return null as never;
+      },
+      // One transaction: the verdict, the release and the queued key.
+      async rejectStoredObject(tenantId: string, artifactId: string, input: { pii: Record<string, unknown>; status?: "failed" }) {
+        if (overrides.rejectThrows) throw overrides.rejectThrows;
+        order.push(`detail:${String(input.pii.status)}+queue`);
+        piiDetailCalls.push({ tenantId, artifactId, pii: input.pii });
+        if (input.status) artifactUpdateCalls.push({ tenantId, artifactId, input: { status: input.status } });
+        if (overrides.rejectedRowGone) return null;
+        return { sessionId: "session-1", storageKey: overrides.currentStorageKey ?? "users/user-1/session-1/art-1.txt" };
       }
     },
-    storage: {
-      async delete(storageKey: string) {
+    storageGc: {
+      async collectArtifactObject(row: { queue: string; tenantId: string; ownerId: string; storageKey: string }) {
         order.push("purge");
-        if (overrides.storageDeleteThrows) throw overrides.storageDeleteThrows;
-        deleteCalls.push(storageKey);
+        collectCalls.push(row);
+        if (overrides.storageDeleteFails) return "pending" as const;
+        deleteCalls.push(row.storageKey);
+        return "deleted" as const;
       }
     },
     subjectReader: reader,
@@ -163,6 +181,7 @@ function buildDeps(overrides: {
     logErrorCalls,
     auditCalls,
     deleteCalls,
+    collectCalls,
     recordDecisionCalls,
     order
   };
@@ -324,24 +343,51 @@ test("block mode on a dirty artifact marks it failed, deletes the object, and re
   // The stored bytes are purged and the audit records the delete.
   expect(deleteCalls).toEqual(["users/user-1/session-1/art-1.txt"]);
   const blockedAudit = auditCalls.find((a) => a.type === "pii_blocked");
-  expect((blockedAudit!.payload as Record<string, unknown>).objectDeleted).toBe(true);
+  expect(blockedAudit!.payload).toMatchObject({ objectDeleted: true, objectCleanup: "deleted" });
 });
 
-test("block still returns blocked and audits an orphan when object delete fails", async () => {
-  const { deps, scanRunUpdateCalls, auditCalls } = buildDeps({
+test("block still returns blocked and keeps the key queued when the object delete fails", async () => {
+  const { deps, scanRunUpdateCalls, auditCalls, collectCalls } = buildDeps({
     settings: { enabled: true, mode: "block" },
     decision: dirtyBlockDecision,
-    storageDeleteThrows: new Error("s3 down"),
+    storageDeleteFails: true,
     withAuditEvents: true
   });
   const result = await new PiiArtifactScanEnqueuer(deps).enqueue(sampleInput());
   // The block outcome must stand even though cleanup failed.
   expect(result.kind).toBe("blocked");
   expect(scanRunUpdateCalls.some((c) => c.patch.status === "blocked")).toBe(true);
-  // The orphan is queryable, and pii_blocked records objectDeleted:false.
-  expect(auditCalls.some((a) => a.type === "pii_block_object_orphaned")).toBe(true);
+  // The delete went through the session queue that the worker drains.
+  expect(collectCalls).toEqual([{
+    queue: "session_storage_gc", tenantId: "tenant-1", ownerId: "session-1",
+    storageKey: "users/user-1/session-1/art-1.txt"
+  }]);
+  expect(auditCalls.find((a) => a.type === "pii_block_object_orphaned")?.payload).toMatchObject({ retry: "queued" });
   const blockedAudit = auditCalls.find((a) => a.type === "pii_blocked");
-  expect((blockedAudit!.payload as Record<string, unknown>).objectDeleted).toBe(false);
+  expect(blockedAudit!.payload).toMatchObject({ objectDeleted: false, objectCleanup: "pending" });
+});
+
+test("a block deletes the key that the artifact row holds now, not the key of the request", async () => {
+  const { deps, deleteCalls } = buildDeps({
+    settings: { enabled: true, mode: "block" },
+    decision: dirtyBlockDecision,
+    currentStorageKey: "tenant-1/user-1/session-1/replaced.txt"
+  });
+  await new PiiArtifactScanEnqueuer(deps).enqueue(sampleInput({ storageKey: "users/user-1/session-1/stale.txt" }));
+  expect(deleteCalls).toEqual(["tenant-1/user-1/session-1/replaced.txt"]);
+});
+
+test("a block whose artifact row is gone deletes nothing", async () => {
+  const { deps, deleteCalls, auditCalls } = buildDeps({
+    settings: { enabled: true, mode: "block" },
+    decision: dirtyBlockDecision,
+    rejectedRowGone: true,
+    withAuditEvents: true
+  });
+  await expect(new PiiArtifactScanEnqueuer(deps).enqueue(sampleInput())).resolves.toMatchObject({ kind: "blocked" });
+  expect(deleteCalls).toEqual([]);
+  expect(auditCalls.find((a) => a.type === "pii_blocked")?.payload)
+    .toMatchObject({ objectDeleted: false, objectCleanup: "row_gone" });
 });
 
 test("block mode records that a clean PDF's images were not scanned", async () => {
@@ -400,7 +446,7 @@ test("detect mode rejects an unscannable type at once and deletes its bytes", as
     settings: { enabled: true, mode: "detect" },
     evaluateThrows: new PiiProtectionServiceError("unsupported_mime", "cannot scan image/png files")
   });
-  const input = sampleInput({ contentType: "image/png", storageKey: "users/user-1/session-1/art-1.png" });
+  const input = sampleInput({ contentType: "image/png", storageKey: "users/user-1/session-1/art-1.txt" });
   const result = await new PiiArtifactScanEnqueuer(deps).enqueue(input);
   expect(result).toMatchObject({ kind: "failed", errorCode: "unsupported_mime" });
   expect(jobCalls).toEqual([]);
@@ -687,12 +733,12 @@ test("a synchronous scan records the policy that the evaluation applied", async 
   expect(auditCalls.find((call) => call.type === "pii_blocked")?.payload).toMatchObject({ mode: "detect", policyRevision: 8 });
 });
 
-test("a synchronous block records its decision before it deletes the bytes, and closes the run last", async () => {
+test("a synchronous block records its decision, commits the verdict with the queued key, deletes, and closes the run last", async () => {
   const h = buildDeps({ settings: { enabled: true, mode: "block" }, decision: dirtyBlockDecision, withAuditEvents: true });
 
   await new PiiArtifactScanEnqueuer(h.deps).enqueue(sampleInput());
 
-  expect(h.order).toEqual(["decision", "purge", "detail:blocked", "run:blocked"]);
+  expect(h.order).toEqual(["decision", "detail:blocked+queue", "purge", "run:blocked"]);
   expect(h.recordDecisionCalls).toEqual([{
     scanRunId: "scan-1",
     decision: {
@@ -717,6 +763,7 @@ test("a synchronous allow records its decision, then makes the upload ready, the
 });
 
 test("a write that fails after the purge keeps the block and leaves the recorded decision to recovery", async () => {
+  // The verdict and the queued key committed before the purge.
   const h = buildDeps({
     settings: { enabled: true, mode: "block" },
     decision: dirtyBlockDecision,
@@ -729,7 +776,7 @@ test("a write that fails after the purge keeps the block and leaves the recorded
   expect(result).toMatchObject({ kind: "blocked", scanRunId: "scan-1", blockReason: "email" });
   expect(h.deleteCalls).toEqual(["users/user-1/session-1/art-1.txt"]);
   // Not a provider failure: nothing records "not scanned".
-  expect(h.order).toEqual(["decision", "purge", "detail:blocked", "run:blocked"]);
+  expect(h.order).toEqual(["decision", "detail:blocked+queue", "purge", "run:blocked"]);
   expect(h.piiDetailCalls.map((call) => call.pii.status)).toEqual(["blocked"]);
   expect(h.artifactUpdateCalls).toEqual([]);
   expect(h.auditCalls.map((call) => call.type)).toEqual(["pii_blocked"]);
@@ -773,4 +820,37 @@ test("plan skips an upload while protection is off", async () => {
   const h = buildDeps({ settings: { enabled: false, mode: "detect" } });
   await expect(new PiiArtifactScanEnqueuer(h.deps).plan({ tenantId: "tenant-1", contentType: "text/plain", source: "upload" }))
     .resolves.toEqual({ kind: "skip" });
+});
+
+test("a failed rejection write leaves the recorded decision to recovery and deletes nothing", async () => {
+  const h = buildDeps({
+    settings: { enabled: true, mode: "block" },
+    decision: dirtyBlockDecision,
+    rejectThrows: new Error("connection terminated"),
+    withAuditEvents: true
+  });
+
+  const result = await new PiiArtifactScanEnqueuer(h.deps).enqueue(sampleInput());
+
+  // The decision stands; recovery applies it again, with the queue write.
+  expect(result).toMatchObject({ kind: "blocked", scanRunId: "scan-1" });
+  expect(h.order).toEqual(["decision"]);
+  expect(h.deleteCalls).toEqual([]);
+  expect(h.scanRunUpdateCalls).toEqual([]);
+  expect(h.logErrorCalls).toEqual([{
+    payload: expect.objectContaining({ scanRunId: "scan-1", artifactId: "art-1" }),
+    message: "Failed to apply a recorded PII decision; recovery finishes it"
+  }]);
+});
+
+test("a permanent scan error fails the upload with the queued key, then closes the run", async () => {
+  const h = buildDeps({
+    settings: { enabled: true, mode: "block" },
+    evaluateThrows: new PiiProtectionServiceError("unsupported_mime", "rejected")
+  });
+
+  await new PiiArtifactScanEnqueuer(h.deps).enqueue(sampleInput());
+
+  expect(h.order).toEqual(["detail:failed+queue", "purge", "run:failed"]);
+  expect(h.artifactUpdateCalls.map((call) => call.input)).toEqual([{ status: "failed" }]);
 });

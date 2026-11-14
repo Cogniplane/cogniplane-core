@@ -13,6 +13,7 @@ import { gateChatPrompt, type ChatPromptGateStores } from "./pii/chat-prompt-pii
 import type { PiiScanJobHandler } from "./pii/pii-scan-job-handler.js";
 import type { PiiScanJobRecord, PiiScanJobStore } from "./pii/pii-scan-job-store.js";
 import type { ArtifactStorage } from "./artifacts/artifact-storage.js";
+import type { StorageGc } from "./storage/storage-gc.js";
 import type { ProjectFileStore } from "./project-file-store.js";
 import type { RuntimeAdapter, RuntimeReasoningEffort } from "../runtime-contracts.js";
 import type { SessionStore, SessionTrashCleanupOptions } from "./session-store.js";
@@ -158,6 +159,12 @@ export type SchedulerWorkerDeps = {
   scheduledSessions?: Pick<SessionStore, "cleanupExpiredScheduled">;
   sessionStorage?: Pick<ArtifactStorage, "delete">;
   /**
+   * Retries the storage cleanup queues (artifact objects and skill bundles)
+   * on every tick. Independent of the retention settings: a PII rejection or
+   * a skill revision cleanup queues objects while those are off.
+   */
+  storageGc?: Pick<StorageGc, "drain">;
+  /**
    * Disables a job (sets enabled = FALSE) so it permanently leaves the
    * `listDueJobs` query. Used for a job whose cron is invalid; `finishJobRun`
    * disables a job that failed repeatedly. Returns true when this call
@@ -258,6 +265,7 @@ export class SchedulerWorker {
   private projectCleanupInFlight = false;
   private sessionCleanupInFlight = false;
   private scheduledSessionCleanupInFlight = false;
+  private storageGcInFlight = false;
   // Set by stop(): no new job or PII scan is claimed after it.
   private stopping = false;
   // Set by refuseNewTurns(): a claimed job still preparing fails instead of
@@ -336,6 +344,7 @@ export class SchedulerWorker {
     void this.track(this.cleanupExpiredProjectFiles());
     void this.track(this.cleanupExpiredSessions());
     void this.track(this.cleanupExpiredScheduledSessions());
+    void this.track(this.drainStorageGc());
 
     const schedulingEnabled = this.options.schedulingEnabled ?? true;
     if (schedulingEnabled) {
@@ -467,6 +476,21 @@ export class SchedulerWorker {
       this.deps.logger.error({ error }, "Expired scheduled session cleanup failed; will retry");
     } finally {
       this.scheduledSessionCleanupInFlight = false;
+    }
+  }
+
+  private async drainStorageGc(): Promise<void> {
+    if (!this.deps.storageGc || this.storageGcInFlight) return;
+    this.storageGcInFlight = true;
+    try {
+      const result = await this.deps.storageGc.drain();
+      if (result.deletedObjects || result.deletedBundles || result.pending) {
+        this.deps.logger.info(result, "Storage cleanup queues drained");
+      }
+    } catch (error) {
+      this.deps.logger.error({ error }, "Storage cleanup queue drain failed; will retry");
+    } finally {
+      this.storageGcInFlight = false;
     }
   }
 

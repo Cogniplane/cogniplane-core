@@ -31,13 +31,13 @@ it("removes legacy child rows before the session and retries storage GC after co
     .onQuery("DELETE FROM session_executions", () => { events.push("session_executions"); return { rows: [], rowCount: 1 }; })
     .onQuery("DELETE FROM sessions", () => { events.push("session"); return { rows: [], rowCount: 1 }; })
     .onQuery(/SELECT tenant_id, session_id, storage_key[\s\S]*FROM session_storage_gc/, () => storageGcPending
-      ? { rows: [{ tenant_id: "tenant", session_id: "session", storage_key: "artifact-key" }], rowCount: 1 }
+      ? { rows: [{ tenant_id: "tenant", owner_id: "session", storage_key: "artifact-key" }], rowCount: 1 }
       : { rows: [], rowCount: 0 })
     .onQuery(/SELECT tenant_id, session_id, user_id[\s\S]*FROM session_runtime_gc/, () => ({
       rows: [{ tenant_id: "tenant", session_id: "session", user_id: "user" }], rowCount: 1,
     }))
     .onQuery("DELETE FROM session_storage_gc", () => { events.push("storage_gc_remove"); storageGcPending = false; return { rows: [], rowCount: 1 }; })
-    .onQuery(/^\s*SELECT 1 FROM project_file_versions/, () => ({ rows: [], rowCount: 0 }))
+    .onQuery(/AS referenced$/, () => ({ rows: [{ referenced: false }], rowCount: 1 }))
     .onQuery("UPDATE session_storage_gc", () => ({ rows: [], rowCount: 1 }))
     .onQuery("DELETE FROM session_runtime_gc", () => ({ rows: [], rowCount: 1 }))
     .onQuery("UPDATE session_runtime_gc", () => ({ rows: [], rowCount: 1 }));
