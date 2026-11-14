@@ -587,9 +587,12 @@ async function registerScopedSessionRoutes(
           request.log.warn({ err: error, sessionId }, "Failed to publish turn stop");
         });
       }
-      if (stopped && stores.activeTurns?.requestCancelExecution(sessionId, tenantId, stopped.executionId)) {
+      // A scheduled turn has no request slot here, only a turn in the runtime.
+      // The interrupt names the fenced execution, so it cannot stop a newer turn.
+      if (stopped && (stores.activeTurns?.requestCancelExecution(sessionId, tenantId, stopped.executionId) ||
+          owningAdapter.hasActiveTurn(sessionId))) {
         try {
-          await owningAdapter.interruptTurn({ tenantId, sessionId, userId });
+          await owningAdapter.interruptTurn({ tenantId, sessionId, userId, executionId: stopped.executionId });
         } catch (error) {
           request.log.warn({ err: error, sessionId }, "Failed to signal the local runtime after fencing");
         }

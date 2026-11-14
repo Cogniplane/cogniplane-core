@@ -56,6 +56,16 @@ Rules:
    `TOOL_CONTEXT_TTL_MS` from that moment (`deep-agents-runtime-adapter.ts`).
 4. A context records the owner's security version
    ([revocation](local-accounts.md#security-version-and-revocation)).
+   - A context of an interactive or a scheduled turn names the execution of
+     its turn (`executionId`). Each lookup refuses it when that execution does
+     not hold an active lease with the same user and runtime: after a stop, a
+     release, a lease expiry or a newer execution
+     (`toolContextExecutionSql`, `services/session-execution-store.ts`). A call
+     that waits at the gateway after its turn ends is refused.
+   - A scheduled context that names no execution comes from a version before
+     scheduled turns took a lease. It stays valid until its TTL
+     (`SCHEDULER_JOB_TIMEOUT_MS` plus one minute), so such turns keep their
+     tools during a rolling upgrade.
 5. Never accept identity fields (`user_id`, `session_id`, tokens) from tool
    arguments.
 6. Before a result reaches the runtime or telemetry, the gateway removes the

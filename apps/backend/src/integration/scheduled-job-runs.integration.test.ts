@@ -20,12 +20,14 @@ import {
   type SchedulerWorkerDeps
 } from "../services/scheduler-worker.js";
 import { SessionStore } from "../services/session-store.js";
+import { SessionExecutionStore } from "../services/session-execution-store.js";
 import { GENERIC_TURN_FAILURE } from "../services/turn-transcript.js";
 import { UserSettingsStore } from "../services/user-settings-store.js";
 import type { RuntimeSessionRef } from "../runtime-contracts.js";
 import { createSilentLogger } from "../test-helpers/silent-logger.js";
 import { adminDatabaseUrl, appPool, maintenancePool, superuserPool } from "./support/database.js";
 import { seedScheduledJob, seedScheduledJobRun, seedTenantGraph, type TenantFixture } from "./support/fixtures.js";
+import { buildMessageApp } from "./support/message-app.js";
 
 const LATER = () => new Date(Date.now() + 60 * 60 * 1000).toISOString();
 
@@ -200,6 +202,10 @@ function scopedWorker(tenantId: string, options: {
   afterClaim?: (worker: SchedulerWorker) => void;
   jobTimeoutMs?: number;
   abortSettleGraceMs?: number;
+  /** The lease store of the worker's replica. */
+  executions?: SessionExecutionStore;
+  /** Runs inside the turn, after RUN_STARTED. */
+  duringTurn?: () => Promise<void>;
 } = {}) {
   const runtimeSessions: string[] = [];
   const runtime: SchedulerRuntimeAdapter = {
@@ -210,6 +216,7 @@ function scopedWorker(tenantId: string, options: {
     },
     runMessageAGUI: (session) => (async function* (): AsyncGenerator<BaseEvent> {
       yield { type: EventType.RUN_STARTED, threadId: session.sessionId, runId: "run" } as BaseEvent;
+      await options.duringTurn?.();
       yield { type: EventType.TEXT_MESSAGE_CONTENT, messageId: "m", delta: "Digest ready." } as BaseEvent;
       yield { type: EventType.RUN_FINISHED, threadId: session.sessionId, runId: "run" } as BaseEvent;
     })(),
@@ -233,6 +240,13 @@ function scopedWorker(tenantId: string, options: {
     },
     runtimeAdapter: runtime,
     resolveRuntime: async () => ({ kind: "ok", adapter: runtime, modelId: null }),
+    turnAdmission: {
+      executions: options.executions ?? new SessionExecutionStore(appPool()),
+      limits: { consumeTurnQuota: async () => null },
+      leaseMs: 30_000,
+      heartbeatMs: 5_000,
+      caps: { perUser: 5, perTenant: 50 }
+    },
     auditEvents: new AuditEventStore(appPool()),
     disableJob: ({ tenantId: jobTenantId, jobId }) => settings.disableJob(jobTenantId, jobId),
     logger: createSilentLogger()
@@ -358,5 +372,46 @@ describe.skipIf(!adminDatabaseUrl())("scheduler worker run history", () => {
     }]);
     // A crash is not the job's fault: the failure counter does not move.
     expect((await jobState(tenant.jobId))?.consecutive_failures).toBe(0);
+  });
+
+  // Two replicas on one database: A runs the scheduled turn, B serves the owner.
+  test("a scheduled turn holds the session lease on every replica until its cleanup ends", async () => {
+    const tenant = await seedTenantGraph();
+    const replicaB = await buildMessageApp({ tenantId: tenant.tenantId, auth: { userId: tenant.userId } });
+    const sessionStore = new SessionStore(appPool());
+    const listed = async (sessionId: string) =>
+      (await sessionStore.listPage(tenant.tenantId, tenant.userId, { ids: [sessionId], purposes: "all" })).sessions[0];
+    let seen: { busyAcquire: unknown; busyMessage: { statusCode: number; body: unknown }; running: unknown } | null = null;
+    const { worker } = scopedWorker(tenant.tenantId, {
+      executions: new SessionExecutionStore(appPool(), "replica-a"),
+      duringTurn: async () => {
+        const [sessionId] = await scheduledSessions(tenant.tenantId);
+        const busyAcquire = await new SessionExecutionStore(appPool(), "replica-b")
+          .acquire({ tenantId: tenant.tenantId, sessionId: sessionId!, userId: tenant.userId }, 30_000)
+          .then(() => "admitted", (error: unknown) => error);
+        const response = await replicaB.send(sessionId!, "Continue the digest");
+        seen = {
+          busyAcquire,
+          busyMessage: { statusCode: response.statusCode, body: response.json() },
+          running: (await listed(sessionId!))?.isRunning
+        };
+      }
+    });
+
+    await worker.tick();
+
+    const [sessionId] = await scheduledSessions(tenant.tenantId);
+    expect(seen).toEqual({
+      busyAcquire: expect.objectContaining({ code: "session_busy" }),
+      busyMessage: { statusCode: 409, body: expect.objectContaining({ error: "session_busy" }) },
+      running: true
+    });
+    // The rejected message saved nothing and spent no quota.
+    expect(replicaB.quota).not.toHaveBeenCalled();
+    expect(await runsOf(tenant.jobId)).toEqual([expect.objectContaining({ session_id: sessionId, status: "completed" })]);
+    expect((await listed(sessionId!))?.isRunning).toBe(false);
+    const lease = await superuserPool().query<{ status: string; owner_id: string }>(
+      "SELECT status, owner_id FROM session_executions WHERE tenant_id=$1 AND session_id=$2", [tenant.tenantId, sessionId]);
+    expect(lease.rows).toEqual([{ status: "finished", owner_id: "replica-a" }]);
   });
 });

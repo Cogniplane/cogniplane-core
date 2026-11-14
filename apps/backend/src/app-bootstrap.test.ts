@@ -1,10 +1,10 @@
-import { test, expect, vi, onTestFinished } from "vitest";
+import { describe, test, expect, vi, onTestFinished } from "vitest";
 
 import Fastify from "fastify";
 
 import { get } from "node:http";
 
-import { registerAppLifecycle, registerAppRoutes } from "./app-bootstrap.js";
+import { registerAppLifecycle, registerAppRoutes, stopRemoteExecution } from "./app-bootstrap.js";
 import { createTestConfig } from "./test-helpers/test-config.js";
 import { FakeDatabase } from "./test-helpers/fake-database.js";
 import type { Pool } from "./lib/db.js";
@@ -421,4 +421,56 @@ test("app gateway accepts tokens issued by adapter creation and capability refre
     headers: { authorization: `Bearer ${wrongKeyToken}` }, payload });
   expect(denied.statusCode).toBe(401);
   expect(lookup).toHaveBeenCalledTimes(2);
+});
+
+// The stop route fences the lease on any replica and publishes the stop. The
+// replica that owns the lease interrupts its local turn of that execution.
+describe("remote Stop", () => {
+  const signal = { tenantId: "tenant", sessionId: "session", userId: "user", executionId: "execution-1", ownerId: "replica-a" };
+  function remoteStopDeps(input: { stopped?: boolean; requestSlot?: ActiveTurnsRegistry; runtimeTurn?: boolean } = {}) {
+    const interruptTurn = vi.fn(async () => "interrupted" as const);
+    const isStopped = vi.fn(async () => input.stopped ?? true);
+    return {
+      deps: {
+        executions: { ownerId: "replica-a", isStopped },
+        activeTurns: input.requestSlot ?? new ActiveTurnsRegistry(),
+        runtimeAdapter: { hasActiveTurn: () => input.runtimeTurn ?? false, interruptTurn }
+      },
+      interruptTurn,
+      isStopped
+    };
+  }
+
+  test("interrupts a scheduled turn that has a runtime turn but no request slot, by its execution", async () => {
+    const { deps, interruptTurn } = remoteStopDeps({ runtimeTurn: true });
+    await stopRemoteExecution(deps, signal);
+    expect(interruptTurn).toHaveBeenCalledExactlyOnceWith({
+      tenantId: "tenant", sessionId: "session", userId: "user", executionId: "execution-1"
+    });
+  });
+
+  test("cancels the request slot of an interactive turn and interrupts it by its execution", async () => {
+    const requestSlot = new ActiveTurnsRegistry();
+    requestSlot.mark("session", { tenantId: "tenant", userId: "user" });
+    requestSlot.setExecution("session", "execution-1");
+    const { deps, interruptTurn } = remoteStopDeps({ requestSlot });
+    await stopRemoteExecution(deps, signal);
+    expect(requestSlot.cancelSignal("session")?.aborted).toBe(true);
+    expect(interruptTurn).toHaveBeenCalledWith(expect.objectContaining({ executionId: "execution-1" }));
+  });
+
+  test("ignores a stop for another replica, a lease that is not stopped, and a session with no turn here", async () => {
+    const otherOwner = remoteStopDeps({ runtimeTurn: true });
+    await stopRemoteExecution(otherOwner.deps, { ...signal, ownerId: "replica-b" });
+    expect(otherOwner.isStopped).not.toHaveBeenCalled();
+    expect(otherOwner.interruptTurn).not.toHaveBeenCalled();
+
+    const notStopped = remoteStopDeps({ stopped: false, runtimeTurn: true });
+    await stopRemoteExecution(notStopped.deps, signal);
+    expect(notStopped.interruptTurn).not.toHaveBeenCalled();
+
+    const noTurn = remoteStopDeps({ runtimeTurn: false });
+    await stopRemoteExecution(noTurn.deps, signal);
+    expect(noTurn.interruptTurn).not.toHaveBeenCalled();
+  });
 });

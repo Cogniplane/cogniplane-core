@@ -31,6 +31,7 @@ import { buildSettingsRouteStores, registerSettingsRoutes } from "./routes/setti
 import type { RuntimeAdapter } from "./runtime-contracts.js";
 import type { AppDependencies } from "./app-dependencies.js";
 import type { SessionExecutionStore } from "./services/session-execution-store.js";
+import type { StopSignal } from "./services/turn-coordination-bus.js";
 import { buildApiKeyPresenceCheckers } from "./services/runtime/api-key-presence.js";
 import type { SchedulerWorker } from "./services/scheduler-worker.js";
 import type { MailOutboxWorker } from "./services/mail/mail-outbox-worker.js";
@@ -46,6 +47,29 @@ import {
 // How often expired in-memory rate-limit windows are removed.
 const RATE_LIMIT_SWEEP_INTERVAL_MS = 60_000;
 
+/**
+ * Interrupts the local turn of an execution that the stop route fenced on
+ * another replica. A scheduled turn has no request slot, only a turn in the
+ * runtime. The interrupt names the stopped execution, so it cannot stop a newer
+ * turn of the session.
+ */
+export async function stopRemoteExecution(
+  deps: {
+    executions: Pick<SessionExecutionStore, "ownerId" | "isStopped">;
+    activeTurns: Pick<AppDependencies["activeTurns"], "requestCancelExecution">;
+    runtimeAdapter: Pick<RuntimeAdapter, "hasActiveTurn" | "interruptTurn">;
+  },
+  signal: StopSignal
+): Promise<void> {
+  if (signal.ownerId !== deps.executions.ownerId) return;
+  if (!await deps.executions.isStopped(signal)) return;
+  const cancelled = deps.activeTurns.requestCancelExecution(signal.sessionId, signal.tenantId, signal.executionId);
+  if (!cancelled && !deps.runtimeAdapter.hasActiveTurn(signal.sessionId)) return;
+  await deps.runtimeAdapter.interruptTurn({
+    tenantId: signal.tenantId, sessionId: signal.sessionId, userId: signal.userId, executionId: signal.executionId
+  });
+}
+
 export async function registerAppRoutes(
   app: FastifyInstance,
   deps: AppDependencies,
@@ -53,11 +77,7 @@ export async function registerAppRoutes(
 ): Promise<void> {
   if (deps.turnBus) {
     await deps.turnBus.subscribeStop(signal => {
-      if (signal.ownerId !== deps.executions.ownerId) return;
-      void deps.executions.isStopped(signal).then(stopped => {
-        if (!stopped || !deps.activeTurns.requestCancelExecution(signal.sessionId, signal.tenantId, signal.executionId)) return;
-        return deps.runtimeAdapter.interruptTurn(signal);
-      }).catch(err => {
+      void stopRemoteExecution(deps, signal).catch(err => {
         app.log.warn({ err, sessionId: signal.sessionId }, "Failed to process remote Stop");
       });
     });

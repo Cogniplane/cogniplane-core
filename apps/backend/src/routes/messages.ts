@@ -1,4 +1,4 @@
-import { startExecutionHeartbeat } from "../services/execution-heartbeat.js";
+import { startExecutionHeartbeat, stopLostExecution } from "../services/execution-heartbeat.js";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { z } from "zod";
 
@@ -255,14 +255,9 @@ export async function registerMessageRoutes(
           onLost: async () => {
             // Release independently: a stuck runtime abort must not retain the
             // admission. Dispatch checks still reject this execution generation.
-            // A lease that a security change stopped ends the turn with that
-            // reason, as on the replica that made the change.
-            const stop = async () => {
-              const bySecurityChange = await stores.executions.stoppedBySecurityChange?.(admitted).catch(() => false);
-              await runtimeAdapter.abortSession({ ...admitted, ...(bySecurityChange ? { reason: "security_change" as const } : {}) });
-            };
             await Promise.all([
-              stop().catch(error => request.log.error({ err: error }, "Failed to stop expired execution")),
+              stopLostExecution({ execution: admitted, executions: stores.executions, runtime: runtimeAdapter })
+                .catch(error => request.log.error({ err: error }, "Failed to stop expired execution")),
               releaseAdmission(),
             ]);
           },

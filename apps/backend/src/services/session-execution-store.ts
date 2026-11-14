@@ -7,12 +7,16 @@ import { AuditEventStore } from "./audit-event-store.js";
 import type { ReleasedSandbox } from "./runtime/e2b-sandbox-disposal.js";
 
 export type ExecutionActor = { tenantId: string; sessionId: string; userId: string };
+/** Who started the turn. Kept in memory only: the lease row is the same for both. */
+export type ExecutionTurnContext = "interactive" | "scheduled";
 export type SessionExecution = ExecutionActor & {
   executionId: string;
   projectId: string | null;
   ownerId: string;
   /** Database-issued lease expiry used by the local watchdog. */
   expiresAt: string;
+  /** Absent means interactive. A scheduled runtime saves no sandbox record (deep-agents-runtime-adapter.ts). */
+  turnContext?: ExecutionTurnContext;
 };
 export type TurnOwner = { executionId: string; ownerId: string | null };
 
@@ -31,13 +35,23 @@ export function sessionExecutionAccessSql(session: string, user: string): string
   return `(${session}.purpose <> 'project_reference' AND ${sessionUploadAccessSql(session, user)})`;
 }
 
-// Interactive contexts name the exact admitted execution. Scheduled contexts
-// have their own lifecycle and do not use this fence.
-export function interactiveContextExecutionSql(context: string): string {
+// A context of a project session, an interactive context, and each context
+// that names an execution (interactive and scheduled turns write
+// `executionId`) is live only while that exact execution holds an active
+// lease, with the same runtime and user. After a stop, a release, an expiry or
+// a newer execution, the gateway refuses it.
+//
+// The one exception is a personal context with no `executionId` that is not
+// interactive: a scheduled context written by a version before scheduled turns
+// took a lease. It stays live until its TTL (SCHEDULER_JOB_TIMEOUT_MS plus one
+// minute), so the scheduled turns of a replica that still runs that version
+// keep their tools during a rolling upgrade.
+export function toolContextExecutionSql(context: string): string {
   return `EXISTS (SELECT 1 FROM sessions execution_session
     WHERE execution_session.tenant_id=${context}.tenant_id AND execution_session.session_id=${context}.session_id
       AND ((execution_session.project_id IS NULL AND
-        ${context}.metadata->>'turnContext' IS DISTINCT FROM 'interactive') OR EXISTS (
+        ${context}.metadata->>'turnContext' IS DISTINCT FROM 'interactive' AND
+        ${context}.metadata->>'executionId' IS NULL) OR EXISTS (
         SELECT 1 FROM session_executions execution
         WHERE execution.tenant_id=${context}.tenant_id AND execution.session_id=${context}.session_id
           AND execution.user_id=${context}.user_id AND execution.runtime_id=${context}.runtime_id
@@ -206,7 +220,14 @@ export class SessionExecutionStore {
     return result.rows[0]?.count ?? 0;
   }
 
-  async acquire(actor: ExecutionActor, leaseMs: number, caps?: { perUser: number; perTenant: number }): Promise<SessionExecution> {
+  /**
+   * Interactive and scheduled turns take the same lease, so one session runs one
+   * turn on all replicas, and both count toward the same caps.
+   */
+  async acquire(
+    actor: ExecutionActor, leaseMs: number, caps?: { perUser: number; perTenant: number },
+    turnContext: ExecutionTurnContext = "interactive"
+  ): Promise<SessionExecution> {
     return withTenantScope(this.pool, actor.tenantId, async (db) => {
       // Serialize admissions for this tenant so the two caps are global.
       if (caps) await db.query("SELECT pg_advisory_xact_lock(hashtextextended('turn_admission:' || $1, 0))", [actor.tenantId]);
@@ -263,7 +284,8 @@ export class SessionExecutionStore {
           heartbeat_at=EXCLUDED.heartbeat_at, started_at=NOW(), updated_at=NOW()
         RETURNING expires_at`,
       [actor.tenantId, actor.sessionId, executionId, actor.userId, projectId, leaseMs, this.ownerId]);
-      return { ...actor, executionId, projectId, ownerId: this.ownerId, expiresAt: new Date(inserted.rows[0].expires_at).toISOString() };
+      return { ...actor, executionId, projectId, ownerId: this.ownerId,
+        expiresAt: new Date(inserted.rows[0].expires_at).toISOString(), turnContext };
     });
   }
 

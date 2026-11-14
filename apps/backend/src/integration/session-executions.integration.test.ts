@@ -1,5 +1,5 @@
 import { describe, expect, test, vi } from "vitest";
-import Fastify from "fastify";
+import Fastify, { type FastifyRequest } from "fastify";
 import { registerSessionRoutes, type SessionRouteStores } from "../routes/sessions.js";
 import { SessionStore } from "../services/session-store.js";
 import { AuditEventStore } from "../services/audit-event-store.js";
@@ -209,6 +209,68 @@ describe.skipIf(!adminDatabaseUrl())("durable session execution", () => {
     expect(capped.find(result => result.status === "rejected")).toMatchObject({
       reason: { code: "running_turn_limit" }
     });
+  });
+
+  // The scheduler takes the same lease as an interactive turn (scheduler-worker.ts).
+  test("a scheduled lease counts toward the interactive caps on every replica, and only its owner stops it", async () => {
+    const tenantId = await seedTenant(), userId = await seedUser(), adminId = await seedUser();
+    await seedMembership(tenantId, userId);
+    await seedMembership(tenantId, adminId, "admin");
+    const sessions = new SessionStore(appPool());
+    // The interrupt route takes UUID session ids.
+    const scheduledSession = (await sessions.create(tenantId, userId, "[Scheduled] Digest", { purpose: "scheduled" })).sessionId;
+    const chat = await seedSession(tenantId, userId);
+    const worker = new SessionExecutionStore(appPool(), "scheduler-replica");
+    const other = new SessionExecutionStore(appPool(), "request-replica");
+    const caps = { perUser: 1, perTenant: 5 };
+
+    const scheduled = await worker.acquire({ tenantId, sessionId: scheduledSession, userId }, 30_000, caps, "scheduled");
+    expect(scheduled).toMatchObject({ ownerId: "scheduler-replica", turnContext: "scheduled" });
+    // The scheduled turn holds the session, and it uses the one turn of the owner.
+    await expect(other.acquire({ tenantId, sessionId: scheduledSession, userId }, 30_000, caps))
+      .rejects.toMatchObject({ code: "session_busy" });
+    await expect(other.acquire({ tenantId, sessionId: chat, userId }, 30_000, caps))
+      .rejects.toMatchObject({ code: "running_turn_limit" });
+    const listed = async () => (await sessions.listPage(tenantId, userId, { ids: [scheduledSession], purposes: "all" })).sessions[0];
+    expect(await listed()).toMatchObject({ isRunning: true });
+
+    const app = Fastify();
+    let caller: Pick<FastifyRequest["auth"], "userId" | "role" | "isAdmin"> = { userId: adminId, role: "admin", isAdmin: true };
+    app.addHook("preHandler", async request => { request.auth = { tenantId, ...caller }; });
+    const publishStop = vi.fn(async () => {});
+    const interruptTurn = vi.fn();
+    await registerSessionRoutes(app, {
+      sessions, executions: other, auditEvents: new AuditEventStore(appPool()),
+      turnBus: { publishStop }, runtimeAdapter: { id: "deep-agents", interruptTurn, hasActiveTurn: () => false }
+    } as unknown as SessionRouteStores);
+    try {
+      const url = `/sessions/${scheduledSession}/interrupt`;
+      // An admin cannot read the session of another member, so cannot stop it.
+      expect((await app.inject({ method: "POST", url })).statusCode).toBe(404);
+      expect(await worker.heartbeat(scheduled, 30_000)).toBe(true);
+
+      caller = { userId, role: "member", isAdmin: false };
+      expect((await app.inject({ method: "POST", url })).json()).toEqual({ status: "interrupted" });
+      // The replica that runs the turn gets the stop, and its heartbeat finds the lease fenced.
+      expect(publishStop).toHaveBeenCalledWith({
+        tenantId, sessionId: scheduledSession, userId, executionId: scheduled.executionId, ownerId: "scheduler-replica"
+      });
+      expect(interruptTurn).not.toHaveBeenCalled();
+      expect(await worker.heartbeat(scheduled, 30_000)).toBe(false);
+      expect(await worker.isStopped({ ...scheduled })).toBe(true);
+      expect((await app.inject({ method: "POST", url })).statusCode).toBe(409);
+      const audit = await superuserPool().query(
+        "SELECT user_id, payload FROM audit_events WHERE tenant_id=$1 AND event_type='turn.interrupted'", [tenantId]);
+      expect(audit.rows).toEqual([expect.objectContaining({
+        user_id: userId, payload: expect.objectContaining({ executionId: scheduled.executionId })
+      })]);
+    } finally { await app.close(); }
+
+    // The release of a stopped lease changes nothing, and the session is free.
+    await worker.release(scheduled);
+    expect(await listed()).toMatchObject({ isRunning: false });
+    const next = await other.acquire({ tenantId, sessionId: scheduledSession, userId }, 30_000, caps);
+    expect(next.turnContext).toBe("interactive");
   });
 
   test("an expired standalone owner is swept with its unfinished reply", async () => {
@@ -437,7 +499,7 @@ describe.skipIf(!adminDatabaseUrl())("durable session execution", () => {
     const interruptTurn = vi.fn();
     await registerSessionRoutes(app, {
       sessions: new SessionStore(appPool()), executions: new SessionExecutionStore(appPool()),
-      runtimeAdapter: { interruptTurn }
+      runtimeAdapter: { interruptTurn, hasActiveTurn: () => false }
     } as unknown as SessionRouteStores);
     try {
       const url = `/sessions/${h.sessionId}/interrupt`;

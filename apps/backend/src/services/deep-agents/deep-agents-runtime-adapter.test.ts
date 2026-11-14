@@ -2120,6 +2120,42 @@ describe("DeepAgentsRuntimeAdapter runMessageAGUI (AG-UI)", () => {
     await adapter.close();
   });
 
+  it("ignores a Stop that names another execution than the running turn", async () => {
+    const factory: DeepAgentsRuntimeFactory = () =>
+      ({
+        ...emptyRuntimeCapabilities(),
+        async getAgentForModel() {
+          return {
+            async *streamEvents(_input: unknown, config: { signal?: AbortSignal }) {
+              yield { event: "on_chat_model_stream", metadata: {}, data: { chunk: { content: "partial" } } };
+              await new Promise<never>((_resolve, reject) => {
+                config.signal?.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")), { once: true });
+              });
+            }
+          };
+        },
+        dispose: async () => {}
+      });
+    const adapter = makeAdapter({ factory, executions: { isCurrent: async () => true, bindRuntime: async () => {} } });
+    const execution = { ...sessionInput, executionId: "execution-2", ownerId: "replica-a",
+      projectId: null, expiresAt: new Date(Date.now() + 30_000).toISOString() };
+    try {
+      const session = await adapter.createSession({ ...sessionInput, execution });
+      const events: AGUIBaseEvent[] = [];
+      const done = (async () => {
+        for await (const event of adapter.runMessageAGUI(session, { prompt: "hi", toolContextId: null })) events.push(event);
+      })();
+      await waitForAGUIEvent(events, (e) => e.type === AGUIEventType.TEXT_MESSAGE_CONTENT);
+
+      // A late stop of an older execution must not stop the newer turn.
+      expect(await adapter.interruptTurn({ ...sessionInput, executionId: "execution-1" })).toBe("no_active_turn");
+      expect(adapter.hasActiveTurn(sessionInput.sessionId)).toBe(true);
+      expect(await adapter.interruptTurn({ ...sessionInput, executionId: "execution-2" })).toBe("interrupted");
+      await done;
+      expect(isAGUIInterruptedFinish(events.at(-1) as AGUIBaseEvent)).toBe(true);
+    } finally { await adapter.close(); }
+  });
+
   it("translates an intentional Stop into a graceful RUN_FINISHED, not RUN_ERROR", async () => {
     // A stream that emits one chunk then hangs until the turn signal aborts —
     // lets us interrupt mid-turn the way the Stop button / a disconnect would.
@@ -3484,6 +3520,38 @@ it("keeps a standalone runtime and checkpointer across execution generations", a
     await binding.release("sandbox-one");
     expect(await binding.load()).toBeNull();
     expect(sandboxExecutions).toEqual(["second", "second", "second", "second"]);
+  } finally { await adapter.close(); }
+});
+
+// A scheduled run gets a new session each time. With a sandbox record, its disposal
+// would keep the sandbox for a next turn that never comes.
+it("gives a scheduled execution no sandbox record, and an interactive turn does not reuse its runtime", async () => {
+  const runtime = makeRuntimeFactory(() => scriptedChatStream());
+  const sandboxBinding = vi.fn(async () => null);
+  const adapter = makeAdapter({ factory: runtime.factory, checkpointer: { deleteThread: async () => {} }, executions: {
+    isCurrent: async () => true,
+    bindRuntime: async () => {},
+    sandboxBinding,
+    bindSandboxId: async () => {},
+    releaseSandboxId: async () => {},
+  } });
+  const scheduled = { ...sessionInput, executionId: "scheduled-1", ownerId: "replica-a", projectId: null,
+    expiresAt: new Date(Date.now() + 30_000).toISOString(), turnContext: "scheduled" as const };
+  try {
+    const first = await adapter.createSession({ ...sessionInput, execution: scheduled });
+    expect(runtime.factoryCalls[0]?.sandboxBinding).toBeUndefined();
+    expect(runtime.factoryCalls[0]?.requireExecution).toBeDefined();
+    expect(runtime.factoryCalls[0]?.checkpointer).toBeDefined();
+    await collect(adapter.runMessageAGUI(first, runMessageInput()));
+
+    // A later interactive turn on this replica gets a new runtime with a sandbox record.
+    const interactive = { ...scheduled, executionId: "interactive-1", turnContext: "interactive" as const };
+    const next = await adapter.createSession({ ...sessionInput, execution: interactive });
+    expect(next.runtimeId).not.toBe(first.runtimeId);
+    expect(runtime.dispose).toHaveBeenCalledTimes(1);
+    expect(runtime.factoryCalls).toHaveLength(2);
+    expect(runtime.factoryCalls[1]?.sandboxBinding).toBeDefined();
+    expect(sandboxBinding).not.toHaveBeenCalled();
   } finally { await adapter.close(); }
 });
 

@@ -62,6 +62,10 @@ audited in its transaction):
   provider's usage records that no request of that turn is still running; take
   the total from those records; then reconcile. Do not reconcile to zero only
   because usage is missing. Closing does not cancel a request already sent.
+- The interrupt route stops only a turn that the caller can edit, interactive
+  or scheduled ([reconnect and stop](runtime.md#reconnect-and-stop)). An admin
+  cannot stop another member's turn. Closing its reservation stops its next
+  model call, and the turn then ends with an error.
 
 ## Not covered
 

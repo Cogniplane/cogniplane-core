@@ -91,7 +91,7 @@ describe("POST /sessions/:sessionId/interrupt", () => {
       expect(response.statusCode).toBe(200);
       expect(response.json()).toEqual({ status: "interrupted" });
       expect(stopAndGetOwner).toHaveBeenCalledWith({ tenantId: "tenant", sessionId, userId: "user" });
-      expect(interruptTurn).toHaveBeenCalledWith({ tenantId: "tenant", sessionId, userId: "user" });
+      expect(interruptTurn).toHaveBeenCalledWith({ tenantId: "tenant", sessionId, userId: "user", executionId: "turn-1" });
       expect(activeTurns.cancelSignal(sessionId)?.aborted).toBe(true);
     });
 
@@ -99,18 +99,52 @@ describe("POST /sessions/:sessionId/interrupt", () => {
       const activeTurns = new ActiveTurnsRegistry();
       activeTurns.mark(sessionId, { tenantId: "tenant", userId: "user" });
       activeTurns.setExecution(sessionId, "turn-2");
-      const interruptTurn = vi.fn();
+      // The runtime runs turn-2. The interrupt names turn-1, so the runtime ignores it.
+      const interruptTurn = vi.fn(async () => "no_active_turn");
 
       const response = await interrupt({
         sessions: { getReadable: readable() },
         executions: { stopAndGetOwner: async () => ({ executionId: "turn-1", ownerId: null }) },
         activeTurns,
-        runtimeAdapter: { interruptTurn }
+        runtimeAdapter: { interruptTurn, hasActiveTurn: () => true }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(interruptTurn).toHaveBeenCalledTimes(1);
+      expect(interruptTurn).toHaveBeenCalledWith(expect.objectContaining({ executionId: "turn-1" }));
+      expect(activeTurns.cancelSignal(sessionId)?.aborted).toBe(false);
+    });
+
+    it("interrupts a scheduled turn that has a runtime turn but no request slot", async () => {
+      const activeTurns = new ActiveTurnsRegistry();
+      const interruptTurn = vi.fn(async () => "interrupted");
+      const hasActiveTurn = vi.fn(() => true);
+
+      const response = await interrupt({
+        sessions: { getReadable: readable() },
+        executions: { stopAndGetOwner: async () => ({ executionId: "scheduled-1", ownerId: "replica-1" }) },
+        activeTurns,
+        runtimeAdapter: { interruptTurn, hasActiveTurn }
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toEqual({ status: "interrupted" });
+      expect(hasActiveTurn).toHaveBeenCalledWith(sessionId);
+      expect(interruptTurn).toHaveBeenCalledWith({ tenantId: "tenant", sessionId, userId: "user", executionId: "scheduled-1" });
+    });
+
+    it("does not signal the local runtime when it runs no turn of the session", async () => {
+      const interruptTurn = vi.fn();
+
+      const response = await interrupt({
+        sessions: { getReadable: readable() },
+        executions: { stopAndGetOwner: async () => ({ executionId: "scheduled-1", ownerId: "replica-2" }) },
+        activeTurns: new ActiveTurnsRegistry(),
+        runtimeAdapter: { interruptTurn, hasActiveTurn: () => false }
       });
 
       expect(response.statusCode).toBe(200);
       expect(interruptTurn).not.toHaveBeenCalled();
-      expect(activeTurns.cancelSignal(sessionId)?.aborted).toBe(false);
     });
 
     it("still reports the stop when publishing it to the owning replica fails", async () => {
@@ -121,7 +155,7 @@ describe("POST /sessions/:sessionId/interrupt", () => {
         executions: { stopAndGetOwner: async () => ({ executionId: "turn-1", ownerId: "replica-2" }) },
         turnBus: { publishStop },
         activeTurns: new ActiveTurnsRegistry(),
-        runtimeAdapter: { interruptTurn: vi.fn() }
+        runtimeAdapter: { interruptTurn: vi.fn(), hasActiveTurn: () => false }
       });
 
       expect(response.statusCode).toBe(200);

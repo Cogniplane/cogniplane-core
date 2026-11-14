@@ -3,6 +3,7 @@ import { test, expect, vi } from "vitest";
 import { createTestConfig } from "../test-helpers/test-config.js";
 import { createSilentLogger } from "../test-helpers/silent-logger.js";
 import { buildSchedulerWorker } from "./build-scheduler-worker.js";
+import type { SchedulerWorkerDeps } from "./scheduler-worker.js";
 import type { PiiScanJobHandler } from "./pii/pii-scan-job-handler.js";
 import type { PiiScanJobStore } from "./pii/pii-scan-job-store.js";
 
@@ -27,6 +28,8 @@ function makeInput(overrides?: Partial<SchedulerWorkerInput>) {
     sessions: stub<SchedulerWorkerInput["sessions"]>(),
     messages: stub<SchedulerWorkerInput["messages"]>(),
     toolContexts: stub<SchedulerWorkerInput["toolContexts"]>(),
+    executions: stub<SchedulerWorkerInput["executions"]>(),
+    limits: stub<SchedulerWorkerInput["limits"]>(),
     runtimeAdapter: stub<SchedulerWorkerInput["runtimeAdapter"]>(),
     dynamicConfig: stub<SchedulerWorkerInput["dynamicConfig"]>(),
     customModels: stub<SchedulerWorkerInput["customModels"]>(),
@@ -207,4 +210,22 @@ test("scheduler-enabled worker runs the cron half on tick", async () => {
   await worker!.tick();
 
   expect(listDueJobs).toHaveBeenCalledTimes(1);
+});
+
+test("scheduled turns get the lease store, the quota and the turn limits of interactive turns", () => {
+  const config = createTestConfig({
+    SCHEDULER_ENABLED: true,
+    SESSION_EXECUTION_LEASE_MS: 40_000,
+    SESSION_EXECUTION_HEARTBEAT_MS: 6_000,
+    MAX_RUNNING_TURNS_PER_USER: 3,
+    MAX_RUNNING_TURNS_PER_TENANT: 7
+  });
+  const { input } = makeInput();
+
+  const worker = buildSchedulerWorker(config, input);
+
+  const admission = (worker as unknown as { deps: SchedulerWorkerDeps }).deps.turnAdmission;
+  expect(admission.executions).toBe(input.executions);
+  expect(admission.limits).toBe(input.limits);
+  expect(admission).toMatchObject({ leaseMs: 40_000, heartbeatMs: 6_000, caps: { perUser: 3, perTenant: 7 } });
 });

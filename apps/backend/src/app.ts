@@ -353,6 +353,8 @@ export async function buildApp() {
     sessions: deps.sessions,
     messages: deps.messages,
     toolContexts: deps.toolContexts,
+    executions: deps.executions,
+    limits: deps.limits,
     runtimeAdapter: deps.runtimeAdapter,
     dynamicConfig: deps.dynamicConfig,
     customModels: deps.customModels,

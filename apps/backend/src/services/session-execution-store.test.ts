@@ -96,7 +96,8 @@ describe("SessionExecutionStore.acquire", () => {
       executionId: expect.any(String),
       projectId: null,
       ownerId: "owner-a",
-      expiresAt: "2026-10-01T12:00:30.000Z"
+      expiresAt: "2026-10-01T12:00:30.000Z",
+      turnContext: "interactive"
     });
     expect(insertValues(pool)).toEqual([
       ["tenant-a", "session-1", execution.executionId, "user-1", null, 30_000, "owner-a"]
@@ -105,6 +106,18 @@ describe("SessionExecutionStore.acquire", () => {
     // Without caps there is nothing to count, so admission takes no tenant-wide lock.
     expect(pool.queries.some(query => query.text.includes("pg_advisory_xact_lock"))).toBe(false);
     expect(pool.queries.at(-1)?.text).toBe("COMMIT");
+  });
+
+  test("marks a scheduled turn in memory and writes the same lease row", async () => {
+    const pool = admissionPool(standalone());
+    const store = new SessionExecutionStore(pool.asPool(), "owner-a");
+
+    const execution = await store.acquire(actor, 30_000, undefined, "scheduled");
+
+    expect(execution.turnContext).toBe("scheduled");
+    expect(insertValues(pool)).toEqual([
+      ["tenant-a", "session-1", execution.executionId, "user-1", null, 30_000, "owner-a"]
+    ]);
   });
 
   test("admits an editor's turn in a project session and records the project", async () => {

@@ -14,6 +14,8 @@ import type { ProviderCredentials } from "./runtime/provider-credentials.js";
 import { resolveRuntimeModel } from "./runtime/runtime-model-resolver.js";
 import { SchedulerWorker, type SchedulerRuntimeResolution, type SchedulerWorkerDeps } from "./scheduler-worker.js";
 import type { SessionStore } from "./session-store.js";
+import type { SessionExecutionStore } from "./session-execution-store.js";
+import type { RequestLimitsInterface } from "./request-limits.js";
 import type { ToolExecutionContextStore } from "./auth/tool-execution-context-store.js";
 import type { UserSettingsStore } from "./user-settings-store.js";
 import type { ProjectFileStore } from "./project-file-store.js";
@@ -81,6 +83,9 @@ export function buildSchedulerWorker(
     sessions: SessionStore;
     messages: MessageStore;
     toolContexts: ToolExecutionContextStore;
+    /** The lease store that interactive turns use, with this replica's owner id. */
+    executions: SessionExecutionStore;
+    limits: Pick<RequestLimitsInterface, "consumeTurnQuota">;
     runtimeAdapter: RuntimeAdapter;
     dynamicConfig: DynamicConfigService;
     customModels: CustomModelStore;
@@ -137,6 +142,14 @@ export function buildSchedulerWorker(
       messages: input.messages,
       toolContexts: input.toolContexts,
       resolveRuntime,
+      // The same lease, caps and daily quota as an interactive turn.
+      turnAdmission: {
+        executions: input.executions,
+        limits: input.limits,
+        leaseMs: config.SESSION_EXECUTION_LEASE_MS,
+        heartbeatMs: config.SESSION_EXECUTION_HEARTBEAT_MS,
+        caps: { perUser: config.MAX_RUNNING_TURNS_PER_USER, perTenant: config.MAX_RUNNING_TURNS_PER_TENANT }
+      },
       auditEvents: input.auditEvents,
       piiProtection: input.piiProtection,
       piiScanRuns: input.piiScanRuns,

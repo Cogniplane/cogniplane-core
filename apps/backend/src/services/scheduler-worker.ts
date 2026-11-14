@@ -2,6 +2,10 @@ import { uuidv7 } from "../lib/uuid.js";
 import type { TurnStopReason } from "@cogniplane/shared-types";
 
 import type { ToolExecutionContextStore } from "./auth/tool-execution-context-store.js";
+import { startExecutionHeartbeat, stopLostExecution } from "./execution-heartbeat.js";
+import { RequestLimitsUnavailableError } from "./redis-request-limits.js";
+import type { RequestLimitsInterface } from "./request-limits.js";
+import { SessionExecutionError, type SessionExecution, type SessionExecutionStore } from "./session-execution-store.js";
 import type { AuditEventStore } from "./audit-event-store.js";
 import { computeNextCronRunAt } from "../lib/cron.js";
 import type { MessageStore } from "./message-store.js";
@@ -33,6 +37,15 @@ function jobOwnerError(message: string): Error {
 }
 
 /**
+ * A turn limit refused the run: a running-turn cap, the daily quota, or a
+ * limit store that is down. That is not the job's fault, so the run does not
+ * count toward the auto-disable, and the job runs again at its next time.
+ */
+class TurnLimitRefusal extends Error {
+  readonly statusCode = 400;
+}
+
+/**
  * The run error of an interrupted scheduled turn. The owner reads it in the
  * job's run list, so a backend stop says why (TurnStopReason).
  */
@@ -48,6 +61,34 @@ export const OWNER_SECURITY_CHANGED_RUN_ERROR =
 
 /** The run error when the backend shut down after the claim, before the turn started. */
 export const SCHEDULER_STOPPED_RUN_ERROR = "The run did not start because the scheduler stopped.";
+
+/** The run error when MAX_RUNNING_TURNS_PER_USER or MAX_RUNNING_TURNS_PER_TENANT refused the turn. */
+export const RUNNING_TURN_LIMIT_RUN_ERROR =
+  "The run did not start because too many turns were running. The job runs again at its next scheduled time.";
+
+/** The run error when the daily turn quota (TURN_QUOTA_PER_*_PER_DAY) refused the turn. */
+export const TURN_QUOTA_RUN_ERROR =
+  "The run did not start because the daily turn quota is used up. The job runs again at its next scheduled time.";
+
+/** The run error when the request limit store could not count the turn. */
+export const TURN_LIMITS_UNAVAILABLE_RUN_ERROR =
+  "The run did not start because the turn limits could not be checked. The job runs again at its next scheduled time.";
+
+/**
+ * The admission of a scheduled turn, the same as for an interactive turn
+ * (routes/messages.ts): a session execution lease, the running-turn caps and
+ * the daily turn quota. The `message_turn` rate limit applies to requests only.
+ */
+export type ScheduledTurnAdmission = {
+  executions: Pick<SessionExecutionStore, "acquire" | "heartbeat" | "release" | "stoppedBySecurityChange">;
+  limits: Pick<RequestLimitsInterface, "consumeTurnQuota">;
+  /** SESSION_EXECUTION_LEASE_MS */
+  leaseMs: number;
+  /** SESSION_EXECUTION_HEARTBEAT_MS */
+  heartbeatMs: number;
+  /** MAX_RUNNING_TURNS_PER_USER and MAX_RUNNING_TURNS_PER_TENANT */
+  caps: { perUser: number; perTenant: number };
+};
 
 /**
  * Per-job runtime resolution, mirroring the interactive /messages path
@@ -84,6 +125,7 @@ export type SchedulerWorkerDeps = {
   toolContexts: Pick<ToolExecutionContextStore, "create">;
   runtimeAdapter: SchedulerRuntimeAdapter;
   resolveRuntime: (tenantId: string) => Promise<SchedulerRuntimeResolution>;
+  turnAdmission: ScheduledTurnAdmission;
   auditEvents: Pick<AuditEventStore, "create">;
   /**
    * Chat-prompt PII policy for scheduled prompts, the same gate interactive
@@ -166,6 +208,11 @@ type ScheduledTurnHandle = {
   sessionId: string | null;
   adapter: SchedulerRuntimeAdapter | null;
   timedOut: boolean;
+  /** The lease of the turn. Set at admission; the job keeps it until its cleanup ends. */
+  execution: SessionExecution | null;
+  stopHeartbeat: (() => void) | null;
+  /** Stops the heartbeat and releases the lease. Runs once. */
+  releaseLease: (() => Promise<void>) | null;
 };
 
 /**
@@ -671,7 +718,10 @@ export class SchedulerWorker {
     // unblocks the `for await` loop, so the same promise settles with
     // status="failed" and records the outcome. We therefore never need to
     // invent a second completeJobRun here.
-    const turn: ScheduledTurnHandle = { sessionId: null, adapter: null, timedOut: false };
+    const turn: ScheduledTurnHandle = {
+      sessionId: null, adapter: null, timedOut: false,
+      execution: null, stopHeartbeat: null, releaseLease: null
+    };
     // Tracked on its own: after the abort grace this wrapper returns and frees
     // the slot, but the job can still be writing its outcome.
     const execution = this.track(this.executeJob(job, turn));
@@ -694,43 +744,47 @@ export class SchedulerWorker {
           "Scheduled job exceeded timeout; aborting runtime session"
         );
 
-        // No adapter yet means the runtime was never resolved/started for this
-        // job, so there is nothing to abort — the slot-release grace below
-        // still bounds the wait.
-        if (turn.sessionId && turn.adapter) {
-          try {
-            await turn.adapter.abortSession({
-              tenantId: job.tenantId,
-              sessionId: turn.sessionId,
-              userId: job.userId
-            });
-          } catch (error) {
-            this.deps.logger.error(
-              { error, jobId: job.jobId, sessionId: turn.sessionId },
-              "Failed to abort timed-out scheduled job runtime"
-            );
-          }
-        }
-
         // Aborting ends the AG-UI turn. `executeJob` then records a failed outcome.
-        // Bound the wait so a turn that never settles (no session was
-        // created yet, or the runtime ignored the abort) can't pin this slot
-        // forever — after the grace we return and let the slot free.
+        // The grace starts before the abort and bounds it too: the abort waits
+        // for the runtime disposal (MCP close, sandbox kill), which can hang.
+        // After the grace we return and the slot is free.
         const graceMs = this.options.abortSettleGraceMs ?? ABORT_SETTLE_GRACE_MS;
         let graceTimer: ReturnType<typeof setTimeout> | null = null;
         const settleGrace = new Promise<"grace">((resolve) => {
           graceTimer = setTimeout(() => resolve("grace"), graceMs);
           graceTimer.unref?.();
         });
+
+        // A runtime session exists only after admission, so no lease means
+        // nothing to abort. The abort names the execution of this job, so it
+        // cannot stop a newer turn of the session. It can outlive the grace, so
+        // drain() tracks it.
+        if (turn.sessionId && turn.adapter && turn.execution) {
+          const { sessionId, adapter, execution: admitted } = turn;
+          void this.track(adapter.abortSession({
+            tenantId: job.tenantId, sessionId, userId: job.userId, executionId: admitted.executionId
+          }).catch((error: unknown) => {
+            this.deps.logger.error({ error, jobId: job.jobId, sessionId }, "Failed to abort timed-out scheduled job runtime");
+          }));
+        }
+
         try {
           const settled = await Promise.race([
             execution.then(() => "settled" as const),
             settleGrace
           ]);
           if (settled === "grace") {
+            // The job is still running, so it keeps its lease: a release now
+            // would let a new turn start while the old work can still write to
+            // the thread. Stop renewing the lease instead. It ends at its
+            // expiry, and then the runtime refuses each dispatch of the old
+            // turn and the session is free. An admission that ends after this
+            // point finds `timedOut` and starts no heartbeat
+            // (admitScheduledTurn).
+            turn.stopHeartbeat?.();
             this.deps.logger.error(
               { jobId: job.jobId, sessionId: turn.sessionId, graceMs },
-              "Timed-out scheduled job did not settle after abort; releasing slot"
+              "Timed-out scheduled job did not settle after abort; releasing slot, its lease ends at expiry"
             );
           }
         } finally {
@@ -824,6 +878,11 @@ export class SchedulerWorker {
       // Expose the adapter so the timeout watchdog aborts via the owning runtime.
       turn.adapter = runtime;
 
+      // The lease, before the PII check and the quota: one turn per session on
+      // all replicas, and the running-turn caps count this turn.
+      stopIfTimedOut();
+      const execution = await this.admitScheduledTurn(job, sessionId, runtime, turn, stopIfTimedOut);
+
       // Apply the current policy at every run: it can change after the job was
       // saved. Nothing is saved or sent to the model before this check.
       const pii = await gateChatPrompt(
@@ -867,6 +926,10 @@ export class SchedulerWorker {
       }
       const prompt = pii.runtimePrompt;
 
+      // After the PII check, as for an interactive turn: a blocked prompt does
+      // not spend the quota.
+      await this.consumeTurnQuota(job);
+
       await this.deps.messages.create({
         tenantId: job.tenantId,
         sessionId,
@@ -900,7 +963,8 @@ export class SchedulerWorker {
       const runtimeSession = await runtime.createSession({
         tenantId: job.tenantId,
         sessionId,
-        userId: job.userId
+        userId: job.userId,
+        execution
       });
 
       const toolContext = await this.deps.toolContexts.create({
@@ -917,6 +981,7 @@ export class SchedulerWorker {
         metadata: { runtimePolicy: runtimeSession.runtimePolicy,
           ...(runtimeSession.mcpServerSources ? { mcpServerSources: runtimeSession.mcpServerSources } : {}),
           ...(runtimeSession.integrationAccounts ? { integrationAccounts: runtimeSession.integrationAccounts } : {}),
+          executionId: execution.executionId,
           turnContext: "scheduled" },
         // The version that the claim and admitTurn compared. After a security
         // change of the owner, the gateway refuses the turn's tool calls, also
@@ -949,6 +1014,7 @@ export class SchedulerWorker {
         scheduledTurn.apply(event);
       }
     } catch (error) {
+      if (error instanceof TurnLimitRefusal) countsTowardDisable = false;
       // Classify before persisting. The message is written to the assistant
       // row and scheduled_job_runs, put into the scheduler.job.run.failed audit
       // payload, and returned to the job owner by
@@ -964,15 +1030,21 @@ export class SchedulerWorker {
     let responseText = "";
     let inputTokens = 0;
     let outputTokens = 0;
-    if (transcript) {
-      // Read usage first, so a timeout during the read still fails the turn.
-      ({ inputTokens, outputTokens } = await this.readTurnUsage(job, transcript));
-      const finalized = await transcript.finalize(failure);
-      outcome = finalized.outcome;
-      responseText = finalized.text;
-    }
+    // The lease stays until the runtime is gone, so no other turn of the
+    // session starts before then.
+    try {
+      if (transcript) {
+        // Read usage first, so a timeout during the read still fails the turn.
+        ({ inputTokens, outputTokens } = await this.readTurnUsage(job, transcript));
+        const finalized = await transcript.finalize(failure);
+        outcome = finalized.outcome;
+        responseText = finalized.text;
+      }
 
-    await this.reclaimScheduledSession(job, sessionId, turn.adapter);
+      await this.reclaimScheduledSession(job, sessionId, turn);
+    } finally {
+      await turn.releaseLease?.();
+    }
 
     const durationMs = Date.now() - startTime;
     // The job owner reads the summary from the run ledger. Redact the full
@@ -996,6 +1068,84 @@ export class SchedulerWorker {
       outputTokens,
       countsTowardDisable
     });
+  }
+
+  /**
+   * Takes the lease of the scheduled turn and starts its heartbeat. The caps
+   * are those of interactive turns. When the heartbeat loses the lease (a stop,
+   * a security change, an expiry), the runtime turn of this execution stops.
+   *
+   * `stopIfTimedOut` runs after the lease is taken: a slow admission can end
+   * after the watchdog fired, or after it gave up on the job. Then no runtime
+   * session uses the lease yet, so it is released at once, and no heartbeat
+   * renews it.
+   */
+  private async admitScheduledTurn(
+    job: ClaimedScheduledJob,
+    sessionId: string,
+    runtime: SchedulerRuntimeAdapter,
+    turn: ScheduledTurnHandle,
+    stopIfTimedOut: () => void
+  ): Promise<SessionExecution> {
+    const admission = this.deps.turnAdmission;
+    const leaseStartedAt = performance.now();
+    let execution: SessionExecution;
+    try {
+      execution = await admission.executions.acquire(
+        { tenantId: job.tenantId, sessionId, userId: job.userId }, admission.leaseMs, admission.caps, "scheduled"
+      );
+    } catch (error) {
+      if (error instanceof SessionExecutionError && error.code === "running_turn_limit") {
+        throw new TurnLimitRefusal(RUNNING_TURN_LIMIT_RUN_ERROR, { cause: error });
+      }
+      throw error;
+    }
+    turn.execution = execution;
+    const admitted = execution;
+    let released: Promise<void> | null = null;
+    const releaseLease = () => released ??= (async () => {
+      turn.stopHeartbeat?.();
+      try {
+        await admission.executions.release(admitted);
+      } catch (error) {
+        this.deps.logger.error({ error, jobId: job.jobId, sessionId }, "Failed to release scheduled execution lease");
+      }
+    })();
+    turn.releaseLease = releaseLease;
+    try {
+      stopIfTimedOut();
+    } catch (error) {
+      await releaseLease();
+      throw error;
+    }
+    const leaseExpiresAt = performance.now() + Math.max(0, new Date(admitted.expiresAt).getTime() - Date.now());
+    turn.stopHeartbeat = startExecutionHeartbeat({
+      leaseStartedAt,
+      leaseExpiresAt,
+      leaseMs: admission.leaseMs,
+      intervalMs: admission.heartbeatMs,
+      renew: () => admission.executions.heartbeat(admitted, admission.leaseMs),
+      onError: (error) => this.deps.logger.warn({ error, jobId: job.jobId, sessionId }, "Scheduled execution heartbeat failed"),
+      onLost: async () => {
+        this.deps.logger.warn({ jobId: job.jobId, sessionId }, "Scheduled execution lease lost; stopping the turn");
+        await stopLostExecution({ execution: admitted, executions: admission.executions, runtime });
+      }
+    });
+    return execution;
+  }
+
+  /** Spends one unit of the daily turn quota of the owner and the tenant. */
+  private async consumeTurnQuota(job: ClaimedScheduledJob): Promise<void> {
+    let exceeded: Awaited<ReturnType<ScheduledTurnAdmission["limits"]["consumeTurnQuota"]>>;
+    try {
+      exceeded = await this.deps.turnAdmission.limits.consumeTurnQuota({ userId: job.userId, tenantId: job.tenantId });
+    } catch (error) {
+      if (error instanceof RequestLimitsUnavailableError) {
+        throw new TurnLimitRefusal(TURN_LIMITS_UNAVAILABLE_RUN_ERROR, { cause: error });
+      }
+      throw error;
+    }
+    if (exceeded) throw new TurnLimitRefusal(TURN_QUOTA_RUN_ERROR);
   }
 
   /**
@@ -1027,67 +1177,52 @@ export class SchedulerWorker {
   }
 
   /**
-   * Release the per-run runtime and its checkpointer thread.
+   * Releases the per-run runtime.
    *
-   * Each firing creates a fresh session (see executeJob), and nothing else ever
-   * reclaims it. Without this call, a completed run leaves a warm runtime, and a
-   * live E2B sandbox if the job touched files, parked until RUNTIME_IDLE_TIMEOUT_MS.
-   * It also leaves a LangGraph thread in the `deep_agents` schema forever.
-   * Nothing resumes a scheduled session, because each tick creates a new one. So
-   * that thread is pure garbage. Session or project deletion normally calls
-   * `purgeSessionData`.
+   * Each firing creates a new session (see executeJob), and nothing else
+   * reclaims its runtime. Without this call, a completed run leaves a warm
+   * runtime, and a live E2B sandbox if the job touched files, until
+   * RUNTIME_IDLE_TIMEOUT_MS.
    *
-   * The `sessions` / `messages` rows stay: `scheduled_job_runs` references the
-   * session id, and the owner can read the transcript and continue the chat.
-   * Scheduled session retention (`cleanupExpiredScheduledSessions`) deletes
-   * them after SCHEDULED_SESSION_RETENTION_DAYS without activity.
+   * The worker does not delete the checkpoint thread. Scheduled session
+   * retention (`cleanupExpiredScheduledSessions`) deletes it with the session,
+   * SCHEDULED_SESSION_RETENTION_DAYS after the last activity. An eager delete
+   * here would be a check and then a write with no lock between them: after a
+   * Stop or a lease expiry, the owner can start a turn on this session on any
+   * replica, and a delete that started before that would remove the new
+   * turn's checkpoints. The cost is storage: one thread for each run, kept for
+   * the retention window. The `sessions` and `messages` rows stay too:
+   * `scheduled_job_runs` references the session, and the owner can read the
+   * transcript and continue the chat.
    *
-   * Best-effort throughout — reclamation must never change a run's recorded
-   * outcome.
+   * Best-effort: reclamation must never change a run's recorded outcome.
    *
-   * The abort runs UNCONDITIONALLY, including after a watchdog timeout. It is
-   * tempting to skip it when `turn.timedOut` is set, since executeJobWithTimeout
-   * aborts on that path — but "timed out" does not imply "aborted": the watchdog
-   * only aborts `if (turn.sessionId && turn.adapter)`, and `turn.adapter` is
-   * assigned by the racing executeJob, so a timeout that fires before runtime
-   * resolution aborts nothing. Its abortSession can also throw. Either way the
-   * skip would drop the ONLY abort and leave the runtime (and its E2B sandbox)
-   * alive, then purge the thread underneath a graph still writing checkpoints.
-   * abortSession is idempotent — it no-ops on a session id it no longer holds —
-   * so the redundant call on the happy timeout path costs a map lookup.
+   * No lease means no runtime: the runtime session is created only after
+   * admission. The abort names the execution of this job, so it cannot stop a
+   * newer turn of the session.
+   *
+   * The abort runs UNCONDITIONALLY, also after a watchdog timeout. "Timed out"
+   * does not mean "aborted": the watchdog aborts only when the job had a lease
+   * at that time, its abort can throw, and it can hang. abortSession is
+   * idempotent (it does nothing for a session or execution that it does not
+   * hold), so the second call on the normal timeout path costs a map lookup.
    */
   private async reclaimScheduledSession(
     job: ScheduledJobRecord,
     sessionId: string | null,
-    adapter: SchedulerRuntimeAdapter | null
+    turn: ScheduledTurnHandle
   ): Promise<void> {
-    if (!sessionId || !adapter) return;
-    const scope = { tenantId: job.tenantId, sessionId, userId: job.userId };
-
-    // Ordered before the purge: tearing the thread down while the graph can
-    // still write would race checkpoint writes against the delete.
+    const { adapter, execution } = turn;
+    if (!sessionId || !adapter || !execution) return;
     try {
-      await adapter.abortSession(scope);
+      await adapter.abortSession({
+        tenantId: job.tenantId, sessionId, userId: job.userId, executionId: execution.executionId
+      });
     } catch (error) {
-      // The abort is a PRECONDITION of the purge, not a best-effort step beside
-      // it. If it failed we cannot assume the graph has stopped, so deleting its
-      // thread now would corrupt a run that is still writing. Bail out and leave
-      // the thread: idle teardown still reclaims the runtime, and an orphaned
-      // checkpointer thread is a bounded storage leak — strictly the better of
-      // the two failures.
+      // Idle teardown still reclaims the runtime.
       this.deps.logger.warn(
         { error, jobId: job.jobId, sessionId },
-        "Failed to release scheduled-run runtime; skipping thread purge and falling back to idle teardown"
-      );
-      return;
-    }
-
-    try {
-      await adapter.purgeSessionData(scope);
-    } catch (error) {
-      this.deps.logger.warn(
-        { error, jobId: job.jobId, sessionId },
-        "Failed to purge scheduled-run checkpointer thread"
+        "Failed to release scheduled-run runtime; falling back to idle teardown"
       );
     }
   }
