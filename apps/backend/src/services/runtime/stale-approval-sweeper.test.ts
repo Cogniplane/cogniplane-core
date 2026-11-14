@@ -1,7 +1,6 @@
 import { test, expect } from "vitest";
 
 import type { ApprovalRecord } from "../auth/approval-store.js";
-import { InMemoryAuditEventStore } from "../../test-helpers/in-memory-audit-events.js";
 import { createSilentLogger } from "../../test-helpers/silent-logger.js";
 import { sweepStaleApprovals } from "./stale-approval-sweeper.js";
 
@@ -30,8 +29,11 @@ function fakeRow(overrides: Partial<ApprovalRecord> = {}): ApprovalRecord {
   };
 }
 
-test("sweepStaleApprovals writes one approval.expired audit event per swept row", async () => {
-  const audit = new InMemoryAuditEventStore();
+// `ApprovalStore.sweepExpired` writes each row's `approval.expired` event in
+// the batch's transaction (approval-store.test.ts, and against PostgreSQL in
+// approval-sweep.integration.test.ts). These tests cover the batch loop.
+
+test("sweepStaleApprovals stops once a batch returns fewer than the batch size", async () => {
   const swept = [fakeRow({ approvalId: "a", tenantId: "t1" }), fakeRow({ approvalId: "b", tenantId: "t2" })];
   let calls = 0;
   const approvals = {
@@ -41,21 +43,13 @@ test("sweepStaleApprovals writes one approval.expired audit event per swept row"
     }
   };
 
-  const total = await sweepStaleApprovals(
-    { approvals, auditEvents: audit, logger: createSilentLogger() },
-    500
-  );
+  const total = await sweepStaleApprovals({ approvals, logger: createSilentLogger() }, 500);
 
   expect(total).toBe(2);
-  expect(audit.events).toHaveLength(2);
-  expect(audit.events.every((e) => e.type === "approval.expired")).toBe(true);
-  expect(audit.events[0].payload).toMatchObject({ reason: "stale_on_sweep" });
-  // Loop stops once a batch returns fewer than the batch size.
   expect(calls).toBe(1);
 });
 
 test("sweepStaleApprovals drains multiple full batches", async () => {
-  const audit = new InMemoryAuditEventStore();
   const batch = Array.from({ length: 2 }, (_, i) => fakeRow({ approvalId: `x${i}` }));
   let calls = 0;
   const approvals = {
@@ -66,38 +60,22 @@ test("sweepStaleApprovals drains multiple full batches", async () => {
     }
   };
 
-  const total = await sweepStaleApprovals(
-    { approvals, auditEvents: audit, logger: createSilentLogger() },
-    2
-  );
+  const total = await sweepStaleApprovals({ approvals, logger: createSilentLogger() }, 2);
 
   expect(total).toBe(4);
   expect(calls).toBe(3);
 });
 
-test("sweepStaleApprovals continues past a failed audit write", async () => {
-  let failed = false;
-  const attempted: Array<string | null | undefined> = [];
-  const audit = {
-    create: async (input: { approvalId?: string | null }) => {
-      attempted.push(input.approvalId);
-      if (!failed) {
-        failed = true;
-        throw new Error("audit down");
-      }
+test("sweepStaleApprovals stops and rejects when a batch fails, so the rows stay for the next sweep", async () => {
+  let calls = 0;
+  const approvals = {
+    sweepExpired: async () => {
+      calls += 1;
+      throw new Error("audit insert failed");
     }
   };
-  const approvals = {
-    sweepExpired: async (limit: number) =>
-      // one short batch (< limit) so the loop terminates after a single pass
-      limit > 1 ? [fakeRow({ approvalId: "a" }), fakeRow({ approvalId: "b" })] : []
-  };
 
-  const total = await sweepStaleApprovals(
-    { approvals, auditEvents: audit, logger: createSilentLogger() },
-    500
-  );
-
-  expect(attempted).toEqual(["a", "b"]);
-  expect(total).toBe(2);
+  await expect(sweepStaleApprovals({ approvals, logger: createSilentLogger() }, 500))
+    .rejects.toThrow("audit insert failed");
+  expect(calls).toBe(1);
 });

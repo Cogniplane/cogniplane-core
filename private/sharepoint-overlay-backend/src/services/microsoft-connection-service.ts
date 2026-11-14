@@ -276,14 +276,15 @@ export class MicrosoftConnectionService {
     await this.integrationStates.applyChanges(tenantId, "microsoft", { configChanges, updatedBy }, audit);
   }
 
-  async removeTenantMicrosoftConfig(tenantId: string): Promise<void> {
+  /** `audit` builds the removal's audit event, which commits in the removal's transaction. */
+  async removeTenantMicrosoftConfig(tenantId: string, audit?: () => AuditEventInput): Promise<void> {
     const existingState = await this.integrationStates.get(tenantId, "microsoft");
     await this.integrationStates.upsert(tenantId, "microsoft", {
       readsEnabled: false,
       writesEnabled: false,
       config: {},
       updatedBy: existingState?.updatedBy ?? null
-    });
+    }, audit);
   }
 
   async getConnectionStatus(tenantId: string, userId: string): Promise<MicrosoftConnectionStatus> {
@@ -487,9 +488,8 @@ export class MicrosoftConnectionService {
         refreshTokenExpiresAt: null,
         tokenLastRefreshedAt: tokenPayload.refresh_token ? new Date().toISOString() : null,
         ownerSecurityVersion: state.sv ?? null
-      });
-
-      await this.auditEvents?.create({
+      // The event commits with the connection: a failed event saves nothing.
+      }, () => ({
         tenantId: state.tid,
         sessionId: null,
         userId: state.sub,
@@ -498,7 +498,7 @@ export class MicrosoftConnectionService {
           microsoftUserId: profile.id,
           microsoftEmail: profile.mail ?? profile.userPrincipalName
         }
-      });
+      }));
       await this.runtimeManager?.invalidateRuntimesForIntegration(state.tid, state.sub, "microsoft");
 
       return this.buildRedirectUrl("/settings/microsoft", {
@@ -549,19 +549,19 @@ export class MicrosoftConnectionService {
 
   async disconnect(tenantId: string, userId: string): Promise<boolean> {
     const existing = await this.store.getForOwner(tenantId, userId);
-    const removed = await this.store.delete(tenantId, userId);
+    // The event commits with the delete and names the row that it removed.
+    const removed = await this.store.delete(tenantId, userId, (row) => ({
+      tenantId,
+      sessionId: null,
+      userId,
+      type: "user.microsoft.disconnected",
+      payload: {
+        microsoftUserId: row.microsoftUserId,
+        microsoftEmail: row.microsoftEmail
+      }
+    }));
 
     if (removed && existing) {
-      await this.auditEvents?.create({
-        tenantId,
-        sessionId: null,
-        userId,
-        type: "user.microsoft.disconnected",
-        payload: {
-          microsoftUserId: existing.microsoftUserId,
-          microsoftEmail: existing.microsoftEmail
-        }
-      });
       await this.runtimeManager?.invalidateRuntimesForIntegration(tenantId, userId, "microsoft");
     }
 

@@ -4,6 +4,7 @@ import type { PoolClient } from "pg";
 
 import { type Pool, withTenantScope } from "../lib/db.js";
 import { isoTimestamp } from "../lib/db-mappers.js";
+import { AuditEventStore, type AuditEventInput } from "./audit-event-store.js";
 import type { AvailableModel } from "../domain/models.js";
 
 /**
@@ -80,7 +81,9 @@ export class CustomModelStore {
   }
 
   /** Returns null when the model id already exists for the tenant. */
-  async create(tenantId: string, input: CustomModelInput): Promise<CustomModelRecord | null> {
+  /** `audit` builds the create's audit event, which commits in the create's transaction. */
+  async create(tenantId: string, input: CustomModelInput,
+    audit?: (record: CustomModelRecord) => AuditEventInput): Promise<CustomModelRecord | null> {
     const modelId = customModelId(input.provider, input.vendorModelId);
     return withTenantScope(this.db, tenantId, async (client) => {
       const result = await client.query(
@@ -102,7 +105,10 @@ export class CustomModelStore {
           input.createdBy
         ]
       );
-      return result.rows[0] ? mapRow(result.rows[0]) : null;
+      if (!result.rows[0]) return null;
+      const record = mapRow(result.rows[0]);
+      if (audit) await AuditEventStore.createInTransaction(client, audit(record));
+      return record;
     });
   }
 

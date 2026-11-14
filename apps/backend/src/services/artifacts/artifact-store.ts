@@ -5,7 +5,7 @@ import { ARTIFACT_PII_ELIGIBLE_STATUSES, isArtifactPiiEligible } from "@cognipla
 import { requireSessionUploadAccess, sessionUploadAccessSql, SessionUploadAccessError } from "../session-upload-access.js";
 import { uuidv7 } from "../../lib/uuid.js";
 
-import { escapeLikePattern, type Pool, withTenantScope } from "../../lib/db.js";
+import { escapeLikePattern, type Pool, withTenantScope, withTransaction } from "../../lib/db.js";
 import { isoTimestamp } from "../../lib/db-mappers.js";
 import { AuditEventStore, type AuditEventInput } from "../audit-event-store.js";
 
@@ -467,10 +467,15 @@ export class ArtifactStore {
    * while holding the session/project locks so a revocation cannot race the
    * insert after runtime admission has already succeeded.
    */
-  async createGenerated(input: Parameters<ArtifactStore["create"]>[0]): Promise<ArtifactRecord> {
+  async createGenerated(input: Parameters<ArtifactStore["create"]>[0],
+    audit: (artifact: ArtifactRecord) => AuditEventInput): Promise<ArtifactRecord> {
     return withTenantScope(this.db, input.tenantId, async client => {
       await requireSessionUploadAccess(client, input, true);
-      return this.insert(client, input);
+      const artifact = await this.insert(client, input);
+      // The event commits with the row. When it fails, no row commits, so the
+      // caller can delete the stored bytes.
+      await AuditEventStore.createInTransaction(client, audit(artifact));
+      return artifact;
     });
   }
 
@@ -871,19 +876,35 @@ export class ArtifactStore {
   //
   // Gating is identical to `peekDownloadToken`, so a refused request never
   // burns the token.
-  async consumeDownloadToken(input: { token: string }): Promise<ArtifactDownloadTokenRecord | null> {
-    const tokenRows = await this.privilegedDb.query(
-      `
-        UPDATE artifact_download_tokens AS download
-           SET consumed_at = NOW()
-          FROM artifacts AS artifact
-         WHERE ${DOWNLOAD_TOKEN_GATING}
-           AND download.expires_at > NOW()
-        RETURNING ${DOWNLOAD_TOKEN_COLUMNS}
-      `,
-      [input.token]
-    );
-    return tokenRows.rows[0] ? mapDownloadToken(tokenRows.rows[0]) : null;
+  //
+  // The download's audit event, built from the token row by `audit`, commits
+  // in the consume's transaction. When the event cannot be written, the token
+  // stays unconsumed and the error goes to the caller, which must not send
+  // the file. The token's tenant is not known before the lookup, so this runs
+  // on the privileged pool; the event takes its tenant from the token row.
+  async consumeDownloadToken(input: {
+    token: string;
+    audit: (token: ArtifactDownloadTokenRecord) => AuditEventInput;
+  }): Promise<ArtifactDownloadTokenRecord | null> {
+    return withTransaction(this.privilegedDb, async (client) => {
+      const tokenRows = await client.query(
+        `
+          UPDATE artifact_download_tokens AS download
+             SET consumed_at = NOW()
+            FROM artifacts AS artifact
+           WHERE ${DOWNLOAD_TOKEN_GATING}
+             AND download.expires_at > NOW()
+          RETURNING ${DOWNLOAD_TOKEN_COLUMNS}
+        `,
+        [input.token]
+      );
+      if (!tokenRows.rows[0]) return null;
+      const token = mapDownloadToken(tokenRows.rows[0]);
+      const event = input.audit(token);
+      if (event.tenantId !== token.tenantId) throw new Error("A download audit event must name the token's tenant.");
+      await AuditEventStore.createInTransaction(client, event);
+      return token;
+    });
   }
 }
 

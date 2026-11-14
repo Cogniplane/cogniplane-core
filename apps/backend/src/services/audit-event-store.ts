@@ -87,6 +87,13 @@ const PROJECT_ACTIVITY_SESSION_EVENT_TYPES = [
 export class AuditEventStore {
   constructor(private readonly db: Pool) {}
 
+  /**
+   * Writes the event in a transaction of its own. Use it only for an event
+   * that records no database change: telemetry, a refusal, or an action
+   * outside PostgreSQL. A change of governed state writes its event with
+   * `createInTransaction`, in the change's transaction.
+   * `audit-event-sites.test.ts` lists each call of this method.
+   */
   async create(input: AuditEventInput): Promise<void> {
     await withTenantScope(this.db, input.tenantId,
       (client) => AuditEventStore.createInTransaction(client, input));
@@ -181,5 +188,11 @@ export class AuditEventStore {
       ]
     );
     if (input.alsoInTransaction) await input.alsoInTransaction(client);
+  }
+
+  /** Writes several events in the caller's transaction, in order. */
+  static async createManyInTransaction(client: PoolClient,
+    inputs: ReadonlyArray<Omit<AuditEventInput, "userId"> & { userId: string | null }>): Promise<void> {
+    for (const input of inputs) await AuditEventStore.createInTransaction(client, input);
   }
 }

@@ -59,6 +59,7 @@ import {
   type TenantFixture
 } from "./support/fixtures.js";
 import { PII_SAVE_ALLOWED } from "../test-helpers/data-routes.js";
+import { downloadAudit } from "../test-helpers/download-audit.js";
 
 // Any 32-byte-derivable string works; the tests only need encrypt/decrypt to
 // round-trip through the same instance.
@@ -535,7 +536,7 @@ describe.skipIf(!adminDatabaseUrl())("privileged pool tenant predicates", () => 
       );
 
       expect(await store().peekDownloadToken({ token })).toBeNull();
-      expect(await store().consumeDownloadToken({ token })).toBeNull();
+      expect(await store().consumeDownloadToken({ token, audit: downloadAudit })).toBeNull();
     });
 
     test("peek and consume refuse a token for an upload still waiting for its PII scan", async () => {
@@ -552,7 +553,7 @@ describe.skipIf(!adminDatabaseUrl())("privileged pool tenant predicates", () => 
       );
 
       expect(await store().peekDownloadToken({ token })).toBeNull();
-      expect(await store().consumeDownloadToken({ token })).toBeNull();
+      expect(await store().consumeDownloadToken({ token, audit: downloadAudit })).toBeNull();
     });
 
     // A block can land on a record that is already ready and carries no pending
@@ -591,7 +592,7 @@ describe.skipIf(!adminDatabaseUrl())("privileged pool tenant predicates", () => 
       // Precondition: this is the inconsistent record the verdict must deny.
       expect(rows[0]?.status).toBe("ready");
       expect(await store().peekDownloadToken({ token })).toBeNull();
-      expect(await store().consumeDownloadToken({ token })).toBeNull();
+      expect(await store().consumeDownloadToken({ token, audit: downloadAudit })).toBeNull();
       expect(await consumedAt(token)).toBeNull();
     });
 
@@ -602,7 +603,7 @@ describe.skipIf(!adminDatabaseUrl())("privileged pool tenant predicates", () => 
         await store().setPiiDetail(graph.tenantId, graph.artifactId, { status });
 
         expect(await store().peekDownloadToken({ token })).toBeNull();
-        expect(await store().consumeDownloadToken({ token })).toBeNull();
+        expect(await store().consumeDownloadToken({ token, audit: downloadAudit })).toBeNull();
       }
     );
 
@@ -615,8 +616,8 @@ describe.skipIf(!adminDatabaseUrl())("privileged pool tenant predicates", () => 
       });
 
       expect(await store().peekDownloadToken({ token })).toMatchObject({ artifactId: graph.artifactId });
-      expect((await store().consumeDownloadToken({ token }))?.artifactId).toBe(graph.artifactId);
-      expect(await store().consumeDownloadToken({ token })).toBeNull();
+      expect((await store().consumeDownloadToken({ token, audit: downloadAudit }))?.artifactId).toBe(graph.artifactId);
+      expect(await store().consumeDownloadToken({ token, audit: downloadAudit })).toBeNull();
     });
 
     test("the SQL eligibility predicate agrees with the TS predicate for every status and verdict", async () => {
@@ -664,7 +665,7 @@ describe.skipIf(!adminDatabaseUrl())("privileged pool tenant predicates", () => 
         sessionId: tenantA.sessionId,
         artifactId: tenantA.artifactId
       });
-      expect(await store().consumeDownloadToken({ token: refused })).toBeNull();
+      expect(await store().consumeDownloadToken({ token: refused, audit: downloadAudit })).toBeNull();
       const { rows } = await superuserPool().query<{ consumed_at: string | null }>(
         `SELECT consumed_at FROM artifact_download_tokens WHERE token = $1`,
         [refused]
@@ -677,8 +678,8 @@ describe.skipIf(!adminDatabaseUrl())("privileged pool tenant predicates", () => 
         sessionId: tenantA.sessionId,
         artifactId: tenantA.artifactId
       });
-      expect((await store().consumeDownloadToken({ token }))?.artifactId).toBe(tenantA.artifactId);
-      expect(await store().consumeDownloadToken({ token })).toBeNull();
+      expect((await store().consumeDownloadToken({ token, audit: downloadAudit }))?.artifactId).toBe(tenantA.artifactId);
+      expect(await store().consumeDownloadToken({ token, audit: downloadAudit })).toBeNull();
     });
   });
 

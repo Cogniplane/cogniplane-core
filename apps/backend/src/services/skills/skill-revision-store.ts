@@ -5,6 +5,7 @@ import type { Pool } from "../../lib/db.js";
 import { withTenantScope } from "../../lib/db.js";
 import { canActivateRevision } from "../../domain/skill-lifecycle.js";
 import { AdminConfigError } from "../admin-config-error.js";
+import { AuditEventStore, type AuditEventInput } from "../audit-event-store.js";
 
 import type { SkillConfigStore } from "./skill-config-store.js";
 import {
@@ -173,6 +174,10 @@ export class SkillRevisionStore {
     // Deletes what storeBundle wrote when the import fails. Without it, a
     // failed import leaves the stored bundle in place.
     deleteBundle?: (storageUri: string) => Promise<void>;
+    // The import's audit event, built from the imported records. It commits
+    // in the import's transaction; when it fails, the import fails and its
+    // stored bundle is deleted like on any other failure.
+    audit?: (imported: ImportedSkillBundleRecord) => AuditEventInput;
   }): Promise<ImportedSkillBundleRecord> {
     const { storageUri } = await input.storeBundle();
     try {
@@ -325,6 +330,7 @@ export class SkillRevisionStore {
       if (!skill) {
         throw new Error(`Failed to load imported skill ${input.skillId}.`);
       }
+      if (input.audit) await AuditEventStore.createInTransaction(client, input.audit({ skill, revision }));
       return { skill, revision };
     });
   }
@@ -371,6 +377,8 @@ export class SkillRevisionStore {
     reviewNotes: string | null;
     audience?: "test-users" | "members";
     expectedSnapshot?: AdminSkillReleaseSnapshot;
+    /** The activation's audit events, built from its result. They commit in the activation's transaction. */
+    audit?: (activated: ActivatedSkillRevisionRecord) => AuditEventInput[];
     /** Runs in the activation's transaction after the change: the owner notice of the release. */
     alsoInTransaction?: (client: PoolClient) => Promise<void>;
   }): Promise<ActivatedSkillRevisionRecord | null> {
@@ -476,13 +484,15 @@ export class SkillRevisionStore {
       if (!skill || !active.rows[0]) {
         throw new Error(`Failed to load activated skill revision ${input.skillRevisionId}.`);
       }
-      if (input.alsoInTransaction) await input.alsoInTransaction(client);
-      return {
+      const activated: ActivatedSkillRevisionRecord = {
         skill,
         revision: mapSkillRevision(active.rows[0]),
         previousActiveRevisionId,
         previousActiveRevisionNumber: previous?.rows[0] ? Number(previous.rows[0].revision_number) : null
       };
+      if (input.audit) await AuditEventStore.createManyInTransaction(client, input.audit(activated));
+      if (input.alsoInTransaction) await input.alsoInTransaction(client);
+      return activated;
     });
   }
 

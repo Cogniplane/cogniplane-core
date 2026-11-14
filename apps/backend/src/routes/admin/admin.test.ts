@@ -17,6 +17,7 @@ import type {
 } from "../../services/tenant-settings-store.js";
 import { FakeDatabase } from "../../test-helpers/fake-database.js";
 import { InMemoryAuditEventStore } from "../../test-helpers/in-memory-audit-events.js";
+import type { AuditEventInput } from "../../services/audit-event-store.js";
 import { createTestConfig } from "../../test-helpers/test-config.js";
 import { devDataRoutes } from "../../test-helpers/data-routes.js";
 import type { AdminMcpServerRecord } from "../../services/admin-config-records.js";
@@ -295,7 +296,8 @@ class InMemoryAdminConfig implements AdminDynamicConfig {
     return [...this.skills, ...this.bundleSkills];
   }
 
-  async disableSkill(_tenantId: string, skillId: string) {
+  async disableSkill(_tenantId: string, skillId: string, _expectedSnapshot?: unknown,
+    options?: { audit?: (skill: never) => AuditEventInput }) {
     const existing = this.skills.find((skill) => skill.skillId === skillId);
     if (!existing) {
       return null;
@@ -304,6 +306,7 @@ class InMemoryAdminConfig implements AdminDynamicConfig {
     existing.enabled = false;
     existing.version += 1;
     existing.updatedAt = new Date().toISOString();
+    if (options?.audit) await this.transactionAudits?.create(options.audit(existing as never));
     return existing;
   }
 
@@ -311,6 +314,7 @@ class InMemoryAdminConfig implements AdminDynamicConfig {
     archiveBuffer: Buffer;
     originalFileName: string;
     actorUserId: string;
+    audit?: (imported: never) => AuditEventInput;
   }) {
     expect(input.archiveBuffer.byteLength > 0).toBeTruthy();
     const skill = {
@@ -354,7 +358,9 @@ class InMemoryAdminConfig implements AdminDynamicConfig {
       reviewedAt: null,
       activatedAt: null
     };
-    return { skill, revision, previousActiveRevisionId: 2, previousActiveRevisionNumber: 2 };
+    const imported = { skill, revision, previousActiveRevisionId: 2, previousActiveRevisionNumber: 2 };
+    if (input.audit) await this.transactionAudits?.create(input.audit(imported as never));
+    return imported;
   }
 
   async importSkillBundleFromInline(_tenantId: string, input: {
@@ -363,13 +369,14 @@ class InMemoryAdminConfig implements AdminDynamicConfig {
     description: string;
     instructions: string;
     actorUserId: string;
+    audit?: (imported: never) => AuditEventInput;
   }) {
     const imported = await this.importSkillBundleFromZip(_tenantId, {
       archiveBuffer: Buffer.from(input.instructions),
       originalFileName: `${input.skillId}.zip`,
       actorUserId: input.actorUserId
     });
-    return {
+    const inline = {
       ...imported,
       skill: {
         ...imported.skill,
@@ -379,6 +386,8 @@ class InMemoryAdminConfig implements AdminDynamicConfig {
         instructions: input.instructions
       }
     };
+    if (input.audit) await this.transactionAudits?.create(input.audit(inline as never));
+    return inline;
   }
 
   async cleanupInactiveSkillRevisions(_tenantId: string, input: { dryRun?: boolean }) {
@@ -396,6 +405,7 @@ class InMemoryAdminConfig implements AdminDynamicConfig {
     ref?: string;
     subdirectory?: string;
     actorUserId: string;
+    audit?: (imported: never) => AuditEventInput;
   }) {
     expect(input.githubUrl).toBe("https://github.com/example-org/pdf-processing");
     const skill = {
@@ -445,7 +455,9 @@ class InMemoryAdminConfig implements AdminDynamicConfig {
       reviewedAt: null,
       activatedAt: null
     };
-    return { skill, revision, previousActiveRevisionId: 2, previousActiveRevisionNumber: 2 };
+    const imported = { skill, revision, previousActiveRevisionId: 2, previousActiveRevisionNumber: 2 };
+    if (input.audit) await this.transactionAudits?.create(input.audit(imported as never));
+    return imported;
   }
 
   async listSkillRevisions(_tenantId: string, skillId: string) {
@@ -490,6 +502,7 @@ class InMemoryAdminConfig implements AdminDynamicConfig {
     skillRevisionId: number;
     actorUserId: string;
     reviewNotes?: string | null;
+    audit?: (activated: never) => AuditEventInput[];
   }) {
     if (input.skillId !== "pdf-processing" || input.skillRevisionId !== 3) {
       return null;
@@ -541,7 +554,9 @@ class InMemoryAdminConfig implements AdminDynamicConfig {
       activatedAt: new Date().toISOString()
     };
 
-    return { skill, revision, previousActiveRevisionId: 2, previousActiveRevisionNumber: 2 };
+    const activated = { skill, revision, previousActiveRevisionId: 2, previousActiveRevisionNumber: 2 };
+    for (const event of input.audit?.(activated as never) ?? []) await this.transactionAudits?.create(event);
+    return activated;
   }
 
   /** Servers that saveMcpServerWithAudience stored, as the real store lists them. */
@@ -732,8 +747,8 @@ class InMemoryAdminConfig implements AdminDynamicConfig {
 }
 
 test("admin routes list, disable skills, and show runtime rollout state", async () => {
-  const adminConfig = new InMemoryAdminConfig();
   const auditEvents = new InMemoryAuditEventStore();
+  const adminConfig = new InMemoryAdminConfig(auditEvents);
   const app = Fastify();
   const testConfig = createTestConfig({
     LOCAL_DEV_USER_ID: "admin-user",
@@ -1776,7 +1791,7 @@ test("admin routes import a skill bundle zip", async () => {
 
   const auditEvents = new InMemoryAuditEventStore();
   await registerTestAdminRoutes(app, {
-    dynamicConfig: new InMemoryAdminConfig(),
+    dynamicConfig: new InMemoryAdminConfig(auditEvents),
     skillMarketplace: createMarketplaceStore(),
     skillBundleStorage: createSkillBundleStorage(),
     auditEvents,
@@ -1998,7 +2013,7 @@ test("admin routes import a skill bundle from GitHub", async () => {
 
   const auditEvents = new InMemoryAuditEventStore();
   await registerTestAdminRoutes(app, {
-    dynamicConfig: new InMemoryAdminConfig(),
+    dynamicConfig: new InMemoryAdminConfig(auditEvents),
     skillMarketplace: createMarketplaceStore(),
     skillBundleStorage: createSkillBundleStorage(),
     auditEvents,
@@ -2054,7 +2069,7 @@ test("admin routes list and activate skill revisions", async () => {
 
   const auditEvents = new InMemoryAuditEventStore();
   await registerTestAdminRoutes(app, {
-    dynamicConfig: new InMemoryAdminConfig(),
+    dynamicConfig: new InMemoryAdminConfig(auditEvents),
     skillMarketplace: createMarketplaceStore(),
     skillBundleStorage: createSkillBundleStorage(),
     auditEvents,

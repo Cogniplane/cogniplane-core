@@ -127,16 +127,28 @@ export class ApprovalCoordinator {
         entry.settle(decision);
       }
     };
+    // `resolve` writes the decision and its audit event in one transaction.
+    // Both commit before a local wait resumes. When the write fails, the wait
+    // stays pending and the caller gets the error, so the user can decide again.
     if (eligible.length > 0 && eligible.every((entry) => !entry.requiresDurableProof)) {
       if (!eligible.some((entry) => entry.turn.hasLocalActor(actor))) return this.compareSavedDecision(input);
-      settleEligible();
+      let approval: ApprovalRecord | null;
       try {
-        const approval = await this.deps.approvals.resolve(tenantId, approvalId, userId, decision,
+        approval = await this.deps.approvals.resolve(tenantId, approvalId, userId, decision,
           rememberForTurn === true);
-        if (approval) await this.auditDecision(tenantId, approval, decision);
       } catch (err) {
         this.deps.logger.error({ err, approvalId, tenantId }, "failed to persist native approval decision");
+        throw err;
       }
+      // A concurrent request can have saved a decision while this one waited
+      // for its write. That request settles the wait, so this one only
+      // compares. When no row has a decision, the local wait stays the
+      // authority of a native approval, as before.
+      if (!approval) {
+        const saved = await this.compareSavedDecision(input);
+        if (saved !== "missing") return saved;
+      }
+      settleEligible();
       return "resolved";
     }
 
@@ -151,11 +163,6 @@ export class ApprovalCoordinator {
     }
     if (!approval) return this.compareSavedDecision(input);
     settleEligible();
-    try {
-      await this.auditDecision(tenantId, approval, decision);
-    } catch (err) {
-      this.deps.logger.warn({ err, approvalId }, "failed to write approval decision audit event");
-    }
     return "resolved";
   }
 
@@ -182,14 +189,6 @@ export class ApprovalCoordinator {
       remembersForTurn(saved, saved.decision, saved.rememberForTurn) ===
         remembersForTurn(saved, decision, rememberForTurn);
     return equivalent ? "resolved" : "conflict";
-  }
-
-  private async auditDecision(tenantId: string, approval: ApprovalRecord, decision: "approve" | "reject"): Promise<void> {
-    await this.deps.auditEvents.create({
-      tenantId, sessionId: approval.sessionId, userId: approval.userId,
-      approvalId: approval.approvalId, type: decision === "approve" ? "approval.approved" : "approval.rejected",
-      payload: { itemId: approval.itemId, kind: approval.kind }
-    });
   }
 
   cancelPending(scope: ApprovalActor & { sessionId: string; runtimeId: string }, reason: ApprovalCleanupReason): Promise<void> {
@@ -241,6 +240,7 @@ export class ApprovalCoordinator {
     // Per tool: a remembered write or read must not approve `delete`.
     const rememberKey = `${kind}:${name}`;
     if (!action.policyApproval && turn.remembered.has(rememberKey)) {
+      // No row changes: the approval that the turn remembered has its own event.
       try {
         await this.deps.auditEvents.create({
           ...identity, approvalId: null, type: "approval.auto_approved", payload: { toolName: name, kind }

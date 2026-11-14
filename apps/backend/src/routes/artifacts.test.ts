@@ -85,17 +85,21 @@ function buildApp(opts: {
         return toRecord(row);
       },
       // Same gating as peek plus the single-use flip and `expires_at > NOW()`
-      // predicate — an expired token is never consumed.
-      async consumeDownloadToken(input: { token: string }) {
+      // predicate — an expired token is never consumed. The audit event is
+      // written in the consume's transaction: when it fails, the token stays.
+      async consumeDownloadToken(input: {
+        token: string;
+        audit: (token: ReturnType<typeof toRecord>) => Parameters<InMemoryAuditEventStore["create"]>[0];
+      }) {
         const row = rows.get(input.token);
         if (!row) return null;
         if (row.consumedAt !== null) return null;
         if (new Date(row.expiresAt).getTime() <= Date.now()) return null;
+        await audit.create(input.audit(toRecord(row)));
         row.consumedAt = new Date().toISOString();
         return toRecord(row);
       }
     },
-    auditEvents: audit,
     storage: {
       openReadStream:
         opts.openReadStream ??
@@ -240,22 +244,41 @@ test("GET /downloads/:token does NOT consume the token when the storage read fai
   await app.close();
 });
 
-test("GET /downloads/:token still streams the file when the audit write fails — the consumed token is not burned", async () => {
-  const { app, stores, audit } = buildApp({
+test("GET /downloads/:token sends no file when the audit write fails, keeps the token, and closes the stream", async () => {
+  let destroyed = 0;
+  const { app, stores, audit, rows } = buildApp({
     initialRows: [makeRow()],
-    auth: { userId: "user-1", tenantId: "tenant-A", role: "member" }
+    auth: { userId: "user-1", tenantId: "tenant-A", role: "member" },
+    openReadStream: async () => {
+      const { Readable } = await import("node:stream");
+      const stream = Readable.from([Buffer.from("PAYLOAD")]);
+      const destroy = stream.destroy.bind(stream);
+      stream.destroy = (error?: Error) => { destroyed += 1; return destroy(error); };
+      return { stream, fileSizeBytes: 7 };
+    }
   });
-  // The audit write runs AFTER consumeDownloadToken; if its failure escaped,
-  // the client would get a 500 with the single-use token already spent.
+  // The event commits with the consume, so a failed event leaves no
+  // download without evidence and no burned token.
+  const create = audit.create.bind(audit);
   audit.create = async () => {
     throw new Error("audit table unavailable");
   };
+  app.setErrorHandler(handleAppError);
   await registerArtifactRoutes(app, stores as never);
   await app.ready();
 
-  const response = await app.inject({ method: "GET", url: "/downloads/tok-1" });
-  expect(response.statusCode).toBe(200);
-  expect(response.body).toBe("PAYLOAD");
+  const failed = await app.inject({ method: "GET", url: "/downloads/tok-1" });
+  expect(failed.statusCode).toBe(500);
+  expect(failed.body).not.toContain("PAYLOAD");
+  expect(failed.body).not.toContain("audit table unavailable");
+  expect(rows.get("tok-1")?.consumedAt).toBeNull();
+  expect(destroyed).toBe(1);
+
+  audit.create = create;
+  const retry = await app.inject({ method: "GET", url: "/downloads/tok-1" });
+  expect(retry.statusCode).toBe(200);
+  expect(retry.body).toBe("PAYLOAD");
+  expect(audit.events.filter((entry) => entry.type === "artifact_downloaded")).toHaveLength(1);
 
   await app.close();
 });
@@ -329,7 +352,6 @@ function buildBrowseApp(opts: {
         return { items, nextCursor: null };
       }
     },
-    auditEvents: new InMemoryAuditEventStore(),
     storage: { async openReadStream() { return { stream: null, fileSizeBytes: 0 }; } },
     processor: { async extractArtifactText() { return null; } }
   };

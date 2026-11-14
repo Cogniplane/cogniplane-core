@@ -13,7 +13,6 @@ import type {
 
 import { registerAdminPolicyRoutes } from "./admin-policy-routes.js";
 import type { Pool } from "../../lib/db.js";
-import type { AuditEventStore } from "../../services/audit-event-store.js";
 import { DataRouteControl } from "../../services/data-route-control.js";
 import { PolicyService } from "../../services/policy/policy-service.js";
 import type { PolicyDecisionStore } from "../../services/policy/policy-decision-store.js";
@@ -239,8 +238,7 @@ async function buildApp(options: { now?: () => Date; dataRoutes?: DataRouteContr
   const decisionStore = new InMemoryDecisionStore();
   const policyService = new PolicyService({
     rules: ruleStore as unknown as PolicyRuleStore,
-    decisions: decisionStore as unknown as PolicyDecisionStore,
-    auditEvents: audit as unknown as AuditEventStore
+    decisions: decisionStore as unknown as PolicyDecisionStore
   });
 
   app.decorate("config", createTestConfig({ LOCAL_DEV_USER_ID: "admin-user" }));

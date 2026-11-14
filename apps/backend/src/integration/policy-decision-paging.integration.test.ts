@@ -4,7 +4,6 @@ import { describe, expect, onTestFinished, test } from "vitest";
 import { PolicyDecisionDetailResponseSchema, PolicyDecisionsListResponseSchema, PolicyMonitorSummaryResponseSchema } from "@cogniplane/shared-types";
 
 import { registerAdminPolicyRoutes } from "../routes/admin/admin-policy-routes.js";
-import { AuditEventStore } from "../services/audit-event-store.js";
 import { PolicyDecisionStore } from "../services/policy/policy-decision-store.js";
 import { PolicyRuleStore } from "../services/policy/policy-rule-store.js";
 import { PolicyService } from "../services/policy/policy-service.js";
@@ -41,7 +40,6 @@ async function buildApp(tenantId: string) {
   await seedMembership(tenantId, adminId, "admin");
   const decisions = new PolicyDecisionStore(appPool());
   const rules = new PolicyRuleStore(appPool());
-  const auditEvents = new AuditEventStore(appPool());
   const app = Fastify();
   app.decorate("db", appPool());
   app.addHook("preHandler", async (request) => {
@@ -50,7 +48,7 @@ async function buildApp(tenantId: string) {
   await registerAdminPolicyRoutes(app, {
     policyRules: rules,
     policyDecisions: decisions,
-    policyService: new PolicyService({ rules, decisions, auditEvents }),
+    policyService: new PolicyService({ rules, decisions }),
     dataRoutes: devDataRoutes(),
     now: () => WINDOW_END
   });
@@ -96,7 +94,9 @@ describe.skipIf(!adminDatabaseUrl())("policy decision paging with microsecond ti
       sessionId: null, userId: null, runtimeId: null, toolName: "export_customers", toolCategory: null,
       severity: null, serverId: null, matchedRuleId: "pol_paging", outcome: "block", enforced: false,
       explanation: null, actionSnapshot: { argumentKeys: ["repo"] }
-    });
+    }, (decision) => ({
+      tenantId: tenant, sessionId: null, type: "policy.decision.recorded", payload: { decisionId: decision.decisionId }
+    }));
 
     const later = await readPages(app, { before: pin }, 247, PAGE);
     const listed = [...first.decisions.map((decision) => decision.decisionId), ...later];

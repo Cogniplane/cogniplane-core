@@ -21,6 +21,7 @@ import {
 import { escapeLikePattern, type Pool, withTenantScope } from "../lib/db.js";
 import { isoTimestamp, isoTimestampOrNull } from "../lib/db-mappers.js";
 import { uuidv7 } from "../lib/uuid.js";
+import { AuditEventStore, type AuditEventInput } from "./audit-event-store.js";
 
 export type MemoryRecord = {
   memoryId: string;
@@ -280,7 +281,9 @@ export class MemoryStore {
     tenantId: string,
     userId: string,
     memoryId: string,
-    input: { content: string; expectedVersion: number }
+    input: { content: string; expectedVersion: number },
+    // The edit's audit event; it commits in the edit's transaction.
+    audit?: (memory: MemoryRecord) => AuditEventInput
   ): Promise<MemoryRecord> {
     assertValidContent(input.content);
     return withTenantScope(this.db, tenantId, async (client) => {
@@ -300,7 +303,11 @@ export class MemoryStore {
         `,
         [tenantId, userId, memoryId, input.content, input.expectedVersion]
       );
-      if (updated.rows[0]) return mapMemory(updated.rows[0]);
+      if (updated.rows[0]) {
+        const memory = mapMemory(updated.rows[0]);
+        if (audit) await AuditEventStore.createInTransaction(client, audit(memory));
+        return memory;
+      }
       const exists = await client.query(
         `SELECT slug FROM agent_memories WHERE tenant_id = $1 AND user_id = $2 AND memory_id = $3`,
         [tenantId, userId, memoryId]
@@ -311,7 +318,9 @@ export class MemoryStore {
   }
 
   /** The user deletes one of their own memories. Returns its name, or null when they have none with that id. */
-  async removeById(tenantId: string, userId: string, memoryId: string): Promise<{ slug: string } | null> {
+  /** `audit` builds the removal's audit event, which commits in the removal's transaction. */
+  async removeById(tenantId: string, userId: string, memoryId: string,
+    audit?: (removed: { slug: string }) => AuditEventInput): Promise<{ slug: string } | null> {
     return withTenantScope(this.db, tenantId, async (client) => {
       const removal = await client.query(
         `
@@ -321,7 +330,10 @@ export class MemoryStore {
         `,
         [tenantId, userId, memoryId]
       );
-      return removal.rows[0] ? { slug: String(removal.rows[0].slug) } : null;
+      if (!removal.rows[0]) return null;
+      const removed = { slug: String(removal.rows[0].slug) };
+      if (audit) await AuditEventStore.createInTransaction(client, audit(removed));
+      return removed;
     });
   }
 

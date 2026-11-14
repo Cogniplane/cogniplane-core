@@ -3242,12 +3242,12 @@ describe("approval bookkeeping failures (R10, R56)", () => {
     }
   });
 
-  it("reports a decision resolved even when the approval row write throws", async () => {
-    // `entry.settle` has already handed the decision to the turn loop in-process,
-    // so the tool has run (or been denied) and the graph resumed. Letting the
-    // store's error escape would 500 the decision route, and the client's retry
-    // would 404 — for an action that already happened.
-    const { factory } = makeInterruptingFactory({
+  it("keeps the approval wait when the decision write throws, so a retry can decide it", async () => {
+    // The decision and its audit event commit before the turn resumes. A failed
+    // write resumes nothing: the route reports the error, the local wait stays,
+    // and the client's retry on this replica decides it.
+    let writes = 0;
+    const { factory, resumes } = makeInterruptingFactory({
       rounds: [[{ interruptId: "int-1", name: "execute", args: { command: "ls" } }], []]
     });
     const adapter = new DeepAgentsRuntimeAdapter(
@@ -3262,7 +3262,12 @@ describe("approval bookkeeping failures (R10, R56)", () => {
             return {} as never;
           },
           async resolve() {
-            throw new Error("connection terminated");
+            writes += 1;
+            if (writes === 1) throw new Error("connection terminated");
+            return null;
+          },
+          async getDecided() {
+            return null;
           }
         } as never,
         auditEvents: fakeAuditEventStore,
@@ -3279,16 +3284,18 @@ describe("approval bookkeeping failures (R10, R56)", () => {
       (event) => event.type === AGUIEventType.CUSTOM && event.name === "approval_required"
     )) as AGUIBaseEvent & { value: { approvalId: string } };
 
-    await expect(
-      adapter.resolveApproval({
-        tenantId: sessionInput.tenantId,
-        userId: sessionInput.userId,
-        approvalId: approvalEvent.value.approvalId,
-        decision: "approve"
-      })
-    ).resolves.toBe("resolved");
+    const decision = {
+      tenantId: sessionInput.tenantId,
+      userId: sessionInput.userId,
+      approvalId: approvalEvent.value.approvalId,
+      decision: "approve" as const
+    };
+    await expect(adapter.resolveApproval(decision)).rejects.toThrow("connection terminated");
+    expect(resumes).toEqual([]);
 
+    await expect(adapter.resolveApproval(decision)).resolves.toBe("resolved");
     await done;
+    expect(resumes).toEqual([[{ type: "approve" }]]);
     expect(events.at(-1)).toMatchObject({ type: AGUIEventType.RUN_FINISHED });
     await adapter.close();
   });
@@ -4239,7 +4246,9 @@ describe("approval decisions: ownership, durability, and edge outcomes", () => {
     const { factory, resumes } = makeInterruptingFactory({ rounds: [[actionFor(true)], []], mcpToolNames: ["github_write_file"] });
     const approvals = createInMemoryApprovalStore();
     const audit: Array<Record<string, unknown>> = [];
-    const adapter = makeApprovalAdapter({ factory, approvals, auditEvents: { async create(event) { audit.push(event); } } });
+    // ApprovalStore.resolve writes the decision's event in its transaction.
+    approvals.audit.mockImplementation(async (event) => { audit.push(event); });
+    const adapter = makeApprovalAdapter({ factory, approvals });
     try {
       const turn = await promptedTurn(adapter);
 

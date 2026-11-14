@@ -7,7 +7,8 @@ import { AGUI_INTERRUPTED_RESULT } from "./deep-agents/agui-events.js";
 import type { SessionRecord } from "./session-store.js";
 import type { MessageRecord, ToolResultRecord } from "./message-store.js";
 import type { ToolExecutionContext } from "./auth/tool-execution-context-store.js";
-import type { ClaimJobResult, ClaimedScheduledJob } from "./user-settings-store.js";
+import type { ClaimJobResult, ClaimedScheduledJob, OrphanedJobRunRecord } from "./user-settings-store.js";
+import type { AuditEventInput } from "./audit-event-store.js";
 import type { ExecutionActor, SessionExecution } from "./session-execution-store.js";
 import type { LimitExceededErrorPayload } from "./request-limits.js";
 import { PiiProtectionServiceError, type PiiDecision } from "./pii/pii-protection-service.js";
@@ -353,15 +354,18 @@ function createFakeDeps(options?: {
         jobRunsCreated.push({ runId, jobId: result.jobId, userId: result.userId, sessionId: null });
         return { status: "claimed", job: { ...result, runId } };
       },
-      parkJob: async (tenantId, jobId) => {
+      // Like the store, the audit event commits with a change that matched the job.
+      parkJob: async (tenantId, jobId, _revision, audit) => {
         parkCalls.push({ tenantId, jobId });
-        return options?.parkReturns ?? true;
+        const parked = options?.parkReturns ?? true;
+        if (parked && audit) auditEvents.push(audit);
+        return parked;
       },
       attachJobRunSession: async (input) => {
         runSessionsAttached.push(input);
         return options?.attachReturns ?? true;
       },
-      finishJobRun: async ({ counts, revision, disableAtFailures, jobId, ...input }) => {
+      finishJobRun: async ({ counts, revision, disableAtFailures, jobId, ...input }, audit) => {
         order.push("complete");
         jobRunsCompleted.push(input);
         finishCalls.push({ jobId, runId: input.runId, revision, counts, disableAtFailures });
@@ -377,8 +381,8 @@ function createFakeDeps(options?: {
           disabled = !succeeded && !options?.jobOffAtFinish && disableAtFailures > 0
             && consecutiveFailures >= disableAtFailures;
         }
-        return {
-          status: "finished",
+        const finished = {
+          status: "finished" as const,
           consecutiveFailures,
           disabled,
           run: {
@@ -398,17 +402,24 @@ function createFakeDeps(options?: {
             createdAt: new Date().toISOString()
           }
         };
+        // The run's events commit with the finish, in the store's transaction.
+        if (audit) auditEvents.push(...audit(finished));
+        return finished;
       },
-      sweepStaleJobRuns: async (olderThanMs: number, limit: number) => {
+      sweepStaleJobRuns: async (olderThanMs: number, limit: number, audit?: (run: OrphanedJobRunRecord) => AuditEventInput) => {
         sweepStaleJobRunsCalls.push({ olderThanMs, limit });
         if (options?.sweepStaleJobRunsError) {
           throw options.sweepStaleJobRunsError;
         }
-        return options?.orphanedRuns ?? [];
+        const runs = options?.orphanedRuns ?? [];
+        if (audit) auditEvents.push(...runs.map(audit));
+        return runs;
       },
-      pauseJobForSecurityChange: async (tenantId: string, jobId: string) => {
+      pauseJobForSecurityChange: async (tenantId: string, jobId: string, audit?: AuditEventInput) => {
         pauseCalls.push({ tenantId, jobId });
-        return options?.pauseReturns ?? false;
+        const paused = options?.pauseReturns ?? false;
+        if (paused && audit) auditEvents.push(audit);
+        return paused;
       },
       getOwnerSecurityVersion: async (tenantId: string, userId: string) => {
         ownerVersionReads.push({ tenantId, userId });
@@ -1172,6 +1183,7 @@ describe("SchedulerWorker", () => {
     const disabled: string[] = [];
     deps.disableJob = async (input) => {
       disabled.push(input.jobId);
+      if (input.audit) auditEvents.push(input.audit);
       return true;
     };
 
@@ -1210,6 +1222,7 @@ describe("SchedulerWorker", () => {
     const disabled: string[] = [];
     deps.disableJob = async (input) => {
       disabled.push(input.jobId);
+      if (input.audit) auditEvents.push(input.audit);
       return true;
     };
 
@@ -1234,6 +1247,7 @@ describe("SchedulerWorker", () => {
     const disabled: string[] = [];
     deps.disableJob = async (input) => {
       disabled.push(input.jobId);
+      if (input.audit) auditEvents.push(input.audit);
       return true;
     };
 

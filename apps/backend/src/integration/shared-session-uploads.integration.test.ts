@@ -87,7 +87,7 @@ async function setup(mode: PiiProtectionSettings["mode"] = "off") {
   const enqueuer = new PiiArtifactScanEnqueuer(scanDeps);
   const worker = new PiiScanJobHandler({ ...scanDeps, messages: { setPiiDetail: async () => {} } });
   const processor = new ArtifactProcessor({ config, storage, logger: app.log });
-  await registerArtifactRoutes(app, { sessions, artifacts, storage, processor, auditEvents,
+  await registerArtifactRoutes(app, { sessions, artifacts, storage, processor,
     piiScanEnqueuer: enqueuer, limits: { consumeRateLimit: async () => null } });
   // These routes publish uploads and read versions; neither needs the PII service.
   await registerProjectFileRoutes(app, { artifactStorage: storage, artifactProcessor: processor,

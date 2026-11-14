@@ -252,11 +252,25 @@ Deployment of 089:
 - Admin > History (`GET /admin/history`, `routes/admin/admin-history-routes.ts`)
   shows only the audit event types and fields that `HISTORY_EVENTS`
   (`services/admin-history-projection.ts`) allows, never raw payloads.
+- Write the audit event of a governed change in the change's transaction:
+  `AuditEventStore.createInTransaction(client, ...)`, or an audit builder that
+  the store method takes and runs on its client after the change (for example
+  `ArtifactStore.createGenerated`, `SkillConfigStore.setSkillPublished`). When
+  the event cannot be written, the change rolls back; a committed change always
+  has its event. Put an owner notice in the event's `alsoInTransaction`.
+- `auditEvents.create` writes in a transaction of its own. Use it only for an
+  event that records no database change (telemetry, a refusal), or an action
+  outside PostgreSQL (Redis, the runtime). `services/audit-event-sites.test.ts`
+  lists each such call by file and function, with its reason and the number of
+  calls in that function, and allows SQL that inserts into `audit_events` only
+  in `audit-event-store.ts`. A session archive, restore or delete changes
+  `sessions.status`, so `SessionStore` writes its event in the change's
+  transaction; the route kills the released sandbox only after the commit.
 - Add an audit event: add its name to `AUDIT_EVENT_TYPES`
   (`services/audit-event-types.ts`; an overlay augments `OverlayAuditEventTypes`
-  instead) and call `auditEvents.create` where the change happens. To show it in
-  Admin > History, add an entry with its displayable fields to `HISTORY_EVENTS`;
-  put no secret or free text there.
+  instead) and write it as above. To show it in Admin > History, add an entry
+  with its displayable fields to `HISTORY_EVENTS`; put no secret or free text
+  there.
 - Per-turn token usage and `cost_usd` are on `messages`.
 - Usage: `GET /admin/token-usage` (`routes/admin/admin-token-usage-routes.ts`)
   groups by day, user or model over a rolling window of 1 to 365 days, or the

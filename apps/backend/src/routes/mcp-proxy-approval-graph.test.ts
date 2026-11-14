@@ -14,7 +14,6 @@ import { MemorySaver } from "@langchain/langgraph";
 import type { PolicyRule } from "@cogniplane/shared-types";
 
 import { createSilentLogger } from "../test-helpers/silent-logger.js";
-import { InMemoryAuditEventStore } from "../test-helpers/in-memory-audit-events.js";
 import { createProxyMcpUpstream } from "../test-helpers/mcp-route-test-support.js";
 import {
   createTestApp,
@@ -29,7 +28,6 @@ import { POLICY_APPROVAL_REQUEST_METHOD, type PolicyApprovalProof } from "../ser
 import { PolicyService } from "../services/policy/policy-service.js";
 import type { PolicyDecisionStore } from "../services/policy/policy-decision-store.js";
 import type { PolicyRuleStore } from "../services/policy/policy-rule-store.js";
-import type { AuditEventStore } from "../services/audit-event-store.js";
 
 type ToolCall = { id: string; name: string; args: Record<string, unknown> };
 
@@ -124,7 +122,6 @@ async function setup() {
   const policyService = new PolicyService({
     rules: { async list() { return [REVIEW_RULE]; } } as unknown as PolicyRuleStore,
     decisions: { async record() { return { decisionId: "pdc_1" }; }, async list() { return []; } } as unknown as PolicyDecisionStore,
-    auditEvents: new InMemoryAuditEventStore() as unknown as AuditEventStore,
     ruleCacheTtlMs: 0
   });
   const { app, toolContexts, approvals } = await createTestApp({ proxyUpstreamUrl: `${upstreamUrl}/`, policyService });
