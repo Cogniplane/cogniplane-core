@@ -38,7 +38,7 @@ function mcpAuthHeaders(claims: { sid?: string; uid?: string; rid?: string } = {
   const sid = claims.sid ?? "session-1";
   return {
     authorization: `Bearer ${generateRuntimeToken(
-      { sid, tid: "test-tenant", uid: claims.uid ?? "test-user", rid: claims.rid ?? `runtime-${sid}` },
+      { sid, tid: "test-tenant", uid: claims.uid ?? "test-user", rid: claims.rid ?? `runtime-${sid}`, exp: "2099-01-01T00:00:00.000Z" },
       TEST_RUNTIME_TOKEN_SECRET
     )}`
   };
@@ -879,7 +879,7 @@ test("managed MCP tools/list only exposes tools enabled by the active runtime po
   });
 
   const runtimeToken = generateRuntimeToken(
-    { sid: sessionId, tid: "test-tenant", uid: "test-user", rid: "runtime-session-filtered-tools" },
+    { sid: sessionId, tid: "test-tenant", uid: "test-user", rid: "runtime-session-filtered-tools", exp: "2099-01-01T00:00:00.000Z" },
     TEST_RUNTIME_TOKEN_SECRET
   );
 
