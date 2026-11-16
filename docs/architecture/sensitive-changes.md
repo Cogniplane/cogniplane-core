@@ -25,8 +25,12 @@ and accounts are in [auth](auth.md) and [local accounts](local-accounts.md).
   the marketplace setting. The comments in that file give each condition; for
   example, a password change needs step-up only when the account has a second
   factor.
-- A WorkOS session never needs step-up: Cogniplane cannot ask WorkOS for a fresh
-  proof. The owner notice is the check for WorkOS tenants.
+- Protected data-route changes, weaker controls and skill releases from a
+  WorkOS session return 403 `workos_step_up_unavailable`, with the action and
+  fixed text. Cogniplane has no supported fresh WorkOS proof flow, so these
+  writes are blocked, with email on or off. A new ordinary WorkOS sign-in and
+  an owner notice do not replace an action-bound proof. Supporting these writes
+  requires a provider reauthentication design and verification of its proof.
 
 ## Data routes
 
@@ -89,3 +93,4 @@ every user, and every skill release:
   constant); later changes join one follow-up. A notice that reaches no owner
   logs a warning.
 - With email off, the audit event is the only record.
+  This does not permit a WorkOS protected write without fresh proof.

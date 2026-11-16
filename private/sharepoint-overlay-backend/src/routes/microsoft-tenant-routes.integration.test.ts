@@ -27,6 +27,9 @@ import {
 } from "../../../../apps/backend/src/integration/support/database.js";
 import { decrypt, encrypt } from "../../../../apps/backend/src/lib/crypto-utils.js";
 import { AuditEventStore } from "../../../../apps/backend/src/services/audit-event-store.js";
+import type { LocalAuth } from "../../../../apps/backend/src/services/auth/local-auth.js";
+import { RefreshTokenRotationService } from "../../../../apps/backend/src/services/auth/refresh-token-rotation-service.js";
+import { StepUpStore } from "../../../../apps/backend/src/services/auth/step-up-store.js";
 import { DataRouteControl } from "../../../../apps/backend/src/services/data-route-control.js";
 import {
   IntegrationStateStore,
@@ -34,6 +37,7 @@ import {
 } from "../../../../apps/backend/src/services/integrations/integration-state-store.js";
 import { MailOutbox, type OwnerNoticeQueue } from "../../../../apps/backend/src/services/mail/mail-outbox.js";
 import { createTestConfig } from "../../../../apps/backend/src/test-helpers/test-config.js";
+import { FakeRefreshTokenRedis } from "../../../../apps/backend/src/test-helpers/fake-refresh-token-redis.js";
 import { MicrosoftConnectionService } from "../services/microsoft-connection-service.js";
 import { MicrosoftConnectionStore } from "../services/microsoft-connection-store.js";
 import { registerMicrosoftTenantRoutes } from "./microsoft-tenant-routes.js";
@@ -44,20 +48,24 @@ const SECRET = "microsoft-tenant-routes-integration-secret-32";
 const OLD_DIRECTORY = "11111111-2222-3333-4444-555555555555";
 const NEW_DIRECTORY = "66666666-7777-8888-9999-000000000000";
 
-type Tenant = { tenantId: string; ownerId: string; adminId: string };
+type Tenant = { tenantId: string; ownerId: string; adminId: string; authSource: "local" | "workos" };
 
-async function seedTenant(): Promise<Tenant> {
+async function seedTenant(authSource: Tenant["authSource"] = "local"): Promise<Tenant> {
   const tenantId = `tenant-${randomUUID()}`;
   const ownerId = `owner-${randomUUID()}`;
   const adminId = `admin-${randomUUID()}`;
   const db = superuserPool();
-  await db.query(`INSERT INTO tenants (tenant_id, tenant_name, slug) VALUES ($1, 'Acme', $1)`, [tenantId]);
+  await db.query(`INSERT INTO tenants (tenant_id, tenant_name, slug, login_type) VALUES ($1, 'Acme', $1, $2)`, [tenantId, authSource]);
   for (const [userId, role] of [[ownerId, "owner"], [adminId, "admin"]] as const) {
-    await db.query(`INSERT INTO users (user_id, email, display_name, auth_source) VALUES ($1, $2, $3, 'workos')`,
-      [userId, `${userId}@example.test`, role]);
-    await db.query(`INSERT INTO tenant_memberships (tenant_id, user_id, role) VALUES ($1, $2, $3)`, [tenantId, userId, role]);
+    await db.query(`INSERT INTO users (user_id, email, display_name, auth_source) VALUES ($1, $2, $3, $4)`,
+      [userId, `${userId}@example.test`, role, authSource]);
+    if (authSource === "local") {
+      await db.query(`INSERT INTO local_identities (tenant_id, user_id, status, security_version) VALUES ($1, $2, 'active', 1)`, [tenantId, userId]);
+    }
+    await db.query(`INSERT INTO tenant_memberships (tenant_id, user_id, role, user_auth_source) VALUES ($1, $2, $3, $4)`,
+      [tenantId, userId, role, authSource]);
   }
-  return { tenantId, ownerId, adminId };
+  return { tenantId, ownerId, adminId, authSource };
 }
 
 /** The app as the owner configured it: reads and writes on. */
@@ -76,12 +84,25 @@ async function buildApp(t: Tenant, ownerNotices: OwnerNoticeQueue = new MailOutb
   const app = Fastify({
     logger: { level: "trace", stream: new Writable({ write(chunk, _encoding, done) { logLines.push(String(chunk)); done(); } }) }
   });
-  // The admin's WorkOS session: no step-up, and the owners get the notice.
+  const redis = new FakeRefreshTokenRedis();
+  const refreshTokens = new RefreshTokenRotationService(redis, 60);
+  await refreshTokens.issue({ jti: "jti-1", familyId: "family-1" });
+  const stepUp = new StepUpStore(redis);
+  // Route/store tests supply a local session and a fresh action-bound proof.
+  // WorkOS fixtures receive no proof and must fail before the store writes.
   app.addHook("preHandler", async (request) => {
     request.auth = {
       userId: t.adminId, tenantId: t.tenantId, role: "admin", isAdmin: true,
-      session: { authSource: "workos", familyId: "family-1" }
+      session: t.authSource === "local"
+        ? { authSource: "local", familyId: "family-1", securityVersion: 1 }
+        : { authSource: "workos", familyId: "family-1" }
     };
+    if (t.authSource === "local" && request.method === "PUT") {
+      request.headers["x-step-up"] = (await stepUp.create({
+        tenantId: t.tenantId, userId: t.adminId, familyId: "family-1", securityVersion: 1,
+        action: "integration.overlay_settings"
+      }, ["pwd"])).token;
+    }
   });
   const integrationStates = new IntegrationStateStore(appPool());
   const service = new MicrosoftConnectionService(
@@ -91,7 +112,10 @@ async function buildApp(t: Tenant, ownerNotices: OwnerNoticeQueue = new MailOutb
     microsoftConnections: service,
     auditEvents: new AuditEventStore(appPool()),
     runtimeInvalidator: { invalidateTenantRuntimes: async () => [] },
-    dataRoutes: new DataRouteControl({ authMode: "jwt", ownerNotices })
+    dataRoutes: new DataRouteControl({
+      authMode: "jwt", ownerNotices,
+      localAuth: { stepUp, refreshTokens, mfa: { hasSecondFactor: async () => false } } as unknown as LocalAuth
+    })
   });
   await app.ready();
   return { app, logLines, integrationStates };
@@ -185,6 +209,18 @@ describe.skipIf(!adminDatabaseUrl())("PUT /tenant/settings/microsoft on Postgres
     apps.push(built.app);
     return built;
   }
+
+  test("a WorkOS session cannot save settings even when owner notices are configured", async () => {
+    const t = await seedTenant("workos");
+    const seeded = await seedConfiguredApp(t);
+    const { app, integrationStates } = await harness(t);
+    const response = await app.inject({ method: "PUT", url: "/tenant/settings/microsoft", payload: { clientId: "client-new" } });
+    expect(response.statusCode).toBe(403);
+    expect(response.json().error).toBe("workos_step_up_unavailable");
+    expect(await integrationStates.get(t.tenantId, "microsoft")).toEqual(seeded);
+    expect(await auditEventsOf(t.tenantId)).toEqual([]);
+    expect(await noticesOf(t.tenantId)).toEqual([]);
+  });
 
   test("a client id save that waits for a concurrent change keeps that change, the omitted secret, and records its editor", async () => {
     const t = await seedTenant();

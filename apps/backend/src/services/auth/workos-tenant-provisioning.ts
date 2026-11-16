@@ -36,6 +36,13 @@ export class WrongLoginTypeError extends Error {
   }
 }
 
+export class WorkOsOwnerBootstrapError extends Error {
+  constructor() {
+    super("The first member must have the WorkOS admin role.");
+    this.name = "WorkOsOwnerBootstrapError";
+  }
+}
+
 /**
  * The tenant's own RBAC is authoritative once a membership exists. WorkOS seeds
  * the role at first provisioning only — re-applying the org role slug on every
@@ -53,6 +60,7 @@ export function resolveTenantMembershipRole(input: {
   }
 
   if (input.isFirstMember) {
+    if (input.workosRoleSlug !== "admin") throw new WorkOsOwnerBootstrapError();
     return "owner";
   }
 
@@ -80,7 +88,8 @@ export async function resolveWorkOsOrganization(
   input: { workosUserId: string; organizationIdHint: string | null | undefined }
 ): Promise<WorkOsOrganizationResolution> {
   const memberships = await workos.userManagement.listOrganizationMemberships({
-    userId: input.workosUserId
+    userId: input.workosUserId,
+    statuses: ["active"]
   });
 
   if (!input.organizationIdHint && memberships.data.length > 1) {
@@ -137,6 +146,10 @@ export async function provisionTenantIdentity(
   }
 ): Promise<ProvisionedTenantIdentity> {
   return withTransaction(db, async (client) => {
+    // First sign-ins share both workos_org_id and slug. Serialize before the
+    // INSERT so neither unique index can race another first sign-in. A
+    // refused bootstrap rolls back before an authorized admin retries.
+    await client.query(`SELECT pg_advisory_xact_lock(hashtext('workos:organization:' || $1))`, [input.organizationId]);
     // tenant_name is set on INSERT only. The owner renames the tenant through
     // PUT /tenant; re-applying the WorkOS org name at each sign-in would revert
     // that rename. A later rename in WorkOS therefore does not sync.
@@ -146,9 +159,8 @@ export async function provisionTenantIdentity(
     // can then lock the tenant row (FOR SHARE in
     // LocalAccountService.createMemberInTransaction, UPDATE in the MFA policy
     // change), so a row lock here, before the membership lock below, could
-    // deadlock with them. Two first sign-ins of a new organization still
-    // meet: the second INSERT waits until the first commits, then reads its
-    // row.
+    // deadlock with them. The organization lock above serializes first
+    // sign-ins before either can insert the tenant.
     await client.query(
       `INSERT INTO tenants (tenant_id, tenant_name, slug, workos_org_id)
        VALUES ($1, $2, $3, $4)

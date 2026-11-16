@@ -5,10 +5,12 @@
 
 import { randomUUID } from "node:crypto";
 import type pg from "pg";
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 
 import { withTenantScope } from "../lib/db.js";
-import { provisionTenantIdentity } from "../services/auth/workos-tenant-provisioning.js";
+import { provisionTenantIdentity, WorkOsOwnerBootstrapError } from "../services/auth/workos-tenant-provisioning.js";
+import { WorkOsMembershipRevalidation } from "../services/auth/workos-membership-revalidation.js";
+import { createFakeWorkOS } from "../test-helpers/fake-workos.js";
 import { lockTenantMembership, TENANT_MEMBERSHIP_LOCK_SQL } from "../services/member-authority.js";
 import { endTenantMembership, MemberRemovedError } from "../services/tenant-member-removal.js";
 import { adminDatabaseUrl, appPool, maintenancePool, superuserPool } from "./support/database.js";
@@ -27,7 +29,7 @@ async function roleOf(tenantId: string, userId: string): Promise<string | null> 
 /** A WorkOS tenant with an owner, and a second user with `role`. */
 async function tenantWith(role: "member" | "admin") {
   const organizationId = `org_${randomUUID()}`;
-  const owner = await login(organizationId, `user_${randomUUID()}`, `${randomUUID()}@example.test`);
+  const owner = await login(organizationId, `user_${randomUUID()}`, `${randomUUID()}@example.test`, "admin");
   const email = `${randomUUID()}@example.test`;
   const workosUserId = `user_${randomUUID()}`;
   const second = await login(organizationId, workosUserId, email, role);
@@ -111,6 +113,105 @@ async function removalOf(tenantId: string, userId: string): Promise<boolean> {
 }
 
 describe.skipIf(!adminDatabaseUrl())("WorkOS provisioning and concurrent role changes", () => {
+  test("an ordinary first member leaves no tenant or identity behind", async () => {
+    const organizationId = `org_${randomUUID()}`;
+    const email = `${randomUUID()}@example.test`;
+    await expect(login(organizationId, `user_${randomUUID()}`, email, "member")).rejects.toBeInstanceOf(WorkOsOwnerBootstrapError);
+    const tenant = await superuserPool().query("SELECT 1 FROM tenants WHERE workos_org_id = $1", [organizationId]);
+    const user = await superuserPool().query("SELECT 1 FROM users WHERE email = $1", [email]);
+    expect(tenant.rowCount).toBe(0);
+    expect(user.rowCount).toBe(0);
+  });
+
+  test("an ordinary first login rolls back while an authorized admin bootstraps the owner", async () => {
+    const organizationId = `org_${randomUUID()}`;
+    const memberEmail = `${randomUUID()}@example.test`;
+    const results = await Promise.allSettled([
+      login(organizationId, `user_${randomUUID()}`, memberEmail, "member"),
+      login(organizationId, `user_${randomUUID()}`, `${randomUUID()}@example.test`, "admin")
+    ]);
+    const admin = results[1];
+    expect(admin.status).toBe("fulfilled");
+    if (admin.status !== "fulfilled") throw admin.reason;
+    expect(admin.value.role).toBe("owner");
+    const member = results[0];
+    if (member.status === "rejected") {
+      expect(member.reason).toBeInstanceOf(WorkOsOwnerBootstrapError);
+      const user = await superuserPool().query("SELECT 1 FROM users WHERE email = $1", [memberEmail]);
+      expect(user.rowCount).toBe(0);
+    } else {
+      expect(member.value.role).toBe("member");
+    }
+    const owners = await superuserPool().query("SELECT user_id FROM tenant_memberships WHERE tenant_id = $1 AND role = 'owner'", [admin.value.tenantId]);
+    expect(owners.rows).toEqual([{ user_id: admin.value.userId }]);
+  });
+
+  test.each(["deleted", "disabled"])("refresh revalidation removes a %s WorkOS member under app_user and blocks re-admission", async (status) => {
+    const t = await tenantWith("member");
+    const { workos, mocks } = createFakeWorkOS();
+    mocks.listOrganizationMemberships.mockResolvedValue({ data: status === "deleted" ? [] : [{
+      userId: t.workosUserId, organizationId: t.organizationId, status: "inactive"
+    }] });
+    const afterSecurityChange = vi.fn(async () => {});
+    const service = new WorkOsMembershipRevalidation({
+      lookupDb: maintenancePool(), db: appPool(), workos, afterSecurityChange
+    });
+
+    expect(await service.revalidate(t.tenantId, t.userId)).toBe(false);
+    expect(await roleOf(t.tenantId, t.userId)).toBeNull();
+    expect(await roleOf(t.tenantId, t.ownerId)).toBe("owner");
+    expect(await removalOf(t.tenantId, t.userId)).toBe(true);
+    expect(afterSecurityChange).toHaveBeenCalledWith({ tenantId: t.tenantId, userIds: [t.userId], releasedSandboxes: [] });
+    await expect(login(t.organizationId, t.workosUserId, t.email, "member")).rejects.toBeInstanceOf(MemberRemovedError);
+    const audit = await superuserPool().query(
+      "SELECT payload FROM audit_events WHERE tenant_id = $1 AND user_id = $2 AND event_type = 'tenant.member.removed'",
+      [t.tenantId, t.userId]
+    );
+    expect(audit.rows[0]?.payload).toMatchObject({ targetUserId: t.userId, reason: "workos_membership_inactive" });
+  });
+
+  test("refresh revalidation refuses the last owner and keeps the membership", async () => {
+    const t = await tenantWith("member");
+    const owner = await superuserPool().query<{ workos_user_id: string }>(
+      "SELECT workos_user_id FROM users WHERE user_id = $1", [t.ownerId]
+    );
+    const { workos, mocks } = createFakeWorkOS();
+    mocks.listOrganizationMemberships.mockResolvedValue({ data: [] });
+    const afterSecurityChange = vi.fn(async () => {});
+    const afterRemoval = vi.fn(async () => {});
+    const service = new WorkOsMembershipRevalidation({
+      lookupDb: maintenancePool(), db: appPool(), workos, afterSecurityChange, afterRemoval
+    });
+
+    expect(await service.revalidate(t.tenantId, t.ownerId)).toBe(false);
+    expect(mocks.listOrganizationMemberships).toHaveBeenLastCalledWith({
+      userId: owner.rows[0]!.workos_user_id, organizationId: t.organizationId,
+      statuses: ["active", "inactive", "pending"]
+    });
+    expect(await roleOf(t.tenantId, t.ownerId)).toBe("owner");
+    expect(await removalOf(t.tenantId, t.ownerId)).toBe(false);
+    expect(afterSecurityChange).not.toHaveBeenCalled();
+    expect(afterRemoval).not.toHaveBeenCalled();
+    const audit = await superuserPool().query(
+      "SELECT event_type, payload FROM audit_events WHERE tenant_id = $1 AND user_id = $2 AND event_type LIKE 'tenant.member.%'",
+      [t.tenantId, t.ownerId]
+    );
+    expect(audit.rows).toEqual([{
+      event_type: "tenant.member.removal_refused",
+      payload: { targetUserId: t.ownerId, role: "owner", reason: "workos_membership_inactive_last_owner" }
+    }]);
+
+    // With a second owner, the same owner is removed.
+    await superuserPool().query(
+      "UPDATE tenant_memberships SET role = 'owner' WHERE tenant_id = $1 AND user_id = $2", [t.tenantId, t.userId]
+    );
+    expect(await service.revalidate(t.tenantId, t.ownerId)).toBe(false);
+    expect(await roleOf(t.tenantId, t.ownerId)).toBeNull();
+    expect(await roleOf(t.tenantId, t.userId)).toBe("owner");
+    expect(await removalOf(t.tenantId, t.ownerId)).toBe(true);
+    expect(afterRemoval).toHaveBeenCalledExactlyOnceWith({ tenantId: t.tenantId, userId: t.ownerId });
+  });
+
   test("a promotion that commits during a login is kept", async () => {
     const t = await tenantWith("member");
     const result = await loginDuring(

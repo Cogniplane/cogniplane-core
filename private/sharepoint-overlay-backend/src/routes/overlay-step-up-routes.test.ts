@@ -173,12 +173,13 @@ describe("overlay step-up routes", () => {
     expect(JSON.stringify(notices)).not.toContain(CONFIG.clientSecret);
   });
 
-  test("a WorkOS session changes the Microsoft app with no step-up, and the owners get the notice", async () => {
+  test("a WorkOS session cannot change the Microsoft app without fresh proof", async () => {
     const { app, applyChanges, notices } = await harness("workos");
     const res = await app.inject({ method: "PUT", url: "/tenant/settings/microsoft", payload: CONFIG });
-    expect(res.statusCode, res.body).toBe(200);
-    expect(applyChanges).toHaveBeenCalledTimes(1);
-    expect(notices).toEqual([{ client: CHANGE_TRANSACTION, change: NOTICE }]);
+    expect(res.statusCode, res.body).toBe(403);
+    expect(res.json()).toMatchObject({ error: "workos_step_up_unavailable", action: "integration.overlay_settings" });
+    expect(applyChanges).not.toHaveBeenCalled();
+    expect(notices).toEqual([]);
   });
 
   test("every overlay route is in the step-up list or has a reason to need none, and every overlay action has a route", async () => {

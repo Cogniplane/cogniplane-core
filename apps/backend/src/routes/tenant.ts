@@ -27,7 +27,7 @@ import type { StepUpRoute } from "../services/auth/step-up-routes.js";
 import { LocalMfaService } from "../services/auth/local-mfa-service.js";
 import type { DataRouteControl } from "../services/data-route-control.js";
 import { currentRole, isManager, lockTenantMembership, mayAssignRole, ownerRoleRefusal } from "../services/member-authority.js";
-import { endTenantMembership } from "../services/tenant-member-removal.js";
+import { endTenantMembership, revokeMemberConnections } from "../services/tenant-member-removal.js";
 import type { GithubConnectionService } from "../services/integrations/github/github-connection-service.js";
 import { IntegrationRegistry } from "../services/integrations/integration-registry.js";
 import { PiiImportScopeRegistry } from "../services/pii/pii-import-scopes.js";
@@ -634,29 +634,9 @@ export async function registerTenantRoutes(
       return reply.code(403).send({ error: "forbidden", message: "Insufficient permissions" });
     }
 
-    // Revoke the removed member's stored OAuth connections. This runs AFTER the
-    // membership transaction, not inside it: each connection service opens its
-    // own `withTenantScope` and writes an audit event, so it cannot join the
-    // client above. A crash in the gap leaves connection rows for a user who is
-    // no longer a member. They are unreachable: the membership is gone, and
-    // WorkOS sign-in refuses the removed user.
-    //
-    // Driven off the integration registry rather than a hardcoded table list so
-    // a private overlay's integrations are covered too.
-    for (const descriptor of integrationDescriptors.list()) {
-      const revoke = descriptor.connectionProbe?.deleteConnection;
-      if (!revoke) continue;
-      try {
-        await revoke.call(descriptor.connectionProbe, tenantId, targetUserId);
-      } catch (error) {
-        // One failing integration must not strand the others, and the member is
-        // already removed. Log and continue; the row is unreachable meanwhile.
-        request.log.error(
-          { err: error, integrationId: descriptor.id, tenantId, userId: targetUserId },
-          "member removal: failed to revoke integration connection"
-        );
-      }
-    }
+    // Revoke the removed member's stored OAuth connections, after the
+    // membership transaction (revokeMemberConnections).
+    await revokeMemberConnections(integrationDescriptors, { tenantId, userId: targetUserId }, request.log);
 
     return reply.send({ ok: true });
   });

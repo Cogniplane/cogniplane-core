@@ -1,5 +1,6 @@
 import type { FastifyBaseLogger, FastifyReply, FastifyRequest } from "fastify";
 import type { PoolClient } from "pg";
+import { apiError } from "../lib/http-errors.js";
 
 import type { AuthMode, LoginType } from "../config.js";
 import type { RequestLimitsInterface } from "./request-limits.js";
@@ -17,16 +18,14 @@ import { WeakerChangeError } from "./weaker-change-error.js";
 // stays after the victim's password change or "sign out everywhere". So:
 //
 // 1. Step-up. A local session gives a single-use step-up token for the
-//    route's action, as for the account routes (requireStepUp). A WorkOS
-//    session gives none: Cogniplane cannot ask WorkOS for a fresh proof, and
-//    WorkOS owns that sign-in (the rule of a member role change). A session's
+//    route's action, as for the account routes (requireStepUp). WorkOS
+//    sessions are refused until a fresh provider proof is supported. A session's
 //    login path always equals its tenant's login type (auth-admission.ts), so
 //    a local tenant never skips the check. dev-headers mode has no sessions
 //    (development only).
 // 2. Owner notice. Every change, from every kind of session, queues an email
-//    to each owner of the tenant, in the change's transaction. For a WorkOS
-//    session it is the only check. With email off, the change's audit event
-//    is the only record, and startup logs a warning when WorkOS login is on.
+//    to each owner of the tenant, in the change's transaction. A notice does
+//    not replace fresh proof. With email off, the audit event is the record.
 //    The outbox combines the notices of one owner (mail-outbox.ts).
 // 3. Rate limit. A data route outside /admin/ (the provider key, an
 //    overlay's route) uses the admin limit too: the admin hook in app.ts
@@ -38,10 +37,10 @@ import { WeakerChangeError } from "./weaker-change-error.js";
 // open a blocked tool, send unmasked personal data to the model provider, or
 // give the agent instructions that stay after the victim signs out.
 
-/** Logged at startup when WorkOS tenants have no check at all on data routes. */
+/** Logged at startup when WorkOS tenants cannot receive owner notices. */
 export const NO_OWNER_NOTICE_WARNING =
-  "WorkOS login is on and email is off (SMTP_URL, MAIL_FROM): a change of a data setting by a WorkOS session " +
-  "needs no step-up and sends no owner notice. Only the audit log records it. Set SMTP_URL and MAIL_FROM.";
+  "WorkOS login is on and email is off (SMTP_URL, MAIL_FROM): owner notices are unavailable. " +
+  "WorkOS sensitive changes remain blocked because fresh provider proof is not supported.";
 
 export class DataRouteControl {
   constructor(
@@ -119,7 +118,13 @@ export class DataRouteControl {
   private async check(request: FastifyRequest, reply: FastifyReply, action: StepUpAction): Promise<boolean> {
     if (!(await this.withinRateLimit(request, reply))) return false;
     if (this.deps.authMode === "dev-headers") return true;
-    if (request.auth.session?.authSource === "workos") return true;
+    if (request.auth.session?.authSource === "workos") {
+      reply.code(403).send({
+        ...apiError("workos_step_up_unavailable", "This change requires fresh sign-in proof. WorkOS step-up is not supported."),
+        action
+      });
+      return false;
+    }
     if (!this.deps.localAuth) {
       reply.code(403).send({ error: "step_up_required", action });
       return false;

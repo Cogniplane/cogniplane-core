@@ -19,6 +19,7 @@ import { registerAdminPolicyRoutes } from "../routes/admin/admin-policy-routes.j
 import { PolicyDecisionStore } from "../services/policy/policy-decision-store.js";
 import { PolicyRuleStore } from "../services/policy/policy-rule-store.js";
 import { PolicyService } from "../services/policy/policy-service.js";
+import { weakerPiiFields } from "../services/pii/pii-weakening.js";
 import { ALLOW_WEAKER, PII_SAVE_ALLOWED } from "../test-helpers/data-routes.js";
 import { DEFAULT_PII_PROTECTION } from "@cogniplane/shared-types";
 import { AuditEventStore } from "../services/audit-event-store.js";
@@ -91,7 +92,7 @@ describe.skipIf(!adminDatabaseUrl())("data route owner notices", () => {
     await superuserPool().query(`DELETE FROM email_outbox`);
   });
 
-  test("a provider key change from a WorkOS session emails every owner with an address, with no key", async () => {
+  test("a WorkOS key change is refused; a store transaction emails every owner without the key", async () => {
     const t = await workosTenant();
     const app = Fastify();
     await app.register(cookie);
@@ -109,12 +110,22 @@ describe.skipIf(!adminDatabaseUrl())("data route owner notices", () => {
     });
     await app.ready();
     try {
-      // No step-up from a WorkOS session: the notice is the check.
       const res = await app.inject({ method: "PUT", url: "/tenant/settings", payload: { provider: "openai", apiKey: PROVIDER_KEY } });
-      expect(res.statusCode, res.body).toBe(200);
+      expect(res.statusCode, res.body).toBe(403);
+      expect(res.json().error).toBe("workos_step_up_unavailable");
+      expect(await noticesOf(t.tenantId)).toEqual([]);
     } finally {
       await app.close();
     }
+
+    // The store-level notice remains atomic. This call is not a session write.
+    await new TenantOrgSettingsStore(appPool(), SECRET).setApiKey(t.tenantId, "openai", PROVIDER_KEY, {
+      tenantId: t.tenantId, sessionId: null, userId: t.owner.userId, type: "tenant.provider_key.updated",
+      payload: { provider: "openai", keySet: true },
+      alsoInTransaction: control().ownerNotice(requestOf(t.tenantId, t.owner.userId), {
+        setting: "provider_key", provider: "openai", removed: false
+      })
+    });
 
     const notices = await noticesOf(t.tenantId);
     const owners = t.people.filter((person) => person.role === "owner" && person.email);
@@ -177,10 +188,9 @@ describe.skipIf(!adminDatabaseUrl())("data route owner notices", () => {
     expect(audit.rows).toEqual([{ payload: { integrationId: "github", readsEnabled: true } }]);
   });
 
-  // A Policy Center change and a PII save send the notice only when they
-  // make a control weaker, through the real routes and stores. A WorkOS
-  // session gives no step-up, so the notice is the only check.
-  test("a Policy Center change emails the owners only when it makes the policy weaker", async () => {
+  // WorkOS sessions cannot weaken controls. Store-level changes still queue
+  // their notices in the same transaction.
+  test("WorkOS cannot weaken policy; a store deletion queues the owner notice", async () => {
     const t = await workosTenant();
     const rules = new PolicyRuleStore(appPool());
     const decisions = new PolicyDecisionStore(appPool());
@@ -205,10 +215,23 @@ describe.skipIf(!adminDatabaseUrl())("data route owner notices", () => {
       expect((await app.inject({ method: "POST", url: "/admin/policy/rules", payload: { name: "Block deletes", effect: "block", conditions: { toolNames: ["delete_customers"] } } })).statusCode).toBe(200);
       expect(await noticesOf(t.tenantId)).toEqual([]);
       // Weaker: the export block rule removed.
-      expect((await app.inject({ method: "DELETE", url: `/admin/policy/rules/${block.ruleId}` })).statusCode).toBe(204);
+      expect((await app.inject({ method: "DELETE", url: `/admin/policy/rules/${block.ruleId}` })).statusCode).toBe(403);
+      expect(await rules.get(t.tenantId, block.ruleId)).not.toBeNull();
+      expect(await noticesOf(t.tenantId)).toEqual([]);
     } finally {
       await app.close();
     }
+
+    await rules.delete(t.tenantId, block.ruleId, {
+      allowWeaker: true,
+      audit: (rule, weaker) => ({
+        tenantId: t.tenantId, sessionId: null, userId: t.admin.userId, type: "admin.policy_rule.deleted",
+        payload: { ruleId: rule.ruleId, weaker },
+        alsoInTransaction: control().ownerNotice(requestOf(t.tenantId, t.admin.userId), {
+          setting: "policy_rules", change: "rule_removed", ruleId: rule.ruleId, ruleName: rule.name
+        })
+      })
+    });
 
     const notices = await noticesOf(t.tenantId);
     expect(notices).toHaveLength(2);
@@ -261,7 +284,7 @@ describe.skipIf(!adminDatabaseUrl())("data route owner notices", () => {
       const fromLocal = await patch(staleForm);
       expect(fromLocal.statusCode, fromLocal.body).toBe(409);
       expect(fromLocal.json()).toEqual({ error: "policy_rule_conflict", message: expect.any(String) });
-      // A WorkOS session gets no step-up: the revision is the only check.
+      // A stale WorkOS save is also refused before the fresh-proof check.
       session = { authSource: "workos", familyId: "family-1" };
       expect((await patch(staleForm)).statusCode).toBe(409);
       expect(invalidate).not.toHaveBeenCalled();
@@ -319,7 +342,7 @@ describe.skipIf(!adminDatabaseUrl())("data route owner notices", () => {
     expect(await noticesOf(other.tenantId)).toEqual([]);
   });
 
-  test("a PII save emails the owners with the weaker field names only when it makes the protection weaker", async () => {
+  test("WorkOS cannot weaken PII protection; a store save queues only the weaker field names", async () => {
     const t = await workosTenant();
     const settings = new TenantOrgSettingsStore(appPool(), SECRET);
     const on = { ...DEFAULT_PII_PROTECTION, enabled: true, mode: "block" as const, provider: { type: "openai-compatible" as const, model: "pii-model-secret-name" } };
@@ -338,10 +361,23 @@ describe.skipIf(!adminDatabaseUrl())("data route owner notices", () => {
       // Uploads no longer scanned.
       const res = await app.inject({ method: "PUT", url: "/tenant/settings/pii",
         payload: { ...on, scopes: { chatPrompts: true, uploads: false }, expectedRevision: 2 } });
-      expect(res.statusCode, res.body).toBe(200);
+      expect(res.statusCode, res.body).toBe(403);
+      expect(await noticesOf(t.tenantId)).toEqual([]);
     } finally {
       await app.close();
     }
+
+    await settings.setPiiProtection(t.tenantId, { ...on, scopes: { chatPrompts: true, uploads: false } }, {
+      expectedRevision: 2, allowWeaker: true,
+      weakerFields: (stored, next) => weakerPiiFields(stored, next, { list: () => [] }),
+      audit: (stored, revision, weakerFields) => ({
+        tenantId: t.tenantId, sessionId: null, userId: t.admin.userId, type: "tenant.pii_protection.updated",
+        payload: { piiProtection: stored, revision, checked: true, weakerFields },
+        alsoInTransaction: control().ownerNotice(requestOf(t.tenantId, t.admin.userId), {
+          setting: "pii_protection", fields: weakerFields
+        })
+      })
+    });
 
     const notices = await noticesOf(t.tenantId);
     expect(notices).toHaveLength(2);
@@ -385,7 +421,7 @@ async function rowsOf(tenantId: string): Promise<Row[]> {
 
 const serverChange = (i: number): DataSettingChange => ({ setting: "mcp_server", serverId: `server-${i}`, created: true });
 
-// A loop of changes (a WorkOS token needs no step-up) must not flood the
+// A loop of committed changes must not flood the
 // outbox that every tenant's email shares: one notice per owner per window.
 describe.skipIf(!adminDatabaseUrl())("owner notices are combined", () => {
   beforeEach(async () => {

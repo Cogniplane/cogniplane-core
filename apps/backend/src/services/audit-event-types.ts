@@ -171,6 +171,10 @@ export const AUDIT_EVENT_TYPES = [
   "tenant.pii_protection.updated",
   "tenant.member.role_changed",
   "tenant.member.removed",
+  // WorkOS shows no active membership for the last owner of the tenant. The
+  // refresh is refused and the membership stays
+  // (services/auth/workos-membership-revalidation.ts).
+  "tenant.member.removal_refused",
   "tenant.member.created",
   "tenant.member.password_reset",
   "tenant.member.link_resent",

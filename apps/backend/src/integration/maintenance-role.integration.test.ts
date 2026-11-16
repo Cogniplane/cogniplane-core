@@ -20,7 +20,7 @@ describe.skipIf(!adminDatabaseUrl())("runtime maintenance authority", () => {
       const input = {
         organizationId: `org_${id}`, organizationName: "Permission test",
         workosUserId: `user_${id}`, email: `${id}@example.test`,
-        displayName: "Test member", workosRoleSlug: "member"
+        displayName: "Test member", workosRoleSlug: "admin"
       };
       const identity = await provisionTenantIdentity(maintenancePool(), input);
       expect(await provisionTenantIdentity(maintenancePool(), input)).toMatchObject({ tenantId: identity.tenantId, userId: identity.userId, role: identity.role });

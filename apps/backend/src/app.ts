@@ -296,8 +296,8 @@ export async function buildApp() {
       : undefined;
 
   // Data routes (tenant settings that change where data goes): step-up for
-  // local sessions, a notice to every owner when email is on, and the admin
-  // rate limit. Startup warns when WorkOS login is on and email is off.
+  // local sessions, refusal for WorkOS sessions without fresh proof, a notice
+  // to every owner when email is on, and the admin rate limit.
   const dataRoutes = new DataRouteControl({
     authMode: config.AUTH_MODE,
     loginTypes: config.AUTH_LOGIN_TYPES,
@@ -376,6 +376,7 @@ export async function buildApp() {
     db: config.AUTH_MODE === "jwt" ? privilegedDb : app.db,
     appDb: app.db,
     localAuth,
+    afterSecurityChange,
     config,
     auditEvents: deps.auditEvents,
     limits: deps.limits,

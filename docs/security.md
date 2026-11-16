@@ -183,9 +183,12 @@ redirect and hide. Every rule is enforced in the backend.
 
 ## Known limits
 
-- WorkOS sessions get no step-up and no security version: [sensitive
-  changes](architecture/sensitive-changes.md#step-up),
-  [revocation](architecture/local-accounts.md#security-version-and-revocation).
+- WorkOS protected data/control writes are blocked until fresh provider proof
+  is supported. Provider membership revocation is detected at refresh, subject
+  to IdP synchronization; background work alone does not poll WorkOS. WorkOS
+  accounts have no local security version. See [sensitive
+  changes](architecture/sensitive-changes.md#step-up) and
+  [request authentication](architecture/auth.md#request-authentication).
 - Sandbox network limits are listed in
   [sandbox](architecture/sandbox.md#sandbox-network).
 - A manager who holds a reset link can set a member's password without the

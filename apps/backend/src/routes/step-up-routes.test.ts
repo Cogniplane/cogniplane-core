@@ -665,16 +665,16 @@ describe("step-up routes", () => {
     expect(notices).toEqual([]);
   });
 
-  // WorkOS owns that sign-in, and Cogniplane cannot ask WorkOS for a fresh
-  // proof: the change goes through, and the owners get the notice.
-  test.each(DATA_ROUTE_KEYS)("%s from a WorkOS session needs no step-up and queues the owner notice", async (route) => {
-    const { app, consume, notices } = await buildApp({ authSource: "workos" });
+  test.each(DATA_ROUTE_KEYS)("%s from a WorkOS session refuses the change without fresh proof", async (route) => {
+    const { app, consume, notices, writes } = await buildApp({ authSource: "workos" });
 
     const res = await send(app, route);
 
-    expect(res.statusCode, res.body).toBeLessThan(300);
+    expect(res.statusCode, res.body).toBe(403);
+    expect(res.json()).toMatchObject({ error: "workos_step_up_unavailable" });
     expect(consume).not.toHaveBeenCalled();
-    expect(notices).toEqual([{ client: CHANGE_TRANSACTION, tenantId: IDENTITY.tenantId, actorUserId: IDENTITY.userId, change: DATA_ROUTES[route] }]);
+    expect(notices).toEqual([]);
+    expect(writes).toEqual([]);
   });
 
   // A small change must not ask for a password or send email.
