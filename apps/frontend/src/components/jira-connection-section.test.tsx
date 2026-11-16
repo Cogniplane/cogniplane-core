@@ -51,6 +51,31 @@ it("loads sites only for the account the user chooses", async () => {
   expect(screen.getByRole("button", { name: "Disconnect" })).toBeTruthy();
 });
 
+it("offers no connect or site choice while the backend refuses new authorization", async () => {
+  const { onConnect, onSelectSite } = mount(
+    { ...notConnected, userConnection: connection, authorizationStarted: true, authorizationAvailable: false },
+    [healthy("apn_1", "me@example.test")]
+  );
+  expect(screen.getByText(/New Jira connections and site selection are temporarily unavailable/)).toBeTruthy();
+  const connect = screen.getByRole("button", { name: "Connect another Jira account" }) as HTMLButtonElement;
+  expect(connect.disabled).toBe(true);
+  fireEvent.click(connect);
+  expect(onConnect).not.toHaveBeenCalled();
+
+  // The saved site stays marked; the other site has no action.
+  fireEvent.click(screen.getByRole("button", { name: "Show sites for me@example.test" }));
+  expect(await screen.findByText("Beta")).toBeTruthy();
+  expect(screen.queryByRole("button", { name: "Use this site" })).toBeNull();
+  expect(onSelectSite).not.toHaveBeenCalled();
+  expect((screen.getByRole("button", { name: "Disconnect" }) as HTMLButtonElement).disabled).toBe(false);
+});
+
+it("does not tell a member without an account to connect while authorization is refused", () => {
+  mount({ ...notConnected, authorizationAvailable: false });
+  expect(screen.getByText("No Jira account is connected.")).toBeTruthy();
+  expect((screen.getByRole("button", { name: "Connect my Jira account" }) as HTMLButtonElement).disabled).toBe(true);
+});
+
 it("shows a failed lookup as retryable, not as a broken account", async () => {
   let fail = true;
   const { onLoadSites } = mount(notConnected, [healthy("apn_1", "me@example.test")], {

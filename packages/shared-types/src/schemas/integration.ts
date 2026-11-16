@@ -160,6 +160,9 @@ export const JiraConnectionStatusSchema = z.object({
   authorizationStarted: z.boolean(),
   // An earlier disconnect or member removal did not finish in Pipedream.
   cleanupPending: z.boolean(),
+  // False while new authorization and site selection are refused
+  // (docs/connectors.md). Absent means available.
+  authorizationAvailable: z.boolean().optional(),
   tenantEnabled: z.boolean().optional(),
   tenantReadsEnabled: z.boolean().optional(),
   tenantWritesEnabled: z.boolean().optional(),

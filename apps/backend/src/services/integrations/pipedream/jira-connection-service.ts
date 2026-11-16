@@ -33,6 +33,11 @@ import { integrationAccountChangedMessage } from "../integration-account-binding
 
 export const JIRA_INTEGRATION_ID = "jira";
 const PIPEDREAM_JIRA_APP = "jira";
+// New authorization and site selection are refused (docs/connectors.md). The
+// status reports this, so that the settings page offers no action that fails.
+export const JIRA_AUTHORIZATION_AVAILABLE = false;
+// Appended to tool messages that told the member to connect Jira again.
+const NO_NEW_CONNECTIONS = "New Jira connections are temporarily unavailable.";
 export const JIRA_AUTHORIZATION_UNAVAILABLE_MESSAGE =
   "New Jira connections and site selection are temporarily unavailable while authorization security is updated. Existing connections can still read Jira and be removed.";
 // List-and-delete passes per cleanup. The last pass that finds no account
@@ -148,7 +153,7 @@ function upstreamFailure(status: number): JiraReadResult {
     return { ok: false, status, error: "Jira rejected the request. Check the JQL query and the field IDs." };
   }
   if (status === 401 || status === 403) {
-    return { ok: false, status, error: "Jira denied access. Reconnect Jira in settings or check your Jira permissions." };
+    return { ok: false, status, error: "Jira denied access. Check your Jira permissions." };
   }
   if (status === 404) return { ok: false, status, error: "Jira resource not found, or you cannot see it." };
   if (status === 429) return { ok: false, status, error: "Jira rate limit reached. Try again later." };
@@ -217,6 +222,7 @@ export class JiraConnectionService {
     userConnection: JiraConnectionSummary | null;
     authorizationStarted: boolean;
     cleanupPending: boolean;
+    authorizationAvailable: boolean;
   }> {
     const [record, identity, cleanups] = await Promise.all([
       this.store.getForOwner(tenantId, userId),
@@ -227,7 +233,8 @@ export class JiraConnectionService {
       configured: this.isConfigured(),
       userConnection: record ? toSummary(record) : null,
       authorizationStarted: identity !== null,
-      cleanupPending: cleanups.length > 0
+      cleanupPending: cleanups.length > 0,
+      authorizationAvailable: JIRA_AUTHORIZATION_AVAILABLE
     };
   }
 
@@ -367,7 +374,7 @@ export class JiraConnectionService {
       return { ok: false, error: integrationAccountChangedMessage("Jira") };
     }
     if (!record) {
-      return { ok: false, error: "No Jira connection found. Connect Jira in Settings > Connected accounts." };
+      return { ok: false, error: `No Jira connection found. ${NO_NEW_CONNECTIONS}` };
     }
     const site = toSummary(record).site;
 
@@ -376,10 +383,10 @@ export class JiraConnectionService {
       // made before a DATA_ENCRYPTION_SECRET rotation keep working.
       const account = await client.getAccount(record.accountId);
       if (!account || !this.isOwnedJiraAccount(account, record.externalUserId)) {
-        return { ok: false, error: "Your Jira connection is no longer available. Connect Jira again in Settings > Connected accounts." };
+        return { ok: false, error: `Your Jira connection is no longer available. ${NO_NEW_CONNECTIONS}` };
       }
       if (account.healthy === false || account.dead === true) {
-        return { ok: false, error: "Your Jira account needs to be reconnected in Settings > Connected accounts." };
+        return { ok: false, error: `Your Jira account stopped working. ${NO_NEW_CONNECTIONS}` };
       }
       if (request.kind === "sites") {
         return { ok: true, data: await this.listSites(record.externalUserId, record.accountId), site };

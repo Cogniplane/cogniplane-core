@@ -26,7 +26,9 @@ also blocks selection of accounts from links issued before the restriction.
 Account and site discovery exposes only an existing, active stored connection. Existing
 connections keep their read tools, and members can still disconnect them.
 Suspended connections cannot be restored through site selection during this
-restriction.
+restriction. `GET /me/jira-connection` returns `authorizationAvailable: false`
+(`JIRA_AUTHORIZATION_AVAILABLE` in `jira-connection-service.ts`). The settings
+page then disables Connect and hides the site choice, and keeps Disconnect.
 
 Re-enable new Jira connections only with a provider-attested, one-time
 completion proof bound to the initiating browser/session, or a native Jira

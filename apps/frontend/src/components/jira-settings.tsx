@@ -21,6 +21,7 @@ export function JiraAccountRow() {
       suspended={user?.suspended === true}
       // Jira has no write tools, and authorization requires reads.
       configured={status?.configured === true && status.tenantReadsEnabled === true}
+      connectAvailable={status?.authorizationAvailable !== false}
       statusKnown={status !== null}
       tenantEnabled={status?.tenantReadsEnabled}
       isLoading={isLoading}

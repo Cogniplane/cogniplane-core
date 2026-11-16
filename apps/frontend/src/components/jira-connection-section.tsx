@@ -31,6 +31,9 @@ export function JiraConnectionSection(input: JiraConnectionSectionProps) {
   // Disconnect stays available when the organization turns Jira off, so a
   // member can still remove their account. Connect and site choice do not.
   const enabled = status?.tenantReadsEnabled !== false;
+  // The backend refuses new authorization and site selection while this is
+  // false. A saved connection still reads Jira, and Disconnect stays.
+  const authorizationAvailable = status?.authorizationAvailable !== false;
   // Accounts are not listed while Jira is off. The status still reports an
   // authorization without a selected site, and a removal that did not finish.
   const hasRemoteAuthorizations = userConnection !== null || accounts.length > 0
@@ -47,13 +50,14 @@ export function JiraConnectionSection(input: JiraConnectionSectionProps) {
         identity={userConnection ? <><p>{userConnection.site.url}</p>{userConnection.accountName && !suspended ? <p>{userConnection.accountName}</p> : null}</> : null}
         diagnostics={userConnection ? <p>Connected: {formatMediumDateTime(userConnection.connectedAt, "Not available")}</p> : null}>
         <OAuthConnectionAvailability provider="Jira" configured={configured} enabled={enabled} />
-        <OAuthConnectionActions busyKey={input.busyKey} locked={input.isSaving} configured={configured && enabled && !input.isLoading && !input.statusError} connected={hasRemoteAuthorizations} connectLabel="Connect my Jira account" reconnectLabel="Connect another Jira account" error={input.error === input.statusError ? null : input.error} flashMessage={null} onConnect={input.onConnect} onDisconnect={input.onDisconnect}
+        <OAuthConnectionActions busyKey={input.busyKey} locked={input.isSaving} configured={configured && enabled && authorizationAvailable && !input.isLoading && !input.statusError} connected={hasRemoteAuthorizations} connectLabel="Connect my Jira account" reconnectLabel="Connect another Jira account" error={input.error === input.statusError ? null : input.error} flashMessage={null} onConnect={input.onConnect} onDisconnect={input.onDisconnect}
           suspended={userConnection && suspended ? { confirm: null } : undefined}>
           <p className={HINT}>Pipedream keeps the Jira credentials. Disconnect removes your local binding and asks Pipedream to remove your Jira accounts, including accounts without a chosen site. If cleanup fails, retry Disconnect. This does not revoke your Atlassian grant.</p>
         </OAuthConnectionActions>
+        {configured && enabled && !authorizationAvailable ? <p role="status" className={HINT}>New Jira connections and site selection are temporarily unavailable. {suspended ? "A suspended connection stays suspended; you can disconnect it." : "A saved connection can still read Jira, and you can disconnect it."}</p> : null}
         {status?.cleanupPending ? <p role="status" className={HINT}>An earlier removal did not finish in Pipedream. Select Disconnect to try again.</p> : null}
       </OAuthConnectionOverview>
-      {configured && enabled ? <div className="min-w-0 rounded-xl border border-outline-variant bg-surface-container-lowest p-4 sm:p-6"><SitePicker {...input} selectedSiteId={userConnection?.site.siteId ?? null} selectedAccountId={userConnection?.accountId ?? null} suspended={suspended} /></div> : null}
+      {configured && enabled ? <div className="min-w-0 rounded-xl border border-outline-variant bg-surface-container-lowest p-4 sm:p-6"><SitePicker {...input} selectedSiteId={userConnection?.site.siteId ?? null} selectedAccountId={userConnection?.accountId ?? null} suspended={suspended} selectionAvailable={authorizationAvailable} /></div> : null}
     </OAuthConnectionReadBoundary>
   </section>;
 }
@@ -68,6 +72,7 @@ function SitePicker(input: JiraConnectionSectionProps & {
   selectedAccountId: string | null;
   selectedSiteId: string | null;
   suspended: boolean;
+  selectionAvailable: boolean;
 }) {
   const [lookups, setLookups] = useState<Record<string, SiteLookup>>({});
   const busy = input.isSaving || input.busyKey !== null;
@@ -136,7 +141,7 @@ function SitePicker(input: JiraConnectionSectionProps & {
                             </div>
                             {selected ? (
                               <span className={PILL_BLUE}>selected</span>
-                            ) : (
+                            ) : !input.selectionAvailable ? null : (
                               <Button type="button" size="sm" variant="outline" disabled={busy}
                                 onClick={() => input.onSelectSite({ accountId: account.accountId, siteId: site.siteId })}>
                                 Use this site
@@ -156,7 +161,9 @@ function SitePicker(input: JiraConnectionSectionProps & {
         </ul>
       ) : !input.accountsLoading && !input.accountsError ? (
         <p className={HINT}>
-          No Jira accounts yet. Connect your Jira account, then come back to this page to choose a site.
+          {input.selectionAvailable
+            ? "No Jira accounts yet. Connect your Jira account, then come back to this page to choose a site."
+            : "No Jira account is connected."}
         </p>
       ) : null}
     </div>
