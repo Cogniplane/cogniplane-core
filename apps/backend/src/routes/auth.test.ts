@@ -170,6 +170,7 @@ async function buildHarness(opts: {
   logLines?: Array<{ level: number; msg: string } & Record<string, unknown>>;
   /** Fastify's `trustProxy`, as a TRUST_PROXY IP/CIDR list. Default: trust nothing. */
   trustProxy?: string;
+  integrationDescriptors?: Parameters<typeof registerAuthRoutes>[1]["integrationDescriptors"];
 } = {}): Promise<Harness> {
   const pool = new FakePool();
   const redis = new FakeRefreshTokenRedis();
@@ -218,7 +219,8 @@ async function buildHarness(opts: {
     config: TEST_CONFIG,
     auditEvents: auditEvents as never,
     limits: opts.limits,
-    workos
+    workos,
+    ...(opts.integrationDescriptors ? { integrationDescriptors: opts.integrationDescriptors } : {})
   });
 
   // Browsers send Origin on every POST; most tests are the real frontend.
@@ -1683,6 +1685,29 @@ describe("POST /auth/refresh", () => {
     expect(harness.workosMocks.listOrganizationMemberships).toHaveBeenLastCalledWith({
       userId: "workos-user-123", organizationId: "org_456", statuses: ["active"]
     });
+  });
+
+  test("a WorkOS removal at refresh revokes the member's integration connections", async () => {
+    const deleteConnection = vi.fn(async () => true);
+    const removal = await buildHarness({
+      integrationDescriptors: { list: () => [{ id: "fake", connectionProbe: { deleteConnection } }] } as never
+    });
+    const refreshToken = await signRefreshToken(TEST_CONFIG, { sub: "user-one", tid: "tenant-one", jti: "jti-gone", fid: "fid-gone" });
+    await issueRefreshJti(removal.redis, { jti: "jti-gone", familyId: "fid-gone", ttlSeconds: 60 });
+    removal.workosMocks.listOrganizationMemberships.mockResolvedValue({ data: [] });
+    removal.pool.onQuery("SELECT role, user_auth_source FROM tenant_memberships", () => ({
+      rows: [{ role: "member", user_auth_source: "workos" }], rowCount: 1
+    }));
+    for (const sql of ["SELECT s.session_id FROM sessions s", "UPDATE scheduled_jobs", "DELETE FROM project_memberships",
+      "DELETE FROM tenant_memberships", "INSERT INTO tenant_member_removals", "INSERT INTO audit_events",
+      "UPDATE session_executions", "WITH taken AS"]) {
+      removal.pool.onQuery(sql, () => ({ rows: [], rowCount: 0 }));
+    }
+
+    const refused = await removal.app.inject({ method: "POST", url: "/auth/refresh", cookies: { cogniplane_refresh: refreshToken } });
+    expect(refused.statusCode).toBe(403);
+    expect(deleteConnection).toHaveBeenCalledExactlyOnceWith("tenant-one", "user-one");
+    await removal.app.close();
   });
 
   test("a WorkOS outage returns 503 before consuming the token and permits a later retry", async () => {

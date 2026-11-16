@@ -1,4 +1,7 @@
+import type { FastifyBaseLogger } from "fastify";
 import type { PoolClient } from "pg";
+
+import type { IntegrationRegistry } from "./integrations/integration-registry.js";
 
 // A member removal lasts. The tenant table decides membership after the first
 // sign-in, as it decides roles: WorkOS can admit a user once, and a removal by
@@ -71,4 +74,35 @@ export async function assertMemberNotRemoved(
     [tenantId, userId]
   );
   if (removal.rowCount) throw new MemberRemovedError(tenantId);
+}
+
+/**
+ * Revokes the stored connections of a removed member, for each integration
+ * that has a connection probe. Call it after the removal commits: each
+ * connection service opens its own `withTenantScope` and writes an audit
+ * event, so it cannot join the removal transaction. A crash in the gap leaves
+ * connection rows for a user who is no longer a member. They are unreachable:
+ * the membership is gone, and WorkOS sign-in refuses the removed user.
+ *
+ * The integration registry drives the list, so the integrations of a private
+ * overlay are covered too. One failing integration does not stop the others;
+ * the failure is logged.
+ */
+export async function revokeMemberConnections(
+  integrations: Pick<IntegrationRegistry, "list">,
+  input: { tenantId: string; userId: string },
+  log: Pick<FastifyBaseLogger, "error">
+): Promise<void> {
+  for (const descriptor of integrations.list()) {
+    const revoke = descriptor.connectionProbe?.deleteConnection;
+    if (!revoke) continue;
+    try {
+      await revoke.call(descriptor.connectionProbe, input.tenantId, input.userId);
+    } catch (error) {
+      log.error(
+        { err: error, integrationId: descriptor.id, tenantId: input.tenantId, userId: input.userId },
+        "member removal: failed to revoke integration connection"
+      );
+    }
+  }
 }

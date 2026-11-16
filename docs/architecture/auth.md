@@ -84,8 +84,9 @@ Sign-in types:
 - WorkOS refresh also checks the user's current active organization membership
   with the WorkOS API, before token rotation or a cached refresh response.
   A missing, inactive or pending membership causes a lasting local member
-  removal, pauses scheduled jobs, stops active work and revokes that refresh
-  family. This applies to owners too. Other families fail their next local
+  removal, pauses scheduled jobs, stops active work, revokes the member's
+  stored integration connections (as a removal in People does) and revokes
+  that refresh family. This applies to owners too. Other families fail their next local
   membership check. WorkOS failures return retryable 503 `refresh_unavailable`
   without rotating the token or removing the member.
 - WorkOS revocation is checked at refresh, not on each access-token request.

@@ -111,7 +111,7 @@ export async function registerAuthRoutes(app: FastifyInstance, deps: AuthRouteDe
     case "jwt": {
       const refreshTokens = createRefreshTokenRotationService(app);
       const workos = isLoginTypeEnabled(config, "workos") ? deps.workos ?? getWorkOS(config) : undefined;
-      await registerSessionRoutes(app, { ...deps, refreshTokens, workos });
+      await registerSessionRoutes(app, { ...deps, integrationDescriptors, refreshTokens, workos });
       if (isLoginTypeEnabled(config, "workos")) {
         registerWorkosAuthRoutes(app, { ...deps, refreshTokens, workos: workos! });
       }

@@ -4,18 +4,22 @@ import { FakePool } from "../../test-helpers/fake-pool.js";
 import { createFakeWorkOS } from "../../test-helpers/fake-workos.js";
 import { WorkOsMembershipRevalidation } from "./workos-membership-revalidation.js";
 
-function harness(input: { failRemoval?: boolean; missingMembership?: boolean; missingProviderIds?: boolean } = {}) {
+function harness(input: {
+  failRemoval?: boolean; missingMembership?: boolean; missingProviderIds?: boolean; alreadyRemoved?: boolean;
+} = {}) {
   const lookupDb = new FakePool();
   const db = new FakePool();
   const { workos, mocks } = createFakeWorkOS();
   const afterSecurityChange = vi.fn(async () => {});
+  const afterRemoval = vi.fn(async (_member: { tenantId: string; userId: string }) => {});
   lookupDb.onQuery("SELECT u.workos_user_id, t.workos_org_id", () => ({
     rows: input.missingMembership ? [] : [{ workos_user_id: input.missingProviderIds ? null : "workos-user", workos_org_id: "org-one" }],
     rowCount: input.missingMembership ? 0 : 1
   }));
   db.onQuery("SELECT s.session_id FROM sessions s", () => ({ rows: [], rowCount: 0 }));
   db.onQuery("SELECT role, user_auth_source FROM tenant_memberships", () => ({
-    rows: [{ role: "owner", user_auth_source: "workos" }], rowCount: 1
+    rows: input.alreadyRemoved ? [] : [{ role: "owner", user_auth_source: "workos" }],
+    rowCount: input.alreadyRemoved ? 0 : 1
   }));
   if (input.failRemoval) {
     db.onQuery("INSERT INTO tenant_member_removals", () => { throw new Error("write failed"); });
@@ -27,8 +31,10 @@ function harness(input: { failRemoval?: boolean; missingMembership?: boolean; mi
   db.onQuery("WITH taken AS", () => ({
     rows: [{ user_id: "user-one", session_id: "chat-one", sandbox_id: "sandbox-one" }], rowCount: 1
   }));
-  const service = new WorkOsMembershipRevalidation({ lookupDb: lookupDb.asPool(), db: db.asPool(), workos, afterSecurityChange });
-  return { service, lookupDb, db, mocks, afterSecurityChange };
+  const service = new WorkOsMembershipRevalidation({
+    lookupDb: lookupDb.asPool(), db: db.asPool(), workos, afterSecurityChange, afterRemoval
+  });
+  return { service, lookupDb, db, mocks, afterSecurityChange, afterRemoval };
 }
 
 const ACTIVE = { userId: "workos-user", organizationId: "org-one", status: "active" };
@@ -44,6 +50,7 @@ describe("WorkOS membership revalidation", () => {
     });
     expect(h.db.queries).toEqual([]);
     expect(h.afterSecurityChange).not.toHaveBeenCalled();
+    expect(h.afterRemoval).not.toHaveBeenCalled();
   });
 
   test.each([
@@ -72,12 +79,31 @@ describe("WorkOS membership revalidation", () => {
     });
   });
 
+  // Same follow-up as a removal in People: the member's stored connections are revoked.
+  test("revokes the member's connections after the removal commits", async () => {
+    const h = harness();
+    h.mocks.listOrganizationMemberships.mockResolvedValue({ data: [] });
+    h.afterRemoval.mockImplementation(async () => {
+      expect(h.db.queries.at(-1)?.text).toBe("COMMIT");
+    });
+    expect(await h.service.revalidate("tenant-one", "user-one")).toBe(false);
+    expect(h.afterRemoval).toHaveBeenCalledExactlyOnceWith({ tenantId: "tenant-one", userId: "user-one" });
+  });
+
+  test("does not revoke connections again when another request removed the member first", async () => {
+    const h = harness({ alreadyRemoved: true });
+    h.mocks.listOrganizationMemberships.mockResolvedValue({ data: [] });
+    expect(await h.service.revalidate("tenant-one", "user-one")).toBe(false);
+    expect(h.afterRemoval).not.toHaveBeenCalled();
+  });
+
   test("a WorkOS outage does not delete membership or stop work", async () => {
     const h = harness();
     h.mocks.listOrganizationMemberships.mockRejectedValue(new Error("provider unavailable"));
     await expect(h.service.revalidate("tenant-one", "user-one")).rejects.toThrow("provider unavailable");
     expect(h.db.queries).toEqual([]);
     expect(h.afterSecurityChange).not.toHaveBeenCalled();
+    expect(h.afterRemoval).not.toHaveBeenCalled();
   });
 
   test("a missing local membership is refused without a provider call", async () => {
@@ -100,5 +126,6 @@ describe("WorkOS membership revalidation", () => {
     await expect(h.service.revalidate("tenant-one", "user-one")).rejects.toThrow("write failed");
     expect(h.db.queries.at(-1)?.text).toBe("ROLLBACK");
     expect(h.afterSecurityChange).not.toHaveBeenCalled();
+    expect(h.afterRemoval).not.toHaveBeenCalled();
   });
 });

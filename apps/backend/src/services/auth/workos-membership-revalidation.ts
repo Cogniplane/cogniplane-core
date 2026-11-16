@@ -13,6 +13,11 @@ export class WorkOsMembershipRevalidation {
     db: Pool;
     workos: WorkOS;
     afterSecurityChange: AfterSecurityChange;
+    /**
+     * Runs after a removal commits, as after a removal in People: it revokes
+     * the member's stored integration connections (revokeMemberConnections).
+     */
+    afterRemoval?: (input: { tenantId: string; userId: string }) => Promise<void>;
   }) {}
 
   async revalidate(tenantId: string, userId: string): Promise<boolean> {
@@ -43,7 +48,9 @@ export class WorkOsMembershipRevalidation {
 
     // A confirmed provider removal uses the same lasting removal as People.
     // A WorkOS outage throws above and never removes a local membership.
+    let removed = false;
     await withSecurityChange(this.deps.db, tenantId, this.deps.afterSecurityChange, async (client, change) => {
+      removed = false;
       await lockTenantMembership(client, tenantId);
       await change.lockChatsBeforeMembership(userId);
       const target = await client.query<{ role: string; user_auth_source: string }>(
@@ -68,7 +75,9 @@ export class WorkOsMembershipRevalidation {
         type: "tenant.member.removed",
         payload: { targetUserId: userId, previousRole: target.rows[0].role, projectRolesRemoved, reason: "workos_membership_inactive" }
       });
+      removed = true;
     });
+    if (removed) await this.deps.afterRemoval?.({ tenantId, userId });
     return false;
   }
 }
