@@ -6,7 +6,6 @@ import type { AppConfig } from "../../../config.js";
 import type { AuditEventInput, AuditEventStore } from "../../audit-event-store.js";
 import type { AuditEventType } from "../../audit-event-types.js";
 import type { RuntimeInvalidator } from "../contracts.js";
-import { buildIntegrationRedirectUrl } from "../integration-oauth-helpers.js";
 import type { IntegrationStateStore } from "../integration-state-store.js";
 import {
   JiraLifecycleConflictError,
@@ -34,7 +33,8 @@ import { integrationAccountChangedMessage } from "../integration-account-binding
 
 export const JIRA_INTEGRATION_ID = "jira";
 const PIPEDREAM_JIRA_APP = "jira";
-const CONNECT_TOKEN_TTL_SECONDS = 10 * 60;
+export const JIRA_AUTHORIZATION_UNAVAILABLE_MESSAGE =
+  "New Jira connections and site selection are temporarily unavailable while authorization security is updated. Existing connections can still read Jira and be removed.";
 // List-and-delete passes per cleanup. The last pass that finds no account
 // proves completion; accounts that keep appearing make the cleanup fail.
 const MAX_CLEANUP_ROUNDS = 3;
@@ -65,9 +65,9 @@ export type JiraConnectionSummary = {
   connectedAt: string;
   updatedAt: string;
   // A security change of the owner's account suspended the connection. The
-  // agent does not use it until the owner selects a site again from a current
-  // session. There is no confirm: the Pipedream account ID is opaque and the
-  // account name is chosen by whoever authorized it.
+  // agent does not use it. Site selection is temporarily disabled. There is
+  // no confirm: the Pipedream account ID is opaque and the account name is
+  // chosen by whoever authorized it.
   suspended: boolean;
 };
 
@@ -102,6 +102,7 @@ export class JiraConnectionError extends Error {
   constructor(
     readonly code:
       | "not_configured"
+      | "authorization_unavailable"
       | "account_not_found"
       | "account_unhealthy"
       | "site_not_accessible"
@@ -257,94 +258,55 @@ export class JiraConnectionService {
     return outcome.completed > 0;
   }
 
-  async getAuthorizationUrl(input: { tenantId: string; userId: string }): Promise<{ url: string }> {
-    const client = this.requireClient();
-    const identity = await this.identity(input.tenantId, input.userId, true);
-    const result = await this.upstream(() => client.createConnectToken({
-      externalUserId: identity.externalUserId,
-      successRedirectUri: buildIntegrationRedirectUrl(this.config, "/settings/jira", { jiraAuth: "return" }),
-      errorRedirectUri: buildIntegrationRedirectUrl(this.config, "/settings/jira", { jiraAuth: "error" }),
-      expiresInSeconds: CONNECT_TOKEN_TTL_SECONDS
-    }));
-    const url = new URL(result.connectLinkUrl);
-    if (url.protocol !== "https:") {
-      throw new JiraConnectionError("upstream_unavailable", "Pipedream returned an unexpected connect link.");
-    }
-    url.searchParams.set("app", PIPEDREAM_JIRA_APP);
-    return { url: url.toString() };
+  async getAuthorizationUrl(_input: { tenantId: string; userId: string }): Promise<{ url: string }> {
+    this.requireClient();
+    // Connect links are transferable. Pipedream's public token validation
+    // also reveals the success URI, so callback state plus a browser cookie
+    // cannot prove which browser authorized the remote account.
+    throw new JiraConnectionError("authorization_unavailable", JIRA_AUTHORIZATION_UNAVAILABLE_MESSAGE);
   }
 
-  /** Jira accounts that the member authorized for the current identity. Sites load per account. */
+  /** Only the stored, active account can appear while new authorizations are disabled. */
   async listCandidates(tenantId: string, userId: string): Promise<JiraAccountCandidate[]> {
     const client = this.requireClient();
+    const record = await this.store.get(tenantId, userId);
+    if (!record) return [];
     const identity = await this.identity(tenantId, userId, false);
-    if (!identity) return [];
-    const accounts = await this.upstream(() => client.listAccounts({
-      externalUserId: identity.externalUserId,
-      app: PIPEDREAM_JIRA_APP
-    }));
-    return accounts
-      .filter((account) => this.isOwnedJiraAccount(account, identity.externalUserId))
-      .map((account) => ({
-        accountId: account.id,
-        accountName: account.name ?? null,
-        healthy: account.healthy !== false && account.dead !== true,
-        createdAt: account.created_at ?? null
-      }));
+    if (!identity || identity.externalUserId !== record.externalUserId) return [];
+    const account = await this.upstream(() => client.getAccount(record.accountId));
+    if (!account || account.id !== record.accountId || !this.isOwnedJiraAccount(account, identity.externalUserId)) return [];
+    return [{
+      accountId: account.id,
+      accountName: account.name ?? null,
+      healthy: account.healthy !== false && account.dead !== true,
+      createdAt: account.created_at ?? null
+    }];
   }
 
   /** Sites of one owned, healthy account. One account lookup and one site lookup. */
   async listAccountSites(tenantId: string, userId: string, accountId: string): Promise<JiraSiteView[]> {
+    const record = await this.store.get(tenantId, userId);
+    if (!record || record.accountId !== accountId) {
+      throw new JiraConnectionError("authorization_unavailable", JIRA_AUTHORIZATION_UNAVAILABLE_MESSAGE);
+    }
     const identity = await this.identity(tenantId, userId, false);
-    if (!identity) throw new JiraConnectionError("account_not_found", "Jira account not found.");
+    if (!identity || identity.externalUserId !== record.externalUserId) {
+      throw new JiraConnectionError("account_not_found", "Jira account not found.");
+    }
     const account = await this.requireUsableAccount(identity, accountId);
     return this.upstream(() => this.listSites(identity.externalUserId, account.id));
   }
 
-  /**
-   * Binds one Pipedream account and one Jira site to the member. Nothing from
-   * the browser is trusted beyond the two IDs: the account must belong to the
-   * member's current external ID and the Jira app, and the site must be in
-   * that account's accessible resources. The save fails when a disconnect or
-   * a member removal changed the identity during the remote checks.
-   */
+  /** Selection stays closed for accounts from previously issued connect links too. */
   async selectConnection(
-    tenantId: string,
-    userId: string,
-    input: { accountId: string; siteId: string },
+    _tenantId: string,
+    _userId: string,
+    _input: { accountId: string; siteId: string },
     // The security version of the requesting session (requestSecurityVersion).
-    ownerSecurityVersion: number | null
+    _ownerSecurityVersion: number | null
   ): Promise<JiraConnectionSummary> {
     this.requireClient();
-    const identity = await this.identity(tenantId, userId, false);
-    if (!identity) throw new JiraConnectionError("account_not_found", "Jira account not found.");
-    const account = await this.requireUsableAccount(identity, input.accountId);
-
-    const site = (await this.upstream(() => this.listSites(identity.externalUserId, account.id)))
-      .find((candidate) => candidate.siteId === input.siteId.toLowerCase());
-    if (!site) {
-      throw new JiraConnectionError("site_not_accessible", "This Jira site is not available to the selected account.");
-    }
-
-    let record: JiraConnectionRecord;
-    try {
-      record = await this.store.upsert({
-        tenantId,
-        userId,
-        externalUserId: identity.externalUserId,
-        accountId: account.id,
-        accountName: account.name ?? null,
-        cloudId: site.siteId,
-        siteName: site.name,
-        siteUrl: site.url,
-        ownerSecurityVersion
-      }, identity, () => this.auditEvent(tenantId, userId, "user.jira.connected",
-        { accountId: account.id, siteId: site.siteId }));
-    } catch (error) {
-      throw this.lifecycleError(error);
-    }
-    await this.invalidate(tenantId, userId);
-    return toSummary(record);
+    throw new JiraConnectionError("authorization_unavailable", JIRA_AUTHORIZATION_UNAVAILABLE_MESSAGE);
   }
 
   /**

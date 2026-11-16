@@ -1,7 +1,7 @@
 // Migration 061 backfill of migration 060 data, in its own database: the
 // suite database already has 061 applied. A member removed before 061 keeps a
 // pending cleanup for the generation 0 external ID. When the member comes
-// back, the new authorization must use another ID, so that the old cleanup
+// back, the next identity must use another ID, so that the old cleanup
 // cannot delete the new account.
 
 import { describe, expect, test } from "vitest";
@@ -81,14 +81,18 @@ describe.skipIf(!adminDatabaseUrl())("Jira migration 061", () => {
       // Today's store code needs today's schema.
       await migrate((file) => Number.parseInt(file, 10) > 61);
 
-      // The member comes back and selects a new account. Then the old
-      // cleanup runs, as the removal callback and as an administrator retry.
+      // Seed a later connection through the store, as on an older deployment.
+      // Then run the old cleanup through the removal callback.
       await db.query("INSERT INTO tenant_memberships (tenant_id, user_id, role) VALUES ($1, $2, 'member')", [tenant, user]);
-      await service.getAuthorizationUrl({ tenantId: tenant, userId: user });
+      await store.bindIdentity(tenant, user, { projectId: "proj_abc123", environment: "development" },
+        (generation) => service.externalUserIdFor(tenant, user, generation), true);
       const newId = (await store.getIdentity(tenant, user))!.externalUserId;
       expect(newId).toBe(service.externalUserIdFor(tenant, user, 1));
       accounts.push(jira("apn_new", newId));
-      await service.selectConnection(tenant, user, { accountId: "apn_new", siteId: SITE }, null);
+      const identity = (await store.getIdentity(tenant, user))!;
+      await store.upsert({ tenantId: tenant, userId: user, externalUserId: newId, accountId: "apn_new",
+        accountName: null, cloudId: SITE, siteName: "Acme", siteUrl: "https://acme.atlassian.net",
+        ownerSecurityVersion: null }, identity);
 
       expect(await service.deleteConnection(tenant, user)).toBe(true);
       expect(accounts.map((account) => account.id)).toEqual(["apn_new"]);

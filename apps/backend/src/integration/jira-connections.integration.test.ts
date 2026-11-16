@@ -329,12 +329,14 @@ describe.skipIf(!adminDatabaseUrl())("Jira connections", () => {
     expect(cleanups.map((cleanup) => cleanup.externalUserId)).toEqual(["cp1_test_0"]);
   });
 
+  // Seed connections through the store to cover rows made before authorization was disabled.
   test("a failed remote cleanup stays pending, then a retry deletes only the retired accounts", async () => {
     const { tenant, user } = await member();
     const { store, pipedream, service } = fakeService();
     pipedream.deleteFailure = new PipedreamRequestError("delete_account", 0, "timeout");
 
-    await service.getAuthorizationUrl({ tenantId: tenant, userId: user });
+    await store.bindIdentity(tenant, user, BINDING,
+      (generation) => service.externalUserIdFor(tenant, user, generation), true);
     const oldId = (await store.getIdentity(tenant, user))!.externalUserId;
     pipedream.accounts = [jira("apn_old", oldId)];
 
@@ -345,7 +347,8 @@ describe.skipIf(!adminDatabaseUrl())("Jira connections", () => {
     })]);
 
     await seedMembership(tenant, user);
-    await service.getAuthorizationUrl({ tenantId: tenant, userId: user });
+    await store.bindIdentity(tenant, user, BINDING,
+      (generation) => service.externalUserIdFor(tenant, user, generation), true);
     const newId = (await store.getIdentity(tenant, user))!.externalUserId;
     expect(newId).not.toBe(oldId);
     pipedream.accounts.push(jira("apn_new", newId));
@@ -360,18 +363,21 @@ describe.skipIf(!adminDatabaseUrl())("Jira connections", () => {
   test("a removal callback that runs after the member came back keeps the new account", async () => {
     const { tenant, user } = await member();
     const { store, pipedream, service } = fakeService();
-    await service.getAuthorizationUrl({ tenantId: tenant, userId: user });
-    const oldId = (await store.getIdentity(tenant, user))!.externalUserId;
+    await store.bindIdentity(tenant, user, BINDING,
+      (generation) => service.externalUserIdFor(tenant, user, generation), true);
+    const oldIdentity = (await store.getIdentity(tenant, user))!;
+    const oldId = oldIdentity.externalUserId;
     pipedream.accounts = [jira("apn_old", oldId)];
-    await service.selectConnection(tenant, user, { accountId: "apn_old", siteId: SITE }, null);
+    await store.upsert(mapping(tenant, user, oldId, "apn_old"), oldIdentity);
 
     await removeMembership(tenant, user);
     await seedMembership(tenant, user);
-    await service.getAuthorizationUrl({ tenantId: tenant, userId: user });
+    await store.bindIdentity(tenant, user, BINDING,
+      (generation) => service.externalUserIdFor(tenant, user, generation), true);
     const fresh = (await store.getIdentity(tenant, user))!;
     expect(fresh.externalUserId).not.toBe(oldId);
     pipedream.accounts.push(jira("apn_new", fresh.externalUserId));
-    await service.selectConnection(tenant, user, { accountId: "apn_new", siteId: SITE }, null);
+    await store.upsert(mapping(tenant, user, fresh.externalUserId, "apn_new"), fresh);
 
     // The callback of the first removal runs only now.
     expect(await service.deleteConnection(tenant, user)).toBe(true);

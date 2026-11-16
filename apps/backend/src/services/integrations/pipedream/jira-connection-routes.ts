@@ -35,6 +35,7 @@ export type JiraConnectionRouteDeps = {
 
 const ERROR_STATUS: Record<JiraConnectionError["code"], number> = {
   not_configured: 503,
+  authorization_unavailable: 503,
   account_not_found: 404,
   account_unhealthy: 409,
   site_not_accessible: 422,

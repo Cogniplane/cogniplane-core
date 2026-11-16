@@ -196,7 +196,11 @@ the attacker's account, so:
 - The owner can confirm a GitHub connection, a Microsoft 365 connection (`POST
   /me/microsoft-connection/confirm`, with the account the page shows), or a
   Notion connection with a provider-attested email. Jira and MCP credentials
-  have no confirm: the owner reconnects or removes them.
+  have no confirm. MCP credential owners save credentials again or remove
+  them. Jira authorization and site selection are temporarily disabled;
+  suspended Jira connections stay suspended. Existing active connections
+  can still read Jira and be removed. See the
+  [Jira connection restriction](../connectors.md#github-notion-and-jira).
 - OAuth callbacks (GitHub, Notion) are bound to the browser that started the
   connect: an httpOnly nonce cookie on the callback path, whose SHA-256 is in
   the signed state.
