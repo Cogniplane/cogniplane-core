@@ -50,10 +50,15 @@ export class WorkOsMembershipRevalidation {
     if (isActive(memberships)) return true;
 
     // The removal below is lasting. One wrong provider response must not
-    // cause it, so a second read without the status filter must agree. If it
-    // shows an active membership, the two reads disagree: throw, so that the
-    // refresh route answers its retryable 503 and nothing is removed.
-    const confirmation = await this.deps.workos.userManagement.listOrganizationMemberships(membership);
+    // cause it, so a second read with every status must agree. The WorkOS API
+    // returns only active memberships when `statuses` is absent, so the
+    // statuses are explicit. If this read shows an active membership, the two
+    // reads disagree: throw, so that the refresh route answers its retryable
+    // 503 and nothing is removed.
+    const confirmation = await this.deps.workos.userManagement.listOrganizationMemberships({
+      ...membership,
+      statuses: ["active", "inactive", "pending"]
+    });
     if (isActive(confirmation)) throw new Error("WorkOS membership reads disagree.");
 
     // A confirmed provider removal uses the same lasting removal as People.

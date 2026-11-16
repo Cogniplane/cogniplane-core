@@ -1682,10 +1682,10 @@ describe("POST /auth/refresh", () => {
     expect(harness.redis.store.get(`refresh_family:${familyId}`)).toBe("revoked");
     expectRefreshCookieKept(refused.headers["set-cookie"]);
     expect(harness.pool.queries.some(({ text }) => text.includes("INSERT INTO tenant_member_removals"))).toBe(true);
-    // The filtered read, then the confirming read without the status filter.
+    // The active-only read, then the confirming read with every status.
     expect(harness.workosMocks.listOrganizationMemberships.mock.calls.slice(-2)).toEqual([
       [{ userId: "workos-user-123", organizationId: "org_456", statuses: ["active"] }],
-      [{ userId: "workos-user-123", organizationId: "org_456" }]
+      [{ userId: "workos-user-123", organizationId: "org_456", statuses: ["active", "inactive", "pending"] }]
     ]);
   });
 

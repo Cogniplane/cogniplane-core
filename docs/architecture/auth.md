@@ -83,8 +83,9 @@ Sign-in types:
   case.
 - WorkOS refresh also checks the user's current active organization membership
   with the WorkOS API, before token rotation or a cached refresh response.
-  When that read shows no active membership, a second read without the status
-  filter must confirm it. A confirmed missing, inactive or pending membership
+  When that read shows no active membership, a second read that requests the
+  active, inactive and pending statuses must confirm it (without `statuses`,
+  the WorkOS API returns active memberships only). A confirmed missing, inactive or pending membership
   causes a lasting local member removal, pauses scheduled jobs, stops active
   work, revokes the member's stored integration connections (as a removal in
   People does) and revokes that refresh family. Other families fail their next

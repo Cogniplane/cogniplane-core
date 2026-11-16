@@ -70,9 +70,11 @@ describe("WorkOS membership revalidation", () => {
       expect(h.db.queries.at(-1)?.text).toBe("COMMIT");
     });
     expect(await h.service.revalidate("tenant-one", "user-one")).toBe(false);
-    // The confirming read has no status filter.
+    // The confirming read asks for every status: without `statuses`, WorkOS returns active rows only.
     expect(h.mocks.listOrganizationMemberships).toHaveBeenCalledTimes(2);
-    expect(h.mocks.listOrganizationMemberships).toHaveBeenLastCalledWith({ userId: "workos-user", organizationId: "org-one" });
+    expect(h.mocks.listOrganizationMemberships).toHaveBeenLastCalledWith({
+      userId: "workos-user", organizationId: "org-one", statuses: ["active", "inactive", "pending"]
+    });
     const statements = h.db.queries.map(({ text }) => text);
     expect(statements).toContainEqual(expect.stringContaining("UPDATE scheduled_jobs"));
     expect(statements).toContainEqual(expect.stringContaining("DELETE FROM project_memberships"));
