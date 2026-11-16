@@ -185,7 +185,8 @@ describe.skipIf(!adminDatabaseUrl())("WorkOS provisioning and concurrent role ch
 
     expect(await service.revalidate(t.tenantId, t.ownerId)).toBe(false);
     expect(mocks.listOrganizationMemberships).toHaveBeenLastCalledWith({
-      userId: owner.rows[0]!.workos_user_id, organizationId: t.organizationId
+      userId: owner.rows[0]!.workos_user_id, organizationId: t.organizationId,
+      statuses: ["active", "inactive", "pending"]
     });
     expect(await roleOf(t.tenantId, t.ownerId)).toBe("owner");
     expect(await removalOf(t.tenantId, t.ownerId)).toBe(false);
