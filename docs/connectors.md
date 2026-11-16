@@ -10,13 +10,31 @@ Scope: operator setup of the bundled connectors (GitHub, Notion, Jira, Microsoft
 |---|---|---|---|
 | GitHub (OAuth App) | `GITHUB_OAUTH_CLIENT_ID`, `GITHUB_OAUTH_CLIENT_SECRET`, `GITHUB_OAUTH_REDIRECT_URI` | `https://<backend>/auth/github/user/callback` | Connect in Settings > Connected accounts |
 | Notion | `NOTION_OAUTH_CLIENT_ID`, `NOTION_OAUTH_CLIENT_SECRET`, `NOTION_OAUTH_REDIRECT_URI` | `https://<backend>/integrations/notion/callback` | Connect in Settings > Connected accounts |
-| Jira Cloud (Pipedream Connect, read-only) | `PIPEDREAM_CLIENT_ID`, `PIPEDREAM_CLIENT_SECRET`, `PIPEDREAM_PROJECT_ID`, `PIPEDREAM_PROJECT_ENVIRONMENT` | None (Pipedream hosts the OAuth flow) | Connect a Jira account through Pipedream and pick one site |
+| Jira Cloud (Pipedream Connect, read-only) | `PIPEDREAM_CLIENT_ID`, `PIPEDREAM_CLIENT_SECRET`, `PIPEDREAM_PROJECT_ID`, `PIPEDREAM_PROJECT_ENVIRONMENT` | None (Pipedream hosts the OAuth flow) | Existing connections only; new authorization and site selection are temporarily disabled |
 
 Each group of client id, secret and redirect URI (or project id) is
 all-or-nothing ([startup rules](configuration.md#startup-rules)). Set
 `PIPEDREAM_PROJECT_ENVIRONMENT=production` for a production Pipedream project.
 Then an admin enables the connector for the tenant in Admin > Connections.
 Without the variables, the connector shows "not configured".
+
+Jira Connect links can be forwarded to another browser. The hosted flow does
+not give Cogniplane a provider-attested proof that the initiating browser
+authorized the account. New link creation and account/site selection therefore
+return HTTP 503 with the error code "jira_authorization_unavailable". This
+also blocks selection of accounts from links issued before the restriction.
+Account and site discovery exposes only an existing, active stored connection. Existing
+connections keep their read tools, and members can still disconnect them.
+Suspended connections cannot be restored through site selection during this
+restriction.
+
+Re-enable new Jira connections only with a provider-attested, one-time
+completion proof bound to the initiating browser/session, or a native Jira
+OAuth flow with a one-time authorization code. A browser cookie and a secret
+success redirect URI alone are insufficient. Pipedream's hosted browser page
+can retrieve that URI through Connect token validation. See the provider's
+[Connect Link documentation](https://pipedream.com/docs/connect/managed-auth/connect-link)
+and [token validation response](https://github.com/PipedreamHQ/pipedream-sdk-typescript/blob/main/src/api/types/ValidateTokenResponse.ts).
 
 GitHub tools work only on repositories that the member allows on the page
 Settings > GitHub (API `PUT /me/github-connection/repositories`, at most

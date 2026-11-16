@@ -4,7 +4,7 @@ import { describe, expect, test, vi } from "vitest";
 import type { Pool } from "../../../lib/db.js";
 import { FakeDatabase } from "../../../test-helpers/fake-database.js";
 import { createTestConfig } from "../../../test-helpers/test-config.js";
-import { JiraConnectionError, type JiraCleanupOutcome } from "./jira-connection-service.js";
+import { JIRA_AUTHORIZATION_UNAVAILABLE_MESSAGE, JiraConnectionError, type JiraCleanupOutcome } from "./jira-connection-service.js";
 import { registerJiraConnectionRoutes, type JiraConnectionRouteDeps } from "./jira-connection-routes.js";
 
 const SITE = "11111111-2222-4333-8444-555555555555";
@@ -93,10 +93,9 @@ describe("Jira connection routes", () => {
     expect(jiraConnections.selectConnection).toHaveBeenCalledWith("tenant-b", "user-9", { accountId: "apn_mine", siteId: SITE }, null);
   });
 
-  // A selection stores the security version of the requesting session.
-  // There is no Jira confirm: the account ID is opaque and the name is chosen
-  // by whoever authorized the account. A new selection restores a suspended one.
-  test("selection stores the session's security version, and there is no confirm route", async () => {
+  // Keep session-version propagation at the route boundary. The real service
+  // rejects selection while new authorizations are disabled.
+  test("passes the session's security version to selection, and has no confirm route", async () => {
     const { app, jiraConnections } = await createApp();
     const selected = await app.inject({
       method: "PUT", url: "/me/jira-connection", headers: { "x-security-version": "5" },
@@ -154,6 +153,23 @@ describe("Jira connection routes", () => {
     jiraConnections.selectConnection.mockRejectedValueOnce(new JiraConnectionError("connection_changed", "Changed."));
     expect((await app.inject({ method: "PUT", url: "/me/jira-connection", payload: { accountId: "apn_x", siteId: SITE } })).statusCode)
       .toBe(409);
+  });
+
+  test("returns the stable authorization-unavailable error for connect and selection", async () => {
+    const { app, jiraConnections } = await createApp();
+    const unavailable = () => new JiraConnectionError("authorization_unavailable", JIRA_AUTHORIZATION_UNAVAILABLE_MESSAGE);
+    jiraConnections.getAuthorizationUrl.mockRejectedValueOnce(unavailable());
+    jiraConnections.selectConnection.mockRejectedValueOnce(unavailable());
+    jiraConnections.listAccountSites.mockRejectedValueOnce(unavailable());
+    for (const request of [
+      { method: "POST" as const, url: "/me/jira-connection/authorize" },
+      { method: "PUT" as const, url: "/me/jira-connection", payload: { accountId: "apn_unbound", siteId: SITE } },
+      { method: "GET" as const, url: "/me/jira-connection/accounts/apn_unbound/sites" }
+    ]) {
+      const response = await app.inject(request);
+      expect(response.statusCode).toBe(503);
+      expect(response.json()).toEqual({ error: "jira_authorization_unavailable", message: JIRA_AUTHORIZATION_UNAVAILABLE_MESSAGE });
+    }
   });
 
   test("loads sites for one account of the authenticated member", async () => {
