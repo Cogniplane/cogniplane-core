@@ -28,7 +28,8 @@ describe("readable artifact approval", () => {
     ["quotes", 'my"report.md', 'my"report.md'],
     ["long Unicode", "🙂".repeat(130) + ".md", "🙂".repeat(117) + "..."],
     ["inline credential", "ghp_abcdefghi0123456789.md", "[REDACTED].md"],
-    ["split credential", "ghp_abcd\u200befghi0123456789.md", "[REDACTED].md"]
+    ["split credential", "ghp_abcd\u200befghi0123456789.md", "[REDACTED].md"],
+    ["environment assignment after a newline", "report\nAPI_KEY=opaque", "reportAPI_KEY=[REDACTED]"]
   ])("cleans and bounds a display filename with %s", (_case, name, expected) => {
     const action = artifact({ args: { name, content: "private body" } });
     expect(approvalPresentation(action, null).title).toBe(`Save ${JSON.stringify(expected)} to Artifacts`);
@@ -56,6 +57,14 @@ describe("readable artifact approval", () => {
       ruleId: null, explanation: "\u202e\u0000\u200b" });
     expect(approvalPresentation({ ...action, policyApproval: proof }, null).summary)
       .toContain("Reason: Policy Center requires approval.");
+  });
+
+  it("redacts environment assignments before joining a policy reason's lines", () => {
+    const action = artifact();
+    const proof = createPolicyApprovalProof({ toolContextId: "ctx", toolCallId: "call", toolName: action.name,
+      serverId: action.server!.id, args: action.args, ruleId: null, explanation: "Review this write.\nAPI_KEY=opaque" });
+    expect(approvalPresentation({ ...action, policyApproval: proof }, null).summary)
+      .toContain("Reason: Review this write. API_KEY=[REDACTED]");
   });
 
   const unsupported: Array<[string, Partial<ApprovalRequest>, string | null]> = [

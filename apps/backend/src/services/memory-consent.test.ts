@@ -137,6 +137,10 @@ describe("prepareMemorySaveApproval", () => {
     for (const args of [
       { name: "deploy", content: "Deploy key is ghp_" + "A".repeat(36) },
       { name: "deploy", content: "Call it with Authorization: Bearer abc.def.ghi" },
+      { name: "deploy", content: "Authorization: bAsIc dXNlcjpwYXNz" },
+      { name: "deploy", content: "postgres://us%40er:opaque@db.test/app" },
+      { name: "deploy", content: "export OPENAI_API_KEY='opaque\nmultiline value'" },
+      { name: "deploy", content: "fine", metadata: { note: "CLIENT_SECRET=opaque" } },
       { name: "deploy", content: "fine", metadata: { password: "hunter2" } }
     ]) {
       const prepared = await prepareMemorySaveApproval({ memories, tenantId: "t1", userId: "u1", args });

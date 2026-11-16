@@ -64,7 +64,7 @@ export type LoggedToolError = {
 const MAX_LOGGED_CAUSES = 3;
 
 function redactToolErrorText(value: string): string {
-  return redactSecrets(value).replace(/\b([a-z][a-z0-9+.-]*:\/\/)[^/\s@]+@/gi, "$1[REDACTED]@");
+  return redactSecrets(value);
 }
 
 /**

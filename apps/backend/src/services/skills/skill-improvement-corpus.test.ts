@@ -245,8 +245,10 @@ test("formatCorpus byteBudget excludes additional sessions but always keeps the 
   expect(result.markdown).toContain("additional session(s) were excluded");
 });
 
-test("formatCorpus tool input is excerpted to TOOL_INPUT_EXCERPT_BYTES (400)", () => {
-  const longInput = "i".repeat(800);
+test.each([
+  ["i".repeat(800), "i".repeat(400)],
+  ["https://" + "opaque".repeat(100) + ":password@host.test/path", "https://[REDACTED]@host.test/path"]
+])("formatCorpus redacts tool input before its 400-character excerpt", (longInput, expected) => {
   const result = formatCorpus({
     skill,
     tenantId: "tenant-1",
@@ -290,9 +292,8 @@ test("formatCorpus tool input is excerpted to TOOL_INPUT_EXCERPT_BYTES (400)", (
       }
     ]
   });
-  // The input is cut to 400 characters. The markdown has a run of 400 i's, and no run of 500.
-  expect(result.markdown).toMatch(/i{400}/);
-  expect(result.markdown).not.toMatch(/i{500}/);
+  expect(result.markdown).toContain(expected);
+  expect(result.markdown).not.toContain(longInput);
 });
 
 test("formatCorpus redacts Bearer tokens in user message content", () => {

@@ -177,7 +177,7 @@ function renderSession(session: CorpusSessionInput): {
           (status === toolResult.status ? "" : ` (no result before the turn ended; stored status: ${toolResult.status})`)
       );
       if (toolResult.input) {
-        const safeInput = redactSecrets(toolResult.input.slice(0, TOOL_INPUT_EXCERPT_BYTES));
+        const safeInput = redactSecrets(toolResult.input).slice(0, TOOL_INPUT_EXCERPT_BYTES);
         sessionLines.push("  - input:");
         sessionLines.push(indent(quote(safeInput), 4));
       }

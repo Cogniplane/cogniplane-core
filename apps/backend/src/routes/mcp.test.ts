@@ -1269,7 +1269,12 @@ test("proxy tool/call forwards the framework-signed X-Framework identity and ign
   expect(toolCallRequests(upstreamRequests)[0].headers["x-framework-user-id"]).toBe("header-user");
 });
 
-test("redacts credentials in a proxy tool result before returning to the runtime", async () => {
+test.each([
+  ["sk-abcdefghijklmnopqrstuvwxyz0123", "[REDACTED]"],
+  ["Authorization: Basic dXNlcjpwYXNz", "Authorization: Basic [REDACTED]"],
+  ["postgres://us%40er:opaque@db.test/app", "postgres://[REDACTED]@db.test/app"],
+  ["export API_KEY='opaque\nmultiline'", "export API_KEY=[REDACTED]"]
+])("redacts proxy tool credential %s before returning to the runtime", async (secret, expected) => {
   // A proxy upstream that echoes an OpenAI-shaped key back in its result body.
   // The gateway must strip it at the boundary so it never lands in the durable
   // LangGraph checkpoint (restored into model context on later turns).
@@ -1295,7 +1300,6 @@ test("redacts credentials in a proxy tool result before returning to the runtime
     }
   });
 
-  const secret = "sk-abcdefghijklmnopqrstuvwxyz0123";
   const response = await app.inject({
     method: "POST",
     url: "/mcp/test-proxy",
@@ -1310,7 +1314,7 @@ test("redacts credentials in a proxy tool result before returning to the runtime
         name: "echo",
         arguments: {
           toolContextId: context.toolContextId,
-          query: `here is the key ${secret}`
+          query: secret
         }
       }
     }
@@ -1320,6 +1324,7 @@ test("redacts credentials in a proxy tool result before returning to the runtime
   const body = response.body;
   expect(body).not.toContain(secret);
   expect(body).toContain("[REDACTED]");
+  expect(response.json().result.structuredContent.echoedArguments.query).toBe(expected);
 });
 
 test("scrubs an organization secret and token patterns from an upstream error before telemetry", async () => {
@@ -1673,7 +1678,8 @@ test("redacts a managed tool result in content[0].text, not only structuredConte
           // Key-based redaction territory: the VALUE carries no prefix a
           // pattern could recognise, so only the key gives it away.
           connection: { host: "db.internal", password: leaked },
-          apiKey: leaked
+          apiKey: leaked,
+          notes: ["Authorization: Basic dXNlcjpwYXNz", "postgres://us%40er:opaque@db.test/app", "API_KEY=opaque"]
         })
       } as never
     ]
@@ -1709,6 +1715,9 @@ test("redacts a managed tool result in content[0].text, not only structuredConte
   expect(result.content[0]!.text).not.toContain(leaked);
   expect(JSON.stringify(result.structuredContent)).not.toContain(leaked);
   expect(result.content[0]!.text).toContain("[REDACTED]");
+  const notes = ["Authorization: Basic [REDACTED]", "postgres://[REDACTED]@db.test/app", "API_KEY=[REDACTED]"];
+  expect(JSON.parse(result.content[0]!.text).notes).toEqual(notes);
+  expect(result.structuredContent.notes).toEqual(notes);
 
   // And nothing anywhere in the response body.
   expect(response.body).not.toContain(leaked);

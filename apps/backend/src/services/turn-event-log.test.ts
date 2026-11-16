@@ -419,6 +419,34 @@ const BEFORE_TEXT = "前文没有空格".repeat(100);
 const AFTER_TEXT = "后文也没有空格".repeat(100);
 const SECRET_BODY = "Q7xK9mP2vL4nR8tW3yZ6bC1dF5gH0jA";
 
+test.each([
+  ["Basic authorization", `前文 Authorization: Basic ${"秘".repeat(800)}\nvisible`, "前文 Authorization: Basic [REDACTED]\nvisible"],
+  ["URL userinfo", `前文 https://${"秘".repeat(800)}:password@host.test/path 后文`, "前文 https://[REDACTED]@host.test/path 后文"],
+  ["SSH URL password", `前文 ssh://${"秘".repeat(800)}:password@host.test/path 后文`, "前文 ssh://[REDACTED]@host.test/path 后文"],
+  ["multiline environment value", `visible\nexport API_KEY="${"secret word ".repeat(100)}\nsecond line"\nPORT=3000`, "visible\nexport API_KEY=[REDACTED]\nPORT=3000"],
+  ["unterminated quoted value", `visible\nPASSWORD='${"secret word ".repeat(100)}\nmore`, "visible\nPASSWORD=[REDACTED]"]
+])("never releases a split %s to live listeners or the replay mirror", async (_name, source, expected) => {
+  for (const sizes of [[1], [3, 7, 31], [source.length]]) {
+    const { log, mirrored } = mirroredLog();
+    const live: SequencedTurnEvent[] = [];
+    log.subscribe(0, (entry) => { if (entry) live.push(entry); });
+    log.append({ type: EventType.TEXT_MESSAGE_START, messageId: "answer", role: "assistant" } as BaseEvent);
+    for (const delta of chunks(source, sizes)) log.append(textEvent(delta));
+    log.append({ type: EventType.TEXT_MESSAGE_END, messageId: "answer" } as BaseEvent);
+    expect(replayedText(live)).toBe(expected);
+    expect(replayedText(log.subscribe(0, () => undefined)!.replay)).toBe(expected);
+    await vi.waitFor(() => expect(replayedText(mirrored)).toBe(expected), { interval: 1 });
+  }
+});
+
+test("drops an oversized open assignment without releasing its secret words", () => {
+  const log = new TurnEventLog();
+  log.append({ type: EventType.TEXT_MESSAGE_START, messageId: "answer", role: "assistant" } as BaseEvent);
+  for (const delta of chunks(`API_KEY="${"secret word ".repeat(2_000)}`, [19])) log.append(textEvent(delta));
+  log.append({ type: EventType.TEXT_MESSAGE_END, messageId: "answer" } as BaseEvent);
+  expect(replayedText(log.subscribe(0, () => undefined)!.replay)).toBe("[Reply text exceeds live replay limit]");
+});
+
 // Each piece of `secret` that has `length` code units.
 function pieces(secret: string, length: number): string[] {
   return Array.from({ length: secret.length - length + 1 }, (_, index) => secret.slice(index, index + length));
