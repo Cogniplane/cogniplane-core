@@ -35,16 +35,26 @@ export class WorkOsMembershipRevalidation {
     if (!row) return false;
     if (!row.workos_user_id || !row.workos_org_id) throw new Error("WorkOS identity identifiers are missing.");
 
+    const membership = { userId: row.workos_user_id, organizationId: row.workos_org_id };
+    const isActive = (list: { data: Array<{ userId: string; organizationId: string; status: string }> }) =>
+      list.data.some((entry) =>
+        entry.userId === membership.userId &&
+        entry.organizationId === membership.organizationId &&
+        entry.status === "active"
+      );
+
     const memberships = await this.deps.workos.userManagement.listOrganizationMemberships({
-      userId: row.workos_user_id,
-      organizationId: row.workos_org_id,
+      ...membership,
       statuses: ["active"]
     });
-    if (memberships.data.some((membership) =>
-      membership.userId === row.workos_user_id &&
-      membership.organizationId === row.workos_org_id &&
-      membership.status === "active"
-    )) return true;
+    if (isActive(memberships)) return true;
+
+    // The removal below is lasting. One wrong provider response must not
+    // cause it, so a second read without the status filter must agree. If it
+    // shows an active membership, the two reads disagree: throw, so that the
+    // refresh route answers its retryable 503 and nothing is removed.
+    const confirmation = await this.deps.workos.userManagement.listOrganizationMemberships(membership);
+    if (isActive(confirmation)) throw new Error("WorkOS membership reads disagree.");
 
     // A confirmed provider removal uses the same lasting removal as People.
     // A WorkOS outage throws above and never removes a local membership.
@@ -60,6 +70,27 @@ export class WorkOsMembershipRevalidation {
       );
       if (!target.rows[0]) return;
       if (target.rows[0].user_auth_source !== "workos") throw new Error("The membership is not a WorkOS identity.");
+      if (target.rows[0].role === "owner") {
+        // A tenant must keep an owner. The tenant's membership lock is held,
+        // so no other change can remove or demote an owner before the commit.
+        const otherOwner = await client.query(
+          `SELECT 1 FROM tenant_memberships
+           WHERE tenant_id = $1 AND role = 'owner' AND user_id <> $2 LIMIT 1`,
+          [tenantId, userId]
+        );
+        if (!otherOwner.rows[0]) {
+          // The last owner keeps the membership, jobs and connections, so an
+          // operator can act. The refresh is refused.
+          await AuditEventStore.createInTransaction(client, {
+            tenantId,
+            userId,
+            sessionId: null,
+            type: "tenant.member.removal_refused",
+            payload: { targetUserId: userId, role: "owner", reason: "workos_membership_inactive_last_owner" }
+          });
+          return;
+        }
+      }
       await client.query(
         `UPDATE scheduled_jobs
          SET enabled = FALSE, next_run_at = NULL, paused_reason = 'security_change', updated_at = NOW()

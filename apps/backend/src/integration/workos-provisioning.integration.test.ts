@@ -170,6 +170,47 @@ describe.skipIf(!adminDatabaseUrl())("WorkOS provisioning and concurrent role ch
     expect(audit.rows[0]?.payload).toMatchObject({ targetUserId: t.userId, reason: "workos_membership_inactive" });
   });
 
+  test("refresh revalidation refuses the last owner and keeps the membership", async () => {
+    const t = await tenantWith("member");
+    const owner = await superuserPool().query<{ workos_user_id: string }>(
+      "SELECT workos_user_id FROM users WHERE user_id = $1", [t.ownerId]
+    );
+    const { workos, mocks } = createFakeWorkOS();
+    mocks.listOrganizationMemberships.mockResolvedValue({ data: [] });
+    const afterSecurityChange = vi.fn(async () => {});
+    const afterRemoval = vi.fn(async () => {});
+    const service = new WorkOsMembershipRevalidation({
+      lookupDb: maintenancePool(), db: appPool(), workos, afterSecurityChange, afterRemoval
+    });
+
+    expect(await service.revalidate(t.tenantId, t.ownerId)).toBe(false);
+    expect(mocks.listOrganizationMemberships).toHaveBeenLastCalledWith({
+      userId: owner.rows[0]!.workos_user_id, organizationId: t.organizationId
+    });
+    expect(await roleOf(t.tenantId, t.ownerId)).toBe("owner");
+    expect(await removalOf(t.tenantId, t.ownerId)).toBe(false);
+    expect(afterSecurityChange).not.toHaveBeenCalled();
+    expect(afterRemoval).not.toHaveBeenCalled();
+    const audit = await superuserPool().query(
+      "SELECT event_type, payload FROM audit_events WHERE tenant_id = $1 AND user_id = $2 AND event_type LIKE 'tenant.member.%'",
+      [t.tenantId, t.ownerId]
+    );
+    expect(audit.rows).toEqual([{
+      event_type: "tenant.member.removal_refused",
+      payload: { targetUserId: t.ownerId, role: "owner", reason: "workos_membership_inactive_last_owner" }
+    }]);
+
+    // With a second owner, the same owner is removed.
+    await superuserPool().query(
+      "UPDATE tenant_memberships SET role = 'owner' WHERE tenant_id = $1 AND user_id = $2", [t.tenantId, t.userId]
+    );
+    expect(await service.revalidate(t.tenantId, t.ownerId)).toBe(false);
+    expect(await roleOf(t.tenantId, t.ownerId)).toBeNull();
+    expect(await roleOf(t.tenantId, t.userId)).toBe("owner");
+    expect(await removalOf(t.tenantId, t.ownerId)).toBe(true);
+    expect(afterRemoval).toHaveBeenCalledExactlyOnceWith({ tenantId: t.tenantId, userId: t.ownerId });
+  });
+
   test("a promotion that commits during a login is kept", async () => {
     const t = await tenantWith("member");
     const result = await loginDuring(

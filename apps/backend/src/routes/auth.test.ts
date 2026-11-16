@@ -1682,9 +1682,11 @@ describe("POST /auth/refresh", () => {
     expect(harness.redis.store.get(`refresh_family:${familyId}`)).toBe("revoked");
     expectRefreshCookieKept(refused.headers["set-cookie"]);
     expect(harness.pool.queries.some(({ text }) => text.includes("INSERT INTO tenant_member_removals"))).toBe(true);
-    expect(harness.workosMocks.listOrganizationMemberships).toHaveBeenLastCalledWith({
-      userId: "workos-user-123", organizationId: "org_456", statuses: ["active"]
-    });
+    // The filtered read, then the confirming read without the status filter.
+    expect(harness.workosMocks.listOrganizationMemberships.mock.calls.slice(-2)).toEqual([
+      [{ userId: "workos-user-123", organizationId: "org_456", statuses: ["active"] }],
+      [{ userId: "workos-user-123", organizationId: "org_456" }]
+    ]);
   });
 
   test("a WorkOS removal at refresh revokes the member's integration connections", async () => {
