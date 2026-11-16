@@ -105,6 +105,9 @@ redirect and hide. Every rule is enforced in the backend.
   numbers and booleans under those names stay; a nested object is walked, not
   blanked; paging fields (`pageToken`, `nextPageToken`, ...) stay.
   `lib/sanitize-url.ts` uses the same parameter list for logged URLs.
+  A user name alone (no `:`) stays in a URL with an SSH scheme (`ssh`,
+  `git+ssh`, `ssh+git`, `svn+ssh`), so git URLs such as `ssh://git@host/repo`
+  stay correct.
   Environment rules accept optional `export`, quoted multiline values and
   escaped line breaks. An unmatched quote hides the rest of the value.
   Ordinary settings such as port, environment name and public keys stay.

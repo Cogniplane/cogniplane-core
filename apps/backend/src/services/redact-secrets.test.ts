@@ -122,7 +122,12 @@ test.each([
   ["https://user:password@example.test/path?q=ok#keep", "https://[REDACTED]@example.test/path?q=ok#keep"],
   ["POSTGRESQL://us%40er:p%2Fass%3Aword@db.test:5432/db", "POSTGRESQL://[REDACTED]@db.test:5432/db"],
   ["redis+tls://:password@[::1]:6379/0", "redis+tls://[REDACTED]@[::1]:6379/0"],
-  ["ssh://only-user@host.test/repo", "ssh://[REDACTED]@host.test/repo"],
+  ["ssh://user:pw@host.test/repo", "ssh://[REDACTED]@host.test/repo"],
+  ["git+ssh://git:pw@github.com/o/r.git", "git+ssh://[REDACTED]@github.com/o/r.git"],
+  ["ssh://first@second:pw@host.test", "ssh://[REDACTED]@host.test"],
+  ["https://token@host.test/repo", "https://[REDACTED]@host.test/repo"],
+  ["sshx://git@host.test/repo", "sshx://[REDACTED]@host.test/repo"],
+  ["xssh://git@host.test/repo", "xssh://[REDACTED]@host.test/repo"],
   ["https://user:bad%zz@host.test", "https://[REDACTED]@host.test"],
   ["https://first@second:pass@host.test", "https://[REDACTED]@host.test"],
   ['URL="https://user:pass@host.test"', 'URL="https://[REDACTED]@host.test"'],
@@ -131,6 +136,19 @@ test.each([
 ])("redacts URL userinfo in %s", (source, expected) => {
   expect(redactSecrets(source)).toBe(expected);
   expect(redactSecrets(expected)).toBe(expected);
+});
+
+// An SSH-family scheme has no password in a user name alone.
+test.each([
+  "ssh://only-user@host.test/repo",
+  "ssh://git@github.com/org/repo",
+  "git+ssh://git@github.com/o/r.git",
+  "ssh+git://git@github.com/o/r.git",
+  "svn+ssh://svn@host.test/repo",
+  "SSH://git@host.test",
+  'url = "Git+SSH://git@host.test:22/o/r.git"'
+])("keeps the SSH user name in %s", (source) => {
+  expect(redactSecrets(source)).toBe(source);
 });
 
 test.each([
@@ -550,6 +568,8 @@ test("redactSecrets stays linear on large adversarial input", { timeout: 60_000 
       urlSchemeRun: timed(() => redactSecrets("a-".repeat(1_000_000) + "://user:pass@host").slice(-15)),
       urlAuthorities: timed(() => redactSecrets("x://no-user/".repeat(100_000) + "x://u:p@host").slice(-19)),
       nestedAuthorities: timed(() => redactSecrets("x://".repeat(200_000) + "u:p@host").slice(-19)),
+      sshUsers: timed(() => redactSecrets("ssh://git@host/".repeat(100_000) + "ssh://u:p@host").slice(-21)),
+      sshLongUser: timed(() => redactSecrets("ssh://" + "u".repeat(2_000_000) + "@host").length),
       envName: timed(() => redactSecrets("A_".repeat(1_000_000) + "PUBLIC_KEY=public").length),
       envQuotes: timed(() => redactSecrets('API_KEY="' + ("escaped" + String.fromCharCode(92, 34, 10)).repeat(100_000)).slice(-10)),
       envLines: timed(() => redactSecrets("PORT=3000\\n".repeat(200_000) + "API_KEY=opaque").slice(-18))
@@ -566,6 +586,8 @@ test("redactSecrets stays linear on large adversarial input", { timeout: 60_000 
   expect(runs.urlSchemeRun!.result).toBe("[REDACTED]@host");
   expect(runs.urlAuthorities!.result).toBe("x://[REDACTED]@host");
   expect(runs.nestedAuthorities!.result).toBe("x://[REDACTED]@host");
+  expect(runs.sshUsers!.result).toBe("ssh://[REDACTED]@host");
+  expect(runs.sshLongUser!.result).toBe(2_000_011);
   expect(runs.envName!.result).toBe(2_000_017);
   expect(runs.envQuotes!.result).toBe("[REDACTED]");
   expect(runs.envLines!.result).toBe("API_KEY=[REDACTED]");

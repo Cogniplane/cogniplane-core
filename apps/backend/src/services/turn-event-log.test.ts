@@ -422,6 +422,7 @@ const SECRET_BODY = "Q7xK9mP2vL4nR8tW3yZ6bC1dF5gH0jA";
 test.each([
   ["Basic authorization", `前文 Authorization: Basic ${"秘".repeat(800)}\nvisible`, "前文 Authorization: Basic [REDACTED]\nvisible"],
   ["URL userinfo", `前文 https://${"秘".repeat(800)}:password@host.test/path 后文`, "前文 https://[REDACTED]@host.test/path 后文"],
+  ["SSH URL password", `前文 ssh://${"秘".repeat(800)}:password@host.test/path 后文`, "前文 ssh://[REDACTED]@host.test/path 后文"],
   ["multiline environment value", `visible\nexport API_KEY="${"secret word ".repeat(100)}\nsecond line"\nPORT=3000`, "visible\nexport API_KEY=[REDACTED]\nPORT=3000"],
   ["unterminated quoted value", `visible\nPASSWORD='${"secret word ".repeat(100)}\nmore`, "visible\nPASSWORD=[REDACTED]"]
 ])("never releases a split %s to live listeners or the replay mirror", async (_name, source, expected) => {

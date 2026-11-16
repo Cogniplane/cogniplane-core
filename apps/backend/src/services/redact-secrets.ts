@@ -174,11 +174,24 @@ function redactAssignments(value: string): string {
   return copied === 0 ? value : result + value.slice(copied);
 }
 
+// These schemes take the password or key from the SSH client, never from the
+// user name. A user name alone (no ':') is kept, so that a git URL such as
+// ssh://git@host/repo stays correct in the files that the model reads and
+// edits. For other schemes a user name alone can be a token.
+const SSH_URL_SCHEMES = new Set(["ssh", "git+ssh", "ssh+git", "svn+ssh"]);
+const SSH_URL_SCHEME_MAX_LENGTH = 7;
+
 function redactUrlUserinfo(value: string): string {
   let result = "";
   let copied = 0;
-  visitUrlAuthorities(value, (_range, at, start) => {
+  visitUrlAuthorities(value, (range, at, start) => {
     if (at < start) return;
+    // `start - 3` is the "://" separator. The length check comes first, so a
+    // long scheme run is not copied.
+    const schemeLength = start - 3 - range.start;
+    if (schemeLength <= SSH_URL_SCHEME_MAX_LENGTH &&
+      SSH_URL_SCHEMES.has(value.slice(range.start, start - 3).toLowerCase()) &&
+      !value.slice(start, at).includes(":")) return;
     result += value.slice(copied, start) + "[REDACTED]";
     copied = at;
   });
