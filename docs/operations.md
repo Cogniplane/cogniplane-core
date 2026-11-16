@@ -43,6 +43,20 @@ are not tested against a newer schema. If the new backends fail `/ready`, fix
 forward, or stop the backends, restore the backup from step 1 and redeploy the
 previous images.
 
+### Upgrade to required runtime-token claims
+
+The MCP gateway now refuses a runtime token without an ISO 8601 UTC expiry or
+with a missing, empty or non-string identity claim. There is no compatibility
+window for older tokens without an expiry. Both current runtime mint paths
+already include these claims, so their unexpired tokens remain valid without a
+secret change.
+
+Restart runtimes that still hold older tokens without an expiry. Finish the
+backend rollout before you rely on this restriction, because an older backend
+still accepts those tokens. Drain and replace each backend as described above;
+do not keep an older replica as a compatibility path. Browser access and
+refresh tokens are not runtime tokens and do not change in this upgrade.
+
 ### Upgrade to removal records
 
 Migration `091` adds `tenant_member_removals` ([roles](architecture/auth.md#roles)).

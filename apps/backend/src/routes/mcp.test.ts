@@ -1,3 +1,4 @@
+import { createHmac } from "node:crypto";
 import { test, expect, onTestFinished, vi } from "vitest";
 import Fastify from "fastify";
 
@@ -292,13 +293,36 @@ function makePolicyRule(overrides: Partial<PolicyRule>): PolicyRule {
 // it here exercises the real key relationship rather than a shared literal.
 const RUNTIME_TOKEN_SECRET = TEST_RUNTIME_TOKEN_SECRET;
 
+test.each([{ exp: undefined }, { jti: undefined }, { sid: "" }, { tid: [] }, { uid: {} }, { rid: null }])(
+  "gateway refuses signed invalid runtime claims before context lookup: %j", async invalid => {
+    const { app, toolContexts } = await createTestApp();
+    onTestFinished(() => app.close());
+    const good = runtimeToken({ sid: "session-1", uid: "test-user" });
+    const claims = JSON.parse(Buffer.from(good.slice(3).split(".")[0]!, "base64url").toString("utf8"));
+    const payload = Buffer.from(JSON.stringify({ ...claims, ...invalid })).toString("base64url");
+    const signature = createHmac("sha256", RUNTIME_TOKEN_SECRET).update(payload).digest("base64url");
+    const request = (token: string) => app.inject({
+      method: "POST", url: "/mcp/managed-session-context",
+      headers: { authorization: `Bearer ${token}` },
+      payload: { jsonrpc: "2.0", id: 1, method: "initialize" }
+    });
+    expect((await request(good)).statusCode).toBe(200);
+    const lookup = vi.spyOn(toolContexts, "findLatestActiveBySession");
+    const response = await request(`rt_${payload}.${signature}`);
+    expect(response.statusCode).toBe(401);
+    expect(response.json().error.message).toBe("The MCP gateway requires a valid runtime token (rt_*).");
+    expect(lookup).not.toHaveBeenCalled();
+  }
+);
+
 function runtimeToken(claims: { sid: string; uid: string; rid?: string; tid?: string }): string {
   return generateRuntimeToken(
     {
       sid: claims.sid,
       tid: claims.tid ?? "test-tenant",
       uid: claims.uid,
-      rid: claims.rid ?? `runtime-${claims.sid}`
+      rid: claims.rid ?? `runtime-${claims.sid}`,
+      exp: "2099-01-01T00:00:00.000Z"
     },
     RUNTIME_TOKEN_SECRET
   );

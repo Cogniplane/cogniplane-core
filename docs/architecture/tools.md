@@ -39,6 +39,11 @@ Rules:
    runtime). The token lives `RUNTIME_TOKEN_TTL_MS`; a session that runs longer
    gets `runtime_token_expired` until its runtime restarts. The gateway reads
    only this header, never a query-string token.
+   Verification requires nonblank string `jti`, `sid`, `tid`, `uid` and `rid`
+   claims and an ISO 8601 UTC `exp`. The token is invalid without any of them,
+   and expires at the exact `exp` time. Its format uses HMAC-SHA256, not JWT
+   headers or a caller-selected algorithm. Upgrade behavior:
+   [runtime-token validation](../operations.md#upgrade-to-required-runtime-token-claims).
 2. Every call needs a `toolContextId` that resolves in
    `ToolExecutionContextStore`
    (`services/auth/tool-execution-context-store.ts`).

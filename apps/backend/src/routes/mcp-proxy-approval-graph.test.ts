@@ -137,7 +137,8 @@ async function setup() {
   const context = await createTestToolContext(toolContexts, { sessionId, userId: "test-user", runtimeId,
     metadata: { runtimePolicy, turnContext: "interactive" } });
   const token = generateRuntimeToken(
-    { sid: sessionId, tid: "test-tenant", uid: "test-user", rid: runtimeId }, TEST_RUNTIME_TOKEN_SECRET);
+    { sid: sessionId, tid: "test-tenant", uid: "test-user", rid: runtimeId,
+      exp: "2099-01-01T00:00:00.000Z" }, TEST_RUNTIME_TOKEN_SECRET);
   const runtime = createDeepAgentsSessionRuntime({
     tenantId: "test-tenant", sessionId, userId: "test-user", runtimeId,
     resolveProviderKey: async () => "sk-test", systemPrompt: null, workspacePath: "/workspace", e2b: null,

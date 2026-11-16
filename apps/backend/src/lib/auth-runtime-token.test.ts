@@ -1,3 +1,4 @@
+import { createHmac } from "node:crypto";
 import { test, expect, describe, vi } from "vitest";
 
 import type { FastifyRequest } from "fastify";
@@ -24,10 +25,11 @@ const CLAIMS: RuntimeTokenMintClaims = {
   sid: "session-1",
   tid: "tenant-A",
   uid: "user-1",
-  rid: "runtime-1"
+  rid: "runtime-1",
+  exp: "2099-01-01T00:00:00.000Z"
 };
 
-function validToken(claims: RuntimeTokenMintClaims = CLAIMS): string {
+function validToken(claims: Omit<RuntimeTokenMintClaims, "exp"> = CLAIMS): string {
   const token = generateRuntimeToken(
     { ...claims, exp: runtimeTokenExpiry(60 * 60 * 1000) },
     SECRET
@@ -173,6 +175,17 @@ describe("tryAuthenticateRuntimeToken — non-rt_ values are ignored", () => {
 });
 
 describe("tryAuthenticateRuntimeToken — rejected tokens", () => {
+  test.each([{ exp: undefined }, { uid: [] }, { tid: "" }])("invalid signed claims do not populate request.auth: %j", invalid => {
+    const payload = Buffer.from(JSON.stringify({ ...CLAIMS, jti: "token-id", ...invalid })).toString("base64url");
+    const signature = createHmac("sha256", SECRET).update(payload).digest("base64url");
+    const request = fakeRequest({
+      url: "/mcp/server-1",
+      headers: { authorization: `Bearer rt_${payload}.${signature}` }
+    });
+    expect(tryAuthenticateRuntimeToken(request, config)).toBe(false);
+    expect(request.auth).toBeUndefined();
+  });
+
   test("expired token returns false, logs a warn, and leaves request.auth untouched", () => {
     const expired = generateRuntimeToken(
       { ...CLAIMS, exp: runtimeTokenExpiry(-60 * 1000) },

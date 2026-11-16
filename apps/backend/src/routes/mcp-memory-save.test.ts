@@ -98,7 +98,8 @@ function policySnapshot(overrides: Record<string, unknown> = {}) {
 }
 
 function runtimeToken(claims: { sid: string; uid: string; rid: string }): string {
-  return generateRuntimeToken({ sid: claims.sid, tid: "test-tenant", uid: claims.uid, rid: claims.rid }, TEST_RUNTIME_TOKEN_SECRET);
+  return generateRuntimeToken({ sid: claims.sid, tid: "test-tenant", uid: claims.uid, rid: claims.rid,
+    exp: "2099-01-01T00:00:00.000Z" }, TEST_RUNTIME_TOKEN_SECRET);
 }
 
 async function setup(options: { policyService?: NonNullable<Parameters<typeof createTestApp>[0]>["policyService"] } = {}) {

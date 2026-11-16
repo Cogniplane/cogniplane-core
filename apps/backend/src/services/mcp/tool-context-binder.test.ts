@@ -8,7 +8,7 @@ test.each([new Error("database password leaked"), new ToolContextUnavailableErro
     const result = await resolveBoundToolContext({
       rpc: { id: 1 }, tenantId: "tenant", args: { toolContextId: "ctx_trusted_id" },
       metadataToolContextId: null, urlToolContextId: null, sessionIdFromRuntimeToken: "session",
-      runtimeTokenClaims: { jti: "token", sid: "session", tid: "tenant", uid: "user", rid: "runtime" },
+      runtimeTokenClaims: { jti: "token", sid: "session", tid: "tenant", uid: "user", rid: "runtime", exp: "2099-01-01T00:00:00.000Z" },
       toolContexts: {
         require: async () => { throw error; },
         findLatestActiveBySession: async () => null
@@ -23,7 +23,7 @@ test.each([new Error("database password leaked"), new ToolContextUnavailableErro
 );
 
 describe("context sources", () => {
-  const claims = { jti: "token", sid: "session", tid: "tenant", uid: "user", rid: "runtime" };
+  const claims = { jti: "token", sid: "session", tid: "tenant", uid: "user", rid: "runtime", exp: "2099-01-01T00:00:00.000Z" };
   const context = (toolContextId: string, overrides: Partial<ToolExecutionContext> = {}): ToolExecutionContext => ({
     toolContextId, tenantId: "tenant", sessionId: "session", userId: "user", runtimeId: "runtime",
     runtimePolicyId: "policy", messageId: null, credentialEnvelope: {}, metadata: {},

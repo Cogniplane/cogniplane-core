@@ -1,20 +1,20 @@
 import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
+import { z } from "zod";
 
 /**
  * Session-scoped runtime tokens allow the agent runtime to authenticate HTTP
  * requests back to the backend's MCP gateway without holding a real user JWT.
  *
  * Token format: `rt_<payload>.<signature>`
- *   payload = base64url(JSON.stringify({ jti, sid, tid, uid, rid, exp? }))
+ *   payload = base64url(JSON.stringify({ jti, sid, tid, uid, rid, exp }))
  *   signature = HMAC-SHA256(payload, secret)
  *
  * The token is generated once per runtime session and sent as the
  * `Authorization: Bearer rt_...` header on every MCP gateway request.
  *
- * Production callers set `exp` via `runtimeTokenExpiry(config.RUNTIME_TOKEN_TTL_MS)`
- * to limit the leak window if someone captures backend process memory or
- * internal request diagnostics. Verification still tolerates absence of `exp` so
- * older in-flight tokens keep working through a deploy.
+ * Every token requires an ISO 8601 UTC `exp` and nonblank string identities.
+ * Callers set `exp` via `runtimeTokenExpiry(config.RUNTIME_TOKEN_TTL_MS)`.
+ * Older tokens without an expiry are invalid, including during a deploy.
  *
  * The token is a bearer credential valid until `exp` — there is no revocation
  * deny-list. The leak window is bounded by two controls instead: the TTL, and
@@ -49,20 +49,17 @@ export function runtimeTokenExpiry(ttlMs: number, now: Date = new Date()): strin
   return new Date(now.getTime() + ttlMs).toISOString();
 }
 
-export type RuntimeTokenClaims = {
-  /** Unique token id — audit/log correlation. */
-  jti: string;
-  /** Session ID */
-  sid: string;
-  /** Tenant ID */
-  tid: string;
-  /** User ID */
-  uid: string;
-  /** Runtime ID */
-  rid: string;
-  /** Optional expiry (ISO 8601) */
-  exp?: string;
-};
+const identityClaimSchema = z.string().refine(value => value.trim().length > 0);
+const runtimeTokenClaimsSchema = z.object({
+  jti: identityClaimSchema,
+  sid: identityClaimSchema,
+  tid: identityClaimSchema,
+  uid: identityClaimSchema,
+  rid: identityClaimSchema,
+  exp: z.iso.datetime()
+});
+
+export type RuntimeTokenClaims = z.infer<typeof runtimeTokenClaimsSchema>;
 
 /** Claims a caller supplies at mint time. `jti` is auto-generated if omitted. */
 export type RuntimeTokenMintClaims = Omit<RuntimeTokenClaims, "jti"> & { jti?: string };
@@ -75,7 +72,10 @@ export function generateRuntimeToken(
   claims: RuntimeTokenMintClaims,
   secret: string
 ): string {
-  const fullClaims: RuntimeTokenClaims = { jti: claims.jti ?? randomUUID(), ...claims };
+  const fullClaims = runtimeTokenClaimsSchema.parse({
+    ...claims,
+    jti: claims.jti === undefined ? randomUUID() : claims.jti
+  });
   const payload = Buffer.from(JSON.stringify(fullClaims)).toString("base64url");
   const signature = hmac(payload, secret);
   return `${TOKEN_PREFIX}${payload}.${signature}`;
@@ -110,7 +110,8 @@ export function verifyRuntimeToken(
   const payload = body.slice(0, dotIndex);
   const signature = body.slice(dotIndex + 1);
 
-  if (payload.length > MAX_PAYLOAD_LENGTH) {
+  if (payload.length > MAX_PAYLOAD_LENGTH || !/^[A-Za-z0-9_-]+$/.test(payload) ||
+      !/^[A-Za-z0-9_-]{43}$/.test(signature)) {
     return { kind: "invalid" };
   }
 
@@ -123,24 +124,19 @@ export function verifyRuntimeToken(
     return { kind: "invalid" };
   }
 
-  let claims: RuntimeTokenClaims;
+  let decoded: unknown;
   try {
-    claims = JSON.parse(
+    decoded = JSON.parse(
       Buffer.from(payload, "base64url").toString("utf8")
-    ) as RuntimeTokenClaims;
+    );
   } catch {
     return { kind: "invalid" };
   }
 
-  if (typeof claims.exp !== "undefined") {
-    const expiresAt = new Date(claims.exp);
-    if (Number.isNaN(expiresAt.getTime())) {
-      return { kind: "invalid" };
-    }
-    if (expiresAt <= new Date()) {
-      return { kind: "expired" };
-    }
-  }
+  const parsed = runtimeTokenClaimsSchema.safeParse(decoded);
+  if (!parsed.success) return { kind: "invalid" };
+  const claims = parsed.data;
+  if (Date.parse(claims.exp) <= Date.now()) return { kind: "expired" };
 
   return { kind: "valid", claims };
 }
