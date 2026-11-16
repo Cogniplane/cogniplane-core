@@ -840,7 +840,9 @@ export async function createTestApp(
   const artifactProcessor = new NoopArtifactProcessor();
   const artifactStorageRoot = await mkdtemp(path.join(os.tmpdir(), "cogniplane-core-artifact-tests-"));
   const artifactStorage = new LocalArtifactStorage(artifactStorageRoot);
-  const config = createTestConfig({ ARTIFACT_STORAGE_ROOT: artifactStorageRoot, ...appConfigOverrides });
+  // Route tests use loopback MCP fixtures as a self-hosted deployment would.
+  const config = createTestConfig({ ARTIFACT_STORAGE_ROOT: artifactStorageRoot,
+    MCP_UPSTREAM_ALLOW_PRIVATE_ADDRESSES: true, ...appConfigOverrides });
   const app = Fastify({
     bodyLimit: config.MAX_REQUEST_BODY_BYTES,
     ...(logStream ? { logger: { level: "warn", stream: logStream } } : {})

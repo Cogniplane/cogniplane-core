@@ -8,6 +8,7 @@ export function proxyUpstreamLimits(config: AppConfig, logger: ForwardRpcLimits[
   return {
     timeoutMs: config.MCP_UPSTREAM_TIMEOUT_MS,
     maxResponseBytes: config.MCP_UPSTREAM_MAX_RESPONSE_BYTES,
+    allowPrivateAddresses: config.MCP_UPSTREAM_ALLOW_PRIVATE_ADDRESSES,
     logger
   };
 }

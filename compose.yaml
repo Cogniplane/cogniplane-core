@@ -187,6 +187,7 @@ services:
       DATABASE_URL: postgres://app_user:${APP_USER_PASSWORD:-local-dev-app-user-password}@postgres:5432/cogniplane
       MAINTENANCE_DATABASE_URL: postgres://maintenance_user:${MAINTENANCE_USER_PASSWORD:-local-dev-maintenance-password}@postgres:5432/cogniplane
       LOCAL_DEV_USER_ID: local-dev-user
+      MCP_UPSTREAM_ALLOW_PRIVATE_ADDRESSES: ${MCP_UPSTREAM_ALLOW_PRIVATE_ADDRESSES:-false}
       REDIS_URL: redis://redis:6379
       ARTIFACT_STORAGE_ROOT: /var/lib/cogniplane/artifacts
       SKILL_BUNDLE_STORAGE_ROOT: /var/lib/cogniplane/skills

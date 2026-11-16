@@ -83,6 +83,7 @@ export class McpConnectionTestService {
     servers: Pick<McpServerStore, "getAdminMcpServer" | "getMcpServer">;
     credentials: Pick<MemberMcpCredentialStore, "getStatus" | "listStatuses" | "getRuntimeCredential">;
     timeoutMs: number;
+    allowPrivateAddresses?: boolean;
     logger?: Pick<FastifyBaseLogger, "warn">;
     forward?: typeof forwardRpc;
   }) {}
@@ -188,6 +189,7 @@ export class McpConnectionTestService {
       const response: McpRpcResponse = await send(runtime.upstreamUrl, rpc,
         { "X-Forwarded-By": "cogniplane-core" }, undefined,
         { timeoutMs: this.input.timeoutMs, maxResponseBytes: MAX_RESPONSE_BYTES,
+          allowPrivateAddresses: this.input.allowPrivateAddresses,
           signal, logger: this.input.logger, serverId: server.serverId,
           onDiagnostic: value => { observed.diagnostic = value; } },
         personalAuth ?? runtime.upstreamAuth ?? null);

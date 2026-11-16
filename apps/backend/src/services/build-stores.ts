@@ -53,6 +53,7 @@ export function buildStores(
     TOOL_CONTEXT_TTL_MS: number;
     SESSION_TRASH_RETENTION_DAYS?: number;
     DATA_ENCRYPTION_SECRET: string;
+    MCP_UPSTREAM_ALLOW_PRIVATE_ADDRESSES?: boolean;
     MODEL_SPENDING_MONTHLY_LIMIT_USD?: number;
     MODEL_SPENDING_TURN_RESERVATION_USD?: number;
   },
@@ -78,7 +79,7 @@ export function buildStores(
   if (!timers?.DATA_ENCRYPTION_SECRET) {
     throw new Error("DATA_ENCRYPTION_SECRET is required to construct McpServerStore.");
   }
-  const mcpServers = new McpServerStore(db, timers.DATA_ENCRYPTION_SECRET);
+  const mcpServers = new McpServerStore(db, timers.DATA_ENCRYPTION_SECRET, timers.MCP_UPSTREAM_ALLOW_PRIVATE_ADDRESSES);
   const tenantSettings = new TenantSettingsStore(db);
   const customModels = new CustomModelStore(db);
   const userSettings = new UserSettingsStore(db, schedulerDb);

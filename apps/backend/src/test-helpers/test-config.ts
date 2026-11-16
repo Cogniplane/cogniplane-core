@@ -90,6 +90,7 @@ const baseTestConfig: AppConfig = {
   COGNIPLANE_ALLOW_DEV_HEADERS_ON_NON_LOOPBACK: false,
   DATA_ENCRYPTION_SECRET: "test-encryption-secret-must-be-at-least-32chars!",
   MCP_UPSTREAM_TIMEOUT_MS: 30_000,
+  MCP_UPSTREAM_ALLOW_PRIVATE_ADDRESSES: false,
   MCP_CONNECTION_TEST_TIMEOUT_MS: 8_000,
   MCP_UPSTREAM_MAX_RESPONSE_BYTES: 4 * 1024 * 1024,
   JWT_SECRET: "test-jwt-secret-must-be-at-least-32chars!",

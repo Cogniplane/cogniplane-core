@@ -24,6 +24,13 @@ Center](policy-center.md).
 
 Admin setup of a proxy server: [connectors](../connectors.md#proxy-mcp-servers).
 
+Proxy upstreams use public addresses by default. Admission rejects local and
+reserved hosts, and each DNS lookup rejects any private or reserved answer.
+The backend connects to that checked DNS result. For self-hosted LAN servers,
+the operator must set `MCP_UPSTREAM_ALLOW_PRIVATE_ADDRESSES=true`. Existing
+private servers also need this setting after an upgrade. It applies to all
+tenants and every proxy request. See [outbound request rules](../security.md#outbound-requests).
+
 Connection test: `POST /admin/mcp-servers/:serverId/connection-test`
 (`services/mcp/mcp-connection-test-service.ts`) sends `tools/list` with the
 saved configuration. For per-member credentials it uses the admin's own. It

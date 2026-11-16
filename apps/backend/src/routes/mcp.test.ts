@@ -110,6 +110,25 @@ test("advertises and binds the managed widget resource only for an enabled succe
 type ProxyRequest = Awaited<ReturnType<typeof createProxyMcpUpstream>>["upstreamRequests"][number];
 const toolCallRequests = (requests: ProxyRequest[]) => requests.filter((request) => request.body.method === "tools/call");
 
+test("public-only deployment refuses a saved loopback proxy before egress", async () => {
+  const { upstream, upstreamUrl, upstreamRequests } = await createProxyMcpUpstream();
+  const { app, toolContexts } = await createTestApp({
+    proxyUpstreamUrl: upstreamUrl,
+    MCP_UPSTREAM_ALLOW_PRIVATE_ADDRESSES: false
+  });
+  onTestFinished(async () => { await Promise.all([app.close(), upstream.close()]); });
+  const context = await createTestToolContext(toolContexts, { sessionId: "public-only-session",
+    metadata: { runtimePolicy: { ...testRuntimePolicy, enabledMcpServers: ["test-proxy"] } } });
+  const response = await app.inject({
+    method: "POST", url: "/mcp/test-proxy",
+    headers: { authorization: `Bearer ${runtimeToken({ sid: "public-only-session", uid: "test-user", rid: context.runtimeId })}` },
+    payload: { jsonrpc: "2.0", id: 1, method: "tools/list" }
+  });
+  expect(response.statusCode).toBe(200);
+  expect(response.json().error?.message).toBe("Upstream MCP destination is not permitted.");
+  expect(upstreamRequests).toEqual([]);
+});
+
 test("proxy calls use each runtime member's credential and reject a disconnected member before egress", async () => {
   const { upstream, upstreamUrl, upstreamRequests } = await createProxyMcpUpstream();
   const connected = new Map([["alice", "alice-token"], ["bob", "bob-token"]]);
@@ -1841,7 +1860,8 @@ test.each(["https://mcp.example.test", "http://127.0.0.1:3108"])(
     `${origin}/v1`,
     { jsonrpc: "2.0", id: 1, method: "tools/list" },
     { "X-Framework-User-Id": "u1" },
-    fetchFn as never
+    fetchFn as never,
+    { allowPrivateAddresses: origin.startsWith("http://127.0.0.1") }
   );
 
   expect(result.result).toEqual({ ok: true });

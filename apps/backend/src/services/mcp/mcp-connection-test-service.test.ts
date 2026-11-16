@@ -23,6 +23,7 @@ function makeService(options: {
   runtime?: AdminMcpServerRecord;
   responses?: McpRpcResponse[];
   diagnostics?: Array<{ kind: "http"; status: number } | { kind: "transport" }>;
+  allowPrivateAddresses?: boolean;
 } = {}) {
   const saved = options.saved ?? server;
   const runtime = options.runtime ?? saved;
@@ -42,6 +43,7 @@ function makeService(options: {
   const service = new McpConnectionTestService({
     db: {} as never, servers: servers as never, credentials: credentials as never,
     timeoutMs: 8_000,
+    allowPrivateAddresses: options.allowPrivateAddresses,
     forward: forward as never
   });
   Object.defineProperty(service, "persist", {
@@ -49,6 +51,13 @@ function makeService(options: {
   });
   return { service, forward, servers, credentials };
 }
+
+test.each([false, true])("uses the operator address policy for connection tests: %s", async allowPrivateAddresses => {
+  const { service, forward } = makeService({ allowPrivateAddresses });
+  const result = await service.test("tenant", "admin", "docs", { expectedVersion: 2, expectedConfigHash: hash });
+  expect(result.toolDiscovery).toBe("succeeded");
+  expect(forward.mock.calls[0]?.[4]).toMatchObject({ allowPrivateAddresses });
+});
 
 test("rejects a changed runtime destination before forwarding credentials", async () => {
   const { service, forward } = makeService({ runtime: { ...server, upstreamUrl: "https://other.example/mcp", configHash: "b".repeat(64) } });

@@ -1630,11 +1630,10 @@ test("MCP creates validate required IDs and pass defaulted fields to the store",
       upstreamUrl: "http://100.108.24.234:3108/mcp"
     }
   });
-  expect(localResponse.statusCode).toBe(201);
-  expect(createMcpServer).toHaveBeenLastCalledWith(
-    "admin-tenant",
-    expect.objectContaining({ upstreamUrl: "http://100.108.24.234:3108/mcp" }),
-    expect.any(Function)
+  expect(localResponse.statusCode).toBe(400);
+  expect(localResponse.json()).toHaveProperty("error");
+  expect(createMcpServer).not.toHaveBeenCalledWith(
+    "admin-tenant", expect.objectContaining({ upstreamUrl: "http://100.108.24.234:3108/mcp" }), expect.any(Function)
   );
 
   const managedUrlResponse = await app.inject({

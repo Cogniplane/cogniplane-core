@@ -15,6 +15,13 @@ function devConfig(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   };
 }
 
+test("MCP private addresses require an explicit operator opt-in", () => {
+  expect(loadConfig(devConfig()).MCP_UPSTREAM_ALLOW_PRIVATE_ADDRESSES).toBe(false);
+  expect(loadConfig(workosConfig({ NODE_ENV: "production" })).MCP_UPSTREAM_ALLOW_PRIVATE_ADDRESSES).toBe(false);
+  expect(loadConfig(workosConfig({ NODE_ENV: "production", MCP_UPSTREAM_ALLOW_PRIVATE_ADDRESSES: "true" }))
+    .MCP_UPSTREAM_ALLOW_PRIVATE_ADDRESSES).toBe(true);
+});
+
 function workosConfig(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   return {
     AUTH_MODE: "workos",

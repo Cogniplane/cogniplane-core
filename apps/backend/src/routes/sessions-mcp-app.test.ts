@@ -79,6 +79,7 @@ it("reads only a saved app call in a readable session and filters resource metad
     mcpAppCsp: { listApproved: async () => approvedSources, recordRequested: async () => undefined }
   });
   app.decorate("config", { MCP_UPSTREAM_TIMEOUT_MS: 2000, MCP_UPSTREAM_MAX_RESPONSE_BYTES: 2 * 1024 * 1024,
+    MCP_UPSTREAM_ALLOW_PRIVATE_ADDRESSES: true,
     DATA_ENCRYPTION_SECRET: "test-data-encryption-secret-32-bytes-minimum" } as typeof app.config);
   expect((await app.inject(`/sessions/${DENIED}/mcp-apps/saved`)).statusCode).toBe(404);
   expect(consumeRateLimit).toHaveBeenLastCalledWith({ resource: "resource_read", userId: "user", tenantId: "tenant" });

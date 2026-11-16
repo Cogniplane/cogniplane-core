@@ -206,6 +206,7 @@ from build arguments). Frontend variables are in `apps/frontend/.env.example`
 | `DATA_ENCRYPTION_SECRET` | string, minimum 32 | `"local-dev-data-encryption-secret-change-in-production!!"` | [startup rules](#startup-rules), [email](architecture/email.md) |
 | `MCP_UPSTREAM_SIGNING_ROOT_SECRET` | string, minimum 32 | `unset` | [startup rules](#startup-rules), [mcp-proxy-signature](mcp-proxy-signature.md) |
 | `MCP_UPSTREAM_SIGNING_SECRET` | string | `unset` | [startup rules](#startup-rules), [mcp-proxy-signature](mcp-proxy-signature.md) |
+| `MCP_UPSTREAM_ALLOW_PRIVATE_ADDRESSES` | boolean | `false` | [tools](architecture/tools.md), [security](security.md) |
 | `MCP_UPSTREAM_TIMEOUT_MS` | number, integer, > 0 | `30000` | [tools](architecture/tools.md) |
 | `MCP_UPSTREAM_MAX_RESPONSE_BYTES` | number, integer, > 0 | `4194304` | [tools](architecture/tools.md) |
 | `MCP_CONNECTION_TEST_TIMEOUT_MS` | number, integer, > 0, maximum 30_000 | `8000` | [tools](architecture/tools.md) |

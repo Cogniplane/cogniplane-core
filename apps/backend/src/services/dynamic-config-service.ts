@@ -471,6 +471,7 @@ export class DynamicConfigService {
         tenantId,
         store: this.stores.mcpServers,
         payload: input,
+        allowPrivateAddresses: this.config.MCP_UPSTREAM_ALLOW_PRIVATE_ADDRESSES,
         client
       });
       if (audit) await AuditEventStore.createInTransaction(client, audit(server));
@@ -488,6 +489,7 @@ export class DynamicConfigService {
         tenantId,
         store: this.stores.mcpServers,
         payload: input,
+        allowPrivateAddresses: this.config.MCP_UPSTREAM_ALLOW_PRIVATE_ADDRESSES,
         client
       });
       if (server && audit) await AuditEventStore.createInTransaction(client, audit(server));
@@ -506,7 +508,10 @@ export class DynamicConfigService {
     editing?: { serverId: string; expectedVersion: number },
     audit?: (server: AdminMcpServerRecord) => AuditEventInput
   ): Promise<AdminMcpServerRecord | null> {
-    validateMcpServerInput(input, { requireUrlAndSecret: !editing });
+    validateMcpServerInput(input, {
+      requireUrlAndSecret: !editing,
+      allowPrivateAddresses: this.config.MCP_UPSTREAM_ALLOW_PRIVATE_ADDRESSES
+    });
     const enabled = audience !== "off";
     return this.stores.mcpServers.withTransaction(tenantId, async (client) => {
       const saved = editing

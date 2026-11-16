@@ -134,8 +134,13 @@ redirect and hide. Every rule is enforced in the backend.
     bundles another undici version and may reject the agent or not apply it.
     Call `assertDispatcherAwareFetch` on an injected fetch, so the global one
     throws.
-- Proxy MCP upstreams are the exception: `mcpUpstreamUrlSchema` allows local and
-  private addresses, because admins connect servers on their own network.
+- Proxy MCP upstreams reject private and reserved hosts at admission and use
+  `ssrfSafeAgent` at connect time by default. This applies to saved servers too.
+  Self-hosted operators can set `MCP_UPSTREAM_ALLOW_PRIVATE_ADDRESSES=true` to
+  connect servers on their own network. This disables the address restriction
+  for every tenant, including connection tests. Enable it only when all tenant
+  admins can be trusted with the backend's network access. Keep it off on
+  hosted deployments and enforce outbound network limits as a second control.
 
 ## Frontend
 
