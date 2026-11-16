@@ -33,8 +33,10 @@ The SQL in `apps/backend/db/migrations/` is authoritative for the schema.
      USING (tenant_id = current_setting('app.current_tenant_id', true))
      WITH CHECK (tenant_id = current_setting('app.current_tenant_id', true));
    ```
-   Add no grant: the migration runner grants it ([database
-   roles](../database-roles.md)).
+   Add no SQL grant. List the runtime operations in `APP_USER_GRANTS`, and any
+   generated-id sequence in `APP_USER_SEQUENCES`. The migration runner applies
+   these lists; a new table has no runtime access by default. See [database
+   roles](../database-roles.md#application-grants).
 2. Write a store whose methods take `tenantId` first and use `withTenantScope`.
 3. If a cross-tenant worker needs the table, add grants to `MAINTENANCE_GRANTS`
    ([database roles](../database-roles.md#maintenance-grants)).

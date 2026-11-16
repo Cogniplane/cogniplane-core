@@ -14,7 +14,7 @@ import {
 } from "./support/fixtures.js";
 
 describe.skipIf(!adminDatabaseUrl())("session Trash retention", () => {
-  test("expires a session in FK-safe order, preserves shared objects, and enforces GC RLS", async () => {
+  test("expires a session in FK-safe order, preserves shared objects, and denies application queue reads", async () => {
     const tenant = await seedTenant();
     const otherTenant = await seedTenant();
     const user = await seedUser();
@@ -66,12 +66,14 @@ describe.skipIf(!adminDatabaseUrl())("session Trash retention", () => {
        VALUES ($1, $2, $3)`,
       [otherTenant, otherSessionId, otherUser],
     );
-    const hiddenStorageRows = await withTenantScope(appPool(), tenant, (db) =>
-      db.query("SELECT session_id FROM session_storage_gc WHERE tenant_id=$1", [otherTenant]));
-    expect(hiddenStorageRows.rows).toEqual([]);
-    const hiddenRuntimeRows = await withTenantScope(appPool(), tenant, (db) =>
-      db.query("SELECT session_id FROM session_runtime_gc WHERE tenant_id=$1", [otherTenant]));
-    expect(hiddenRuntimeRows.rows).toEqual([]);
+    // These reads are maintenance-only. rls-write-paths probes the queue
+    // policies separately with temporary privileges.
+    await expect(withTenantScope(appPool(), tenant, (db) =>
+      db.query("SELECT session_id FROM session_storage_gc WHERE tenant_id=$1", [otherTenant])))
+      .rejects.toMatchObject({ code: "42501" });
+    await expect(withTenantScope(appPool(), tenant, (db) =>
+      db.query("SELECT session_id FROM session_runtime_gc WHERE tenant_id=$1", [otherTenant])))
+      .rejects.toMatchObject({ code: "42501" });
     await superuserPool().query("DELETE FROM session_storage_gc WHERE tenant_id=$1 AND session_id=$2", [otherTenant, otherSessionId]);
     await superuserPool().query("DELETE FROM session_runtime_gc WHERE tenant_id=$1 AND session_id=$2", [otherTenant, otherSessionId]);
   });

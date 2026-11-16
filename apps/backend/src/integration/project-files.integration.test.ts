@@ -766,6 +766,16 @@ describe.skipIf(!adminDatabaseUrl())("versioned project files", () => {
           [initial.fileId],
         ),
       ),
+    ).rejects.toMatchObject({ code: "42501" });
+    // The runtime has no UPDATE grant. The trigger must also protect history
+    // if an operator has that privilege.
+    await expect(
+      withTenantScope(superuserPool(), h.actor.tenantId, (db) =>
+        db.query(
+          "UPDATE project_file_versions SET checksum_sha256='forged' WHERE file_id=$1",
+          [initial.fileId],
+        ),
+      ),
     ).rejects.toThrow("immutable");
     const restored = await h.files.restoreVersion(
       h.actor,

@@ -124,9 +124,16 @@ describe.skipIf(!adminDatabaseUrl())("Jira connections", () => {
       for (const table of ["user_jira_connections", "user_jira_identities", "user_jira_cleanups"]) {
         expect((await client.query(`SELECT * FROM ${table} WHERE tenant_id = $1`, [tenant])).rows).toEqual([]);
         expect((await client.query(`UPDATE ${table} SET tenant_id = tenant_id WHERE tenant_id = $1`, [tenant])).rowCount).toBe(0);
-        expect((await client.query(`DELETE FROM ${table} WHERE tenant_id = $1`, [tenant])).rowCount).toBe(0);
+        if (table !== "user_jira_identities") {
+          expect((await client.query(`DELETE FROM ${table} WHERE tenant_id = $1`, [tenant])).rowCount).toBe(0);
+        }
       }
     });
+    // Identities are retired by UPDATE, not DELETE. The policy probe in
+    // rls-write-paths tests DELETE separately with a temporary test grant.
+    await expect(withTenantScope(appPool(), otherTenant, client =>
+      client.query("DELETE FROM user_jira_identities WHERE tenant_id = $1", [tenant])))
+      .rejects.toMatchObject({ code: "42501" });
     // A tenant scope cannot write a row for another tenant.
     await expect(withTenantScope(appPool(), otherTenant, (client) => client.query(
       `INSERT INTO user_jira_cleanups (tenant_id, user_id, pipedream_external_user_id, reason)

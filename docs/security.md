@@ -16,6 +16,11 @@ only with a reason in a comment at the call site, and keep tenant predicates in
 the query. Validate session access before any checkpoint access.
 [data](architecture/data.md#tenant-isolation)
 
+Runtime roles have explicit table and sequence grants. `app_user` cannot read
+or change migration metadata or operator deletion records. New database
+objects receive no runtime grant by default. Run the release's migration job
+on every upgrade to remove obsolete grants. [database roles](database-roles.md#application-grants)
+
 ### Credentials
 
 Never give user tokens, provider keys or upstream secrets to the model, the

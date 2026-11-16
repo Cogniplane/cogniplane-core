@@ -37,7 +37,9 @@ The roles and their grants are in [database roles](database-roles.md).
 1. Run `pnpm db:migrate` (backend image: `node
    apps/backend/dist/scripts/migrate.js`) with all three URLs before each
    backend release. It creates and updates both runtime roles and their
-   passwords.
+   passwords. Run it even when no numbered migration is pending. It replaces
+   old grants with the release's explicit lists. Do not rerun an older release's
+   migration job after the upgrade; it can restore obsolete grants.
 2. Start the backend with `DATABASE_URL` and `MAINTENANCE_DATABASE_URL` only.
    `MIGRATION_DATABASE_URL` is for the migration job and operator commands. The
    backend image entry point (`docker/backend-entrypoint.sh`) also unsets it;

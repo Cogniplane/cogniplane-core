@@ -27,7 +27,8 @@
 // `setupDeepAgentsCheckpointer` — PostgresSaver.setup() is idempotent and
 // tracks its own internal migrations, so library upgrades that add DDL are
 // applied on the next `pnpm db:migrate`, never at serve time. migrate.ts then
-// grants app_user DML on the schema; the runtime saver connects as app_user.
+// grants app_user DML on the three runtime tables, not checkpoint_migrations;
+// the runtime saver connects as app_user.
 
 import { BaseCheckpointSaver } from "@langchain/langgraph";
 import { PostgresSaver } from "@langchain/langgraph-checkpoint-postgres";
