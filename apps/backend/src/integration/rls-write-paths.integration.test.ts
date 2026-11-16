@@ -1483,15 +1483,17 @@ async function countRows(db: Queryable, table: string, key: RowKey): Promise<num
   return Number(rows[0]?.count);
 }
 
-/**
- * Runs `work` as the application role in `tenantId`'s scope, then rolls back
- * whatever happened. Same GUC as withTenantScope; only the ending differs.
- */
-async function rolledBack<T>(tenantId: string, work: (client: pg.PoolClient) => Promise<T>): Promise<T> {
-  const client = await appPool().connect();
+/** Runs a policy probe as the application role with temporary test privileges. */
+async function rolledBack<T>(table: string, tenantId: string, work: (client: pg.PoolClient) => Promise<T>): Promise<T> {
+  const client = await superuserPool().connect();
   let rollbackError: Error | undefined;
   try {
     await client.query("BEGIN");
+    // Policy probes need their own privileges, even for write-only queues or
+    // operations reserved for maintenance. Production writes above still use
+    // the real pools. These temporary grants and every probe are rolled back.
+    await client.query(`GRANT SELECT, INSERT, UPDATE${table === "tenants" ? "" : ", DELETE"} ON ${table} TO ${runRoleName()}`);
+    await client.query(`SET LOCAL ROLE ${runRoleName()}`);
     await client.query("SELECT set_config('app.current_tenant_id', $1, true)", [tenantId]);
     return await work(client);
   } finally {
@@ -1571,25 +1573,25 @@ describe.skipIf(!adminDatabaseUrl())("RLS through production write paths", () =>
         displayName: "Application pool",
         workosRoleSlug: null
       });
-      await expect(attempt).rejects.toMatchObject(rlsRejection);
+      await expect(attempt).rejects.toMatchObject({ code: INSUFFICIENT_PRIVILEGE });
     });
 
-    test("session Trash cleanup on the application pool purges nothing", async () => {
+    test("session Trash cleanup refuses the application pool", async () => {
       const { owner } = await people();
       const { sessionId } = await expiredSession();
-      // No tenant scope, so the cross-tenant candidate query sees no session.
-      const result = await new SessionStore(appPool()).cleanupExpired(await storage(), { batchSize: 10_000 });
-      expect(result).toEqual({ deletedSessions: 0, deletedObjects: 0, purgedRuntimes: 0 });
+      // The application role cannot read or drain the maintenance queues.
+      await expect(new SessionStore(appPool()).cleanupExpired(await storage(), { batchSize: 10_000 }))
+        .rejects.toMatchObject({ code: INSUFFICIENT_PRIVILEGE });
       expect(
         await countRows(superuserPool(), "sessions", { tenant_id: owner.tenantId, session_id: sessionId, status: "deleted" })
       ).toBe(1);
     });
 
-    test("project file cleanup on the application pool removes nothing", async () => {
+    test("project file cleanup refuses the application pool", async () => {
       const actor = await projectActor();
       const { fileId } = await expiredProjectFile();
-      const result = await new ProjectFileStore(appPool(), createSilentLogger()).cleanupExpired(await storage(), 10_000);
-      expect(result).toEqual({ deletedFiles: 0, deletedObjects: 0 });
+      await expect(new ProjectFileStore(appPool(), createSilentLogger()).cleanupExpired(await storage(), 10_000))
+        .rejects.toMatchObject({ code: INSUFFICIENT_PRIVILEGE });
       expect(
         await countRows(superuserPool(), "project_files", {
           tenant_id: actor.tenantId,
@@ -1616,8 +1618,14 @@ describe.skipIf(!adminDatabaseUrl())("RLS through production write paths", () =>
     test("one stored row, visible to its tenant, hidden from the peer", async () => {
       // Present at all, and not ambiguous: the zero under the peer means nothing otherwise.
       expect(await countRows(superuserPool(), table, key), `${table} row was not written`).toBe(1);
-      expect(await withTenantScope(appPool(), owner.tenantId, (client) => countRows(client, table, key))).toBe(1);
-      expect(await withTenantScope(appPool(), peer.tenantId, (client) => countRows(client, table, key))).toBe(0);
+      const queue = ["session_storage_gc", "session_runtime_gc", "project_file_storage_gc", "skill_bundle_storage_gc"].includes(table);
+      // Queue reads are maintenance-only. Probe their tenant policy with a
+      // temporary SELECT grant; every other read uses the real runtime grants.
+      const read = (tenantId: string) => queue
+        ? rolledBack(table, tenantId, (client) => countRows(client, table, key))
+        : withTenantScope(appPool(), tenantId, (client) => countRows(client, table, key));
+      expect(await read(owner.tenantId)).toBe(1);
+      expect(await read(peer.tenantId)).toBe(0);
     });
 
     test("the peer's UPDATE and DELETE do not reach the row", async () => {
@@ -1628,7 +1636,7 @@ describe.skipIf(!adminDatabaseUrl())("RLS through production write paths", () =>
       // undoes that. Then, in the same transaction, the owner's scope looks
       // for the row.
       const afterPeer = (statement: string, values: unknown[] = []) =>
-        rolledBack(peer.tenantId, async (client) => {
+        rolledBack(table, peer.tenantId, async (client) => {
           await client.query(statement, values);
           await client.query("SELECT set_config('app.current_tenant_id', $1, true)", [owner.tenantId]);
           return countRows(client, table, key);
@@ -1653,7 +1661,7 @@ describe.skipIf(!adminDatabaseUrl())("RLS through production write paths", () =>
       // reads columns adds the SELECT policy's check on the new row, which
       // would hide a permissive UPDATE WITH CHECK. The owner's other rows in
       // this table move too; the rollback undoes that.
-      const move = rolledBack(owner.tenantId, (client) =>
+      const move = rolledBack(table, owner.tenantId, (client) =>
         client.query(`UPDATE ${table} SET tenant_id = $1`, [peer.tenantId])
       );
       if (ownerUpdate === "append-only") {
@@ -1678,7 +1686,7 @@ describe.skipIf(!adminDatabaseUrl())("RLS through production write paths", () =>
          ORDER BY ordinal_position`,
         [table]
       )).rows.map((row) => `"${row.column_name}"`).join(", ");
-      const copy = rolledBack(owner.tenantId, (client) =>
+      const copy = rolledBack(table, owner.tenantId, (client) =>
         client.query(
           `INSERT INTO ${table} (${columns}) OVERRIDING SYSTEM VALUE
            SELECT ${columns} FROM (

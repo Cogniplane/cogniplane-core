@@ -5,6 +5,7 @@ import path from "node:path";
 import type { Pool, PoolClient } from "pg";
 
 import { DEEP_AGENTS_CHECKPOINT_SCHEMA } from "../services/deep-agents/deep-agents-checkpointer.js";
+import { APP_USER_CHECKPOINT_GRANTS, APP_USER_GRANTS, APP_USER_LOCK_GRANTS, APP_USER_SEQUENCES } from "./app-user-grants.js";
 
 /**
  * Reject two migrations sharing a numeric prefix (e.g. two `005_` files).
@@ -210,8 +211,8 @@ function assertSafeRoleName(role: string): void {
  *
  * Idempotent, and safe to re-run: the role may be absent if migrations were
  * previously applied without it. Each call reapplies grants because a later
- * migration can add tables the earlier grant never covered. The production
- * runner skips this helper when it cannot derive an app_user password.
+ * migration can add tables. Obsolete grants are removed in the same transaction
+ * as the new grants, including when no numbered migration was pending.
  *
  * Runs on ONE pinned client. `pool.query()` checks out a connection per call,
  * so a separate `SET standard_conforming_strings` could land on a different
@@ -234,8 +235,10 @@ export async function ensureAppUserRole(
   //
   // CREATE/ALTER ROLE reject parameterized passwords; force ON so the
   // single-quote-doubling in escapeAppUserPassword is interpreted correctly.
-  await client.query("SET standard_conforming_strings = on");
-  await client.query(`
+  await client.query("BEGIN");
+  try {
+    await client.query("SET LOCAL standard_conforming_strings = on");
+    await client.query(`
     DO $$
     BEGIN
       IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '${role}') THEN
@@ -245,27 +248,39 @@ export async function ensureAppUserRole(
       END IF;
     END
     $$
-  `);
-
-  await client.query(`GRANT USAGE ON SCHEMA public TO ${role}`);
-  await client.query(`GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO ${role}`);
-  // Only the operator command deletes a tenant. Every tenant table cascades
-  // from tenants, and the cascade ignores row security. Thus a DELETE of a
-  // tenants row removes all rows of the tenant, also the audit events. The
-  // revoke comes after the bulk grant, so each run removes the privilege again.
-  // TRUNCATE is not in the grant above; the revoke removes it if a later change
-  // adds it. The second control is policy tenants_no_delete (migration 088).
-  await client.query(`REVOKE DELETE, TRUNCATE ON public.tenants FROM ${role}`);
-  await client.query(`GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO ${role}`);
-  // The runtime Deep Agents checkpointer connects as this role; its tables live
-  // in a dedicated schema (superuser-owned). No RLS there — tenant→thread
-  // ownership is enforced at the app layer (see
-  // services/deep-agents/deep-agents-checkpointer.ts).
-  await client.query(`GRANT USAGE ON SCHEMA ${DEEP_AGENTS_CHECKPOINT_SCHEMA} TO ${role}`);
-  await client.query(
-    `GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA ${DEEP_AGENTS_CHECKPOINT_SCHEMA} TO ${role}`
-  );
-  await client.query(
-    `GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA ${DEEP_AGENTS_CHECKPOINT_SCHEMA} TO ${role}`
-  );
+    `);
+    // Remove grants left by earlier runners, including metadata, sequence
+    // UPDATE for setval, TRUNCATE and schema CREATE. No grants to future tables.
+    await client.query(`REVOKE ALL ON ALL TABLES IN SCHEMA public, ${DEEP_AGENTS_CHECKPOINT_SCHEMA} FROM ${role}`);
+    // Table-level REVOKE does not remove column-level ACLs. Clear those too,
+    // before restoring the one column grant required for a row lock below.
+    const columnGrants = await client.query<{ revoke_sql: string }>(`
+      SELECT format('REVOKE ALL (%I) ON %I.%I FROM %I', a.attname, n.nspname, c.relname, $1::text) AS revoke_sql
+      FROM pg_attribute a
+      JOIN pg_class c ON c.oid = a.attrelid
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE n.nspname IN ('public', '${DEEP_AGENTS_CHECKPOINT_SCHEMA}')
+        AND a.attnum > 0 AND NOT a.attisdropped
+        AND EXISTS (SELECT 1 FROM aclexplode(a.attacl) acl
+          JOIN pg_roles r ON r.oid = acl.grantee WHERE r.rolname = $1)
+    `, [role]);
+    for (const { revoke_sql } of columnGrants.rows) await client.query(revoke_sql);
+    await client.query(`REVOKE ALL ON ALL SEQUENCES IN SCHEMA public, ${DEEP_AGENTS_CHECKPOINT_SCHEMA} FROM ${role}`);
+    await client.query(`REVOKE ALL ON SCHEMA public, ${DEEP_AGENTS_CHECKPOINT_SCHEMA} FROM ${role}`);
+    await client.query(`GRANT USAGE ON SCHEMA public, ${DEEP_AGENTS_CHECKPOINT_SCHEMA} TO ${role}`);
+    for (const [privileges, tables] of Object.entries(APP_USER_GRANTS)) {
+      await client.query(`GRANT ${privileges} ON ${tables.map(table => `public.${table}`).join(", ")} TO ${role}`);
+    }
+    for (const grant of APP_USER_LOCK_GRANTS) await client.query(`${grant} TO ${role}`);
+    await client.query(`GRANT USAGE ON SEQUENCE ${APP_USER_SEQUENCES.map(sequence => `public.${sequence}`).join(", ")} TO ${role}`);
+    // No RLS in this schema: the runtime enforces tenant/thread ownership.
+    // checkpoint_migrations is used only by migration-role saver.setup().
+    for (const [privileges, tables] of Object.entries(APP_USER_CHECKPOINT_GRANTS)) {
+      await client.query(`GRANT ${privileges} ON ${tables.map(table => `${DEEP_AGENTS_CHECKPOINT_SCHEMA}.${table}`).join(", ")} TO ${role}`);
+    }
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  }
 }

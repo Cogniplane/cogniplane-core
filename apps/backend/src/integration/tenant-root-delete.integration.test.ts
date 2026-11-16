@@ -7,8 +7,8 @@
 //
 // Two controls keep the application role out, and this file tests each one:
 //
-//   - privilege: ensureAppUserRole revokes DELETE and TRUNCATE on tenants after
-//     its bulk grant, on each migration run;
+//   - privilege: ensureAppUserRole resets grants on each migration run and
+//     grants only SELECT and UPDATE on tenants;
 //   - row security: the restrictive policy tenants_no_delete refuses DELETE to
 //     every role under row security, whatever grants the role has.
 //
@@ -122,8 +122,7 @@ describe.skipIf(!adminDatabaseUrl())("the application role cannot delete a tenan
   });
 
   test("a bulk grant of DELETE does not let the tenant delete its row", async () => {
-    // The grant ensureAppUserRole applies to every table, without the revoke
-    // that follows it. Row security alone must stop the DELETE. Rolled back.
+    // An accidental bulk grant must not bypass row security. Rolled back.
     const tenant = await tenantWithAudit();
     const role = runRoleName();
     const client = await superuserPool().connect();
@@ -176,7 +175,7 @@ describe.skipIf(!adminDatabaseUrl())("the application role cannot delete a tenan
     expect(await tablePrivileges(role)).toEqual(expected);
 
     // The migration runner calls ensureAppUserRole on each run, after every
-    // migration. Its bulk grant must not give DELETE back.
+    // migration. Re-provisioning must not give DELETE back.
     const client = await superuserPool().connect();
     try {
       await ensureAppUserRole(client, APP_USER_PASSWORD, role);
@@ -290,13 +289,9 @@ describe.skipIf(!adminDatabaseUrl())("upgrade of a database whose application ro
 
       // The role as the earlier runner left it: its bulk grant included DELETE
       // on tenants.
-      const setup = await db.connect();
-      try {
-        await ensureAppUserRole(setup, APP_USER_PASSWORD, role);
-      } finally {
-        setup.release();
-      }
-      await db.query(`GRANT DELETE ON public.tenants TO ${role}`);
+      await db.query(`CREATE ROLE ${role} LOGIN PASSWORD ${pg.escapeLiteral(APP_USER_PASSWORD)}`);
+      await db.query(`GRANT USAGE ON SCHEMA public TO ${role}`);
+      await db.query(`GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO ${role}`);
 
       const tenantId = `tenant_${randomUUID()}`;
       await db.query(`INSERT INTO tenants (tenant_id, tenant_name, slug) VALUES ($1, 'Upgraded', $1)`, [tenantId]);

@@ -256,9 +256,9 @@ describe.skipIf(!adminDatabaseUrl())("tenant offboarding", () => {
       expect(remaining.rowCount, tableName).toBe(0);
     }
 
-    expect(
-      (await appPool().query(`SELECT * FROM tenant_deletion_receipts WHERE request_id = $1`, [requestId])).rowCount
-    ).toBe(0);
+    await expect(
+      appPool().query(`SELECT * FROM tenant_deletion_receipts WHERE request_id = $1`, [requestId])
+    ).rejects.toMatchObject({ code: "42501" });
   });
 
   // A local tenant's accounts, also one removed earlier (it has no membership

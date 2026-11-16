@@ -12,14 +12,32 @@
 // Fixtures are seeded on the superuser pool, so no store runs here.
 
 import { beforeAll, describe, expect, test } from "vitest";
+import type { PoolClient } from "pg";
 
 import { withTenantScope } from "../lib/db.js";
 
-import { adminDatabaseUrl, appPool, superuserPool } from "./support/database.js";
+import { adminDatabaseUrl, appPool, runRoleName, superuserPool } from "./support/database.js";
 import { seedTenantGraph, type TenantFixture } from "./support/fixtures.js";
 
 /** Postgres raises this when an RLS policy rejects a write. */
 const INSUFFICIENT_PRIVILEGE = "42501";
+
+// Test policies even where production privileges now reject the operation
+// first. The grants and data changes never leave this transaction.
+async function policyProbe<T>(table: string, tenantId: string, work: (client: PoolClient) => Promise<T>): Promise<T> {
+  const client = await superuserPool().connect();
+  let rollbackError: Error | undefined;
+  try {
+    await client.query("BEGIN");
+    await client.query(`GRANT UPDATE, DELETE ON ${table} TO ${runRoleName()}`);
+    await client.query(`SET LOCAL ROLE ${runRoleName()}`);
+    await client.query("SELECT set_config('app.current_tenant_id', $1, true)", [tenantId]);
+    return await work(client);
+  } finally {
+    await client.query("ROLLBACK").catch((error: Error) => { rollbackError = error; });
+    client.release(rollbackError);
+  }
+}
 
 describe.skipIf(!adminDatabaseUrl())("RLS row isolation", () => {
   let tenant: TenantFixture;
@@ -42,8 +60,15 @@ describe.skipIf(!adminDatabaseUrl())("RLS row isolation", () => {
     );
     const eventId = inserted[0]!.id;
 
-    const { updated, deleted } = await withTenantScope(
-      appPool(),
+    await expect(withTenantScope(appPool(), tenant.tenantId, client =>
+      client.query("UPDATE audit_events SET event_type = 'tampered' WHERE id = $1::bigint", [eventId])))
+      .rejects.toMatchObject({ code: INSUFFICIENT_PRIVILEGE });
+    await expect(withTenantScope(appPool(), tenant.tenantId, client =>
+      client.query("DELETE FROM audit_events WHERE id = $1::bigint", [eventId])))
+      .rejects.toMatchObject({ code: INSUFFICIENT_PRIVILEGE });
+
+    const { updated, deleted } = await policyProbe(
+      "audit_events",
       tenant.tenantId,
       async (client) => {
         const u = await client.query(
@@ -111,8 +136,8 @@ describe.skipIf(!adminDatabaseUrl())("system-tenant defaults", () => {
   test.each(SYSTEM_TABLES)("%s: a tenant cannot UPDATE or DELETE a system row", async (table) => {
     const fixture = await seedTenantGraph();
 
-    const { updated, deleted } = await withTenantScope(
-      appPool(),
+    const { updated, deleted } = await policyProbe(
+      table,
       fixture.tenantId,
       async (client) => {
         // `created_by` is the one nullable text column all three share.
