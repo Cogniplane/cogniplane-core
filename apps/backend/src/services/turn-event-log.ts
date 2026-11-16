@@ -1,5 +1,5 @@
 import { EventType, type BaseEvent } from "@ag-ui/client";
-import { redactSecrets } from "./redact-secrets.js";
+import { redactSecrets, secretSafeTextCutoff } from "./redact-secrets.js";
 
 const MAX_EVENTS = 1_000;
 const MAX_BYTES = 1_000_000;
@@ -140,13 +140,11 @@ function safeTextCutoff(text: string): number {
 
 const WHITESPACE = /\s/;
 
-// Whether the word that starts at `start` follows `Bearer` and whitespace, so
-// that it can be a Bearer value. Unlike the redactor, no word boundary is
-// needed before `Bearer`.
+// Hold Basic and Bearer values. No word boundary is needed for this safe cut.
 function followsBearer(text: string, start: number): boolean {
   let end = start;
   while (end > 0 && WHITESPACE.test(text[end - 1]!)) end -= 1;
-  return end < start && /bearer$/i.test(text.slice(Math.max(0, end - 6), end));
+  return end < start && /(?:bearer|basic)$/i.test(text.slice(Math.max(0, end - 6), end));
 }
 
 // A cut between two non-ASCII code units, not inside a surrogate pair.
@@ -160,12 +158,13 @@ function isNonAsciiCut(text: string, index: number): boolean {
 /**
  * The last index where `text` can be cut so that each part is redacted alone,
  * or 0. The cut is in a word, between two non-ASCII characters. Of the inline
- * rules in redact-secrets.ts, only a Bearer value and a URL query parameter
- * can match a non-ASCII character, and they stop only at whitespace or at an
- * ASCII delimiter. So there is no cut in a word that follows `Bearer`, or
+ * rules in redact-secrets.ts, Basic/Bearer values and URL query parameters
+ * can match non-ASCII characters and stop at whitespace or ASCII delimiters.
+ * So there is no cut in a word that follows `Basic` or `Bearer`, or
  * after a `?` or `&` that is still open in the word. Then no rule can match
  * across the cut, whatever text comes next. Remove key blocks first. A
- * partial BEGIN header is ASCII, so no cut falls in it.
+ * partial BEGIN header is ASCII, so no cut falls in it. releaseText also
+ * holds cuts inside an environment assignment or URL authority.
  */
 function lastSafeSplit(text: string): number {
   let split = 0;
@@ -342,6 +341,7 @@ export class TurnEventLog {
 
   // Redacts and releases the held text before `cutoff`.
   private releaseText(state: BufferedContent, event: BaseEvent, cutoff: number): void {
+    cutoff = secretSafeTextCutoff(state.text, cutoff);
     if (cutoff <= 0) return;
     const safe = redactSecrets(state.text.slice(0, cutoff));
     state.text = state.text.slice(cutoff);

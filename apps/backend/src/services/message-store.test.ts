@@ -1051,7 +1051,12 @@ test("MessageStore.updateStreamingContent: passes provided fields through and nu
   expect(captured![4]).toBe(null);
 });
 
-test("MessageStore.updateContent redacts secrets before persisting assistant text", async () => {
+test.each([
+  ["The key is sk-ant-abc123def456ghi789jkl012mno and token rt_xyz.sender.v1 for you.", "The key is [REDACTED] and token [REDACTED] for you."],
+  ["Authorization: Basic dXNlcjpwYXNz", "Authorization: Basic [REDACTED]"],
+  ["postgres://user:opaque@db.test/app", "postgres://[REDACTED]@db.test/app"],
+  ["export API_KEY='opaque\nmultiline'\nPORT=3000", "export API_KEY=[REDACTED]\nPORT=3000"]
+])("MessageStore.updateContent redacts %s before persistence", async (content, expected) => {
   const db = new ScriptedDatabase();
   let captured: unknown[] | null = null;
   db.scripts = [
@@ -1069,10 +1074,10 @@ test("MessageStore.updateContent redacts secrets before persisting assistant tex
     "m-1",
     "u",
     "completed",
-    `The key is sk-ant-abc123def456ghi789jkl012mno and token rt_xyz.sender.v1 for you.`
+    content
   );
   expect(captured).toBeTruthy();
-  expect(captured![4]).toBe("The key is [REDACTED] and token [REDACTED] for you.");
+  expect(captured![4]).toBe(expected);
 });
 
 test("MessageStore.updateStreamingContent redacts secrets in reasoning and plan", async () => {

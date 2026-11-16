@@ -57,7 +57,8 @@ function enabledMemoryToolDocs(enabledToolIds: string[]) {
 }
 
 function excerpt(content: string): string {
-  const singleLine = content.replace(/\s+/g, " ").trim();
+  // Redact before whitespace changes or truncation can hide a credential's syntax.
+  const singleLine = redactSecrets(content).replace(/\s+/g, " ").trim();
   const points = Array.from(singleLine);
   const shown = points.length > EXCERPT_LENGTH ? `${points.slice(0, EXCERPT_LENGTH).join("")}…` : singleLine;
   // Hidden characters stay visible, so the model reads what the user could read.

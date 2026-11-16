@@ -108,6 +108,63 @@ test("redactSecrets redacts inline bearer tokens without blanking the surroundin
   expect(result).toBe("curl -H 'Authorization: Bearer [REDACTED]' https://example.com");
 });
 
+test.each([
+  ["Authorization: Basic dXNlcjpwYXNz", "Authorization: Basic [REDACTED]"],
+  ["aUtHoRiZaTiOn \t: bAsIc\tdXNlcjpwYXNz==", "aUtHoRiZaTiOn \t: bAsIc\t[REDACTED]"],
+  ["Proxy-Authorization: Basic malformed%%%", "Proxy-Authorization: Basic [REDACTED]"],
+  ["curl -H 'Authorization: Basic dXNlcjpwYXNz' https://example.com", "curl -H 'Authorization: Basic [REDACTED]' https://example.com"]
+])("redacts Basic authorization in %s", (source, expected) => {
+  expect(redactSecrets(source)).toBe(expected);
+  expect(redactSecrets(expected)).toBe(expected);
+});
+
+test.each([
+  ["https://user:password@example.test/path?q=ok#keep", "https://[REDACTED]@example.test/path?q=ok#keep"],
+  ["POSTGRESQL://us%40er:p%2Fass%3Aword@db.test:5432/db", "POSTGRESQL://[REDACTED]@db.test:5432/db"],
+  ["redis+tls://:password@[::1]:6379/0", "redis+tls://[REDACTED]@[::1]:6379/0"],
+  ["ssh://only-user@host.test/repo", "ssh://[REDACTED]@host.test/repo"],
+  ["https://user:bad%zz@host.test", "https://[REDACTED]@host.test"],
+  ["https://first@second:pass@host.test", "https://[REDACTED]@host.test"],
+  ['URL="https://user:pass@host.test"', 'URL="https://[REDACTED]@host.test"'],
+  ["https://outer.test/?next=https://u:p@inner.test/", "https://outer.test/?next=https://[REDACTED]@inner.test/"],
+  ["https://outer:https://u:p@inner.test/", "https://outer:https://[REDACTED]@inner.test/"]
+])("redacts URL userinfo in %s", (source, expected) => {
+  expect(redactSecrets(source)).toBe(expected);
+  expect(redactSecrets(expected)).toBe(expected);
+});
+
+test.each([
+  "API_KEY", "OPENAI_API_KEY", "CLIENT_SECRET", "PASSWORD", "ACCESS_TOKEN", "REFRESH_TOKEN", "SECRET_ACCESS_KEY"
+])("redacts environment assignment %s", (name) => {
+  const source = `PORT=3000\r\n  export ${name.toLowerCase()} = 'opaque value' # keep\r\nNODE_ENV=production`;
+  const expected = `PORT=3000\r\n  export ${name.toLowerCase()} = [REDACTED] # keep\r\nNODE_ENV=production`;
+  expect(redactSecrets(source)).toBe(expected);
+  expect(redactSecrets(expected)).toBe(expected);
+});
+
+test.each([
+  ['API_KEY="first\\"part\nsecond part"\nPORT=3000', "API_KEY=[REDACTED]\nPORT=3000"],
+  ["PASSWORD='first\r\nsecond'\r\nNODE_ENV=production", "PASSWORD=[REDACTED]\r\nNODE_ENV=production"],
+  ["CLIENT_SECRET=first\\\r\nsecond\r\nPORT=3000", "CLIENT_SECRET=[REDACTED]\r\nPORT=3000"],
+  ["PASSWORD=unquoted value # comment", "PASSWORD=[REDACTED] # comment"],
+  ["API_KEY='unterminated\nmore sensitive words", "API_KEY=[REDACTED]"],
+  ["ACCESS_TOKEN=trailing\\", "ACCESS_TOKEN=[REDACTED]"],
+  ["API_KEY='one'\"two\"; PORT=3000", "API_KEY=[REDACTED]; PORT=3000"]
+])("redacts escaped, multiline or malformed assignments in %s", (source, expected) => {
+  expect(redactSecrets(source)).toBe(expected);
+});
+
+test("keeps ordinary assignments, prose, URL paths and incomplete authorization headers", () => {
+  const source = [
+    "PORT=3000", "NODE_ENV=production", "PUBLIC_KEY=public-value", "TOKEN_COUNT=100", "key=value",
+    "An example is API_KEY=value, not a setting.", "Basic authentication is supported.",
+    "Authorization: Basic", "API_KEY=", "export PASSWORD = # no value",
+    "https://host.test/user:password@path", "https://host.test/?contact=user@example.test",
+    "mail user@example.test", "https://host.test/path", "https://", "not_a_scheme://u:p@host"
+  ].join("\n");
+  expect(redactSecrets(source)).toBe(source);
+});
+
 test("redactSecrets redacts raw GitHub token formats in plain text output", () => {
   const result = redactSecrets(
     "tokens: ghu_user_token_123 ghs_install_token_456 github_pat_abcdefghijklmnopqrstuvwxyz"
@@ -391,13 +448,13 @@ function recursiveQueryRedaction(_match: string, separator: string, name: string
 }
 
 function compareOnRandomText(
-  seed: number, alphabet: readonly string[], expected: (text: string) => string
+  seed: number, alphabet: readonly string[], expected: (text: string) => string, prefix = ""
 ): { mismatches: string[]; changed: number } {
   const random = seededRandom(seed);
   const mismatches: string[] = [];
   let changed = 0;
   for (let i = 0; i < 10_000; i += 1) {
-    const text = randomText(random, alphabet, 24);
+    const text = prefix + randomText(random, alphabet, 24);
     const want = expected(text);
     if (want !== text) changed += 1;
     if (redactSecrets(text) !== want) mismatches.push(JSON.stringify(text));
@@ -423,7 +480,8 @@ test("redactSecrets redacts the same PEM blocks as the regex on random text", ()
 test("redactSecrets redacts the same nested query values as the recursive scan on random text", () => {
   const alphabet = ["?", "&", "=", "token", "next", "a", "${", "#", " ", "x", "'", "%74oken", "?a=", "?next=", "=${x}", "sig",
     "?token=", "?next=x?sig="];
-  const result = compareOnRandomText(3, alphabet, (text) => text.replace(QUERY_PATTERN, recursiveQueryRedaction));
+  // Keep this comparison about query values, not a line-start TOKEN assignment.
+  const result = compareOnRandomText(3, alphabet, (text) => text.replace(QUERY_PATTERN, recursiveQueryRedaction), "URL query ");
   expect(result.mismatches).toEqual([]);
   expect(result.changed).toBeGreaterThan(2_000);
 });
@@ -475,7 +533,14 @@ test("redactSecrets stays linear on large adversarial input", { timeout: 60_000 
       // Provider key patterns: a hex run with no dot after it (Z.AI), and many
       // short provider prefixes.
       providerHexRun: timed(() => redactSecrets("a".repeat(2_000_000) + ". Bearer abc").slice(-17)),
-      providerPrefixes: timed(() => redactSecrets("sk-ant-x AIza sk- ".repeat(200_000) + "Bearer abc").slice(-17))
+      providerPrefixes: timed(() => redactSecrets("sk-ant-x AIza sk- ".repeat(200_000) + "Bearer abc").slice(-17)),
+      basicSpaces: timed(() => redactSecrets("Authorization: Basic " + " ".repeat(2_000_000) + "opaque").slice(-10)),
+      urlSchemeRun: timed(() => redactSecrets("a-".repeat(1_000_000) + "://user:pass@host").slice(-15)),
+      urlAuthorities: timed(() => redactSecrets("x://no-user/".repeat(100_000) + "x://u:p@host").slice(-19)),
+      nestedAuthorities: timed(() => redactSecrets("x://".repeat(200_000) + "u:p@host").slice(-19)),
+      envName: timed(() => redactSecrets("A_".repeat(1_000_000) + "PUBLIC_KEY=public").length),
+      envQuotes: timed(() => redactSecrets('API_KEY="' + ("escaped" + String.fromCharCode(92, 34, 10)).repeat(100_000)).slice(-10)),
+      envLines: timed(() => redactSecrets("PORT=3000\\n".repeat(200_000) + "API_KEY=opaque").slice(-18))
     });
   `);
 
@@ -485,5 +550,12 @@ test("redactSecrets stays linear on large adversarial input", { timeout: 60_000 
   expect(runs.nestedQuery!.result).toBe("?token=REDACTED");
   expect(runs.providerHexRun!.result).toBe("Bearer [REDACTED]");
   expect(runs.providerPrefixes!.result).toBe("Bearer [REDACTED]");
+  expect(runs.basicSpaces!.result).toBe("[REDACTED]");
+  expect(runs.urlSchemeRun!.result).toBe("[REDACTED]@host");
+  expect(runs.urlAuthorities!.result).toBe("x://[REDACTED]@host");
+  expect(runs.nestedAuthorities!.result).toBe("x://[REDACTED]@host");
+  expect(runs.envName!.result).toBe(2_000_017);
+  expect(runs.envQuotes!.result).toBe("[REDACTED]");
+  expect(runs.envLines!.result).toBe("API_KEY=[REDACTED]");
   for (const [name, run] of Object.entries(runs)) expect(run.ms, name).toBeLessThan(2_000);
 });

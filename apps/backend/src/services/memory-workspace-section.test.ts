@@ -120,6 +120,17 @@ test("hidden characters in a memory are shown, not passed to the model", () => {
   expect(text).toContain("⟦U+E0049⟧");
 });
 
+test.each([
+  ["https://" + "opaque".repeat(60) + ":password@host.test/path", "https://[REDACTED]@host.test/path"],
+  ["PORT=3000\nAPI_KEY='first line\nsecond line'\nNODE_ENV=production", "PORT=3000 API_KEY=[REDACTED] NODE_ENV=production"],
+  ["Authorization: Basic dXNlcjpwYXNz", "Authorization: Basic [REDACTED]"]
+])("redacts stored credentials before excerpt formatting for %s", (content, expected) => {
+  const text = buildMemoryDataContext([record({ content })], ["memory_search"])!;
+  const lines = text.split("\n");
+  const entry = JSON.parse(lines[lines.indexOf("<saved_memories>") + 1]!);
+  expect(entry.content).toBe(expected);
+});
+
 test("loadWorkspaceMemories skips the store unless memory_search is enabled", async () => {
   let called = false;
   const memories = {

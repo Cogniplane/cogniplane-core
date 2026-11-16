@@ -1,8 +1,14 @@
 import { redactSecrets } from "../redact-secrets.js";
 import type { ApprovalRequest } from "./approval-coordinator.js";
 
+function redactDisplay(value: string): string {
+  // Keep assignment line boundaries until redaction, but join hidden token fragments first.
+  const visible = value.replace(/[\p{Cc}\p{Cf}\p{Cs}]/gu, (char) => /[\r\n\t]/.test(char) ? char : "").normalize("NFC");
+  return redactSecrets(visible);
+}
+
 function cleanDisplay(value: string): string {
-  return redactSecrets(value.replace(/[\p{Cc}\p{Cf}\p{Cs}]/gu, "").normalize("NFC")).trim();
+  return redactDisplay(value).replace(/[\r\n\t]/g, "").trim();
 }
 
 function boundDisplay(value: string, limit: number): string {
@@ -24,7 +30,7 @@ export function approvalPresentation(
   if (!name) return { title: `Approve ${action.name}`, summary: JSON.stringify(redactSecrets(args)) };
 
   const reason = policyApproval
-    ? cleanDisplay(policyApproval.explanation.replace(/\s+/gu, " ")) || "Policy Center requires approval."
+    ? redactDisplay(policyApproval.explanation).replace(/\s+/gu, " ").trim() || "Policy Center requires approval."
     : "This tool requires approval.";
   const bytes = Buffer.byteLength(args.content as string, "utf8");
   return {

@@ -8,6 +8,10 @@ const SECRET_KEY_PATTERN = /(authorization|token|secret|credential|api[_-]?key|p
 const APP_PAGING_KEY_PATTERN = /^(?:pageToken|nextPageToken|previousPageToken|prevPageToken)$/i;
 const isCredentialKey = (key: string) => SECRET_KEY_PATTERN.test(key) && !APP_PAGING_KEY_PATTERN.test(key);
 const BEARER_TOKEN_PATTERN = /(\bBearer\s+)(?!\$\{)([^\s"',;]+)/gi;
+const BASIC_AUTH_PATTERN = /(\bauthorization[ \t]*:[ \t]*Basic[ \t]+)(?!\$\{)([^\s"',;]+)/gi;
+// Match credential names, not all assignments or public-key settings.
+const ENV_SECRET_NAME = /(?:^|_)(?:API_?KEY|SECRET|PASSWORD|PASSWD|TOKEN|CREDENTIALS?|PRIVATE_KEY|SECRET_ACCESS_KEY|API_KEY_SECRET|AUTHORIZATION)$/i;
+const ENV_NAME_AT = /[A-Za-z_][A-Za-z0-9_]*/y;
 const GITHUB_TOKEN_PATTERN =
   /\b(?:gh(?:o|u|s|r|p)_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+)\b/g;
 
@@ -78,6 +82,117 @@ const isWordCode = (code: number) =>
   (code >= 48 && code <= 57) || (code >= 65 && code <= 90) || (code >= 97 && code <= 122) || code === 95;
 const isJwtCode = (code: number) => isWordCode(code) || code === 45;
 
+type TextRange = { start: number; end: number };
+const isHorizontalSpace = (char: string | undefined) => char === " " || char === "\t";
+
+// Read an assignment once, including quoted newlines and escaped line breaks.
+// An unmatched quote consumes the rest of the text instead of exposing it.
+function assignmentEnd(value: string, start: number): number {
+  let quote: string | undefined;
+  for (let index = start; index < value.length; index += 1) {
+    const char = value[index]!;
+    if (char === "\\") {
+      index += value[index + 1] === "\r" && value[index + 2] === "\n" ? 2 : 1;
+    } else if (quote) {
+      if (char === quote) quote = undefined;
+    } else if (char === '"' || char === "'") {
+      quote = char;
+    } else if (char === "\r" || char === "\n" || char === ";" || (char === "#" && (index === start || isHorizontalSpace(value[index - 1])))) {
+      return index;
+    }
+  }
+  return value.length;
+}
+
+function visitSecretAssignments(value: string, visit: (range: TextRange, lineStart: number) => void): void {
+  let lineStart = 0;
+  while (lineStart < value.length) {
+    let index = lineStart;
+    while (isHorizontalSpace(value[index])) index += 1;
+    if (value.slice(index, index + 6).toLowerCase() === "export" && isHorizontalSpace(value[index + 6])) {
+      index += 7;
+      while (isHorizontalSpace(value[index])) index += 1;
+    }
+    ENV_NAME_AT.lastIndex = index;
+    const name = ENV_NAME_AT.exec(value)?.[0];
+    if (name && ENV_SECRET_NAME.test(name)) {
+      index += name.length;
+      while (isHorizontalSpace(value[index])) index += 1;
+      if (value[index] === "=") {
+        index += 1;
+        while (isHorizontalSpace(value[index])) index += 1;
+        let end = assignmentEnd(value, index);
+        const nextLine = value.indexOf("\n", end);
+        while (end > index && isHorizontalSpace(value[end - 1])) end -= 1;
+        if (end > index) visit({ start: index, end }, lineStart);
+        lineStart = nextLine < 0 ? value.length : nextLine + 1;
+        continue;
+      }
+    }
+    const newline = value.indexOf("\n", index);
+    lineStart = newline < 0 ? value.length : newline + 1;
+  }
+}
+
+const isSchemeCode = (code: number) => (isWordCode(code) && code !== 95) || code === 43 || code === 45 || code === 46;
+const URL_AUTHORITY_END = /[\s/\\?#"'<>]/;
+
+// Find literal :// separators, then scan each authority once. A global regex
+// with a variable-length scheme can retry a long malformed scheme at every '-'.
+function visitUrlAuthorities(value: string, visit: (range: TextRange, at: number, userinfoStart: number) => void): void {
+  let separator = value.indexOf("://");
+  while (separator >= 0) {
+    let scheme = separator;
+    while (scheme > 0 && isSchemeCode(value.charCodeAt(scheme - 1))) scheme -= 1;
+    const start = separator + 3;
+    let end = start;
+    let at = -1;
+    while (end < value.length && !URL_AUTHORITY_END.test(value[end]!)) {
+      if (value[end] === "@") at = end;
+      end += 1;
+    }
+    if (/[A-Za-z]/.test(value[scheme] ?? "") && !isWordCode(value.charCodeAt(scheme - 1))) {
+      visit({ start: scheme, end }, at, start);
+    }
+    // Another separator can end this authority at its first slash. Include
+    // it in the next pass, so malformed outer URLs cannot hide an inner URL.
+    separator = value.indexOf("://", separator + 3);
+  }
+}
+
+function redactAssignments(value: string): string {
+  let result = "";
+  let copied = 0;
+  visitSecretAssignments(value, ({ start, end }) => {
+    result += value.slice(copied, start) + "[REDACTED]";
+    copied = end;
+  });
+  return copied === 0 ? value : result + value.slice(copied);
+}
+
+function redactUrlUserinfo(value: string): string {
+  let result = "";
+  let copied = 0;
+  visitUrlAuthorities(value, (_range, at, start) => {
+    if (at < start) return;
+    result += value.slice(copied, start) + "[REDACTED]";
+    copied = at;
+  });
+  return copied === 0 ? value : result + value.slice(copied);
+}
+
+/** Keep replay cuts outside assignments and URL authorities, even before '@' arrives. */
+export function secretSafeTextCutoff(value: string, candidate: number): number {
+  let cutoff = candidate;
+  visitSecretAssignments(value, ({ end }, lineStart) => {
+    if (lineStart < cutoff && cutoff < end) cutoff = lineStart;
+  });
+  visitUrlAuthorities(value, ({ start, end }) => {
+    if (start < cutoff && cutoff < end) cutoff = start;
+  });
+  return cutoff;
+}
+
 // Replaces /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----/g.
 // That regex read to the end of the text from each BEGIN line without an END
 // line. When no END line follows one BEGIN line, none follows a later one, so
@@ -121,12 +236,12 @@ function redactJwts(value: string): string {
 }
 
 // Live replay (lastSafeSplit in turn-event-log.ts) cuts held text between two
-// non-ASCII characters. It expects that, apart from private keys, only the
-// Bearer and URL query rules can match a non-ASCII character. Update it when a
-// rule can.
+// non-ASCII characters. Basic/Bearer values and query parameters are held by
+// that scanner. Assignment and URL-authority cuts use secretSafeTextCutoff.
 function redactInlineSecrets(value: string): string {
-  let beforeJwts = redactPemBlocks(value)
+  let beforeJwts = redactAssignments(redactUrlUserinfo(redactPemBlocks(value)))
     .replace(BEARER_TOKEN_PATTERN, "$1[REDACTED]")
+    .replace(BASIC_AUTH_PATTERN, "$1[REDACTED]")
     .replace(GITHUB_TOKEN_PATTERN, "[REDACTED]");
   for (const pattern of PROVIDER_KEY_PATTERNS) beforeJwts = beforeJwts.replace(pattern, "[REDACTED]");
   beforeJwts = beforeJwts

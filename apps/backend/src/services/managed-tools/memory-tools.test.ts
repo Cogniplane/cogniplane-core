@@ -301,13 +301,16 @@ test("memory_save requires a name", async () => {
   expect(memories.calls).toHaveLength(0);
 });
 
-test("memory_save refuses text that looks like a credential", async () => {
+test.each([
+  "sk-ant-abcdefghijklmnopqrstuvwxyz", "Authorization: Basic dXNlcjpwYXNz",
+  "postgresql://user:password@db.test/app", "export API_KEY='opaque'"
+])("memory_save refuses credential text %s before persistence", async (content) => {
   const memories = makeFakeMemories();
   const tool = findTool(memories, "memory_save");
 
   const result = await tool.handler({
     context: ctx(),
-    arguments: { toolContextId: "ctx-1", name: "key", content: "sk-ant-abcdefghijklmnopqrstuvwxyz" },
+    arguments: { toolContextId: "ctx-1", name: "key", content },
     approval: approvalFor()
   });
 
