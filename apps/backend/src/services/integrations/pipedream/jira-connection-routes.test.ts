@@ -32,7 +32,8 @@ const cleanup = {
 async function createApp(options: { readsEnabled?: boolean; isAdmin?: boolean } = {}) {
   const jiraConnections = {
     getConnectionStatus: vi.fn(async () => ({
-      configured: true, userConnection: connection, authorizationStarted: true, cleanupPending: false
+      configured: true, userConnection: connection, authorizationStarted: true, cleanupPending: false,
+      authorizationAvailable: false
     })),
     getAuthorizationUrl: vi.fn(async () => ({ url: "https://pipedream.com/_static/connect.html?app=jira" })),
     listCandidates: vi.fn(async () => [{ accountId: "apn_mine", accountName: null, healthy: true, createdAt: null }]),

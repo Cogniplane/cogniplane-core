@@ -13,6 +13,8 @@ type ConnectedAccountRowProps = {
   // A security change suspended the connection; the owner confirms it in Details.
   suspended?: boolean;
   configured: boolean;
+  // False when the service refuses new authorization. A saved account stays shown.
+  connectAvailable?: boolean;
   statusKnown?: boolean;
   tenantEnabled?: boolean;
   isLoading: boolean;
@@ -60,7 +62,7 @@ export function ConnectedAccountRow(input: ConnectedAccountRowProps) {
         <Button
           type="button"
           size="sm"
-          disabled={!known || isLoading || !configured || busyKey !== null || Boolean(statusError)}
+          disabled={!known || isLoading || !configured || input.connectAvailable === false || busyKey !== null || Boolean(statusError)}
           onClick={input.onConnect}
           aria-label={`${identity ? "Reconnect" : "Connect"} ${service}`}
         >

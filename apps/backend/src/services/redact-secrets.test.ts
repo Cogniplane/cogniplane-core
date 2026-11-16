@@ -172,6 +172,32 @@ test.each([
   expect(redactSecrets(source)).toBe(expected);
 });
 
+test.each(["SECRET_KEY", "JWT_SECRET_KEY", "DATA_ENCRYPTION_KEY", "ENCRYPTION_KEY"])(
+  "redacts the value of the secret key name %s",
+  (name) => {
+    expect(redactSecrets(`${name}=opaque-value\nPUBLIC_KEY=public-value`)).toBe(`${name}=[REDACTED]\nPUBLIC_KEY=public-value`);
+  }
+);
+
+test("keeps an assignment whose value is one variable reference", () => {
+  const source = [
+    "export API_KEY=${API_KEY}", "DB_PASSWORD=$POSTGRES_PASSWORD", "AUTH_TOKEN=\"${AUTH_TOKEN}\"", "SECRET = \"$SECRET\"  # from the shell"
+  ].join("\n");
+  expect(redactSecrets(source)).toBe(source);
+});
+
+test.each([
+  ["a default", "API_KEY=${API_KEY:-literal-secret}"],
+  ["a command", "AUTH_TOKEN=$(vault read secret)"],
+  ["text after the reference", "PASSWORD=${PREFIX}literal-secret"],
+  ["two references", "TOKEN=$FIRST$SECOND"],
+  ["an unmatched quote", "TOKEN=\"$NAME"],
+  ["a single-quoted literal", "TOKEN='$NAME'"],
+  ["a long reference", `TOKEN=$${"A".repeat(300)}`]
+])("redacts an assignment value with %s", (_name, source) => {
+  expect(redactSecrets(source)).toBe(`${source.slice(0, source.indexOf("=") + 1)}[REDACTED]`);
+});
+
 // Tool results that the model reads and edits hold source code. Lowercase and
 // mixed-case names are code variables, not environment settings, and an
 // apostrophe in their value must not hide the rest of the text.

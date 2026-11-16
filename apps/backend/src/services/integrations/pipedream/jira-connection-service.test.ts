@@ -492,7 +492,7 @@ describe("reads", () => {
     const { service, pipedream } = await connected();
     pipedream.accounts[0].dead = true;
     expect(await service.read("tenant-a", "user-1", { kind: "sites" }))
-      .toMatchObject({ ok: false, error: expect.stringContaining("needs to be reconnected") });
+      .toMatchObject({ ok: false, error: "Your Jira account stopped working. New Jira connections are temporarily unavailable." });
     pipedream.accounts = [];
     expect(await service.read("tenant-a", "user-1", { kind: "sites" }))
       .toMatchObject({ ok: false, error: expect.stringContaining("no longer available") });
@@ -545,7 +545,7 @@ describe("disconnect", () => {
     expect(store.rows.size).toBe(0);
     expect(store.cleanups.size).toBe(0);
     expect(await service.getConnectionStatus("tenant-a", "user-1"))
-      .toMatchObject({ authorizationStarted: false, cleanupPending: false });
+      .toMatchObject({ authorizationStarted: false, cleanupPending: false, authorizationAvailable: false });
     expect(runtime.invalidateRuntimesForIntegration).toHaveBeenLastCalledWith("tenant-a", "user-1", "jira");
     expect(await seedIdentity()).not.toBe(externalId);
   });

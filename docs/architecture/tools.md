@@ -31,6 +31,13 @@ the operator must set `MCP_UPSTREAM_ALLOW_PRIVATE_ADDRESSES=true`. Existing
 private servers also need this setting after an upgrade. It applies to all
 tenants and every proxy request. See [outbound request rules](../security.md#outbound-requests).
 
+Without the setting, a saved server with a private address sends no request,
+and each save of its setup is refused until the address is public, also a save
+that only changes the name or the audience. To retire it, remove it from the
+tenant's enabled MCP servers, then call `POST
+/admin/mcp-servers/:serverId/disable`. The admin page has no control for this
+route.
+
 Connection test: `POST /admin/mcp-servers/:serverId/connection-test`
 (`services/mcp/mcp-connection-test-service.ts`) sends `tools/list` with the
 saved configuration. For per-member credentials it uses the admin's own. It
