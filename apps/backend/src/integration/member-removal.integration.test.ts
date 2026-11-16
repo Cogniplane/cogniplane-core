@@ -35,6 +35,7 @@ import { MemberRemovedError } from "../services/tenant-member-removal.js";
 import { TenantOrgSettingsStore } from "../services/tenant-org-settings-store.js";
 import { devDataRoutes } from "../test-helpers/data-routes.js";
 import { FakeRefreshTokenRedis } from "../test-helpers/fake-refresh-token-redis.js";
+import { createFakeWorkOS } from "../test-helpers/fake-workos.js";
 import { InMemoryAuditEventStore } from "../test-helpers/in-memory-audit-events.js";
 import { IGNORE_SECURITY_CHANGE } from "../test-helpers/security-change.js";
 import { createTestConfig } from "../test-helpers/test-config.js";
@@ -50,6 +51,14 @@ type Member = { tenantId: string; userId: string };
 
 const person = (): Person => ({ workosUserId: `user_${randomUUID()}`, email: `${randomUUID()}@example.test` });
 
+function activeWorkos() {
+  const { workos, mocks } = createFakeWorkOS();
+  mocks.listOrganizationMemberships.mockImplementation(async ({ userId, organizationId }) => ({
+    data: [{ userId, organizationId, status: "active" }]
+  }));
+  return workos;
+}
+
 function signIn(organizationId: string, who: Person, workosRoleSlug: string | null = "member") {
   return provisionTenantIdentity(maintenancePool(), {
     organizationId, organizationName: "Removal Org", workosUserId: who.workosUserId, email: who.email,
@@ -60,7 +69,7 @@ function signIn(organizationId: string, who: Person, workosRoleSlug: string | nu
 /** A WorkOS tenant with its owner. */
 async function workosTenant() {
   const organizationId = `org_${randomUUID()}`;
-  const owner = await signIn(organizationId, person());
+  const owner = await signIn(organizationId, person(), "admin");
   expect(owner.role).toBe("owner");
   return { organizationId, tenantId: owner.tenantId, ownerId: owner.userId };
 }
@@ -139,7 +148,8 @@ describe.skipIf(!adminDatabaseUrl())("member removal lasts", () => {
     const app = Fastify();
     await app.register(cookie);
     await registerSessionRoutes(app, {
-      db: maintenancePool(), config: CONFIG, auditEvents: new InMemoryAuditEventStore() as never, refreshTokens
+      db: maintenancePool(), appDb: appPool(), workos: activeWorkos(), afterSecurityChange: IGNORE_SECURITY_CHANGE,
+      config: CONFIG, auditEvents: new InMemoryAuditEventStore() as never, refreshTokens
     });
     const refresh = (refreshToken: string) => app.inject({
       method: "POST", url: "/auth/refresh", headers: { origin: CONFIG.API_ORIGIN }, cookies: { cogniplane_refresh: refreshToken }
@@ -436,7 +446,10 @@ describe.skipIf(!adminDatabaseUrl())("migration 091: removals from before the up
       const refreshTokens = new RefreshTokenRotationService(redis, 60);
       const app = Fastify();
       await app.register(cookie);
-      await registerSessionRoutes(app, { db, config: CONFIG, auditEvents: new InMemoryAuditEventStore() as never, refreshTokens });
+      await registerSessionRoutes(app, {
+        db, appDb: db, workos: activeWorkos(), afterSecurityChange: IGNORE_SECURITY_CHANGE,
+        config: CONFIG, auditEvents: new InMemoryAuditEventStore() as never, refreshTokens
+      });
       const refreshFrom = async (authTime: number) => {
         const jti = randomUUID();
         const familyId = randomUUID();

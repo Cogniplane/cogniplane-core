@@ -154,31 +154,31 @@ function once<T>(make: () => Promise<T>): () => Promise<T> {
 
 type Member = { tenantId: string; userId: string };
 
-async function signIn(organizationId: string): Promise<Member> {
+async function signIn(organizationId: string, workosRoleSlug = "member"): Promise<Member> {
   const identity = await provisionTenantIdentity(maintenancePool(), {
     organizationId,
     organizationName: `Organization ${organizationId}`,
     workosUserId: unique("workos-user"),
     email: `${randomUUID()}@example.test`,
     displayName: "Integration member",
-    workosRoleSlug: null
+    workosRoleSlug
   });
   return { tenantId: identity.tenantId, userId: identity.userId };
 }
 
-/** The first sign-in to an organization becomes its owner; later ones are members. */
+/** An authorized WorkOS admin bootstraps the owner; later sign-ins are members. */
 const people = once(async () => {
   const organization = unique("org-owner");
-  const owner = await signIn(organization);
+  const owner = await signIn(organization, "admin");
   const member = await signIn(organization);
-  const peer = await signIn(unique("org-peer"));
+  const peer = await signIn(unique("org-peer"), "admin");
   return { owner, member, peer };
 });
 
 // A removal ends a membership, so it gets a WorkOS tenant of its own: the
 // cases that use people() keep their members.
 const removalOrganization = unique("org-removal");
-const removalOwner = once(async () => signIn(removalOrganization));
+const removalOwner = once(async () => signIn(removalOrganization, "admin"));
 
 // Local accounts live in a local tenant. The operator command creates the
 // tenant (on the migration pool, as in production); the app pool writes the

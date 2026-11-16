@@ -72,6 +72,11 @@ API_ORIGIN=https://app.example.com   # the frontend origin; exactly one origin
 - WorkOS: set `WORKOS_API_KEY`, `WORKOS_CLIENT_ID`, and `WORKOS_REDIRECT_URI` to
   the frontend page `https://<frontend>/auth/callback`, not the backend; that
   page sends the code to `POST /auth/callback`.
+  The first person to sign in must have the WorkOS organization role `admin`;
+  they become the local owner. Enable Directory Sync when IdP removals must
+  reach WorkOS. Revocation timing and the blocked sensitive writes are in
+  [auth](architecture/auth.md#request-authentication) and
+  [sensitive changes](architecture/sensitive-changes.md#step-up).
 - Passkeys: set `WEBAUTHN_RP_ID` to the frontend host name or a parent domain.
   Choose it once ([local
   accounts](architecture/local-accounts.md#second-factors-and-passkeys)).

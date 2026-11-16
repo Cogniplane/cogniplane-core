@@ -1,4 +1,5 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
+import type { WorkOS } from "@workos-inc/node";
 
 import { uuidv7 } from "../lib/uuid.js";
 
@@ -19,6 +20,8 @@ import { RefreshTokenRotationService } from "../services/auth/refresh-token-rota
 import { clientIp, enforceRateLimit, type RateLimitKey } from "../services/rate-limit-reply.js";
 import type { RequestLimitsInterface } from "../services/request-limits.js";
 import { PrivilegedAuthStateLookup } from "../services/tenant-member-store.js";
+import { type AfterSecurityChange } from "../services/auth/security-change.js";
+import { WorkOsMembershipRevalidation } from "../services/auth/workos-membership-revalidation.js";
 
 // The session layer that every login type shares: token issue, refresh with
 // rotation and reuse detection, logout, and /auth/me. A login route proves who
@@ -258,7 +261,10 @@ export async function registerSessionRoutes(
     config,
     auditEvents,
     limits,
-    refreshTokens
+    refreshTokens,
+    appDb,
+    workos,
+    afterSecurityChange
   }: {
     /** Privileged pool: refresh runs before the tenant context exists. */
     db: Pool;
@@ -266,11 +272,17 @@ export async function registerSessionRoutes(
     auditEvents: AuditEventStore;
     limits?: RequestLimitsInterface;
     refreshTokens: RefreshTokenRotationService;
+    appDb?: Pool;
+    workos?: WorkOS;
+    afterSecurityChange?: AfterSecurityChange;
   }
 ): Promise<void> {
   // One statement on the privileged pool, outside a transaction; the SQL
   // keeps the tenant and user predicates. See PrivilegedAuthStateLookup.
   const authStates = new PrivilegedAuthStateLookup(db);
+  const workosMemberships = workos && appDb && afterSecurityChange
+    ? new WorkOsMembershipRevalidation({ lookupDb: db, db: appDb, workos, afterSecurityChange })
+    : null;
 
   // A refusal of /auth/refresh never deletes the refresh cookie. The cookie
   // jar is shared by every tab of the browser, and the Set-Cookie of an
@@ -311,6 +323,12 @@ export async function registerSessionRoutes(
         sv: payload.sv,
         authTime: payload.auth_time
       });
+      if (admission.ok && admission.state.authSource === "workos") {
+        if (!workosMemberships) throw new Error("WorkOS membership revalidation is not configured.");
+        if (!(await workosMemberships.revalidate(payload.tid, payload.sub))) {
+          admission = { ok: false, error: "not_a_member" };
+        }
+      }
     } catch (error) {
       request.log.error({ err: error }, "auth refresh: membership lookup failed");
       reply.header("Retry-After", "1");

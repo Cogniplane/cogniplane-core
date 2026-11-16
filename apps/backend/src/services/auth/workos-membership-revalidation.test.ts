@@ -1,0 +1,104 @@
+import { describe, expect, test, vi } from "vitest";
+
+import { FakePool } from "../../test-helpers/fake-pool.js";
+import { createFakeWorkOS } from "../../test-helpers/fake-workos.js";
+import { WorkOsMembershipRevalidation } from "./workos-membership-revalidation.js";
+
+function harness(input: { failRemoval?: boolean; missingMembership?: boolean; missingProviderIds?: boolean } = {}) {
+  const lookupDb = new FakePool();
+  const db = new FakePool();
+  const { workos, mocks } = createFakeWorkOS();
+  const afterSecurityChange = vi.fn(async () => {});
+  lookupDb.onQuery("SELECT u.workos_user_id, t.workos_org_id", () => ({
+    rows: input.missingMembership ? [] : [{ workos_user_id: input.missingProviderIds ? null : "workos-user", workos_org_id: "org-one" }],
+    rowCount: input.missingMembership ? 0 : 1
+  }));
+  db.onQuery("SELECT s.session_id FROM sessions s", () => ({ rows: [], rowCount: 0 }));
+  db.onQuery("SELECT role, user_auth_source FROM tenant_memberships", () => ({
+    rows: [{ role: "owner", user_auth_source: "workos" }], rowCount: 1
+  }));
+  if (input.failRemoval) {
+    db.onQuery("INSERT INTO tenant_member_removals", () => { throw new Error("write failed"); });
+  }
+  for (const sql of ["UPDATE scheduled_jobs", "DELETE FROM project_memberships", "DELETE FROM tenant_memberships",
+    "INSERT INTO tenant_member_removals", "INSERT INTO audit_events", "UPDATE session_executions"]) {
+    db.onQuery(sql, () => ({ rows: [], rowCount: sql.includes("project_memberships") ? 2 : 1 }));
+  }
+  db.onQuery("WITH taken AS", () => ({
+    rows: [{ user_id: "user-one", session_id: "chat-one", sandbox_id: "sandbox-one" }], rowCount: 1
+  }));
+  const service = new WorkOsMembershipRevalidation({ lookupDb: lookupDb.asPool(), db: db.asPool(), workos, afterSecurityChange });
+  return { service, lookupDb, db, mocks, afterSecurityChange };
+}
+
+const ACTIVE = { userId: "workos-user", organizationId: "org-one", status: "active" };
+
+describe("WorkOS membership revalidation", () => {
+  test("checks the bound organization and user and retains an active member", async () => {
+    const h = harness();
+    h.mocks.listOrganizationMemberships.mockResolvedValue({ data: [ACTIVE] });
+    expect(await h.service.revalidate("tenant-one", "user-one")).toBe(true);
+    expect(h.lookupDb.queries[0]?.values).toEqual(["tenant-one", "user-one"]);
+    expect(h.mocks.listOrganizationMemberships).toHaveBeenCalledWith({
+      userId: "workos-user", organizationId: "org-one", statuses: ["active"]
+    });
+    expect(h.db.queries).toEqual([]);
+    expect(h.afterSecurityChange).not.toHaveBeenCalled();
+  });
+
+  test.each([
+    ["deleted", []],
+    ["disabled", [{ ...ACTIVE, status: "inactive" }]],
+    ["pending", [{ ...ACTIVE, status: "pending" }]],
+    ["another organization", [{ ...ACTIVE, organizationId: "org-other" }]],
+    ["another user", [{ ...ACTIVE, userId: "workos-other" }]]
+  ])("ends a %s membership, pauses jobs and stops active work after commit", async (_name, data) => {
+    const h = harness();
+    h.mocks.listOrganizationMemberships.mockResolvedValue({ data });
+    h.afterSecurityChange.mockImplementation(async () => {
+      expect(h.db.queries.at(-1)?.text).toBe("COMMIT");
+    });
+    expect(await h.service.revalidate("tenant-one", "user-one")).toBe(false);
+    const statements = h.db.queries.map(({ text }) => text);
+    expect(statements).toContainEqual(expect.stringContaining("UPDATE scheduled_jobs"));
+    expect(statements).toContainEqual(expect.stringContaining("DELETE FROM project_memberships"));
+    expect(statements).toContainEqual(expect.stringContaining("DELETE FROM tenant_memberships"));
+    expect(statements).toContainEqual(expect.stringContaining("INSERT INTO tenant_member_removals"));
+    const audit = h.db.queries.find(({ text }) => text.includes("INSERT INTO audit_events"));
+    expect(JSON.parse(audit!.values[5] as string)).toMatchObject({ projectRolesRemoved: 2, reason: "workos_membership_inactive" });
+    expect(h.afterSecurityChange).toHaveBeenCalledWith({
+      tenantId: "tenant-one", userIds: ["user-one"],
+      releasedSandboxes: [{ tenantId: "tenant-one", userId: "user-one", sessionId: "chat-one", sandboxId: "sandbox-one" }]
+    });
+  });
+
+  test("a WorkOS outage does not delete membership or stop work", async () => {
+    const h = harness();
+    h.mocks.listOrganizationMemberships.mockRejectedValue(new Error("provider unavailable"));
+    await expect(h.service.revalidate("tenant-one", "user-one")).rejects.toThrow("provider unavailable");
+    expect(h.db.queries).toEqual([]);
+    expect(h.afterSecurityChange).not.toHaveBeenCalled();
+  });
+
+  test("a missing local membership is refused without a provider call", async () => {
+    const h = harness({ missingMembership: true });
+    expect(await h.service.revalidate("tenant-one", "user-one")).toBe(false);
+    expect(h.mocks.listOrganizationMemberships).not.toHaveBeenCalled();
+    expect(h.db.queries).toEqual([]);
+  });
+
+  test("missing provider identifiers fail closed without removing the member", async () => {
+    const h = harness({ missingProviderIds: true });
+    await expect(h.service.revalidate("tenant-one", "user-one")).rejects.toThrow("WorkOS identity identifiers are missing.");
+    expect(h.mocks.listOrganizationMemberships).not.toHaveBeenCalled();
+    expect(h.db.queries).toEqual([]);
+  });
+
+  test("a failed removal rolls back and never stops active work", async () => {
+    const h = harness({ failRemoval: true });
+    h.mocks.listOrganizationMemberships.mockResolvedValue({ data: [] });
+    await expect(h.service.revalidate("tenant-one", "user-one")).rejects.toThrow("write failed");
+    expect(h.db.queries.at(-1)?.text).toBe("ROLLBACK");
+    expect(h.afterSecurityChange).not.toHaveBeenCalled();
+  });
+});

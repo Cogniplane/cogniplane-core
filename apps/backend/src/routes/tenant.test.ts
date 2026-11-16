@@ -1751,11 +1751,10 @@ test("PUT /tenant/settings/pii: turning off a legacy scope while its overlay is 
   expect((await local.save(payload)).statusCode).toBe(403);
   expect(resolvePiiPolicy(local.state.pii, overlayPresent).settings.scopes.microsoftImports).toBe(true);
 
-  // A WorkOS session: saved, and the owners get the notice that names the scope.
-  const workos = await piiStepUpApp({ stored, storedRevision: 4, session: "workos" });
-  expect((await workos.save(payload)).statusCode).toBe(200);
-  expect(resolvePiiPolicy(workos.state.pii, overlayPresent).settings.scopes.microsoftImports).toBe(false);
-  expect(workos.notices).toEqual([{ setting: "pii_protection", fields: ["Scanned content: microsoftImports"] }]);
+  // A local session with fresh proof can save and notify owners about the scope.
+  expect((await local.save(payload, await local.token())).statusCode).toBe(200);
+  expect(resolvePiiPolicy(local.state.pii, overlayPresent).settings.scopes.microsoftImports).toBe(false);
+  expect(local.notices).toEqual([{ setting: "pii_protection", fields: ["Scanned content: microsoftImports"] }]);
 });
 
 test("PUT /tenant/settings/pii: a stronger save needs no step-up and sends no notice", async () => {
@@ -1765,11 +1764,15 @@ test("PUT /tenant/settings/pii: a stronger save needs no step-up and sends no no
   expect(notices).toEqual([]);
 });
 
-test("PUT /tenant/settings/pii: a WorkOS session turns protection off with no step-up, and the owners get the notice", async () => {
-  const { consume, notices, save } = await piiStepUpApp({ stored: PII_ON, storedRevision: 4, session: "workos" });
-  expect((await save({ ...PII_OFF, expectedRevision: 4 })).statusCode).toBe(200);
+test("PUT /tenant/settings/pii: a WorkOS session cannot turn protection off without fresh proof", async () => {
+  const { state, consume, notices, save } = await piiStepUpApp({ stored: PII_ON, storedRevision: 4, session: "workos" });
+  const response = await save({ ...PII_OFF, expectedRevision: 4 });
+  expect(response.statusCode).toBe(403);
+  expect(response.json()).toMatchObject({ error: "workos_step_up_unavailable" });
+  expect(state.pii).toEqual(PII_ON);
+  expect(state.piiRevision).toBe(4);
   expect(consume).not.toHaveBeenCalled();
-  expect(notices).toEqual([{ setting: "pii_protection", fields: ["Protection", "Mode"] }]);
+  expect(notices).toEqual([]);
 });
 
 test.each([-1, 1.5, "4", null])("PUT /tenant/settings/pii rejects the revision %j", async (expectedRevision) => {
@@ -1962,4 +1965,3 @@ test.each([
   expect(response.json().error).not.toBe("no_updates");
   expect(updates).toEqual([]);
 });
-

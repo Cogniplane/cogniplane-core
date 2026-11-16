@@ -28,9 +28,9 @@ import type { StepUpAction } from "./step-up-store.js";
 //   the target is a local account (the target's login path decides, not the
 //   caller's session). A WorkOS member needs none: WorkOS owns that sign-in.
 // - PUT /tenant/settings/security: when the rule becomes weaker.
-// - Data routes: when the caller's session is local. A WorkOS session gives
-//   no step-up (WorkOS owns that sign-in), and dev-headers mode has no
-//   sessions. Every change of a data route also emails all tenant owners.
+// - Data routes: local sessions supply fresh proof. WorkOS writes are blocked
+//   until fresh provider proof is supported. dev-headers mode has no sessions.
+//   Every committed change of a data route also emails all tenant owners.
 // - PUT /admin/tenant-settings: when a field that routes data or a control
 //   changes (routes/admin/data-route-fields.ts). PUT
 //   /admin/integrations/:integrationId: when a setting changes or reads or

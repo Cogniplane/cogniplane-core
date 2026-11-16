@@ -81,6 +81,21 @@ Sign-in types:
   `auth_unavailable` with `Retry-After`. It is not a 401, so the client keeps
   the session. `/auth/refresh` answers 503 `refresh_unavailable` in the same
   case.
+- WorkOS refresh also checks the user's current active organization membership
+  with the WorkOS API, before token rotation or a cached refresh response.
+  A missing, inactive or pending membership causes a lasting local member
+  removal, pauses scheduled jobs, stops active work and revokes that refresh
+  family. This applies to owners too. Other families fail their next local
+  membership check. WorkOS failures return retryable 503 `refresh_unavailable`
+  without rotating the token or removing the member.
+- WorkOS revocation is checked at refresh, not on each access-token request.
+  Until refresh detects the change, an access token can act until its
+  `ACCESS_TOKEN_TTL` expires, and saved work can continue. Without a later
+  refresh, background work does not detect a provider removal. Operators must
+  remove the local member to stop it immediately. An IdP disable must reach
+  WorkOS through Directory Sync or an organization membership deactivation;
+  Cogniplane cannot observe an IdP change that WorkOS does not report. See the
+  [WorkOS membership API](https://workos.com/docs/reference/authkit/organization-membership).
 - CSRF: state-changing routes take JSON (artifact upload takes multipart); none
   accepts a form body from another site. Auth mutations (`/auth/callback`,
   `/auth/refresh`, `/auth/logout`, local sign-in, link, step-up and password
@@ -169,9 +184,15 @@ Sign-in types:
 - An email that belongs to another identity (another WorkOS user, or a local
   account) returns 409 `email_in_use`. Sign-in never binds an existing user row
   by email alone.
-- Role at first membership: `owner` for the first member of a new tenant;
-  otherwise `admin` when the WorkOS role slug is `admin`, else `member`. After
-  that the stored role is authoritative ([roles](#roles)).
+- Bootstrap: the first member must have the WorkOS role slug `admin` and
+  becomes `owner`. An ordinary member, a missing role or an unknown role gets
+  403 `owner_bootstrap_required`; the transaction writes nothing. Configure an
+  authorized administrator's WorkOS role before their first sign-in. The
+  membership lock serializes concurrent sign-ins, so an ordinary member cannot
+  win ownership by signing in first. Later new memberships get `admin` for the
+  WorkOS `admin` role, otherwise `member`. Existing memberships keep their
+  stored role ([roles](#roles)). This does not repair owners created before
+  this guard; operators must review them.
 - A user that the tenant removed gets 403 `membership_removed` with fixed text,
   and nothing is written. The check runs under the tenant's membership lock
   (`services/member-authority.ts`), which the removal route also takes first.

@@ -15,6 +15,7 @@ import {
   provisionTenantIdentity,
   resolveWorkOsOrganization,
   WorkOsEmailConflictError,
+  WorkOsOwnerBootstrapError,
   WrongLoginTypeError
 } from "../services/auth/workos-tenant-provisioning.js";
 import { IntegrationRegistry } from "../services/integrations/integration-registry.js";
@@ -22,6 +23,7 @@ import { MemberRemovedError } from "../services/tenant-member-removal.js";
 import { clientIpKey, enforceRateLimit } from "../services/rate-limit-reply.js";
 import type { LocalAuth } from "../services/auth/local-auth.js";
 import type { RequestLimitsInterface } from "../services/request-limits.js";
+import type { AfterSecurityChange } from "../services/auth/security-change.js";
 import { type LocalAuthRoutes, registerLocalAuthRoutes } from "./auth-local.js";
 import {
   createRefreshTokenRotationService,
@@ -71,6 +73,7 @@ type AuthRouteDeps = {
   appDb?: Pool;
   /** Required when local login is enabled. */
   localAuth?: LocalAuth;
+  afterSecurityChange?: AfterSecurityChange;
   config: AppConfig;
   auditEvents: AuditEventStore;
   limits?: RequestLimitsInterface;
@@ -107,9 +110,10 @@ export async function registerAuthRoutes(app: FastifyInstance, deps: AuthRouteDe
       return { passwordResets: null };
     case "jwt": {
       const refreshTokens = createRefreshTokenRotationService(app);
-      await registerSessionRoutes(app, { ...deps, refreshTokens });
+      const workos = isLoginTypeEnabled(config, "workos") ? deps.workos ?? getWorkOS(config) : undefined;
+      await registerSessionRoutes(app, { ...deps, refreshTokens, workos });
       if (isLoginTypeEnabled(config, "workos")) {
-        registerWorkosAuthRoutes(app, { ...deps, refreshTokens, workos: deps.workos ?? getWorkOS(config) });
+        registerWorkosAuthRoutes(app, { ...deps, refreshTokens, workos: workos! });
       }
       if (isLoginTypeEnabled(config, "local")) {
         if (!deps.localAuth || !deps.appDb) throw new Error("Local login is enabled but its services are not wired.");
@@ -270,6 +274,9 @@ function registerWorkosAuthRoutes(
         workosRoleSlug: organization.roleSlug
       });
     } catch (error) {
+      if (error instanceof WorkOsOwnerBootstrapError) {
+        return reply.code(403).send(apiError("owner_bootstrap_required", "A WorkOS organization admin must sign in first to create this tenant."));
+      }
       // The tenant removed this user. The removal lasts whatever WorkOS says
       // (services/tenant-member-removal.ts); nothing was written.
       if (error instanceof MemberRemovedError) {

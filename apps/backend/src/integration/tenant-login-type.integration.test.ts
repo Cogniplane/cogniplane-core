@@ -124,7 +124,7 @@ describe.skipIf(!adminDatabaseUrl())("tenant login type (migration 070)", () => 
   });
 
   test("WorkOS provisioning finds its own row when the email case changes", async () => {
-    const input = provisionInput({ email: `case.${randomUUID()}@example.test` });
+    const input = provisionInput({ email: `case.${randomUUID()}@example.test`, workosRoleSlug: "admin" });
     const first = await provisionTenantIdentity(maintenancePool(), input);
     const again = await provisionTenantIdentity(maintenancePool(), { ...input, email: input.email.toUpperCase() });
     expect(again).toMatchObject({ tenantId: first.tenantId, userId: first.userId });

@@ -65,8 +65,11 @@ other people in Admin > People (`routes/tenant-local-members.ts`).
   does the same for a WorkOS member. Details and limits:
   [sandbox](sandbox.md#e2b-sandbox).
 - WorkOS accounts have no security version in this database, so objects that a
-  revoked WorkOS session created stay active. A member removal still stops
-  their tool contexts, through the membership ([roles](auth.md#roles)).
+  revoked WorkOS session created stay active until a local member removal.
+  WorkOS refresh checks active provider membership and uses that removal when
+  it detects deactivation or deletion. It stops tool contexts, scheduled jobs
+  and active work through the membership. Detection limits and the IdP
+  synchronization requirement are in [request authentication](auth.md#request-authentication).
 
 ## Serialization of account changes
 

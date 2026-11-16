@@ -85,10 +85,10 @@ describe("DataRouteControl.writeWithStepUpIfWeaker", () => {
     expect(writes).toEqual([false, true]);
   });
 
-  test("a WorkOS session writes a weaker change with no step-up", async () => {
+  test("a WorkOS session cannot write a weaker change without fresh proof", async () => {
     const { app, consume, writes } = await harness({ session: { authSource: "workos", familyId: "family-1" } });
-    expect((await app.inject({ method: "PUT", url: "/weaker" })).statusCode).toBe(200);
-    expect(writes).toEqual([false, true]);
+    expect((await app.inject({ method: "PUT", url: "/weaker" })).statusCode).toBe(403);
+    expect(writes).toEqual([false]);
     expect(consume).not.toHaveBeenCalled();
   });
 
@@ -121,9 +121,12 @@ describe("DataRouteControl.requireStepUp", () => {
     expect((await app.inject({ method: "PUT", url: "/overlay", headers: { "x-step-up": await token("integration.overlay_settings") } })).statusCode).toBe(200);
   });
 
-  test("a WorkOS session needs no step-up: WorkOS owns that sign-in", async () => {
+  test("a WorkOS session is refused with a fixed error instead of bypassing step-up", async () => {
     const { app, consume } = await harness({ session: { authSource: "workos", familyId: "family-1" } });
-    expect((await app.inject({ method: "PUT", url: "/route" })).statusCode).toBe(200);
+    const res = await app.inject({ method: "PUT", url: "/route" });
+    expect(res.statusCode).toBe(403);
+    expect(res.json()).toMatchObject({ error: "workos_step_up_unavailable", action: "tenant.settings" });
+    expect((await app.inject({ method: "PUT", url: "/overlay" })).statusCode).toBe(403);
     expect(consume).not.toHaveBeenCalled();
   });
 
@@ -159,7 +162,7 @@ describe("DataRouteControl rate limit", () => {
   test("a data route under /admin/ is not counted twice", async () => {
     const consumeRateLimit = vi.fn(async () => LIMITED as never);
     const { app } = await harness({ session: { authSource: "workos", familyId: "family-1" }, limits: { consumeRateLimit } });
-    expect((await app.inject({ method: "PUT", url: "/admin/route" })).statusCode).toBe(200);
+    expect((await app.inject({ method: "PUT", url: "/admin/route" })).statusCode).toBe(403);
     expect(consumeRateLimit).not.toHaveBeenCalled();
   });
 
@@ -172,7 +175,7 @@ describe("DataRouteControl rate limit", () => {
 });
 
 describe("DataRouteControl warnings", () => {
-  test("startup warns when WorkOS login is on and email is off: WorkOS tenants then have no check", () => {
+  test("startup warns when WorkOS login is on and email is off; protected writes remain blocked", () => {
     const warn = vi.fn();
     new DataRouteControl({ authMode: "jwt", loginTypes: ["workos", "local"], ownerNotices: null, logger: { warn } });
     expect(warn).toHaveBeenCalledWith(NO_OWNER_NOTICE_WARNING);

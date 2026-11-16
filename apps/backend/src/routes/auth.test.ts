@@ -6,7 +6,7 @@ import { OauthException, WorkOS } from "@workos-inc/node";
 
 import { handleAppError } from "../app.js";
 import { registerAuthRoutes, timingSafeEqualString } from "./auth.js";
-import { resolveTenantMembershipRole } from "../services/auth/workos-tenant-provisioning.js";
+import { resolveTenantMembershipRole, WorkOsOwnerBootstrapError } from "../services/auth/workos-tenant-provisioning.js";
 import { signRefreshToken } from "../lib/jwt.js";
 import { issueRefreshJti } from "../lib/refresh-token-store.js";
 import { createTestConfig } from "../test-helpers/test-config.js";
@@ -67,7 +67,7 @@ test("resolveTenantMembershipRole derives the initial role for new memberships",
   expect(resolveTenantMembershipRole({
           existingRole: null,
           isFirstMember: true,
-          workosRoleSlug: "member"
+          workosRoleSlug: "admin"
         })).toBe("owner");
 
   expect(resolveTenantMembershipRole({
@@ -81,6 +81,11 @@ test("resolveTenantMembershipRole derives the initial role for new memberships",
           isFirstMember: false,
           workosRoleSlug: "member"
         })).toBe("member");
+});
+
+test.each(["member", "owner", null, undefined, "unknown"])("the first member cannot bootstrap ownership with WorkOS role %s", (workosRoleSlug) => {
+  expect(() => resolveTenantMembershipRole({ existingRole: null, isFirstMember: true, workosRoleSlug }))
+    .toThrow(WorkOsOwnerBootstrapError);
 });
 
 test("resolveTenantMembershipRole defaults to member when WorkOS slug is null/undefined", () => {
@@ -169,6 +174,9 @@ async function buildHarness(opts: {
   const pool = new FakePool();
   const redis = new FakeRefreshTokenRedis();
   const { workos, mocks } = createFakeWorkOS();
+  mocks.listOrganizationMemberships.mockResolvedValue({ data: [{
+    userId: "workos-user-123", organizationId: "org_456", status: "active", role: { slug: "member" }
+  }] });
   const auditEvents = new InMemoryAuditEventStore();
   const authState: Harness["authState"] = {
     current: { role: "member", login_type: "workos", auth_source: "workos" }
@@ -178,6 +186,9 @@ async function buildHarness(opts: {
     if (authState.fail) throw new Error("connection terminated unexpectedly");
     return authState.current ? { rows: [authState.current], rowCount: 1 } : { rows: [], rowCount: 0 };
   });
+  pool.onQuery(/SELECT u\.workos_user_id, t\.workos_org_id/, () => ({
+    rows: [{ workos_user_id: "workos-user-123", workos_org_id: "org_456" }], rowCount: 1
+  }));
 
   const logLines = opts.logLines;
   const app = Fastify({
@@ -202,6 +213,8 @@ async function buildHarness(opts: {
 
   await registerAuthRoutes(app, {
     db: pool.asPool(),
+    appDb: pool.asPool(),
+    afterSecurityChange: async () => {},
     config: TEST_CONFIG,
     auditEvents: auditEvents as never,
     limits: opts.limits,
@@ -622,8 +635,8 @@ describe("POST /auth/callback", () => {
     expect(res.json()).toEqual({ error: "internal_error", message: "An unexpected error occurred." });
   });
 
-  test("first member of a tenant is promoted to owner; refresh JTI is issued; refresh cookie is scoped to /auth", async () => {
-    seedWorkOSHappyPath({ workosRoleSlug: "member" });
+  test("the first WorkOS admin becomes owner; refresh JTI is issued; refresh cookie is scoped to /auth", async () => {
+    seedWorkOSHappyPath({ workosRoleSlug: "admin" });
 
     // DB choreography: every multi-statement upsert returns the expected row.
     harness.pool
@@ -690,6 +703,29 @@ describe("POST /auth/callback", () => {
 
     // No role_changed audit because previousRole was undefined.
     expect(harness.auditEvents.events.filter((e) => e.type === "role_changed")).toHaveLength(0);
+  });
+
+  test("an ordinary first member is refused and provisioning rolls back", async () => {
+    seedWorkOSHappyPath({ workosRoleSlug: "member" });
+    harness.pool
+      .onQuery(/INSERT INTO tenants|FROM tenants WHERE workos_org_id/, () => ({
+        rows: [{ login_type: "workos", tenant_id: "tenant-new" }], rowCount: 1
+      }))
+      .onQuery(/SELECT user_id, workos_user_id, auth_source FROM users WHERE email_key/, () => ({ rows: [], rowCount: 0 }))
+      .onQuery(/INSERT INTO users/, () => ({ rows: [{ user_id: "user-new" }], rowCount: 1 }))
+      .onQuery(/COUNT\(\*\)[\s\S]*FROM tenant_memberships/, () => ({ rows: [{ cnt: "0" }], rowCount: 1 }));
+
+    const res = await harness.app.inject({
+      method: "POST", url: "/auth/callback", payload: { code: "code", state: "state" },
+      cookies: { cogniplane_oauth_state: "state", cogniplane_oauth_pkce: TEST_PKCE_VERIFIER }
+    });
+
+    expect(res.statusCode).toBe(403);
+    expect(res.json()).toMatchObject({ error: "owner_bootstrap_required" });
+    expect(res.json()).not.toHaveProperty("accessToken");
+    expect(harness.pool.queries.at(-1)?.text).toBe("ROLLBACK");
+    expect(harness.pool.queries.some(({ text }) => text.includes("INSERT INTO tenant_memberships"))).toBe(false);
+    expect(harness.redis.store.size).toBe(0);
   });
 
   // An email row with no WorkOS id (a seed row, or a local user, who never
@@ -1615,6 +1651,57 @@ describe("POST /auth/refresh", () => {
     expect(second.statusCode).toBe(403);
     expect(second.json()).toEqual({ error: "not_a_member" });
     expect(second.json()).not.toHaveProperty("accessToken");
+  });
+
+  test.each(["deleted", "disabled"])("a %s WorkOS membership ends the family before a cached rotation can return", async (status) => {
+    const familyId = `fid-workos-${status}`;
+    const jti = `jti-workos-${status}`;
+    const refreshToken = await signRefreshToken(TEST_CONFIG, { sub: "user-one", tid: "tenant-one", jti, fid: familyId });
+    await issueRefreshJti(harness.redis, { jti, familyId, ttlSeconds: 60 });
+    harness.pool.onQuery(/SELECT email FROM users/, () => ({ rows: [{ email: "alice@example.com" }], rowCount: 1 }));
+    const first = await harness.app.inject({ method: "POST", url: "/auth/refresh", cookies: { cogniplane_refresh: refreshToken } });
+    expect(first.statusCode).toBe(200);
+
+    harness.workosMocks.listOrganizationMemberships.mockResolvedValue({ data: status === "deleted" ? [] : [{
+      userId: "workos-user-123", organizationId: "org_456", status: "inactive"
+    }] });
+    harness.pool.onQuery("SELECT role, user_auth_source FROM tenant_memberships", () => ({
+      rows: [{ role: "member", user_auth_source: "workos" }], rowCount: 1
+    }));
+    for (const sql of ["SELECT s.session_id FROM sessions s", "UPDATE scheduled_jobs", "DELETE FROM project_memberships",
+      "DELETE FROM tenant_memberships", "INSERT INTO tenant_member_removals", "INSERT INTO audit_events",
+      "UPDATE session_executions", "WITH taken AS"]) {
+      harness.pool.onQuery(sql, () => ({ rows: [], rowCount: 0 }));
+    }
+
+    const refused = await harness.app.inject({ method: "POST", url: "/auth/refresh", cookies: { cogniplane_refresh: refreshToken } });
+    expect(refused.statusCode).toBe(403);
+    expect(refused.json()).toEqual({ error: "not_a_member" });
+    expect(harness.redis.store.get(`refresh_family:${familyId}`)).toBe("revoked");
+    expectRefreshCookieKept(refused.headers["set-cookie"]);
+    expect(harness.pool.queries.some(({ text }) => text.includes("INSERT INTO tenant_member_removals"))).toBe(true);
+    expect(harness.workosMocks.listOrganizationMemberships).toHaveBeenLastCalledWith({
+      userId: "workos-user-123", organizationId: "org_456", statuses: ["active"]
+    });
+  });
+
+  test("a WorkOS outage returns 503 before consuming the token and permits a later retry", async () => {
+    const familyId = "fid-workos-outage";
+    const jti = "jti-workos-outage";
+    const token = await signRefreshToken(TEST_CONFIG, { sub: "user-one", tid: "tenant-one", jti, fid: familyId });
+    await issueRefreshJti(harness.redis, { jti, familyId, ttlSeconds: 60 });
+    harness.pool.onQuery(/SELECT email FROM users/, () => ({ rows: [{ email: "alice@example.com" }], rowCount: 1 }));
+    harness.workosMocks.listOrganizationMemberships.mockRejectedValueOnce(new Error("provider unavailable"));
+
+    const failed = await harness.app.inject({ method: "POST", url: "/auth/refresh", cookies: { cogniplane_refresh: token } });
+    expect(failed.statusCode).toBe(503);
+    expect(failed.json()).toEqual({ error: "refresh_unavailable" });
+    expect(failed.headers["retry-after"]).toBe("1");
+    expect(harness.redis.store.has(`refresh_jti:${jti}`)).toBe(true);
+    expect(harness.redis.store.get(`refresh_family:${familyId}`)).toBe("active");
+    expect(harness.pool.queries.some(({ text }) => text.includes("DELETE FROM tenant_memberships"))).toBe(false);
+    const retried = await harness.app.inject({ method: "POST", url: "/auth/refresh", cookies: { cogniplane_refresh: token } });
+    expect(retried.statusCode).toBe(200);
   });
 
   test("refuses a member whose login path is not the tenant's (403)", async () => {
