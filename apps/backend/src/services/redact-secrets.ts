@@ -9,8 +9,12 @@ const APP_PAGING_KEY_PATTERN = /^(?:pageToken|nextPageToken|previousPageToken|pr
 const isCredentialKey = (key: string) => SECRET_KEY_PATTERN.test(key) && !APP_PAGING_KEY_PATTERN.test(key);
 const BEARER_TOKEN_PATTERN = /(\bBearer\s+)(?!\$\{)([^\s"',;]+)/gi;
 const BASIC_AUTH_PATTERN = /(\bauthorization[ \t]*:[ \t]*Basic[ \t]+)(?!\$\{)([^\s"',;]+)/gi;
-// Match credential names, not all assignments or public-key settings.
-const ENV_SECRET_NAME = /(?:^|_)(?:API_?KEY|SECRET|PASSWORD|PASSWD|TOKEN|CREDENTIALS?|PRIVATE_KEY|SECRET_ACCESS_KEY|API_KEY_SECRET|AUTHORIZATION)$/i;
+// Match credential names, not all assignments or public-key settings. Names
+// must be uppercase, as environment variables are. Lowercase names are usually
+// source-code variables (`password = getpass()`), and tool results that the
+// model edits must keep them.
+const ENV_SECRET_NAME = /(?:^|_)(?:API_?KEY|SECRET|PASSWORD|PASSWD|TOKEN|CREDENTIALS?|PRIVATE_KEY|SECRET_ACCESS_KEY|API_KEY_SECRET|AUTHORIZATION)$/;
+const ENV_UPPERCASE_NAME = /^[A-Z0-9_]+$/;
 const ENV_NAME_AT = /[A-Za-z_][A-Za-z0-9_]*/y;
 const GITHUB_TOKEN_PATTERN =
   /\b(?:gh(?:o|u|s|r|p)_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+)\b/g;
@@ -115,7 +119,7 @@ function visitSecretAssignments(value: string, visit: (range: TextRange, lineSta
     }
     ENV_NAME_AT.lastIndex = index;
     const name = ENV_NAME_AT.exec(value)?.[0];
-    if (name && ENV_SECRET_NAME.test(name)) {
+    if (name && ENV_UPPERCASE_NAME.test(name) && ENV_SECRET_NAME.test(name)) {
       index += name.length;
       while (isHorizontalSpace(value[index])) index += 1;
       if (value[index] === "=") {

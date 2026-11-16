@@ -136,8 +136,8 @@ test.each([
 test.each([
   "API_KEY", "OPENAI_API_KEY", "CLIENT_SECRET", "PASSWORD", "ACCESS_TOKEN", "REFRESH_TOKEN", "SECRET_ACCESS_KEY"
 ])("redacts environment assignment %s", (name) => {
-  const source = `PORT=3000\r\n  export ${name.toLowerCase()} = 'opaque value' # keep\r\nNODE_ENV=production`;
-  const expected = `PORT=3000\r\n  export ${name.toLowerCase()} = [REDACTED] # keep\r\nNODE_ENV=production`;
+  const source = `PORT=3000\r\n  export ${name} = 'opaque value' # keep\r\nNODE_ENV=production`;
+  const expected = `PORT=3000\r\n  export ${name} = [REDACTED] # keep\r\nNODE_ENV=production`;
   expect(redactSecrets(source)).toBe(expected);
   expect(redactSecrets(expected)).toBe(expected);
 });
@@ -152,6 +152,18 @@ test.each([
   ["API_KEY='one'\"two\"; PORT=3000", "API_KEY=[REDACTED]; PORT=3000"]
 ])("redacts escaped, multiline or malformed assignments in %s", (source, expected) => {
   expect(redactSecrets(source)).toBe(expected);
+});
+
+// Tool results that the model reads and edits hold source code. Lowercase and
+// mixed-case names are code variables, not environment settings, and an
+// apostrophe in their value must not hide the rest of the text.
+test("keeps source-code assignments with lowercase or mixed-case names", () => {
+  const source = [
+    "password = getpass()", "    access_token = response.json()[\"access_token\"]",
+    "export api_key = 'value'", "Password = the user's choice", "client_Secret = load()",
+    "def handler():", "    return token"
+  ].join("\n");
+  expect(redactSecrets(source)).toBe(source);
 });
 
 test("keeps ordinary assignments, prose, URL paths and incomplete authorization headers", () => {

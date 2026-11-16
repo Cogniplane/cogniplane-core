@@ -97,7 +97,7 @@ redirect and hide. Every rule is enforced in the backend.
 - Startup rules for secrets: [configuration](configuration.md#startup-rules).
 - `redactSecrets()` (`services/redact-secrets.ts`) removes Bearer and Basic
   authorization headers, URL user information, secret-like environment
-  assignments at line starts, and known
+  assignments (uppercase names) at line starts, and known
   token formats (the patterns in that file, for example JWTs, and the
   `keyPattern` of each model provider in `MODEL_PROVIDER_META`, for example
   `sk-ant-` keys) and credential query parameters in any string. It blanks string and array
@@ -108,6 +108,8 @@ redirect and hide. Every rule is enforced in the backend.
   Environment rules accept optional `export`, quoted multiline values and
   escaped line breaks. An unmatched quote hides the rest of the value.
   Ordinary settings such as port, environment name and public keys stay.
+  Lowercase and mixed-case names are source-code variables and stay, so tool
+  results that the model reads and edits keep code such as `password = getpass()`.
   This is pattern-based protection, not a guarantee that every opaque secret
   can be recognized. The gateway also removes its configured upstream secret.
   New rules do not rewrite old database rows or checkpoints. Remove any
