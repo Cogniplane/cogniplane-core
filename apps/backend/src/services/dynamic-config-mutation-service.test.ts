@@ -130,11 +130,18 @@ describe("upstreamUrl credential rejection at the persistence boundary", () => {
     "http://10.0.4.17/mcp",
     "http://localhost:3108/mcp",
     "https://[::1]/mcp"
-  ])("accepts a local upstream at %s", async (upstreamUrl) => {
+  ])("requires operator opt-in for a local upstream at %s", async (upstreamUrl) => {
     const { store, created } = storeSpy();
+    await expect(createMcpServer({
+      tenantId: "t1",
+      store,
+      payload: { ...basePayload, upstreamUrl, actorUserId: "u1" }
+    })).rejects.toThrow("permitted address");
+    expect(created).not.toHaveBeenCalled();
     await createMcpServer({
       tenantId: "t1",
       store,
+      allowPrivateAddresses: true,
       payload: { ...basePayload, upstreamUrl, actorUserId: "u1" }
     });
     expect(created).toHaveBeenCalledTimes(1);

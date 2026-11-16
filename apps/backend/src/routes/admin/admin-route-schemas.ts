@@ -5,23 +5,26 @@ import {
   AdminSkillReleaseSnapshotSchema
 } from "@cogniplane/shared-types";
 
-import { httpsUrlSchema, mcpUpstreamUrlSchema } from "../../lib/url-validation.js";
+import { httpsUrlSchema, mcpUpstreamUrlSchemaForPolicy } from "../../lib/url-validation.js";
 
 import { adminIdSchema } from "./admin-route-helpers.js";
 
-export const mcpCreateBodySchema = AdminMcpServerCreateRequestSchema.extend({
-  upstreamUrl: mcpUpstreamUrlSchema.nullable().optional()
+export const createMcpCreateBodySchema = (allowPrivateAddresses = false) => AdminMcpServerCreateRequestSchema.extend({
+  upstreamUrl: mcpUpstreamUrlSchemaForPolicy(allowPrivateAddresses).nullable().optional()
 }).refine((body) => body.mode === "proxy" || !body.upstreamUrl, {
   path: ["upstreamUrl"],
   message: "Managed MCP servers cannot configure an upstreamUrl"
 });
 
-export const mcpUpdateBodySchema = AdminMcpServerUpdateRequestSchema.extend({
-  upstreamUrl: mcpUpstreamUrlSchema.nullable().optional()
+export const createMcpUpdateBodySchema = (allowPrivateAddresses = false) => AdminMcpServerUpdateRequestSchema.extend({
+  upstreamUrl: mcpUpstreamUrlSchemaForPolicy(allowPrivateAddresses).nullable().optional()
 }).refine((body) => body.mode === "proxy" || !body.upstreamUrl, {
   path: ["upstreamUrl"],
   message: "Managed MCP servers cannot configure an upstreamUrl"
 });
+
+export const mcpCreateBodySchema = createMcpCreateBodySchema();
+export const mcpUpdateBodySchema = createMcpUpdateBodySchema();
 
 // The request schema lives in shared-types, so the frontend sends the same
 // shape. This name stays for the route and its tests.

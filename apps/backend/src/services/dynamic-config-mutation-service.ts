@@ -1,5 +1,5 @@
 import { isReservedMcpUpstreamHeader } from "../lib/mcp-upstream-client.js";
-import { mcpUpstreamUrlSchema } from "../lib/url-validation.js";
+import { mcpUpstreamUrlSchemaForPolicy } from "../lib/url-validation.js";
 
 import { AdminConfigError } from "./admin-config-error.js";
 
@@ -18,7 +18,7 @@ export function validateMcpServerInput(input: {
   upstreamAuthName?: string | null;
   upstreamAuthSecret?: string | null;
   credentialScope?: AdminMcpServerRecord["credentialScope"];
-}, options: { requireUrlAndSecret: boolean }): void {
+}, options: { requireUrlAndSecret: boolean; allowPrivateAddresses?: boolean }): void {
   if (!input.routePath.startsWith("/mcp/")) {
     throw new AdminConfigError("routePath must start with /mcp/.");
   }
@@ -88,9 +88,9 @@ export function validateMcpServerInput(input: {
   // Keep the route and persistence boundary on the same MCP URL policy.
   // The store takes a bare string, so callers outside HTTP still must not
   // write URL credentials into the plaintext upstream_url column.
-  if (input.upstreamUrl && !mcpUpstreamUrlSchema.safeParse(input.upstreamUrl).success) {
+  if (input.upstreamUrl && !mcpUpstreamUrlSchemaForPolicy(options.allowPrivateAddresses).safeParse(input.upstreamUrl).success) {
     throw new AdminConfigError(
-      "upstreamUrl must be an HTTP(S) URL and must not carry credentials."
+      "upstreamUrl must be an HTTP(S) URL without credentials and must use a permitted address."
     );
   }
 }
@@ -131,8 +131,9 @@ export async function createMcpServer(input: {
   store: Pick<McpServerStore, "createMcpServer">;
   payload: CreateMcpServerPayload;
   client?: PoolClient;
+  allowPrivateAddresses?: boolean;
 }): Promise<AdminMcpServerRecord> {
-  validateMcpServerInput(input.payload, { requireUrlAndSecret: true });
+  validateMcpServerInput(input.payload, { requireUrlAndSecret: true, allowPrivateAddresses: input.allowPrivateAddresses });
 
   return input.store.createMcpServer(input.tenantId, {
     ...input.payload,
@@ -145,8 +146,9 @@ export async function updateMcpServer(input: {
   store: Pick<McpServerStore, "updateMcpServer">;
   payload: UpdateMcpServerPayload;
   client?: PoolClient;
+  allowPrivateAddresses?: boolean;
 }): Promise<AdminMcpServerRecord | null> {
-  validateMcpServerInput(input.payload, { requireUrlAndSecret: false });
+  validateMcpServerInput(input.payload, { requireUrlAndSecret: false, allowPrivateAddresses: input.allowPrivateAddresses });
 
   return input.store.updateMcpServer(input.tenantId, input.payload, input.client);
 }

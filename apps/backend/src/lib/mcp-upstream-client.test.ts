@@ -357,7 +357,7 @@ test.each([
     { headers: { "content-type": "application/json" } }
   ));
   const response = await forwardRpc(
-    upstreamUrl, payload, {}, reached as unknown as typeof undiciFetch
+    upstreamUrl, payload, {}, reached as unknown as typeof undiciFetch, { allowPrivateAddresses: true }
   );
   expect(response.result).toEqual({ ok: true });
   expect(reached).toHaveBeenCalledTimes(1);
@@ -530,10 +530,17 @@ test("sends an MCP request to a local HTTP server with the production transport"
   try {
     const address = server.address();
     if (!address || typeof address === "string") throw new Error("Test server has no port");
-    const response = await forwardRpc(`http://127.0.0.1:${address.port}/mcp`, payload, {});
+    const url = `http://127.0.0.1:${address.port}/mcp`;
+    const refused = await forwardRpc(url, payload, {});
+    expect(refused.error?.message).toBe("Upstream MCP destination is not permitted.");
+    expect(receivedMethod).toBeUndefined();
+    const response = await forwardRpc(url, payload, {}, undefined, { allowPrivateAddresses: true });
     expect(response.result).toEqual({ local: true });
     expect(receivedMethod).toBe("POST");
     expect(receivedPath).toBe("/mcp");
+    const named = await forwardRpc(`http://localhost:${address.port}/mcp`, payload, {}, undefined,
+      { allowPrivateAddresses: true });
+    expect(named.result).toEqual({ local: true });
   } finally {
     server.closeAllConnections();
     await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
@@ -553,7 +560,7 @@ test("times out an SSE stream that sends keepalives but no reply", async () => {
     if (!address || typeof address === "string") throw new Error("Test server has no port");
     const response = await forwardRpc(
       `http://127.0.0.1:${address.port}/mcp`, payload, {}, undefined,
-      { timeoutMs: 180 }
+      { timeoutMs: 180, allowPrivateAddresses: true }
     );
     expect(response.error?.message).toBe("Upstream MCP request timed out after 180ms.");
   } finally {

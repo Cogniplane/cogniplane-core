@@ -12,6 +12,8 @@ import {
 import {
   mcpCreateBodySchema,
   mcpUpdateBodySchema,
+  createMcpCreateBodySchema,
+  createMcpUpdateBodySchema,
   githubImportBodySchema,
   inlineSkillImportBodySchema,
   tenantSettingsBodySchema
@@ -27,7 +29,7 @@ describe.each([
   ["create", AdminMcpServerCreateRequestSchema, mcpCreateBodySchema],
   ["update", AdminMcpServerUpdateRequestSchema, mcpUpdateBodySchema]
 ])("MCP %s URL validation", (_operation, sharedSchema, routeSchema) => {
-  it("accepts HTTP and private MCP upstreams while rejecting URL credentials", () => {
+  it("requires operator opt-in for private MCP upstreams", () => {
     const body = { ...validBase, serverId: "test" };
     expect(sharedSchema.safeParse({ ...body, upstreamUrl: "not a URL" }).success).toBe(false);
     for (const upstreamUrl of [
@@ -38,7 +40,9 @@ describe.each([
       "http://localhost:3108/mcp"
     ]) {
       expect(sharedSchema.safeParse({ ...body, upstreamUrl }).success).toBe(true);
-      expect(routeSchema.safeParse({ ...body, upstreamUrl }).success).toBe(true);
+      expect(routeSchema.safeParse({ ...body, upstreamUrl }).success).toBe(upstreamUrl === "http://example.com/mcp");
+      const optIn = _operation === "create" ? createMcpCreateBodySchema(true) : createMcpUpdateBodySchema(true);
+      expect(optIn.safeParse({ ...body, upstreamUrl }).success).toBe(true);
     }
     for (const upstreamUrl of [
       "https://user:password@example.com/mcp",
@@ -46,6 +50,7 @@ describe.each([
       "file:///etc/passwd"
     ]) {
       expect(routeSchema.safeParse({ ...body, upstreamUrl }).success).toBe(false);
+      expect(createMcpCreateBodySchema(true).safeParse({ ...body, upstreamUrl }).success).toBe(false);
     }
   });
 

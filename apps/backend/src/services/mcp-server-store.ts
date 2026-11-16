@@ -90,7 +90,8 @@ function urlOrigin(url: string | null): string | null {
 export class McpServerStore {
   constructor(
     private readonly db: Pool,
-    private readonly encryptionSecret: string
+    private readonly encryptionSecret: string,
+    private readonly allowPrivateAddresses = false
   ) {}
 
   withTransaction<T>(tenantId: string, run: (client: PoolClient) => Promise<T>): Promise<T> {
@@ -271,6 +272,7 @@ export class McpServerStore {
     enabled: boolean;
     createdBy: string;
   }, transactionClient?: PoolClient): Promise<AdminMcpServerRecord> {
+    validateMcpServerInput(input, { requireUrlAndSecret: true, allowPrivateAddresses: this.allowPrivateAddresses });
     if (input.mode === "managed" && input.upstreamUrl) {
       throw new AdminConfigError("Managed MCP servers cannot configure an upstreamUrl.");
     }
@@ -456,7 +458,7 @@ export class McpServerStore {
         upstreamAuthName,
         upstreamAuthSecret: input.upstreamAuthSecret,
         credentialScope
-      }, { requireUrlAndSecret: false });
+      }, { requireUrlAndSecret: false, allowPrivateAddresses: this.allowPrivateAddresses });
       if (input.mode === "proxy" && !upstreamUrl) {
         throw new AdminConfigError("Proxy MCP servers require an upstreamUrl.");
       }

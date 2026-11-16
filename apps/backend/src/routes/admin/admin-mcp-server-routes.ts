@@ -15,7 +15,7 @@ import {
   respondAdminNotFound,
   withAdmin
 } from "./admin-route-helpers.js";
-import { mcpCreateBodySchema, mcpUpdateBodySchema } from "./admin-route-schemas.js";
+import { createMcpCreateBodySchema, createMcpUpdateBodySchema } from "./admin-route-schemas.js";
 import type { AdminMcpServerRecord } from "../../services/admin-config-records.js";
 import type { ActivationTracker } from "../../services/activation-tracker.js";
 import type { AuditEventInput } from "../../services/audit-event-store.js";
@@ -68,6 +68,8 @@ export async function registerAdminMcpServerRoutes(
   }
 ): Promise<void> {
   const ACTIVATION_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
+  const mcpCreateBodySchema = createMcpCreateBodySchema(app.config?.MCP_UPSTREAM_ALLOW_PRIVATE_ADDRESSES);
+  const mcpUpdateBodySchema = createMcpUpdateBodySchema(app.config?.MCP_UPSTREAM_ALLOW_PRIVATE_ADDRESSES);
   const audienceSchema = z.object({ audience: z.enum(["off", "test_users", "members"]) });
   const setupCreateBodySchema = z.intersection(mcpCreateBodySchema, audienceSchema);
   // An edit uses the update schema. It has no defaults, so an omitted

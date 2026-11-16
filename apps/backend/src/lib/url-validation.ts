@@ -136,6 +136,9 @@ export function isPrivateOrReservedHost(hostname: string): boolean {
       ? hostname.slice(1, -1)
       : hostname;
 
+  const dnsName = host.toLowerCase().replace(/\.$/, "");
+  if (dnsName === "localhost" || dnsName.endsWith(".localhost") || dnsName.endsWith(".local")) return true;
+
   if (isIP(host) === 4) {
     return isPrivateOrReservedIpv4(host);
   }
@@ -235,7 +238,9 @@ export function isPrivateOrReservedHost(hostname: string): boolean {
       return isPrivateOrReservedIpv4(`${a}.${b}.${c}.${d}`);
     }
 
-    return false;
+    // Other routable IPv6 destinations must be global unicast, 2000::/3.
+    // This excludes multicast, site-local and unassigned address ranges.
+    return (groups[0]! & 0xe000) !== 0x2000;
   }
 
   return false;
@@ -310,8 +315,7 @@ export async function ssrfSafeLookup(
  * Singleton undici Agent that re-validates every outbound DNS lookup against
  * the private/reserved-IP block list and pins the connection to the resolved
  * address. Use it for outbound URLs that must stay on public addresses,
- * such as marketplace manifests and GitHub archive imports. MCP proxy
- * upstreams use a separate policy that permits local addresses.
+ * such as marketplace manifests, GitHub archive imports and MCP upstreams.
  *
  * Use of this agent closes the DNS-rebinding TOCTOU window between
  * `httpsUrlSchema`'s write-time validation and the actual fetch — without
@@ -388,9 +392,8 @@ export const httpsUrlSchema = z
     { message: "URL must not carry credentials in query parameters" }
   );
 
-// MCP upstreams may run on the same host, a LAN, or a tailnet. The admin UI
-// warns about HTTP and private addresses, while the write path still rejects
-// URL credentials because the URL is stored and returned in plaintext.
+// Syntax shared by MCP routes and credential checks. Deployment address policy
+// is applied by mcpUpstreamUrlSchemaForPolicy at persistence and dispatch.
 export const mcpUpstreamUrlSchema = z
   .string()
   .url()
@@ -420,6 +423,19 @@ export const mcpUpstreamUrlSchema = z
     },
     { message: "URL must not carry credentials in query parameters" }
   );
+
+export function mcpUpstreamUrlSchemaForPolicy(allowPrivateAddresses = false) {
+  return mcpUpstreamUrlSchema.refine(
+    (url) => {
+      try {
+        return allowPrivateAddresses || !isPrivateOrReservedHost(new URL(url).hostname);
+      } catch {
+        return false;
+      }
+    },
+    { message: "MCP upstream URL must not point to a private or reserved address" }
+  );
+}
 
 
 /**

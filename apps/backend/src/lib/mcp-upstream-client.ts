@@ -8,7 +8,12 @@ import { createParser } from "eventsource-parser";
 import { fetch as undiciFetch } from "undici";
 import { z } from "zod";
 
-import { logSafeUrl } from "./url-validation.js";
+import {
+  assertDispatcherAwareFetch,
+  isPrivateOrReservedHost,
+  logSafeUrl,
+  ssrfSafeAgent
+} from "./url-validation.js";
 
 export type McpRpcRequest = {
   jsonrpc: "2.0";
@@ -83,6 +88,8 @@ const DEFAULT_UPSTREAM_TIMEOUT_MS = 30_000;
 const DEFAULT_UPSTREAM_MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
 
 export type ForwardRpcLimits = {
+  /** Operator opt-in for self-hosted LAN and loopback MCP servers. */
+  allowPrivateAddresses?: boolean;
   /** Per-hop wall-clock budget. Applied per request, not to the redirect chain. */
   timeoutMs?: number;
   /** Hard cap on the decoded response body. */
@@ -355,7 +362,8 @@ export async function forwardRpc(
       maxResponseBytes,
       upstreamAuth,
       limits.signal,
-      limits.onDiagnostic
+      limits.onDiagnostic,
+      limits.allowPrivateAddresses === true
     );
   } catch (error) {
     limits.onDiagnostic?.({ kind: "transport" });
@@ -427,7 +435,8 @@ async function forwardRpcInner(
   maxResponseBytes: number,
   upstreamAuth: McpUpstreamAuth | null,
   overallSignal?: AbortSignal,
-  onDiagnostic?: ForwardRpcLimits["onDiagnostic"]
+  onDiagnostic?: ForwardRpcLimits["onDiagnostic"],
+  allowPrivateAddresses = false
 ): Promise<McpRpcResponse> {
   let currentUrl: URL;
   try {
@@ -444,6 +453,12 @@ async function forwardRpcInner(
   if (currentUrl.username !== "" || currentUrl.password !== "") {
     return rpcFailure(payload.id, -32000, "Upstream MCP URL must not embed credentials.");
   }
+  // IP literals bypass undici's DNS hook. Check the host before dispatch too,
+  // including saved rows that predate the deployment's public-only policy.
+  if (!allowPrivateAddresses && isPrivateOrReservedHost(currentUrl.hostname)) {
+    return rpcFailure(payload.id, -32000, "Upstream MCP destination is not permitted.");
+  }
+  if (!allowPrivateAddresses) assertDispatcherAwareFetch(fetchFn);
 
   // Serialize once. Every hop sends these same bytes, and a signed body hash in
   // `headers` covers exactly them.
@@ -456,7 +471,7 @@ async function forwardRpcInner(
       return rpcFailure(payload.id, -32000, "Upstream MCP request timed out.");
     }
     // Manual redirects keep signed headers and tool arguments on the
-    // configured origin. HTTP and private destinations are operator choices.
+    // configured origin. Each connection uses the deployment's address policy.
     const requestUrl = new URL(currentUrl);
     const requestHeaders: Record<string, string> = {
       "Content-Type": "application/json",
@@ -479,6 +494,7 @@ async function forwardRpcInner(
       headers: requestHeaders,
       body: requestBody,
       redirect: "manual",
+      ...(!allowPrivateAddresses ? { dispatcher: ssrfSafeAgent } : {}),
       // Per hop, not per chain: the redirect cap already bounds the number of
       // hops, and a per-hop budget is the one an operator can reason about
       // against a single upstream's latency.

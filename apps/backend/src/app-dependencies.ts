@@ -37,6 +37,7 @@ export function buildAppDependencies(input: {
   const stores = buildStores(db, schedulerDb, privilegedDb, logger, config, turnControlDb);
   const { managedToolCatalog, managedToolFactoryRegistry } = buildManagedToolRegistries();
   const mcpConnectionTests = new McpConnectionTestService({
+    allowPrivateAddresses: config.MCP_UPSTREAM_ALLOW_PRIVATE_ADDRESSES,
     db,
     servers: stores.mcpServers,
     credentials: stores.memberMcpCredentials,

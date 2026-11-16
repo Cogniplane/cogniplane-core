@@ -346,6 +346,9 @@ export const envSchema = z.object({
   // Boot refuses this variable. Upstreams once held this value and could
   // derive every per-server key from it. Use MCP_UPSTREAM_SIGNING_ROOT_SECRET.
   MCP_UPSTREAM_SIGNING_SECRET: z.string().optional(),
+  // Self-hosted operators can permit LAN and loopback MCP servers. This grants
+  // every tenant admin access to destinations reachable from the backend.
+  MCP_UPSTREAM_ALLOW_PRIVATE_ADDRESSES: booleanFromEnvSchema.default(false),
   // Per-hop wall-clock budget for a proxy MCP upstream call. An upstream with
   // no timeout can hold a turn open until the turn watchdog fires; 30s is well
   // inside a tool call's useful latency and well under RUNTIME_TURN_TIMEOUT_MS.

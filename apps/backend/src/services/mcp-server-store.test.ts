@@ -8,6 +8,29 @@ import { MCP_SECRET_REENTRY_MESSAGE, McpServerStore } from "./mcp-server-store.j
 
 const ENCRYPTION_SECRET = "test-encryption-secret-must-be-at-least-32chars!";
 
+test("McpServerStore requires the operator opt-in for private upstream writes", async () => {
+  const input = {
+    serverId: "lan", serverName: "LAN", description: null, transportKind: "http" as const,
+    mode: "proxy" as const, routePath: "/mcp/lan", upstreamUrl: "http://10.0.0.2/mcp",
+    upstreamAuthType: "none" as const, upstreamAuthName: null, upstreamAuthSecret: null,
+    enabled: true, createdBy: "admin"
+  };
+  const pool = new FakePool().onQuery("INSERT INTO admin_mcp_servers", (_text, values) => ({
+    rows: [{
+      tenant_id: "system", server_id: values[1], server_name: values[2],
+      transport_kind: values[4], mode: values[5], route_path: values[6], upstream_url: values[7],
+      upstream_auth_type: values[8], config_hash: values[11], enabled: true,
+      created_at: new Date(), updated_at: new Date(), version: 1
+    }], rowCount: 1
+  }));
+  await expect(new McpServerStore(pool.asPool(), ENCRYPTION_SECRET).createMcpServer("system", input))
+    .rejects.toThrow("permitted address");
+  expect(pool.queries).toEqual([]);
+  const saved = await new McpServerStore(pool.asPool(), ENCRYPTION_SECRET, true).createMcpServer("system", input);
+  expect(saved.upstreamUrl).toBe(input.upstreamUrl);
+  expect(pool.queries.some(query => query.text.includes("INSERT INTO admin_mcp_servers"))).toBe(true);
+});
+
 test("McpServerStore rejects tenant servers that reuse a system server ID", async () => {
   const pool = new FakePool().onQuery("FROM admin_mcp_servers", () => ({
     rows: [{ exists: 1 }],
