@@ -207,7 +207,11 @@ scheduled turns:
   until a secret that spans several deltas is complete, and it replaces
   private-key blocks with `[REDACTED PRIVATE KEY]`. Text without whitespace,
   such as Chinese or Japanese, is released in parts, cut where no secret rule
-  can match across the cut. Keep this when you change the replay path.
+  can match across the cut. Keep this when you change the replay path. No cut
+  falls between a value and the text that its rule needs before it (a header
+  name, `Bearer`, a key name): `secretSafeTextCutoff` in
+  `services/redact-secrets.ts` moves the cut before that text. A new rule of
+  this kind must add its span there.
 - `POST /sessions/:sessionId/interrupt` sets the lease to `stopping`. The
   replica that runs the turn sees the stop through dispatch authorization and
   its heartbeat, and dispatches no further model or tool call; a sandbox

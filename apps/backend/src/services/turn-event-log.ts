@@ -164,7 +164,9 @@ function isNonAsciiCut(text: string, index: number): boolean {
  * after a `?` or `&` that is still open in the word. Then no rule can match
  * across the cut, whatever text comes next. Remove key blocks first. A
  * partial BEGIN header is ASCII, so no cut falls in it. releaseText also
- * holds cuts inside an environment assignment or URL authority.
+ * holds cuts inside an environment assignment, a URL authority, or a
+ * credential and the header or key name before it (secretSafeTextCutoff).
+ * That covers the word cut too, which can fall between `Bearer` and its value.
  */
 function lastSafeSplit(text: string): number {
   let split = 0;

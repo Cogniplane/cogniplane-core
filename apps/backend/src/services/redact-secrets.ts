@@ -13,7 +13,7 @@ const BASIC_AUTH_PATTERN = /(\bauthorization[ \t]*:[ \t]*Basic[ \t]+)(?!\$\{)([^
 // must be uppercase, as environment variables are. Lowercase names are usually
 // source-code variables (`password = getpass()`), and tool results that the
 // model edits must keep them.
-const ENV_SECRET_NAME = /(?:^|_)(?:API_?KEY|SECRET|PASSWORD|PASSWD|TOKEN|CREDENTIALS?|PRIVATE_KEY|SECRET_ACCESS_KEY|API_KEY_SECRET|AUTHORIZATION)$/;
+const ENV_SECRET_NAME = /(?:^|_)(?:API_?KEY|SECRET|PASSWORD|PASSWD|TOKEN|CREDENTIALS?|PRIVATE_KEY|SECRET_KEY|ENCRYPTION_KEY|SECRET_ACCESS_KEY|API_KEY_SECRET|AUTHORIZATION)$/;
 const ENV_UPPERCASE_NAME = /^[A-Z0-9_]+$/;
 const ENV_NAME_AT = /[A-Za-z_][A-Za-z0-9_]*/y;
 const GITHUB_TOKEN_PATTERN =
@@ -164,10 +164,20 @@ function visitUrlAuthorities(value: string, visit: (range: TextRange, at: number
   }
 }
 
+// A value that is one variable reference and nothing else (`$NAME`, `${NAME}`,
+// with or without double quotes) holds no secret, and files that the model
+// reads and edits must keep it. A default (`${NAME:-x}`), a command
+// (`$(...)`) or text next to the reference can hold a literal secret, so
+// those values are redacted.
+const VARIABLE_REFERENCE = /^("?)\$(?:[A-Za-z_][A-Za-z0-9_]*|\{[A-Za-z_][A-Za-z0-9_]*\})\1$/;
+const VARIABLE_REFERENCE_MAX_LENGTH = 256;
+
 function redactAssignments(value: string): string {
   let result = "";
   let copied = 0;
   visitSecretAssignments(value, ({ start, end }) => {
+    // The length check comes first, so a long value is not copied.
+    if (end - start <= VARIABLE_REFERENCE_MAX_LENGTH && VARIABLE_REFERENCE.test(value.slice(start, end))) return;
     result += value.slice(copied, start) + "[REDACTED]";
     copied = end;
   });
@@ -198,15 +208,40 @@ function redactUrlUserinfo(value: string): string {
   return copied === 0 ? value : result + value.slice(copied);
 }
 
-/** Keep replay cuts outside assignments and URL authorities, even before '@' arrives. */
+// Rules that need text before the value: the header name or the key name. The
+// spans below cover that text, the separator and the value, also when the
+// value is not there yet. A replay cut in a span would release the value
+// without the text that makes its rule match.
+// - Bearer: the word and its value (BEARER_TOKEN_PATTERN).
+// - Authorization header: the name and the next two words, which covers
+//   `Basic <value>` (BASIC_AUTH_PATTERN) while `Basic` is not complete.
+// - Twilio: the name, the separator and the value (TWILIO_SECRET_ASSIGNMENT_PATTERN).
+// Each pattern starts at a literal and reads each character once.
+const CONTEXT_SPAN_PATTERNS: readonly RegExp[] = [
+  /\bBearer\s+[^\s"',;]*/gi,
+  /\bauthorization[ \t]*:[ \t]*[^\s"',;]*(?:[ \t]+[^\s"',;]*)?/gi,
+  /TWILIO_(?:AUTH_TOKEN|API_KEY_SECRET)\s*(?:[:=]\s*["']?[A-Za-z0-9]*)?/gi
+];
+
+/**
+ * Keep replay cuts outside assignments, URL authorities and the spans of
+ * CONTEXT_SPAN_PATTERNS, even before the value or the '@' arrives. Spans of
+ * different rules can overlap, so the spans are examined from the last start
+ * to the first: a cut that moves to the start of one span can only be in a
+ * span that starts earlier.
+ */
 export function secretSafeTextCutoff(value: string, candidate: number): number {
+  const spans: TextRange[] = [];
+  visitSecretAssignments(value, ({ end }, lineStart) => spans.push({ start: lineStart, end }));
+  visitUrlAuthorities(value, ({ start, end }) => spans.push({ start, end }));
+  for (const pattern of CONTEXT_SPAN_PATTERNS) {
+    for (const match of value.matchAll(pattern)) spans.push({ start: match.index, end: match.index + match[0].length });
+  }
+  spans.sort((a, b) => b.start - a.start);
   let cutoff = candidate;
-  visitSecretAssignments(value, ({ end }, lineStart) => {
-    if (lineStart < cutoff && cutoff < end) cutoff = lineStart;
-  });
-  visitUrlAuthorities(value, ({ start, end }) => {
+  for (const { start, end } of spans) {
     if (start < cutoff && cutoff < end) cutoff = start;
-  });
+  }
   return cutoff;
 }
 
@@ -254,7 +289,8 @@ function redactJwts(value: string): string {
 
 // Live replay (lastSafeSplit in turn-event-log.ts) cuts held text between two
 // non-ASCII characters. Basic/Bearer values and query parameters are held by
-// that scanner. Assignment and URL-authority cuts use secretSafeTextCutoff.
+// that scanner. Every replay cut also goes through secretSafeTextCutoff. A new
+// rule that needs text before its value must add a span there.
 function redactInlineSecrets(value: string): string {
   let beforeJwts = redactAssignments(redactUrlUserinfo(redactPemBlocks(value)))
     .replace(BEARER_TOKEN_PATTERN, "$1[REDACTED]")

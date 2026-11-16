@@ -447,6 +447,32 @@ test("drops an oversized open assignment without releasing its secret words", ()
   expect(replayedText(log.subscribe(0, () => undefined)!.replay)).toBe("[Reply text exceeds live replay limit]");
 });
 
+// The word cut keeps the last words of the text. With many words after a
+// credential, each word boundary becomes a cut, also the one between the
+// header or key name and the value.
+const TRAILING_WORDS = " then call the service and read the result of the call again later";
+test.each([
+  ["Basic value", "Send Authorization: Basic dXNlcjpzdXBlcnNlY3JldA==", "Send Authorization: Basic [REDACTED]"],
+  ["Basic value after extra spaces", "Send authorization :  Basic   dXNlcjpzdXBlcnNlY3JldA==", "Send authorization :  Basic   [REDACTED]"],
+  ["Bearer value", "Send Authorization: Bearer opaque-credential-value", "Send Authorization: Bearer [REDACTED]"],
+  ["Bearer value after a line break", "Send Bearer\nopaque-credential-value", "Send Bearer\n[REDACTED]"],
+  ["Twilio value", "Set TWILIO_AUTH_TOKEN: abcdefghijklmnopqrstuvwxyz", "Set TWILIO_AUTH_TOKEN: [REDACTED]"]
+])("never releases a %s without the text before it", async (_name, source, expected) => {
+  const text = source + TRAILING_WORDS;
+  expect(redactSecrets(text)).toBe(expected + TRAILING_WORDS);
+  for (const deltas of [text.split(/(?<=\s)/), chunks(text, [1]), chunks(text, [3, 7, 31]), [text]]) {
+    const { log, mirrored } = mirroredLog();
+    const live: SequencedTurnEvent[] = [];
+    log.subscribe(0, (entry) => { if (entry) live.push(entry); });
+    log.append({ type: EventType.TEXT_MESSAGE_START, messageId: "answer", role: "assistant" } as BaseEvent);
+    for (const delta of deltas) log.append(textEvent(delta));
+    log.append({ type: EventType.TEXT_MESSAGE_END, messageId: "answer" } as BaseEvent);
+    expect(replayedText(live)).toBe(expected + TRAILING_WORDS);
+    expect(replayedText(log.subscribe(0, () => undefined)!.replay)).toBe(expected + TRAILING_WORDS);
+    await vi.waitFor(() => expect(replayedText(mirrored)).toBe(expected + TRAILING_WORDS), { interval: 1 });
+  }
+});
+
 // Each piece of `secret` that has `length` code units.
 function pieces(secret: string, length: number): string[] {
   return Array.from({ length: secret.length - length + 1 }, (_, index) => secret.slice(index, index + length));

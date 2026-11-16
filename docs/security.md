@@ -115,6 +115,9 @@ redirect and hide. Every rule is enforced in the backend.
   stay correct.
   Environment rules accept optional `export`, quoted multiline values and
   escaped line breaks. An unmatched quote hides the rest of the value.
+  A value that is one variable reference and nothing else (`$NAME`, `${NAME}`,
+  with or without double quotes) stays. A default, a command substitution or
+  text next to the reference is redacted, because it can hold a literal secret.
   Ordinary settings such as port, environment name and public keys stay.
   Lowercase and mixed-case names are source-code variables and stay, so tool
   results that the model reads and edits keep code such as `password = getpass()`.
