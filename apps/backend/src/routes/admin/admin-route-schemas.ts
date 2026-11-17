@@ -5,7 +5,7 @@ import {
   AdminSkillReleaseSnapshotSchema
 } from "@cogniplane/shared-types";
 
-import { httpsUrlSchema, mcpUpstreamUrlSchemaForPolicy } from "../../lib/url-validation.js";
+import { httpsUrlSchema, mcpUpstreamUrlSchema, mcpUpstreamUrlSchemaForPolicy } from "../../lib/url-validation.js";
 
 import { adminIdSchema } from "./admin-route-helpers.js";
 
@@ -16,11 +16,28 @@ export const createMcpCreateBodySchema = (allowPrivateAddresses = false) => Admi
   message: "Managed MCP servers cannot configure an upstreamUrl"
 });
 
-export const createMcpUpdateBodySchema = (allowPrivateAddresses = false) => AdminMcpServerUpdateRequestSchema.extend({
-  upstreamUrl: mcpUpstreamUrlSchemaForPolicy(allowPrivateAddresses).nullable().optional()
+export const MCP_UPSTREAM_ADDRESS_MESSAGE = "MCP upstream URL must not point to a private or reserved address";
+
+/** The deployment's address policy for one upstream URL of a request body. */
+export function isPermittedMcpUpstreamUrl(upstreamUrl: string | null | undefined, allowPrivateAddresses: boolean): boolean {
+  return !upstreamUrl || mcpUpstreamUrlSchemaForPolicy(allowPrivateAddresses).safeParse(upstreamUrl).success;
+}
+
+// An update that leaves the server off can keep a saved address that the
+// policy now refuses, so that an admin can retire the server (the rule and
+// its check against the saved row are in McpServerStore.updateMcpServer).
+// `leavesServerOff` reads that from the body; the setup route reads `audience`.
+export const createMcpUpdateBodySchema = (
+  allowPrivateAddresses = false,
+  leavesServerOff: (body: { enabled: boolean }) => boolean = (body) => body.enabled === false
+) => AdminMcpServerUpdateRequestSchema.extend({
+  upstreamUrl: mcpUpstreamUrlSchema.nullable().optional()
 }).refine((body) => body.mode === "proxy" || !body.upstreamUrl, {
   path: ["upstreamUrl"],
   message: "Managed MCP servers cannot configure an upstreamUrl"
+}).refine((body) => leavesServerOff(body) || isPermittedMcpUpstreamUrl(body.upstreamUrl, allowPrivateAddresses), {
+  path: ["upstreamUrl"],
+  message: MCP_UPSTREAM_ADDRESS_MESSAGE
 });
 
 export const mcpCreateBodySchema = createMcpCreateBodySchema();

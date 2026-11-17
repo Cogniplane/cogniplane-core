@@ -393,4 +393,54 @@ describe.skipIf(!adminDatabaseUrl())("MCP connection setup version", () => {
       await otherApp.close();
     }
   });
+
+  // A row from before the public-address policy can hold a private address.
+  // The editor sends the full draft, the address included.
+  test("an admin can retire a connection whose saved address is now refused, and nothing else", async () => {
+    const { owner, app, serverId, base } = await membersConnection({ upstreamAuthType: "none" });
+    const privateUrl = "http://10.0.0.2/mcp";
+    try {
+      await superuserPool().query(
+        "UPDATE admin_mcp_servers SET upstream_url = $3 WHERE tenant_id = $1 AND server_id = $2",
+        [owner.tenantId, serverId, privateUrl]
+      );
+      const opened = await listed(app, serverId);
+      const before = await savedState(owner.tenantId, serverId);
+      const save = (payload: Record<string, unknown>) => app.inject({
+        method: "PUT",
+        url: `/admin/mcp-servers/${serverId}/setup`,
+        payload: { ...base, upstreamUrl: privateUrl, expectedVersion: opened.version, ...payload }
+      });
+
+      // The address stays refused while the connection is on, and an "off"
+      // save cannot move it to another private address.
+      for (const payload of [
+        { audience: "members" },
+        { audience: "test_users", serverName: "Renamed" },
+        { audience: "off", upstreamUrl: "http://10.0.0.3/mcp" },
+        { audience: "off", upstreamUrl: "http://localhost:3108/mcp" }
+      ]) {
+        const response = await save(payload);
+        expect(response.statusCode, response.body).toBe(400);
+      }
+      expect(await savedState(owner.tenantId, serverId)).toEqual(before);
+
+      const retired = await save({ audience: "off", serverName: "Vendor tools (retired)" });
+      expect(retired.statusCode, retired.body).toBe(200);
+      const after = await savedState(owner.tenantId, serverId);
+      expect(after.row).toMatchObject({ enabled: false, is_published: false, upstream_url: privateUrl });
+      expect(after.settings.enabled_mcp_server_ids).not.toContain(serverId);
+
+      // It cannot come back with that address.
+      const back = await app.inject({
+        method: "PUT",
+        url: `/admin/mcp-servers/${serverId}/setup`,
+        payload: { ...base, upstreamUrl: privateUrl, audience: "members", expectedVersion: after.row.version }
+      });
+      expect(back.statusCode, back.body).toBe(400);
+      expect(await savedState(owner.tenantId, serverId)).toEqual(after);
+    } finally {
+      await app.close();
+    }
+  });
 });

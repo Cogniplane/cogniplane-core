@@ -147,6 +147,23 @@ describe("upstreamUrl credential rejection at the persistence boundary", () => {
     expect(created).toHaveBeenCalledTimes(1);
   });
 
+  // The store knows the saved address. It applies the address policy to an
+  // update that leaves the server off (McpServerStore.updateMcpServer).
+  it("sends an update that leaves the server off to the store, and refuses one that turns it on", async () => {
+    const { store, updated } = storeSpy();
+    const payload = { ...basePayload, upstreamUrl: "http://10.0.4.17/mcp" };
+    await expect(updateMcpServer({ tenantId: "t1", store, payload: { ...payload, enabled: true } }))
+      .rejects.toThrow("permitted address");
+    expect(updated).not.toHaveBeenCalled();
+    await updateMcpServer({ tenantId: "t1", store, payload: { ...payload, enabled: false } });
+    expect(updated).toHaveBeenCalledTimes(1);
+    // Credentials in the URL are refused for each update.
+    await expect(updateMcpServer({
+      tenantId: "t1", store, payload: { ...payload, upstreamUrl: "http://user:pw@10.0.4.17/mcp", enabled: false }
+    })).rejects.toBeInstanceOf(AdminConfigError);
+    expect(updated).toHaveBeenCalledTimes(1);
+  });
+
   it("leaves managed servers with no upstreamUrl alone", async () => {
     const { store, created } = storeSpy();
 

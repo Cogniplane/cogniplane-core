@@ -15,7 +15,12 @@ import {
   respondAdminNotFound,
   withAdmin
 } from "./admin-route-helpers.js";
-import { createMcpCreateBodySchema, createMcpUpdateBodySchema } from "./admin-route-schemas.js";
+import {
+  createMcpCreateBodySchema,
+  createMcpUpdateBodySchema,
+  isPermittedMcpUpstreamUrl,
+  MCP_UPSTREAM_ADDRESS_MESSAGE
+} from "./admin-route-schemas.js";
 import type { AdminMcpServerRecord } from "../../services/admin-config-records.js";
 import type { ActivationTracker } from "../../services/activation-tracker.js";
 import type { AuditEventInput } from "../../services/audit-event-store.js";
@@ -75,7 +80,16 @@ export async function registerAdminMcpServerRoutes(
   // An edit uses the update schema. It has no defaults, so an omitted
   // upstreamAuthType or credentialScope keeps the stored value. It also names
   // the saved version that its draft started from.
-  const setupUpdateBodySchema = z.intersection(mcpUpdateBodySchema, audienceSchema.extend(AdminMcpServerSetupEditSchema.shape));
+  // The setup body gives `audience`, not `enabled`. The address policy is
+  // thus checked here, on the whole body: audience "off" leaves the server off.
+  const allowPrivateAddresses = app.config?.MCP_UPSTREAM_ALLOW_PRIVATE_ADDRESSES === true;
+  const setupUpdateBodySchema = z.intersection(
+    createMcpUpdateBodySchema(allowPrivateAddresses, () => true),
+    audienceSchema.extend(AdminMcpServerSetupEditSchema.shape)
+  ).refine((body) => body.audience === "off" || isPermittedMcpUpstreamUrl(body.upstreamUrl, allowPrivateAddresses), {
+    path: ["upstreamUrl"],
+    message: MCP_UPSTREAM_ADDRESS_MESSAGE
+  });
 
   function auditPayload(
     mcpServer: AdminMcpServerRecord,

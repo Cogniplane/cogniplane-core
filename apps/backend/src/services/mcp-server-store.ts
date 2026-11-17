@@ -447,6 +447,14 @@ export class McpServerStore {
         : input.upstreamAuthSecret
           ? encrypt(input.upstreamAuthSecret, this.encryptionSecret)
           : existingSecret;
+      // A row saved before the deployment refused private addresses can hold
+      // one. No request goes to it (forwardRpc checks each destination), but
+      // the admin must be able to retire the server. So an update can keep
+      // that address when it does not change it and leaves the server off.
+      // Each other update, also one that turns the server on again, applies
+      // the address policy.
+      const keepsSavedAddressOff = !input.enabled &&
+        upstreamUrl === (existing.rows[0].upstream_url ? String(existing.rows[0].upstream_url) : null);
       // A partial update is validated before this merge, with the omitted
       // fields unknown. Validate the merged state as well, so an update that
       // changes only the header name cannot store a reserved or invalid header.
@@ -458,7 +466,7 @@ export class McpServerStore {
         upstreamAuthName,
         upstreamAuthSecret: input.upstreamAuthSecret,
         credentialScope
-      }, { requireUrlAndSecret: false, allowPrivateAddresses: this.allowPrivateAddresses });
+      }, { requireUrlAndSecret: false, allowPrivateAddresses: this.allowPrivateAddresses || keepsSavedAddressOff });
       if (input.mode === "proxy" && !upstreamUrl) {
         throw new AdminConfigError("Proxy MCP servers require an upstreamUrl.");
       }
