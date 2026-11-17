@@ -25,6 +25,24 @@ const validBase = {
   routePath: "/mcp/test"
 };
 
+describe("MCP update that leaves the server off", () => {
+  const body = { ...validBase, serverId: "test", upstreamUrl: "http://10.0.4.17/mcp" };
+
+  it("can keep a private address; the store compares it with the saved address", () => {
+    expect(mcpUpdateBodySchema.safeParse({ ...body, enabled: false }).success).toBe(true);
+    expect(mcpUpdateBodySchema.safeParse({ ...body, enabled: true }).success).toBe(false);
+    // `enabled` defaults to true.
+    expect(mcpUpdateBodySchema.safeParse(body).success).toBe(false);
+  });
+
+  it("does not apply to a create or to URL credentials", () => {
+    expect(mcpCreateBodySchema.safeParse({ ...body, enabled: false }).success).toBe(false);
+    expect(mcpUpdateBodySchema.safeParse({
+      ...body, upstreamUrl: "http://user:password@10.0.4.17/mcp", enabled: false
+    }).success).toBe(false);
+  });
+});
+
 describe.each([
   ["create", AdminMcpServerCreateRequestSchema, mcpCreateBodySchema],
   ["update", AdminMcpServerUpdateRequestSchema, mcpUpdateBodySchema]

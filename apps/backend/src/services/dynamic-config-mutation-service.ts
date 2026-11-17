@@ -148,7 +148,13 @@ export async function updateMcpServer(input: {
   client?: PoolClient;
   allowPrivateAddresses?: boolean;
 }): Promise<AdminMcpServerRecord | null> {
-  validateMcpServerInput(input.payload, { requireUrlAndSecret: false, allowPrivateAddresses: input.allowPrivateAddresses });
+  // An update that leaves the server off can keep a saved address that the
+  // policy now refuses. Only the store knows the saved address, so the store
+  // applies the policy to such an update (McpServerStore.updateMcpServer).
+  validateMcpServerInput(input.payload, {
+    requireUrlAndSecret: false,
+    allowPrivateAddresses: input.allowPrivateAddresses === true || input.payload.enabled === false
+  });
 
   return input.store.updateMcpServer(input.tenantId, input.payload, input.client);
 }

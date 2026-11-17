@@ -411,3 +411,64 @@ test.each([
   })).rejects.toThrow(message);
   expect(writes).toBe(0);
 });
+
+describe("McpServerStore lets an admin retire a server whose saved address is now refused", () => {
+  const savedUrl = "http://10.0.0.2/mcp";
+  const input = {
+    serverId: "lan", serverName: "LAN", description: null,
+    transportKind: "http" as const, mode: "proxy" as const, routePath: "/mcp/lan"
+  };
+
+  /** A store whose server has the private address; `updates` counts the row writes. */
+  function storeWithPrivateAddress(allowPrivateAddresses = false) {
+    const updates: unknown[][] = [];
+    const pool = new FakePool()
+      .onQuery("SELECT upstream_url", () => ({
+        rows: [{
+          upstream_url: savedUrl, upstream_auth_type: "none", upstream_auth_name: null,
+          upstream_auth_secret_encrypted: null, credential_scope: "organization",
+          credential_binding_id: "00000000-0000-4000-8000-000000000001", version: 1
+        }],
+        rowCount: 1
+      }))
+      .onQuery("UPDATE admin_mcp_servers", (_text, values) => {
+        updates.push(values);
+        return { rows: [], rowCount: 0 };
+      });
+    return { store: new McpServerStore(pool.asPool(), ENCRYPTION_SECRET, allowPrivateAddresses), updates };
+  }
+
+  test.each([
+    ["the address omitted", {}],
+    ["the same address", { upstreamUrl: savedUrl }]
+  ])("saves an update that leaves the server off, with %s", async (_case, change) => {
+    const { store, updates } = storeWithPrivateAddress();
+    await store.updateMcpServer("tenant-1", { ...input, ...change, serverName: "LAN (retired)", enabled: false });
+    expect(updates).toHaveLength(1);
+    expect(updates[0]).toContain(savedUrl);
+  });
+
+  test.each([
+    ["turns the server on", { enabled: true }],
+    ["turns the server on with the same address", { enabled: true, upstreamUrl: savedUrl }],
+    ["moves to another private address", { enabled: false, upstreamUrl: "http://10.0.0.3/mcp" }],
+    ["moves to a loopback address", { enabled: false, upstreamUrl: "http://localhost:3108/mcp" }]
+  ])("refuses an update that %s, and writes nothing", async (_case, change) => {
+    const { store, updates } = storeWithPrivateAddress();
+    await expect(store.updateMcpServer("tenant-1", { ...input, ...change })).rejects.toThrow("permitted address");
+    expect(updates).toEqual([]);
+  });
+
+  test("moves the server to a public address and turns it on", async () => {
+    const { store, updates } = storeWithPrivateAddress();
+    await store.updateMcpServer("tenant-1", { ...input, enabled: true, upstreamUrl: "https://vendor.example/mcp" });
+    expect(updates).toHaveLength(1);
+  });
+
+  test("the operator opt-in accepts each of these updates", async () => {
+    const { store, updates } = storeWithPrivateAddress(true);
+    await store.updateMcpServer("tenant-1", { ...input, enabled: true });
+    await store.updateMcpServer("tenant-1", { ...input, enabled: true, upstreamUrl: "http://10.0.0.3/mcp" });
+    expect(updates).toHaveLength(2);
+  });
+});

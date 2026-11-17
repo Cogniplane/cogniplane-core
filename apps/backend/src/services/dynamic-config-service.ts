@@ -508,11 +508,13 @@ export class DynamicConfigService {
     editing?: { serverId: string; expectedVersion: number },
     audit?: (server: AdminMcpServerRecord) => AuditEventInput
   ): Promise<AdminMcpServerRecord | null> {
+    const enabled = audience !== "off";
     validateMcpServerInput(input, {
       requireUrlAndSecret: !editing,
-      allowPrivateAddresses: this.config.MCP_UPSTREAM_ALLOW_PRIVATE_ADDRESSES
+      // An edit that leaves the server off: the store applies the address
+      // policy, with the saved address (McpServerStore.updateMcpServer).
+      allowPrivateAddresses: this.config.MCP_UPSTREAM_ALLOW_PRIVATE_ADDRESSES === true || (Boolean(editing) && !enabled)
     });
-    const enabled = audience !== "off";
     return this.stores.mcpServers.withTransaction(tenantId, async (client) => {
       const saved = editing
         ? await this.stores.mcpServers.updateMcpServer(tenantId, {

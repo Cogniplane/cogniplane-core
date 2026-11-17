@@ -158,6 +158,9 @@ redirect and hide. Every rule is enforced in the backend.
     throws.
 - Proxy MCP upstreams reject private and reserved hosts at admission and use
   `ssrfSafeAgent` at connect time by default. This applies to saved servers too.
+  One update can keep a saved address that admission now refuses: it does not
+  change the address and it leaves the server off
+  ([tools](architecture/tools.md)).
   Self-hosted operators can set `MCP_UPSTREAM_ALLOW_PRIVATE_ADDRESSES=true` to
   connect servers on their own network. This disables the address restriction
   for every tenant, including connection tests. Enable it only when all tenant
