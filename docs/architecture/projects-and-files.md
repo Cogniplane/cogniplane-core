@@ -142,6 +142,14 @@ Limits:
   segment keep `{userId}/{sessionId}/...`. Every read, download and delete uses
   the key stored on the row, so those objects need no migration.
   `ARTIFACT_STORAGE_BACKEND` is `local` or `bucket` (S3-compatible).
+- Uploads, generated artifacts, project drafts and project library copies
+  store their bytes before the database transaction commits. If the commit
+  reply is lost, the backend checks the PostgreSQL transaction ID. It retries
+  up to three times while the transaction is running. A confirmed commit
+  continues the write. A confirmed rollback removes the bytes. If the outcome
+  remains unknown, the request fails and the bytes stay. A later rollback
+  leaves an object without a database row. Both the cleanup worker and tenant
+  deletion use stored object keys, so neither can remove that object.
 - Bucket requests have limits (`BUCKET_REQUEST_LIMITS`,
   `services/artifacts/artifact-storage.ts`; skill bundle storage uses the same
   client): 5 seconds to connect, 30 seconds to the response headers (for an

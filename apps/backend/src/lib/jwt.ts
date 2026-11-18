@@ -87,8 +87,9 @@ export function resolveJwtVerificationKey(
   if (kid === config.JWT_KEY_ID) {
     return getJwtSigningKey(config);
   }
-  const previousSecret = config.JWT_VERIFICATION_KEYS[kid];
-  if (!previousSecret) {
+  const keys = config.JWT_VERIFICATION_KEYS;
+  const previousSecret = Object.hasOwn(keys, kid) ? keys[kid] : undefined;
+  if (typeof previousSecret !== "string" || !previousSecret) {
     throw new Error(`Unknown JWT kid: ${kid}`);
   }
   return new TextEncoder().encode(previousSecret);

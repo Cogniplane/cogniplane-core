@@ -4,7 +4,13 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Readable } from "node:stream";
+import { text as readText } from "node:stream/consumers";
+import type { PoolClient } from "pg";
 import { describe, test, expect, onTestFinished, vi } from "vitest";
+import { poolWithFirstCommit } from "./support/commit-fault.js";
+import { UploadAdmission } from "../services/artifacts/upload-admission.js";
+import { createWriteArtifactTool } from "../services/managed-tools/write-artifact.js";
+import { StoredFileCommitUnknownError } from "../services/storage/stored-file-transaction.js";
 import { ProjectMemberStore } from "../services/project-member-store.js";
 import { ProjectStore } from "../services/project-store.js";
 import { SessionStore } from "../services/session-store.js";
@@ -182,6 +188,102 @@ async function retentionAudits(project: ProjectRef) {
   );
   return rows.map((row) => row.payload);
 }
+
+describe.skipIf(!adminDatabaseUrl())("lost file commit acknowledgement", () => {
+  describe.each(["upload", "generated artifact", "project draft", "project copy"] as const)("%s", (kind) => {
+    test.each(["committed", "aborted", "late commit", "late abort", "in progress", "lookup unavailable"] as const)("%s", async (outcome) => {
+      const lostReply = new Error("lost COMMIT reply");
+      const settlesDuringRetry = outcome === "late commit" || outcome === "late abort";
+      const holdTransaction = settlesDuringRetry || outcome === "in progress";
+      const aborted = outcome === "aborted" || outcome === "late abort";
+      let finishCommit!: () => void;
+      const waitForCommit = new Promise<void>((resolve) => { finishCommit = resolve; });
+      let pending: Promise<unknown> = Promise.resolve();
+      const onCommit = vi.fn(async (client: PoolClient) => {
+        const finish = () => client.query(aborted ? "ROLLBACK" : "COMMIT");
+        if (holdTransaction) pending = waitForCommit.then(finish);
+        else await finish();
+        throw lostReply;
+      });
+      const db = poolWithFirstCommit(appPool(), onCommit, {
+        afterQuery: /INSERT INTO (artifacts|project_file_versions)\b/,
+        holdRelease: holdTransaction ? () => pending : undefined
+      });
+      const h = await setup();
+      const { actor, storage } = h;
+      const source = await h.source("bytes");
+      await h.projects.setAgentFileMode(actor.tenantId, actor.userId, actor.projectId, "create-only");
+      const { sessionId } = await h.sessions.create(actor.tenantId, actor.userId, "File commit");
+      const fileDb = new Proxy(db, {
+        get(target, property) {
+          if (property !== "query") return Reflect.get(target, property);
+          return async (sql: string, values: unknown[]) => {
+            if (outcome === "lookup unavailable") throw new Error("database offline");
+            const result = await target.query(sql, values);
+            if (settlesDuringRetry && result.rows[0]?.status === "in progress") {
+              finishCommit();
+              await pending;
+            }
+            return result;
+          };
+        }
+      });
+      const files = new ProjectFileStore(fileDb, h.app.log, maintenancePool());
+      files.setPiiProtection({ evaluateArtifact: async () => ({ action: "allow", reason: "disabled" }) });
+      const artifacts = new ArtifactStore(fileDb);
+      const put = vi.spyOn(storage, "put");
+      const publish = async () => {
+        if (kind === "project copy") return files.createFromArtifact(actor, {
+          artifactId: source.artifactId, name: "copy.txt", kind: "published",
+          folderId: null, targetFileId: null, baseVersionId: null
+        }, storage, 1000);
+        if (kind === "project draft") return files.createAgentDraftFromContent({
+          actor, name: "draft.txt", mimeType: "text/plain", content: Buffer.from("bytes"),
+          folderId: null, targetFileId: null, baseVersionId: null, storage, maxBytes: 1000
+        });
+        if (kind === "upload") {
+          const admission = new UploadAdmission({ sessions: h.sessions, artifacts, storage });
+          const ticket = await admission.begin({ ...actor, sessionId });
+          return admission.admit(ticket, {
+            artifactName: "upload.txt", mimeType: "text/plain", source: "upload", stream: Readable.from(["bytes"])
+          });
+        }
+        return createWriteArtifactTool({ artifacts, storage, artifactMaxBytes: 1000 })[0].handler({
+          arguments: { name: "output.txt", content: "bytes" },
+          context: {
+            ...actor, sessionId, toolContextId: "tool", runtimeId: "runtime", runtimePolicyId: "default",
+            messageId: null, credentialEnvelope: {}, metadata: {},
+            createdAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 60_000).toISOString()
+          }
+        });
+      };
+      try {
+        if (outcome === "committed" || outcome === "late commit") await publish();
+        else if (aborted) await expect(publish()).rejects.toBe(lostReply);
+        else await expect(publish()).rejects.toBeInstanceOf(StoredFileCommitUnknownError);
+      } finally {
+        finishCommit();
+        await pending;
+      }
+      expect(onCommit).toHaveBeenCalledTimes(1);
+      expect(put).toHaveBeenCalledTimes(1);
+      const key = put.mock.calls[0][0].storageKey;
+      const references = await superuserPool().query(
+        `SELECT storage_key FROM artifacts WHERE tenant_id=$1 AND storage_key=$2
+         UNION ALL SELECT storage_key FROM project_file_versions WHERE tenant_id=$1 AND storage_key=$2`,
+        [actor.tenantId, key]
+      );
+      if (aborted) {
+        expect(references.rows).toHaveLength(0);
+        await expect(storage.openReadStream(key)).rejects.toMatchObject({ code: "ENOENT" });
+      } else {
+        expect(references.rows).toHaveLength(1);
+        const { stream } = await storage.openReadStream(key);
+        expect(await readText(stream)).toBe("bytes");
+      }
+    });
+  });
+});
 
 describe.skipIf(!adminDatabaseUrl())("versioned project files", () => {
   test("reaches every folder across pages when the project has more than one page", async () => {

@@ -1,6 +1,8 @@
 // @vitest-environment jsdom
 
 import { act, cleanup, render, waitFor, screen, fireEvent, within } from "@testing-library/react";
+import type { QueryClient } from "@tanstack/react-query";
+import { requestDraftResolution } from "../lib/project-draft-resolution";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { lazy, useEffect, type ComponentType, type ReactNode } from "react";
 import type { Approval, Artifact, ProjectFilePickerEntry, Session } from "@cogniplane/shared-types";
@@ -75,6 +77,7 @@ const cardProviders = vi.hoisted(() => ({ props: [] as Array<{ sessionId: string
 const eventSeeds = vi.hoisted(() => ({ values: [] as unknown[][] }));
 const sessionListActions = vi.hoisted(() => ({ reload: vi.fn(async () => undefined), select: vi.fn(), create: vi.fn(async () => undefined), confirmDelete: vi.fn(), cancelDelete: vi.fn() }));
 const queryActions = vi.hoisted(() => ({ invalidate: vi.fn(), projectRefetch: vi.fn(), refresh: vi.fn(async () => {}) }));
+const shellClient = vi.hoisted(() => ({ invalidateQueries: queryActions.invalidate }));
 const hostLifecycle = vi.hoisted(() => ({ mounts: 0, unmounts: 0 }));
 const copilotkitCore = vi.hoisted(() => ({ runAgent: vi.fn(({ agent }: { agent: { runAgent: () => Promise<unknown> } }) => agent.runAgent()), connectAgent: vi.fn(async () => undefined), getContextForAgent: vi.fn(() => []) }));
 const navigationState = vi.hoisted(() => ({ resolveDraftId: null as string | null, sessionId: null as string | null }));
@@ -94,7 +97,7 @@ vi.mock("next/navigation", () => ({
 }));
 vi.mock("@tanstack/react-query", () => ({
   keepPreviousData: <T,>(previous: T) => previous,
-  useQueryClient: () => ({ invalidateQueries: queryActions.invalidate }),
+  useQueryClient: () => shellClient,
   useInfiniteQuery: ({ queryKey }: { queryKey: unknown[] }) => {
     const q = String((queryKey[4] as { q?: string } | undefined)?.q ?? "").toLowerCase();
     const items = shellState.projectFiles?.filter((file) => file.name.toLowerCase().includes(q));
@@ -480,9 +483,50 @@ describe("ChatShell session host boundary", () => {
     expect(workspaceActions.openPreview).toHaveBeenCalledExactlyOnceWith("a-1");
   });
 
+  it("clears a copied resolution token through Next's history API without starting a turn", async ({ onTestFinished }) => {
+    const originalUrl = window.location.href;
+    const originalState = window.history.state;
+    onTestFinished(() => window.history.replaceState(originalState, "", originalUrl));
+    window.history.replaceState({ __NA: true }, "", "/?session=session-1&resolveDraft=draft-1#chat");
+    const replaceState = vi.spyOn(window.history, "replaceState");
+    shellState.projectId = "project-1";
+    shellState.projectFiles = [pickerEntry("draft-1", "README.md", "draft")];
+    navigationState.sessionId = "session-1";
+    navigationState.resolveDraftId = "draft-1";
+    render(<ChatShell />);
+    await waitFor(() => expect(agents.instances).toHaveLength(1));
+    restoreHistory(agents.instances[0]);
+    expect(agents.instances[0].runAgent).not.toHaveBeenCalled();
+    expect(replaceState).toHaveBeenCalledWith(null, "", new URL("/?session=session-1#chat", originalUrl));
+    expect(window.location.search).toBe("?session=session-1");
+  });
+
+  it.each(["read-only", "published", "remounted", "page hidden"])("drops a resolution request when %s", async (reason) => {
+    const href = requestDraftResolution(shellClient as unknown as QueryClient, {
+      projectId: "project-1", sessionId: "session-1", draftId: "draft-1"
+    });
+    navigationState.sessionId = "session-1";
+    navigationState.resolveDraftId = new URL(href, window.location.origin).searchParams.get("resolveDraft");
+    shellState.projectId = "project-1";
+    const view = render(<ChatShell />);
+    await waitFor(() => expect(agents.instances).toHaveLength(1));
+    if (reason === "remounted") view.unmount();
+    if (reason === "page hidden") act(() => { window.dispatchEvent(new Event("pagehide")); });
+    shellState.serverActivity = { canEdit: reason !== "read-only" };
+    shellState.projectFiles = [pickerEntry("draft-1", "README.md", reason === "published" ? "published" : "draft")];
+    if (reason === "remounted") render(<ChatShell />);
+    else view.rerender(<ChatShell />);
+    restoreHistory(agents.instances.at(-1)!);
+    expect(agents.instances.at(-1)!.runAgent).not.toHaveBeenCalled();
+  });
+
   it("waits for the project library before consuming a resolve-draft handoff", async () => {
     shellState.projectId = "project-1";
-    navigationState.resolveDraftId = "draft-1";
+    const href = requestDraftResolution(shellClient as unknown as QueryClient, {
+      projectId: "project-1", sessionId: "session-1", draftId: "draft-1"
+    });
+    navigationState.sessionId = "session-1";
+    navigationState.resolveDraftId = new URL(href, window.location.origin).searchParams.get("resolveDraft");
     const view = render(<ChatShell />);
     await waitFor(() => expect(agents.instances).toHaveLength(1));
     const agent = agents.instances[0];

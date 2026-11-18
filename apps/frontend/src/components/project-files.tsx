@@ -26,6 +26,7 @@ import { formatFileSize } from "./artifact-panel.logic";
 import { uploadArtifact } from "@/lib/artifact-api";
 import * as api from "@/lib/project-file-api";
 import { createProjectSession, listProjectArtifacts } from "@/lib/project-api";
+import { cancelDraftResolution, requestDraftResolution } from "../lib/project-draft-resolution";
 import { hasTargetConflict } from "./project-files.logic";
 import {
   FolderBreadcrumbs,
@@ -131,6 +132,21 @@ export function ProjectFiles({
 }) {
   const router = useRouter();
   const client = useQueryClient();
+  const resolutionNavigation = useRef<{ href?: string } | null>(null);
+  useEffect(() => {
+    resolutionNavigation.current = {};
+    const cancel = () => {
+      const href = resolutionNavigation.current?.href;
+      if (href) cancelDraftResolution(client, href);
+      resolutionNavigation.current = {};
+    };
+    window.addEventListener("pagehide", cancel);
+    return () => {
+      window.removeEventListener("pagehide", cancel);
+      if (resolutionNavigation.current?.href !== window.location.pathname + window.location.search) cancel();
+      resolutionNavigation.current = null;
+    };
+  }, [client, project.projectId]);
   const sourcesQuery = useQuery({
     queryKey: queryKeys.projects.artifacts(project.projectId),
     queryFn: ({ signal }) => listProjectArtifacts(project.projectId, signal),
@@ -621,14 +637,18 @@ export function ProjectFiles({
                           disabled={disabled}
                           onClick={() =>
                             mutation.mutate(async () => {
+                              const navigation = resolutionNavigation.current;
+                              if (!navigation) return;
                               const session = await createProjectSession(
                                 project.projectId,
                                 `Resolve ${file.name}`,
                               );
                               await client.invalidateQueries({ queryKey: queryKeys.sessions.list() });
-                              router.push(
-                                `/?session=${encodeURIComponent(session.sessionId)}&resolveDraft=${encodeURIComponent(file.fileId)}`,
-                              );
+                              if (resolutionNavigation.current !== navigation) return;
+                              navigation.href = requestDraftResolution(client, {
+                                projectId: project.projectId, sessionId: session.sessionId, draftId: file.fileId
+                              });
+                              router.push(navigation.href);
                             })
                           }
                         >

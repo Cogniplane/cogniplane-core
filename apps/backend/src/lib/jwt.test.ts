@@ -4,6 +4,7 @@ import { SignJWT, decodeProtectedHeader } from "jose";
 
 import { createTestConfig } from "../test-helpers/test-config.js";
 import {
+  resolveJwtVerificationKey,
   signAccessToken,
   signRefreshToken,
   verifyAccessToken,
@@ -121,6 +122,20 @@ test("verification accepts access and refresh tokens signed by a retained previo
   await expect(verifyRefreshToken(rotatedConfig, refreshToken)).resolves.toMatchObject({
     jti: "j1"
   });
+});
+
+test.each(["constructor", "toString", "__proto__", "inheritedKey", "invalidKey"])(
+  "rejects %s when it has no configured string secret",
+  (kid) => {
+    const keys = Object.create({ inheritedKey: "inherited-test-value" });
+    keys.invalidKey = 42;
+    const keyConfig = createTestConfig({ JWT_VERIFICATION_KEYS: keys });
+    expect(() => resolveJwtVerificationKey(keyConfig, kid)).toThrow(/Unknown JWT kid/);
+  }
+);
+
+test("OAuth state verification accepts a missing kid with the active key", () => {
+  expect(resolveJwtVerificationKey(config, undefined, { allowMissingKid: true })).toEqual(secretKey);
 });
 
 test("verification rejects unknown and missing key ids", async () => {

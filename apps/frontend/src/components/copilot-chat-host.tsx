@@ -130,6 +130,7 @@ import { watchReadingOverflow } from "../lib/reading-overflow";
 import { WidgetDraftNotice, useWidgetDraft, type WidgetDraftComposer, type WidgetDraftSeam } from "./widget-draft";
 import { Button } from "./ui/button";
 import type { ApprovalRow, RuntimeNoticeRow, ToolStatusRow } from "./chat-cards/chat-cards.types";
+import { runtimeNoticeRow } from "./agui-transcript";
 import {
   RuntimeNoticeRowView,
   ToolStatusRowView
@@ -1041,27 +1042,44 @@ function ChatSession({ session, modelSelection, usage, events, agent, draftScope
   // Start an explicit project action once the history is shown and no turn
   // runs. While another turn runs, keep the action and start it when that
   // turn ends.
-  const initialPromptSent = useRef(false);
+  const projectAction = useRef<{ runId: string } | { retry: string } | "canceled" | null>(null);
   useEffect(() => {
-    if (!initialPrompt || !canEdit || busy || initialPromptSent.current) return;
-    initialPromptSent.current = true;
-    agent.addMessage({ id: randomUUID(), role: "user", content: initialPrompt });
-    // Core adds the current catalog envelope before the browser agent builds
-    // the tool guide, just as it does for a send from the composer.
-    copilotkit.runAgent({ agent }).then(
-      () => onInitialPromptSent?.(),
-      (error: unknown) => {
-        // A busy session shows the other turn. Its end re-runs this effect.
-        if (isSessionBusyError(error)) {
-          initialPromptSent.current = false;
-          // The action starts again by itself, so the user has nothing to resend.
-          clearBusyRefusal();
-          return;
-        }
-        onInitialPromptSent?.();
+    const cancelRetry = () => {
+      if (projectAction.current) projectAction.current = "canceled";
+    };
+    window.addEventListener("pagehide", cancelRetry);
+    return () => {
+      window.removeEventListener("pagehide", cancelRetry);
+      cancelRetry();
+    };
+  }, []);
+  useEffect(() => {
+    const action = projectAction.current;
+    if (!canEdit || busy || action === "canceled" || (action && "runId" in action)) return;
+    const prompt = action?.retry ?? initialPrompt;
+    if (!prompt) return;
+    const runId = randomUUID();
+    const attempt = { runId };
+    projectAction.current = attempt;
+    // Claim the prompt before dispatch so a remount cannot send it again.
+    if (!action) onInitialPromptSent?.();
+    agent.addMessage({ id: randomUUID(), role: "user", content: prompt });
+    // CopilotKit resolves runAgent even when the server refuses the send.
+    const subscription = agent.subscribe({
+      onRunFailed({ input, error }) {
+        if (input.runId !== runId || projectAction.current !== attempt || !isSessionBusyError(error)) return;
+        projectAction.current = { retry: prompt };
+        clearBusyRefusal();
       }
-    );
-  }, [agent, busy, canEdit, clearBusyRefusal, copilotkit, initialPrompt, onInitialPromptSent]);
+    });
+    void copilotkit.runAgent({ agent, runId }).catch(() => {
+      if (projectAction.current !== attempt) return;
+      addNotice(runtimeNoticeRow({
+        noticeId: runId, level: "error", title: "Could not confirm the project action",
+        message: "Check the session history before trying again.", createdAt: new Date().toISOString()
+      }));
+    }).finally(() => subscription.unsubscribe());
+  }, [addNotice, agent, busy, canEdit, clearBusyRefusal, copilotkit, initialPrompt, onInitialPromptSent]);
 
   // Lift the live turn-running + pending-approval signals to the shell so the
   // sidebar streaming dot and header attention dot track the AG-UI stream in

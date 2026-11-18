@@ -30,6 +30,7 @@ import { uuidv7 } from "../lib/uuid.js";
 import { requireProjectAccess } from "./project-access.js";
 import { claimArtifactObjectGc, collectArtifactObject } from "./storage/storage-gc.js";
 import { artifactObjectReferencedSql } from "./storage/storage-references.js";
+import { StoredFileCommitUnknownError, withStoredFileTransaction } from "./storage/stored-file-transaction.js";
 import type { AuditEventType } from "./audit-event-types.js";
 import { AuditEventStore } from "./audit-event-store.js";
 import { isoTimestamp, utcMicrosText } from "../lib/db-mappers.js";
@@ -407,8 +408,9 @@ export class ProjectFileStore {
     actor: ProjectFileActor,
     mutate: boolean,
     fn: (db: PoolClient) => Promise<T>,
+    transaction = withTenantScope,
   ): Promise<T> {
-    return withTenantScope(this.db, actor.tenantId, async (db) => {
+    return transaction(this.db, actor.tenantId, async (db) => {
       await requireProjectAccess(db, actor, mutate ? "editor" : "viewer", {
         lock: mutate, active: mutate,
       });
@@ -1023,8 +1025,9 @@ export class ProjectFileStore {
         );
         await this.audit(db, actor, "project_draft_created", { fileId, versionId, targetFileId: input.targetFileId });
         return file(await this.entry(db, actor, fileId));
-      });
+      }, withStoredFileTransaction);
     } catch (error) {
+      if (error instanceof StoredFileCommitUnknownError) throw error;
       await input.storage.delete(stored.storageKey).catch((cleanupError) => {
         this.logger.warn({ err: cleanupError, tenantId: actor.tenantId, projectId: actor.projectId, storageKey: stored.storageKey }, "Failed to remove an uncommitted project draft");
       });
@@ -1419,8 +1422,9 @@ export class ProjectFileStore {
           sourceArtifactId: input.artifactId,
         });
         return file(await this.entry(db, actor, fileId));
-      });
+      }, withStoredFileTransaction);
     } catch (error) {
+      if (error instanceof StoredFileCommitUnknownError) throw error;
       if (stored) {
         try {
           await storage.delete(stored.storageKey);

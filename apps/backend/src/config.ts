@@ -798,8 +798,10 @@ export function loadConfig(
     }
   }
 
-  const configuredActiveSecret = parsed.JWT_VERIFICATION_KEYS[parsed.JWT_KEY_ID];
-  if (configuredActiveSecret && configuredActiveSecret !== parsed.JWT_SECRET) {
+  if (
+    Object.hasOwn(parsed.JWT_VERIFICATION_KEYS, parsed.JWT_KEY_ID) &&
+    parsed.JWT_VERIFICATION_KEYS[parsed.JWT_KEY_ID] !== parsed.JWT_SECRET
+  ) {
     throw new Error(
       "JWT_VERIFICATION_KEYS must not redefine JWT_KEY_ID with a different secret."
     );

@@ -352,7 +352,9 @@ export const createDeepAgentsSessionRuntime: DeepAgentsRuntimeFactory = (init) =
   const policyProofs = new PolicyProofLedger();
   const mcpToolNames = new Set<string>();
   const mcpToolServers = new Map<string, string>();
-  const mcpToolFacts = new Map<string, { readOnly: boolean; category: string; requiresUserApproval?: boolean }>();
+  const mcpToolFacts = new Map<string, {
+    readOnly: boolean; category: string; fromManagedServer: boolean; requiresUserApproval?: boolean
+  }>();
   let mcpClient: GatewayMcpClient | null = null;
   let mcpToolsPromise: Promise<LangchainToolLike[]> | null = null;
   // Cached compiled agent, keyed by BOTH the model id and the reasoning effort
@@ -477,6 +479,7 @@ export const createDeepAgentsSessionRuntime: DeepAgentsRuntimeFactory = (init) =
           mcpToolFacts.set(tool.name, {
             readOnly: managedFacts?.readOnly ?? tool.metadata?.annotations?.readOnlyHint === true,
             category: managedFacts?.category ?? server.id,
+            fromManagedServer: server.mode === "managed",
             // Only our own managed tools can ask for it. A proxy tool that reuses the name cannot.
             requiresUserApproval: managedFacts?.requiresUserApproval === true
           });
@@ -576,7 +579,11 @@ export const createDeepAgentsSessionRuntime: DeepAgentsRuntimeFactory = (init) =
       });
 
       const interruptOn = buildInterruptOn({
-        approvals,
+        approvals: approvals && {
+          ...approvals,
+          // Native read-only exemptions belong to the managed implementation.
+          readOnlyToolNames: approvals.readOnlyToolNames.filter((name) => mcpToolFacts.get(name)?.fromManagedServer)
+        },
         mcpToolNames: [...mcpToolNames],
         policy: init.policyService
           ? {

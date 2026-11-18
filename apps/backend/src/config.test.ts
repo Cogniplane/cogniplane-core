@@ -102,6 +102,11 @@ test("loadConfig parses verification-only JWT keys from JSON", () => {
   });
 });
 
+test("loadConfig accepts an active JWT key id that matches an inherited property", () => {
+  const config = loadConfig(devConfig({ JWT_KEY_ID: "constructor" }));
+  expect(config.JWT_KEY_ID).toBe("constructor");
+});
+
 test("loadConfig rejects conflicting active JWT key definitions", () => {
   expect(() =>
     loadConfig(

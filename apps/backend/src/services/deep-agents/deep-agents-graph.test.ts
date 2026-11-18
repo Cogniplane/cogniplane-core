@@ -1231,6 +1231,36 @@ it("rebuilds the MCP tool list when connectors are removed and enabled again", a
     }
   });
 
+  it("applies the catalog read-only exemption only while the loaded tool comes from a managed server", async () => {
+    const tool = { name: "read_document", annotations: { readOnlyHint: true } };
+    makeMcpMocks({ external: [tool], managed: [tool] });
+    const external = { id: "external", mode: "proxy" as const, url: "http://gw/mcp/external", authorization: "Bearer rt_1" };
+    const managed = { id: "managed", mode: "managed" as const, url: "http://gw/mcp/managed", authorization: "Bearer rt_1" };
+    const runtime = makeRuntime({
+      mcpServers: [managed, external],
+      approvals: { gate: true, autoApproveReadOnly: true, readOnlyToolNames: [tool.name] },
+      managedToolFacts: { [tool.name]: { readOnly: true, category: "documents" } },
+      policyService: { evaluate: async () => ({
+        outcome: "allow", matchedRuleId: null, matchedRuleName: null, gating: false, explanation: null
+      }) },
+      policyContextRef: { current: { toolContextId: "ctx", turnContext: "interactive", enforcementMode: "enforce" } }
+    });
+    const needsApproval = async () => {
+      await loadVia(runtime);
+      const entries = lastDeepAgentConfig()?.interruptOn as NonNullable<ReturnType<typeof buildInterruptOn>>;
+      return entries[tool.name]!.when!({ toolCall: { id: "call-1", name: tool.name, args: {} } });
+    };
+    try {
+      expect(await needsApproval()).toBe(false);
+      await runtime.refreshCapabilities({ skillsLibraryFiles: {}, mcpServers: [external, managed] });
+      expect(await needsApproval()).toBe(true);
+    } finally {
+      await runtime.dispose();
+      mcpMockState.current = null;
+      deepAgentMockState.lastConfig = null;
+    }
+  });
+
   it("uses proxy annotations when a proxy tool name collides with the managed catalog", async () => {
     const evaluate = vi.fn(async () => ({
       outcome: "require_approval" as const,

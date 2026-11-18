@@ -17,8 +17,9 @@ interrupt, one `approvals` row, one AG-UI event and one decision route.
   - all gateway tools, and the deepagents built-ins in `MUTATING_BUILTIN_TOOLS`;
   - the built-ins in `READ_ONLY_BUILTIN_TOOLS`, when
     `auto_approve_read_only_tools` is off.
-- With `auto_approve_read_only_tools` on, catalog tools marked read-only skip
-  approval. A proxy server's `readOnlyHint` does not count for this switch.
+- With `auto_approve_read_only_tools` on, a managed server's tool skips native
+  approval when the catalog marks it read-only. A proxy tool still requires
+  native approval if it has the same name or sets `readOnlyHint`.
 - The interrupt pauses the graph before the tool runs. The adapter saves an
   `approvals` row, emits the `CUSTOM` event `approval_required`, and resumes the
   graph with a `Command` after `POST /approvals/:approvalId/decision` (`{

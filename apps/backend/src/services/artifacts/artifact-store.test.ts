@@ -59,6 +59,9 @@ class GeneratedCreateDatabase extends CaptureDatabase {
 
   override _query(text: string, values: unknown[] = []) {
     this.seenQueries.push(text);
+    if (text.includes("pg_current_xact_id()")) {
+      return { rows: [{ xid: "42" }], rowCount: 1 };
+    }
     if (text.includes("SELECT project_id FROM sessions")) {
       return { rows: [{ project_id: null }], rowCount: 1 };
     }

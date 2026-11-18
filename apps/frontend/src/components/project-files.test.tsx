@@ -9,7 +9,7 @@ import {
   waitFor,
 } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { beforeEach, afterEach, it, expect, vi } from "vitest";
+import { beforeEach, afterEach, it, expect, onTestFinished, vi } from "vitest";
 import type {
   Artifact,
   Project,
@@ -23,6 +23,7 @@ import * as api from "../lib/project-file-api";
 import * as projectApi from "../lib/project-api";
 import * as apiClient from "../lib/api-client";
 import { uploadArtifact } from "../lib/artifact-api";
+import { takeDraftResolution } from "../lib/project-draft-resolution";
 import { queryKeys } from "../lib/query-keys";
 const routerPush = vi.hoisted(() => vi.fn());
 vi.mock("next/navigation", () => ({ useRouter: () => ({ push: routerPush }) }));
@@ -313,7 +314,10 @@ it("keeps drafts project-wide and promotes only after an explicit action", async
   expect(screen.getByText("Proposal.txt")).toBeTruthy();
   expect(api.promoteProjectDraft).toHaveBeenCalledWith("p", "d");
 });
-it("offers an agent conflict resolution session only when the published target advanced", async () => {
+it.each(["session", "leave"])("binds the resolution click to its destination when navigating to %s", async (destination) => {
+  const previousUrl = window.location.href;
+  const previousState = window.history.state;
+  onTestFinished(() => window.history.replaceState(previousState, "", previousUrl));
   setLibrary([
       { ...draft, baseVersionId: "v1" },
       { ...published, version: { ...published.version, versionId: "v2", versionNumber: 2 } },
@@ -325,7 +329,15 @@ it("offers an agent conflict resolution session only when the published target a
   const resolve = await screen.findByRole("button", { name: "Resolve with agent" });
   fireEvent.click(resolve);
   await waitFor(() => expect(projectApi.createProjectSession).toHaveBeenCalledWith("p", "Resolve Proposal.txt"));
-  await waitFor(() => expect(routerPush).toHaveBeenCalledWith("/?session=resolve-session&resolveDraft=d"));
+  await waitFor(() => expect(routerPush).toHaveBeenCalledOnce());
+  const href = routerPush.mock.calls[0][0] as string;
+  expect(new URL(href, window.location.origin).searchParams.get("session")).toBe("resolve-session");
+  window.history.replaceState(null, "", destination === "session" ? href : "/projects");
+  cleanup();
+  if (destination === "session") {
+    expect(takeDraftResolution(client, href)).toMatchObject({ sessionId: "resolve-session", projectId: "p", draftId: "d" });
+  }
+  expect(takeDraftResolution(client, href)).toBeNull();
   expect(client.getQueryData(queryKeys.sessions.list())).toBeUndefined();
 });
 it("hides conflict resolution when either managed tool is disabled", async () => {

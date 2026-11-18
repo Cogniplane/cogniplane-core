@@ -6,6 +6,7 @@ import { requireSessionUploadAccess, sessionUploadAccessSql, SessionUploadAccess
 import { uuidv7 } from "../../lib/uuid.js";
 
 import { escapeLikePattern, type Pool, withTenantScope, withTransaction } from "../../lib/db.js";
+import { withStoredFileTransaction } from "../storage/stored-file-transaction.js";
 import { isoTimestamp } from "../../lib/db-mappers.js";
 import { AuditEventStore, type AuditEventInput } from "../audit-event-store.js";
 import { enqueueSessionStorageGc } from "../storage/storage-gc.js";
@@ -470,7 +471,7 @@ export class ArtifactStore {
    */
   async createGenerated(input: Parameters<ArtifactStore["create"]>[0],
     audit: (artifact: ArtifactRecord) => AuditEventInput): Promise<ArtifactRecord> {
-    return withTenantScope(this.db, input.tenantId, async client => {
+    return withStoredFileTransaction(this.db, input.tenantId, async client => {
       await requireSessionUploadAccess(client, input, true);
       const artifact = await this.insert(client, input);
       // The event commits with the row. When it fails, no row commits, so the
@@ -499,7 +500,7 @@ export class ArtifactStore {
     audit: (artifact: ArtifactRecord) => AuditEventInput,
   ): Promise<ArtifactRecord> {
     const { awaitingScan = true, ...row } = input;
-    return withTenantScope(this.db, input.tenantId, async client => {
+    return withStoredFileTransaction(this.db, input.tenantId, async client => {
       const projectId = await requireSessionUploadAccess(client, row, true);
       if (projectId !== row.expectedProjectId) throw new SessionUploadAccessError("session_changed", 409);
       const artifact = await this.insert(client, {

@@ -8,6 +8,7 @@ import type {
   PiiArtifactScanSource
 } from "../pii/pii-artifact-scan-enqueuer.js";
 import { SessionUploadAccessError } from "../session-upload-access.js";
+import { StoredFileCommitUnknownError } from "../storage/stored-file-transaction.js";
 import type { SessionStore } from "../session-store.js";
 import { assertValidArtifactFilename } from "./artifact-filename.js";
 import { buildArtifactStorageKey } from "./artifact-storage-key.js";
@@ -123,6 +124,7 @@ export class UploadAdmission {
         }
       }));
     } catch (error) {
+      if (error instanceof StoredFileCommitUnknownError) throw error;
       // Keep the access or audit error if cleanup also fails.
       try {
         await this.deps.storage.delete(stored.storageKey);

@@ -18,6 +18,7 @@ import { fetchModels } from "../lib/api-client";
 import { keepTabInside, makeBackgroundInert, tabbableWithin } from "../lib/inert-background";
 import { isApplePlatform, matchesShortcut, SHORTCUTS, useShortcut } from "../lib/keyboard-shortcuts";
 import { queryKeys } from "../lib/query-keys";
+import { takeDraftResolution, type DraftResolution } from "../lib/project-draft-resolution";
 import { listProjects, setProjectSession } from "../lib/project-api";
 
 import { applyLiveTurn, latestCompletedTurn, resolveSessionStatus, type LiveTurnActivity } from "./session-status.logic";
@@ -113,15 +114,33 @@ export function ChatShell() {
   }>({ projectId: null, ids: [] });
   const projectId = sessionList.selectedSession?.projectId ?? null;
   const sessionId = sessionList.selectedSessionId;
-  const resolveDraftIdFromUrl = searchParams?.get("resolveDraft") ?? null;
-  const [consumedResolveDraftId, setConsumedResolveDraftId] = useState<string | null>(null);
-  const resolveDraftId = resolveDraftIdFromUrl !== consumedResolveDraftId
-    ? resolveDraftIdFromUrl
-    : null;
-  const [resolveDraftIntent, setResolveDraftIntent] = useState<{
-    sessionId: string;
-    draftId: string;
-  } | null>(null);
+  const linkedSessionId = searchParams?.get("session") ?? null;
+  const resolutionToken = searchParams?.get("resolveDraft");
+  const [resolution, setResolution] = useState<DraftResolution | null>(null);
+  const [resolveDraftIntent, setResolveDraftIntent] = useState<(DraftResolution & { sent: boolean }) | null>(null);
+  useEffect(() => {
+    const cancel = () => {
+      setResolution(null);
+      setResolveDraftIntent(null);
+    };
+    window.addEventListener("pagehide", cancel);
+    return () => window.removeEventListener("pagehide", cancel);
+  }, []);
+  useEffect(() => {
+    if (!resolutionToken || !linkedSessionId) return;
+    const params = new URLSearchParams({ session: linkedSessionId, resolveDraft: resolutionToken });
+    const request = takeDraftResolution(queryClient, `/?${params}`);
+    // Consume the click before waiting for session access or file metadata.
+    // Leaving the page while either loads discards the local request.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    if (request) setResolution(request);
+    const url = new URL(window.location.href);
+    url.searchParams.delete("resolveDraft");
+    window.history.replaceState(null, "", url);
+  }, [resolutionToken, linkedSessionId, queryClient]);
+  const resolveDraftId = resolution && resolution.sessionId === sessionId && resolution.projectId === projectId
+    ? resolution.draftId : null;
+  const canResolve = sessionList.selectedSession?.canEdit !== false;
   const [unavailableSelections, setUnavailableSelections] = useState<{
     projectId: string | null;
     count: number;
@@ -140,28 +159,30 @@ export function ChatShell() {
   );
 
   useEffect(() => {
-    if (!resolveDraftId || !projectId || !sessionId || resolveDraftQuery.isPlaceholderData) return;
-    // Wait for the draft lookup before consuming the URL intent. This keeps a
-    // valid draft from being dropped while the lookup is still loading.
+    if (!resolution) return;
+    if (resolution.sessionId !== linkedSessionId) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setResolution(null);
+      return;
+    }
+    if (!resolveDraftId || !projectId || resolveDraftQuery.isPlaceholderData) return;
     if (!resolveDraftQuery.isSuccess && !resolveDraftQuery.isError) return;
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    setConsumedResolveDraftId(resolveDraftId);
-    if (resolveDraftQuery.data?.items.some((file) => file.fileId === resolveDraftId)) {
-      setResolveDraftIntent({ sessionId, draftId: resolveDraftId });
+    setResolution(null);
+    const { draftId } = resolution;
+    if (canResolve && resolveDraftQuery.isSuccess &&
+        resolveDraftQuery.data.items.some((file) => file.fileId === draftId && file.kind === "draft")) {
+      setResolveDraftIntent({ ...resolution, sent: false });
       const currentIds = selectedProjectFiles.projectId === projectId
         ? selectedProjectFiles.ids
         : [];
-      if (!currentIds.includes(resolveDraftId)) {
+      if (!currentIds.includes(draftId)) {
         setSelectedProjectFiles({
           projectId,
-          ids: [resolveDraftId, ...currentIds].slice(0, MAX_PROJECT_FILE_SELECTIONS)
+          ids: [draftId, ...currentIds].slice(0, MAX_PROJECT_FILE_SELECTIONS)
         });
       }
     }
-    const url = new URL(window.location.href);
-    url.searchParams.delete("resolveDraft");
-    window.history.replaceState(window.history.state, "", url);
-  }, [projectId, resolveDraftId, resolveDraftQuery.data, resolveDraftQuery.isError, resolveDraftQuery.isPlaceholderData, resolveDraftQuery.isSuccess, selectedProjectFiles.ids, selectedProjectFiles.projectId, sessionId]);
+  }, [resolution, linkedSessionId, resolveDraftId, projectId, canResolve, resolveDraftQuery.data, resolveDraftQuery.isError, resolveDraftQuery.isPlaceholderData, resolveDraftQuery.isSuccess, selectedProjectFiles]);
 
   useEffect(() => {
     if (!resolveDraftIntent || resolveDraftIntent.sessionId === sessionId) return;
@@ -196,9 +217,11 @@ export function ChatShell() {
     const confirmed = new Set(selectionQuery.data?.items.map((file) => file.fileId) ?? []);
     // The resolve-draft lookup confirmed its draft. Keep it for the handoff
     // turn while the lookup for the full list is still loading.
-    if (resolveDraftIntent?.sessionId === sessionId) confirmed.add(resolveDraftIntent.draftId);
+    if (resolveDraftIntent?.sessionId === sessionId && (!selectionQuery.isSuccess || selectionQuery.isPlaceholderData)) {
+      confirmed.add(resolveDraftIntent.draftId);
+    }
     return selectedProjectFileIds.filter((fileId) => confirmed.has(fileId));
-  }, [resolveDraftIntent, selectedProjectFileIds, selectionQuery.data, sessionId]);
+  }, [resolveDraftIntent, selectedProjectFileIds, selectionQuery.data, selectionQuery.isSuccess, selectionQuery.isPlaceholderData, sessionId]);
   // Newly added IDs wait for the lookup. The picker tells the user that a turn
   // sent now does not include them.
   const checkingProjectFileCount = !selectionQuery.isError &&
@@ -216,7 +239,6 @@ export function ChatShell() {
 
   // Quick jump opens a session with a link to "/?session=<id>". On this page the link
   // changes only the URL, so select the session when the link changes.
-  const linkedSessionId = searchParams?.get("session") ?? null;
   const previousLinkedSessionId = useRef(linkedSessionId);
   useEffect(() => {
     if (linkedSessionId === previousLinkedSessionId.current) return;
@@ -762,7 +784,7 @@ export function ChatShell() {
                     initialNotices,
                     isRunning: selectedIsServerRunning,
                     canEdit: selectedDisplaySession?.canEdit !== false,
-                    initialPrompt: resolveDraftIntent?.sessionId === sessionId && projectId
+                    initialPrompt: resolveDraftIntent?.sessionId === sessionId && resolveDraftIntent.projectId === projectId && !resolveDraftIntent.sent
                       ? `Resolve the selected project draft conflict. The selected draft ID is ${resolveDraftIntent.draftId}. First call project_get_conflict_context with that draft ID and compare the base, latest published, and proposed text. If the intended merge is clear, call project_reconcile_conflict with the same draft ID and the merged text. If it is ambiguous, explain the alternatives and do not write a draft. Never promote, delete, or change folders.`
                       : undefined
                   }}
@@ -780,7 +802,7 @@ export function ChatShell() {
                   artifactInventory={artifactInventory}
                   draftScope={user ? { userId: user.userId, tenantId: user.tenantId } : undefined}
                   events={{
-                    onInitialPromptSent: () => setResolveDraftIntent(null),
+                    onInitialPromptSent: () => setResolveDraftIntent((current) => current ? { ...current, sent: true } : null),
                     onArtifactsChanged: () => {
                       if (!sessionId) return;
                       void chatWorkspace.refreshSessionData(sessionId).catch(() => {

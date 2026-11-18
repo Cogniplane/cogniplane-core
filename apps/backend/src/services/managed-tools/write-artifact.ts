@@ -6,6 +6,7 @@ import type { ArtifactStore } from "../artifacts/artifact-store.js";
 import { ToolCallError } from "../../lib/tool-call-error.js";
 import { validateArtifactFilename } from "../artifacts/artifact-filename.js";
 import { buildArtifactStorageKey } from "../artifacts/artifact-storage-key.js";
+import { StoredFileCommitUnknownError } from "../storage/stored-file-transaction.js";
 import { strictObjectSchema, withManagedToolErrorSchema, type ManagedToolDefinition } from "./types.js";
 
 type WriteArtifactDeps = {
@@ -184,6 +185,7 @@ export function createWriteArtifactTool(deps: WriteArtifactDeps): ManagedToolDef
             }
           }));
         } catch (error) {
+          if (error instanceof StoredFileCommitUnknownError) throw error;
           // The object is not recoverable by artifact GC until its database row
           // exists. Remove it when the transaction rejects, preserving the
           // original authorization/database error for the caller.

@@ -109,6 +109,7 @@ type HostOptions = {
   model?: string;
   events?: ChatEventHandlers;
   artifactInventory?: ArtifactCardInventory;
+  projectFileIds?: string[];
   draftScope?: { userId: string; tenantId: string };
 };
 
@@ -128,6 +129,7 @@ function hostElement(options: HostOptions = {}) {
       }}
       usage={{ contextTokens: 0, contextWindow: 1000, sessionCostUsd: 0 }}
       artifactIds={[]}
+      projectFileIds={options.projectFileIds}
       artifactInventory={options.artifactInventory}
       draftScope={options.draftScope}
       events={options.events ?? {}}
@@ -699,6 +701,28 @@ describe("CopilotChatHost sends", () => {
     await waitFor(() => expect(textCount("Refused question")).toBe(0));
     await waitFor(() => expect(server.count("GET /sessions/s-1/connect")).toBe(2));
     await screen.findByText("Second question");
+  });
+
+  it("retains the authorized prompt and draft for a retry after a busy refusal", async () => {
+    const { events } = recordEvents();
+    let history: FixtureStream | undefined;
+    server.connect("s-1", idleHistory(EARLIER), (stream) => { history = stream; });
+    server.messageReplies = [{ status: 429, body: { error: "session_busy" } }, (stream) => {
+      stream.push(ev.runStarted("resolution"), ev.runFinished("resolution"));
+      stream.finish();
+    }];
+    const options = { events, projectFileIds: ["draft-1"] };
+    const view = render(hostElement({ ...options, session: { initialPrompt: "Resolve the draft" } }));
+    await waitFor(() => expect(events.onInitialPromptSent).toHaveBeenCalledOnce());
+    view.rerender(hostElement(options));
+    await waitFor(() => expect(history).toBeDefined());
+    await act(async () => {
+      history!.push(...ev.history({ messages: EARLIER }));
+      history!.finish();
+    });
+    const request = sentBody({ sessionId: "s-1", text: "Resolve the draft", model: "model-1", projectFileIds: ["draft-1"] });
+    await waitFor(() => expect(server.sent).toEqual([request, request]));
+    expect(events.onInitialPromptSent).toHaveBeenCalledOnce();
   });
 
   it("sends a one-shot project prompt once, after the history, with the latest getters", async () => {
