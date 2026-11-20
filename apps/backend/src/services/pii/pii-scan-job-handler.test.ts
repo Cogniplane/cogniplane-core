@@ -433,7 +433,7 @@ test("PiiScanJobHandler persists report findings and attaches findingsCount", as
         { entityType: "email", value: "a@b.com", start: 0, end: 7, confidence: "high" }
       ],
       providerType: "openai-compatible",
-      providerModel: "google/gemini-2.5-flash"
+      providerModel: "google/gemini-3.5-flash-lite"
     }
   });
   const handler = new PiiScanJobHandler(deps);
@@ -455,7 +455,7 @@ test("PiiScanJobHandler records a blocked outcome with block reason on the subje
       ],
       blockReason: "email",
       providerType: "openai-compatible",
-      providerModel: "google/gemini-2.5-flash"
+      providerModel: "google/gemini-3.5-flash-lite"
     }
   });
   const handler = new PiiScanJobHandler(deps);

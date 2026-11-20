@@ -103,7 +103,7 @@ const baseTestConfig: AppConfig = {
   E2B_NETWORK_REQUEST_TIMEOUT_MS: 5 * 1000,
   PII_PROVIDER_ENABLED: false,
   PII_LLM_BASE_URL: "https://openrouter.ai/api/v1",
-  PII_LLM_MODEL: "google/gemini-2.5-flash",
+  PII_LLM_MODEL: "google/gemini-3.5-flash-lite",
   PII_LLM_WIRE_FORMAT: "openai",
   PII_LLM_DISABLE_THINKING: false,
   UTILITY_LLM_ENABLED: false,

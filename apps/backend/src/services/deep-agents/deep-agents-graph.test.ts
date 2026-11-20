@@ -555,8 +555,8 @@ describe("resolveModelConstruction", () => {
   });
 
   it("uses the google-genai init prefix for Google models (not 'google'/Vertex)", () => {
-    expect(resolveModelConstruction("google/gemini-2.5-pro").initModelId).toBe(
-      "google-genai:gemini-2.5-pro"
+    expect(resolveModelConstruction("google/gemini-4-carbon").initModelId).toBe(
+      "google-genai:gemini-4-carbon"
     );
   });
 

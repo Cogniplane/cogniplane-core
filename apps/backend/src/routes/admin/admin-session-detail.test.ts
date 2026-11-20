@@ -186,7 +186,7 @@ test("admin session detail — happy path returns all sections in camelCase", as
           source_user_id: "user-1",
           mode: "transform",
           provider_type: "openai-compatible",
-          provider_model: "google/gemini-2.5-flash",
+          provider_model: "google/gemini-3.5-flash-lite",
           status: "transformed",
           findings_json: [{ kind: "email", count: 2 }],
           summary_text: "2 emails masked",
@@ -289,7 +289,7 @@ test("admin session detail — happy path returns all sections in camelCase", as
 
   expect(body.piiRuns.length).toBe(1);
   expect(body.piiRuns[0].findings).toEqual([{ kind: "email", count: 2 }]);
-  expect(body.piiRuns[0].providerModel).toBe("google/gemini-2.5-flash");
+  expect(body.piiRuns[0].providerModel).toBe("google/gemini-3.5-flash-lite");
 
   expect(body.auditEvents.length).toBe(1);
   expect(body.auditEvents[0].eventType).toBe("session.created");

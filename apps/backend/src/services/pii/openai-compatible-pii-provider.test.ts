@@ -61,7 +61,7 @@ function buildProvider(fetchImpl: typeof fetch, overrides: Partial<ConstructorPa
   return new OpenAiCompatiblePiiProvider({
     baseUrl: "https://openrouter.ai/api/v1",
     apiKey: "sk-or-test",
-    model: "google/gemini-2.5-flash",
+    model: "google/gemini-3.5-flash-lite",
     timeoutMs: 5000,
     fetch: fetchImpl,
     ...overrides
@@ -94,7 +94,7 @@ test("detectText returns normalized findings from PII model JSON response", asyn
   });
 
   expect(result.providerType).toBe("openai-compatible");
-  expect(result.providerModel).toBe("google/gemini-2.5-flash");
+  expect(result.providerModel).toBe("google/gemini-3.5-flash-lite");
   expect(result.findings.length).toBe(1);
   expect(result.findings[0]?.entityType).toBe("email");
   expect(result.findings[0]?.start).toBe(12);
@@ -106,7 +106,7 @@ test("detectText returns normalized findings from PII model JSON response", asyn
   expect(request.url).toBe("https://openrouter.ai/api/v1/chat/completions");
   expect(request.headers.Authorization).toBe("Bearer sk-or-test");
   const body = request.body as { model: string; response_format: { type: string } };
-  expect(body.model).toBe("google/gemini-2.5-flash");
+  expect(body.model).toBe("google/gemini-3.5-flash-lite");
   expect(body.response_format.type).toBe("json_object");
 });
 

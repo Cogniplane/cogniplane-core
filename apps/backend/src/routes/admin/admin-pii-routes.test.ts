@@ -510,7 +510,7 @@ test("recent: returns rows shaped without raw value, default actions = block,tra
                   action_taken: "block",
                   status: "blocked",
                   provider_type: "openai-compatible",
-                  provider_model: "google/gemini-2.5-flash",
+                  provider_model: "google/gemini-3.5-flash-lite",
                   findings_count: 2,
                   error_message: null,
                   entity_types: ["email", "phone"]

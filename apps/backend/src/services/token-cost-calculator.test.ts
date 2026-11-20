@@ -31,16 +31,16 @@ describe("calculateCostUsd", () => {
   });
 
   it("discounts cached input tokens at the cachedInput rate", () => {
-    // gemini-2.5-flash: input 0.30, cachedInput 0.03, output 2.50 per 1M.
+    // gemini-3.8-flash: input 0.75, cachedInput 0.075, output 3.75 per 1M.
     // 1M input of which 400k are cached → 600k billable input + 400k cached.
     const cost = calculateCostUsd(
-      "gemini-2.5-flash",
+      "gemini-3.8-flash",
       usage({ inputTokens: 1_000_000, cachedInputTokens: 400_000, outputTokens: 1_000_000 })
     );
     const expected =
-      (600_000 / 1_000_000) * 0.3 +
-      (400_000 / 1_000_000) * 0.03 +
-      (1_000_000 / 1_000_000) * 2.5;
+      (600_000 / 1_000_000) * 0.75 +
+      (400_000 / 1_000_000) * 0.075 +
+      (1_000_000 / 1_000_000) * 3.75;
     expect(cost).toBeCloseTo(expected, 6);
   });
 

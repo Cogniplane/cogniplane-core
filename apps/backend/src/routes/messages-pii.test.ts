@@ -39,7 +39,7 @@ test("POST /messages in block mode persists a system message and does not dispat
           findings: [{ entityType: "email", value: "a@b.com", start: 0, end: 7, confidence: "high" }],
           blockReason: "email",
           providerType: "openai-compatible",
-          providerModel: "google/gemini-2.5-flash"
+          providerModel: "google/gemini-3.5-flash-lite"
         };
       }, { mode: "block", revision: 9 }),
       piiScanRuns: {
@@ -94,7 +94,7 @@ test("POST /messages?format=agui in block mode emits AG-UI BaseEvents the client
           findings: [{ entityType: "email", value: "a@b.com", start: 0, end: 7, confidence: "high" }],
           blockReason: "email",
           providerType: "openai-compatible",
-          providerModel: "google/gemini-2.5-flash"
+          providerModel: "google/gemini-3.5-flash-lite"
         };
       }),
       piiScanRuns: {
@@ -159,7 +159,7 @@ test("POST /messages in transform mode emits user_message_replaced and sends tra
           transformedText: "my email is [REDACTED:email]",
           findings: [{ entityType: "email", value: "user@example.com", start: 0, end: 16, confidence: "high" }],
           providerType: "openai-compatible",
-          providerModel: "google/gemini-2.5-flash"
+          providerModel: "google/gemini-3.5-flash-lite"
         };
       }),
       piiScanRuns: {
@@ -223,7 +223,7 @@ test("POST /messages in detect mode persists raw user message with report metada
           action: "report",
           findings: [{ entityType: "email", value: "user@example.com", start: 0, end: 16, confidence: "high" }],
           providerType: "openai-compatible",
-          providerModel: "google/gemini-2.5-flash"
+          providerModel: "google/gemini-3.5-flash-lite"
         };
       }),
       piiScanRuns: {
@@ -363,7 +363,7 @@ test("POST /messages consumes a rate-limit token but no turn quota for a PII-blo
           findings: [{ entityType: "email", value: "a@b.com", start: 0, end: 7, confidence: "high" }],
           blockReason: "email",
           providerType: "openai-compatible",
-          providerModel: "google/gemini-2.5-flash"
+          providerModel: "google/gemini-3.5-flash-lite"
         };
       }),
       piiScanRuns: {
@@ -423,7 +423,7 @@ test("POST /messages does not call the PII provider when the rate limit is exhau
           reason: "no_findings",
           findings: [],
           providerType: "openai-compatible",
-          providerModel: "google/gemini-2.5-flash"
+          providerModel: "google/gemini-3.5-flash-lite"
         };
       }),
       piiScanRuns: {

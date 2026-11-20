@@ -259,11 +259,11 @@ test("POST /admin/custom-models falls back to a null context length sanely", asy
 test("POST /admin/custom-models rejects built-in collisions and duplicates", async () => {
   const { app } = await makeApp();
   try {
-    // "openrouter/tencent/hy3" is a built-in catalog id.
+    // "openrouter/tencent/hy4" is a built-in catalog id.
     const collision = await app.inject({
       method: "POST",
       url: "/admin/custom-models",
-      payload: { provider: "openrouter", vendorModelId: "tencent/hy3" }
+      payload: { provider: "openrouter", vendorModelId: "tencent/hy4" }
     });
     expect(collision.statusCode).toBe(409);
     expect(collision.json().error).toBe("model_already_in_catalog");

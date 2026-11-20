@@ -319,7 +319,7 @@ const dirtyBlockDecision: PiiDecision = {
   findings: [{ entityType: "email", value: "a@b.com", start: 0, end: 7, confidence: "high" }],
   blockReason: "email",
   providerType: "openai-compatible",
-  providerModel: "google/gemini-2.5-flash"
+  providerModel: "google/gemini-3.5-flash-lite"
 };
 
 test("block mode on a dirty artifact marks it failed, deletes the object, and returns blocked", async () => {
@@ -747,7 +747,7 @@ test("a synchronous block records its decision, commits the verdict with the que
       policyRevision: 3,
       findings: dirtyBlockDecision.findings,
       providerType: "openai-compatible",
-      providerModel: "google/gemini-2.5-flash",
+      providerModel: "google/gemini-3.5-flash-lite",
       blockReason: "email"
     }
   }]);

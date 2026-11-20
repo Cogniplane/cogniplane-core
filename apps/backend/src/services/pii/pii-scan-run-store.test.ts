@@ -60,7 +60,7 @@ function sampleRow(overrides: Record<string, unknown> = {}): Record<string, unkn
     source_user_id: "user-1",
     mode: "block",
     provider_type: "openai-compatible",
-    provider_model: "google/gemini-2.5-flash",
+    provider_model: "google/gemini-3.5-flash-lite",
     status: "pending",
     findings_json: [],
     summary_text: null,
@@ -87,7 +87,7 @@ test("PiiScanRunStore.create inserts with defaults and returns mapped record", a
     sourceUserId: "user-1",
     mode: "block",
     providerType: "openai-compatible",
-    providerModel: "google/gemini-2.5-flash"
+    providerModel: "google/gemini-3.5-flash-lite"
   });
 
   expect(db.lastQuery).toBeTruthy();
@@ -286,7 +286,7 @@ test("maps a finished run's optional fields and normalizes timestamps", async ()
     policyRevision: 3,
     sourceSessionId: "session-1",
     providerType: "openai-compatible",
-    providerModel: "google/gemini-2.5-flash",
+    providerModel: "google/gemini-3.5-flash-lite",
     status: "blocked",
     summaryText: "1 email",
     actionTaken: "block",

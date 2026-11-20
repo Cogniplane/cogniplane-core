@@ -356,7 +356,7 @@ test("loadConfig boots when PII provider is disabled and no API key is set", () 
   expect(config.PII_LLM_API_KEY).toBe(undefined);
   expect(config.PII_PROVIDER_TIMEOUT_MS).toBe(5000);
   expect(config.PII_LLM_BASE_URL).toBe("https://openrouter.ai/api/v1");
-  expect(config.PII_LLM_MODEL).toBe("google/gemini-2.5-flash");
+  expect(config.PII_LLM_MODEL).toBe("google/gemini-3.5-flash-lite");
 });
 
 test("loadConfig requires a PII model API key when PII provider is enabled", () => {

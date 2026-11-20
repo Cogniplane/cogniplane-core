@@ -433,7 +433,7 @@ export const envSchema = z.object({
   // routes to Google's Vertex AI under ZDR. Operators who want stronger
   // guarantees should set PII_LLM_MODEL explicitly and verify the provider's
   // posture (for OpenRouter, https://openrouter.ai/docs/features/privacy-and-logging).
-  PII_LLM_MODEL: z.string().trim().min(1).default("google/gemini-2.5-flash"),
+  PII_LLM_MODEL: z.string().trim().min(1).default("google/gemini-3.5-flash-lite"),
   // Wire dialect the PII endpoint speaks.
   //   - "openai" (default): POST <base>/chat/completions. Base URL ends in /v1.
   //     Works for OpenRouter, vLLM, and Ollama's OpenAI-compat layer.

@@ -16,6 +16,16 @@ type ModelPricing = {
 };
 
 const PRICING: Record<string, ModelPricing> = {
+  // GPT-6.2 long context: input and cache rates double and output is 1.5x the
+  // short rate for the full request (OpenAI pricing page, 2026-11-19).
+  "gpt-6.2-astra": {
+    short: { input:  8.00, cachedInput: 0.40,  output: 40.00 },
+    long:  { input: 16.00, cachedInput: 0.80,  output: 60.00 }
+  },
+  "gpt-6.2-sol": {
+    short: { input:  2.00, cachedInput: 0.10,  output: 10.00 },
+    long:  { input:  4.00, cachedInput: 0.20,  output: 15.00 }
+  },
   "gpt-6-astra-pro": {
     short: { input: 10.00, cachedInput: 1.00,  output: 50.00 },
     long:  null
@@ -77,6 +87,10 @@ const PRICING: Record<string, ModelPricing> = {
   // cache-creation tokens (1.25x input) into `inputTokens`. The calculator then
   // bills them at the regular input rate. This under-bills that bucket a little.
   // A separate pricing tier is not worth it.
+  "claude-fable-5-2": {
+    short: { input:  8.00, cachedInput: 0.20,  output: 40.00 },
+    long:  null
+  },
   "claude-fable-5-1": {
     short: { input: 10.00, cachedInput: 0.25,  output: 50.00 },
     long:  null
@@ -146,11 +160,24 @@ const PRICING: Record<string, ModelPricing> = {
   // Keys are the bare VENDOR model id (catalog id with its first namespace
   // segment stripped — inner slashes and the `:free` suffix preserved), which
   // is exactly what resolveModelConstruction().vendorModel yields.
-  // Gemini 4 Argon is the one Google row taken from Google's own pricing page
-  // (it is newer than the OpenRouter-sourced rows). Google's introductory
-  // rates end on a set date, and this table holds one rate per model: Argon
-  // doubles to $4.00/$0.20/$20.00 on 2026-12-01, and 3.8 Flash doubles to
-  // $1.50/$0.15/$7.50 on 2027-01-01. Update these rows on those dates.
+  // The Gemini 4 rows are taken from Google's own pricing page (2026-11-19);
+  // they are newer than the OpenRouter-sourced rows. Google's introductory
+  // rates end on a set date, and this table holds one rate per model: Carbon
+  // and Argon double to $4.00/$0.20/$20.00 on 2026-12-01, and 3.8 Flash
+  // doubles to $1.50/$0.15/$7.50 on 2027-01-01. Update these rows on those
+  // dates.
+  "gemini-4-carbon": {
+    short: { input: 2.00, cachedInput: 0.10,   output: 10.00 },
+    long:  null
+  },
+  "gemini-4-neon": {
+    short: { input: 3.00, cachedInput: 0.15,   output: 15.00 },
+    long:  null
+  },
+  "gemini-4-hydrogen": {
+    short: { input: 1.50, cachedInput: 0.075,  output:  7.50 },
+    long:  null
+  },
   "gemini-4-argon": {
     short: { input: 2.00, cachedInput: 0.10,   output: 10.00 },
     long:  null
@@ -159,6 +186,12 @@ const PRICING: Record<string, ModelPricing> = {
     short: { input: 0.75, cachedInput: 0.075,  output:  3.75 },
     long:  null
   },
+  "gemini-3.1-pro-preview": {
+    short: { input: 2.00, cachedInput: 0.20,   output: 12.00 },
+    long:  null
+  },
+  // Retired from the model picker but kept for billing history on past
+  // messages. Google routes 3.7 Flash and 3.5 Flash to newer models.
   "gemini-3.7-flash": {
     short: { input: 0.75, cachedInput: 0.075,  output:  3.75 },
     long:  null
@@ -167,26 +200,29 @@ const PRICING: Record<string, ModelPricing> = {
     short: { input: 1.50, cachedInput: 0.15,   output:  9.00 },
     long:  null
   },
-  "gemini-3.1-pro-preview": {
-    short: { input: 2.00, cachedInput: 0.20,   output: 12.00 },
-    long:  null
-  },
-  "gemini-2.5-pro": {
-    short: { input: 1.25, cachedInput: 0.125,  output: 10.00 },
-    long:  null
-  },
-  "gemini-2.5-flash": {
-    short: { input: 0.30, cachedInput: 0.03,   output:  2.50 },
-    long:  null
-  },
 
   // OpenRouter-served (paid). Free `:free` routes below bill at zero.
+  // Rates of the model vendor's own OpenRouter endpoint, or of most hosts when
+  // the vendor does not serve it, without temporary discounts. The top-level
+  // `pricing` of /api/v1/models is the cheapest host and can be far lower.
   "z-ai/glm-5.3": {
     short: { input: 1.40,  cachedInput: 0.14,   output: 4.40 },
     long:  null
   },
-  "tencent/hy3": {
-    short: { input: 0.132, cachedInput: 0.033,  output: 0.528 },
+  "tencent/hy4": {
+    short: { input: 0.834, cachedInput: 0.042,  output: 2.501 },
+    long:  null
+  },
+  "qwen/qwen4-max": {
+    short: { input: 1.50,  cachedInput: 0.075,  output: 4.50 },
+    long:  null
+  },
+  "meta/muse-ember": {
+    short: { input: 0.10,  cachedInput: 0.004,  output: 0.50 },
+    long:  null
+  },
+  "thinkingmachines/inkling-2-small": {
+    short: { input: 0.30,  cachedInput: 0.03,   output: 1.00 },
     long:  null
   },
   "xiaomi/mimo-v2.6-flash": {
@@ -209,10 +245,6 @@ const PRICING: Record<string, ModelPricing> = {
     short: { input: 0.20,  cachedInput: 0.04,   output: 1.15 },
     long:  null
   },
-  "qwen/qwen3.8-max-0902": {
-    short: { input: 2.00,  cachedInput: 0.25,   output: 6.00 },
-    long:  null
-  },
   "z-ai/glm-5.3-flashx": {
     short: { input: 0.37,  cachedInput: 0.09,   output: 1.25 },
     long:  null
@@ -222,7 +254,7 @@ const PRICING: Record<string, ModelPricing> = {
     long:  null
   },
   "mistralai/mistral-large-4-0": {
-    short: { input: 1.36,  cachedInput: 0.14,   output: 4.18 },
+    short: { input: 0.70,  cachedInput: 0.07,   output: 2.10 },
     long:  null
   },
   "meta/muse-spark-1.3": {
@@ -265,10 +297,6 @@ const PRICING: Record<string, ModelPricing> = {
     short: { input: 0, cachedInput: 0, output: 0 },
     long:  null
   },
-  "thinkingmachines/inkling:free": {
-    short: { input: 0, cachedInput: 0, output: 0 },
-    long:  null
-  },
   "nvidia/nemotron-3-ultra-550b-a55b:free": {
     short: { input: 0, cachedInput: 0, output: 0 },
     long:  null
@@ -278,6 +306,18 @@ const PRICING: Record<string, ModelPricing> = {
     long:  null
   },
   // Retired routes, kept for billing history on past messages.
+  "tencent/hy3": {
+    short: { input: 0.132, cachedInput: 0.033,  output: 0.528 },
+    long:  null
+  },
+  "qwen/qwen3.8-max-0902": {
+    short: { input: 2.00,  cachedInput: 0.25,   output: 6.00 },
+    long:  null
+  },
+  "thinkingmachines/inkling:free": {
+    short: { input: 0, cachedInput: 0, output: 0 },
+    long:  null
+  },
   "nvidia/nemotron-3-super-120b-a12b:free": {
     short: { input: 0, cachedInput: 0, output: 0 },
     long:  null

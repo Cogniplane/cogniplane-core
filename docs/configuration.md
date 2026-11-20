@@ -238,7 +238,7 @@ from build arguments). Frontend variables are in `apps/frontend/.env.example`
 | `PII_PROVIDER_ENABLED` | boolean | `false` | [startup rules](#startup-rules), [pii](architecture/pii.md) |
 | `PII_LLM_BASE_URL` | string, URL | `"https://openrouter.ai/api/v1"` | [pii](architecture/pii.md), [self-hosting](self-hosting.md) |
 | `PII_LLM_API_KEY` | string, minimum 1 | `unset` | [startup rules](#startup-rules), [pii](architecture/pii.md) |
-| `PII_LLM_MODEL` | string, minimum 1 | `"google/gemini-2.5-flash"` | [pii](architecture/pii.md), [self-hosting](self-hosting.md) |
+| `PII_LLM_MODEL` | string, minimum 1 | `"google/gemini-3.5-flash-lite"` | [pii](architecture/pii.md), [self-hosting](self-hosting.md) |
 | `PII_LLM_WIRE_FORMAT` | one of ["openai", "ollama"] | `"openai"` | [pii](architecture/pii.md), [self-hosting](self-hosting.md) |
 | `PII_LLM_DISABLE_THINKING` | boolean | `false` | [pii](architecture/pii.md), [self-hosting](self-hosting.md) |
 | `PII_PROVIDER_TIMEOUT_MS` | number, integer, > 0 | `5000` | [pii](architecture/pii.md) |
