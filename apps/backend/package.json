@@ -36,7 +36,7 @@
     "@langchain/openai": "1.8.0",
     "@simplewebauthn/server": "14.0.3",
     "@workos-inc/node": "^12.1.0",
-    "cron-parser": "^5.10.3",
+    "cron-parser": "^5.10.6",
     "deepagents": "1.16.2",
     "e2b": "2.63.0",
     "eventsource-parser": "4.1.3",
