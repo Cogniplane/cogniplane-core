@@ -1,8 +1,9 @@
 import { describe, expect, test } from "vitest";
 import { SessionStore } from "../services/session-store.js";
 import { MessageStore } from "../services/message-store.js";
+import { ToolExecutionContextStore } from "../services/auth/tool-execution-context-store.js";
 import { adminDatabaseUrl, appPool } from "./support/database.js";
-import { seedTenant, seedUser, seedSession } from "./support/fixtures.js";
+import { seedTenant, seedUser, seedSession, seedRuntimeSession } from "./support/fixtures.js";
 
 describe.skipIf(!adminDatabaseUrl())("persisted session activity", () => {
   test("returns the latest assistant outcome after reopening, without crossing ownership boundaries", async () => {
@@ -60,6 +61,15 @@ describe.skipIf(!adminDatabaseUrl())("persisted MCP App calls", () => {
       serverId: "quote-server", toolName: "show_quote_picker",
       app: { resourceUri: "ui://quote-picker/app.html" }
     });
+    const runtimeId = await seedRuntimeSession(tenantId, userId, sessionId);
+    const contexts = new ToolExecutionContextStore(appPool());
+    const bind = (hash: string) => contexts.create({ tenantId, sessionId, userId, runtimeId,
+      runtimePolicyId: "test", messageId: message.messageId, ownerSecurityVersion: null, ttlMs: 1,
+      metadata: { mcpServerSources: [{ id: "another-server", hash: "other" }, { id: "quote-server", hash }] } });
+    await bind("original");
+    expect((await messages.getMcpAppCall(tenantId, sessionId, toolResultId))?.app.sourceHash).toBe("original");
+    await bind("ambiguous");
+    expect((await messages.getMcpAppCall(tenantId, sessionId, toolResultId))?.app.sourceHash).toBeUndefined();
     const history = await messages.listBySession(tenantId, sessionId, userId);
     expect(history.messages[0]?.toolResults).toMatchObject([{ toolResultId, kind: "mcp", status: "completed" }]);
   });

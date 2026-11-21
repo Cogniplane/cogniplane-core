@@ -233,9 +233,13 @@ describe.skipIf(!adminDatabaseUrl())("person access explanation", () => {
     const shared = await server("system", f.userId, { name: "System documents" });
     await server(f.tenantId, f.userId, { id: shared, name: "Test-only documents", published: false });
     const blocked = await server("system", f.userId, { personal: true });
-    await server(f.tenantId, f.userId, { id: blocked, personal: true, enabled: false });
+    await server(f.tenantId, f.userId, { id: blocked, personal: true });
     const connectable = await server(f.tenantId, f.userId, { name: "My notes", personal: true });
     await f.stores.tenantSettings.upsert(f.tenantId, { enabledMcpServerIds: [shared, blocked, connectable] });
+    await f.stores.memberMcpCredentials.save(f.tenantId, f.userId, blocked,
+      { version: 0, serverVersion: 1, secret: "member-test-secret", accountLabel: "Old account" }, null);
+    await superuserPool().query("UPDATE admin_mcp_servers SET enabled=false WHERE tenant_id=$1 AND server_id=$2",
+      [f.tenantId, blocked]);
 
     const app = Fastify();
     try {

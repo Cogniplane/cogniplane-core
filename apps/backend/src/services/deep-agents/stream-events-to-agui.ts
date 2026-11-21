@@ -649,6 +649,7 @@ function extractMcpApp(record: Record<string, unknown>, content: unknown, isErro
       : typeof content === "string" ? [{ type: "text", text: content }] : [];
   return {
     resourceUri,
+    ...(typeof meta?.cogniplaneAppSourceHash === "string" ? { sourceHash: meta.cogniplaneAppSourceHash } : {}),
     readOnly: meta?.cogniplaneAppReadOnly === true,
     turnContext: meta?.cogniplaneAppTurnContext === "interactive" || meta?.cogniplaneAppTurnContext === "scheduled"
       ? meta.cogniplaneAppTurnContext : null,

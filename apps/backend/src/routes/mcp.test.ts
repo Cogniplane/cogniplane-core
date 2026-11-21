@@ -67,7 +67,8 @@ test("carries a managed widget through the runtime's real MCP client into a save
   for (const event of [...start, ...end]) accumulator.apply(event);
   expect(accumulator.toolResults()[0]).toMatchObject({
     kind: "mcp", server: "managed-session-context", status: "completed",
-    mcpApp: { resourceUri: INTERACTIVE_UI_RESOURCE_URI, input, readOnly: true, turnContext: "interactive" }
+    mcpApp: { resourceUri: INTERACTIVE_UI_RESOURCE_URI, sourceHash: "hash-managed-session-context",
+      input, readOnly: true, turnContext: "interactive" }
   });
 });
 
@@ -223,7 +224,7 @@ test("links a forwarded result only to the app URI advertised in tools/list", as
         : { tools: [{ name: "show_quote_picker", description: "Show quotes", inputSchema: { type: "object" },
           _meta: { ui: { resourceUri: "ui://quote-picker/app.html" } } }] }
       : { ...(omitContent ? {} : { content: [{ type: "text", text: "Three quotes" }] }), structuredContent: { quotes: [1, 2, 3] },
-        _meta: { cogniplaneAppResourceUri: "ui://spoofed", other: "kept" } } };
+        _meta: { cogniplaneAppResourceUri: "ui://spoofed", cogniplaneAppSourceHash: "untrusted", other: "kept" } } };
     return reply.header("content-type", "text/event-stream")
       .send(`: upstream comment\n\nevent: message\ndata: ${JSON.stringify(response)}\n\n`);
   });
@@ -243,7 +244,7 @@ test("links a forwarded result only to the app URI advertised in tools/list", as
       params: { name: "show_quote_picker", arguments: { toolContextId: context.toolContextId } } } });
   expect(called.json().result).toMatchObject({
     structuredContent: { quotes: [1, 2, 3] },
-    _meta: { cogniplaneAppResourceUri: "ui://quote-picker/app.html", other: "kept" }
+    _meta: { cogniplaneAppResourceUri: "ui://quote-picker/app.html", cogniplaneAppSourceHash: "hash-test-proxy", other: "kept" }
   });
   omitContent = true;
   const withoutContent = await app.inject({ method: "POST", url: "/mcp/test-proxy", headers,

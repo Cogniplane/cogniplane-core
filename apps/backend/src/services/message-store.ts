@@ -413,16 +413,25 @@ export class MessageStore {
   } | null> {
     return withTenantScope(this.db, tenantId, async (client) => {
       const result = await client.query(
-        `SELECT mcp_app, server_name, tool_name, input_text FROM message_tool_results
+        `SELECT mcp_app, message_id, user_id, server_name, tool_name, input_text FROM message_tool_results
          WHERE tenant_id = $1 AND session_id = $2 AND tool_result_id = $3
            AND kind = 'mcp' AND status = 'completed' LIMIT 1`,
         [tenantId, sessionId, toolCallId]
       );
       const row = result.rows[0];
       const app = McpAppCallSchema.safeParse(row?.mcp_app);
-      return row && typeof row.server_name === "string" && typeof row.tool_name === "string" && app.success
-        ? { app: app.data, serverId: row.server_name, toolName: row.tool_name, input: String(row.input_text ?? "{}") }
-        : null;
+      if (!app.success || typeof row?.server_name !== "string" || typeof row.tool_name !== "string") return null;
+      if (!app.data.sourceHash) {
+        // Older calls stored the connector hash only in the turn's tool context.
+        const contexts = await client.query(
+          `SELECT metadata->'mcpServerSources' AS sources FROM tool_execution_contexts
+           WHERE tenant_id=$1 AND session_id=$2 AND message_id=$3 AND user_id=$4 LIMIT 2`,
+          [tenantId, sessionId, row.message_id, row.user_id]);
+        const sources = contexts.rows.length === 1 ? contexts.rows[0].sources : null;
+        const matches = Array.isArray(sources) ? sources.filter(source => source?.id === row.server_name) : [];
+        if (matches.length === 1 && typeof matches[0].hash === "string") app.data.sourceHash = matches[0].hash;
+      }
+      return { app: app.data, serverId: row.server_name, toolName: row.tool_name, input: String(row.input_text ?? "{}") };
     });
   }
 

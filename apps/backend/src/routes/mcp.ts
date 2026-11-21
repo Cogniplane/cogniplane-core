@@ -597,7 +597,7 @@ async function handleToolsCall(input: {
       ? await handleManagedToolCall(
           rpc,
           tenantId,
-          server.id,
+          server,
           managedTools,
           toolContexts,
           invocation.metadata,
@@ -753,7 +753,7 @@ async function recordToolCallTelemetry(input: {
 async function handleManagedToolCall(
   rpc: z.infer<typeof rpcRequestSchema>,
   tenantId: string,
-  serverId: string,
+  server: McpServerRegistration,
   managedTools: ManagedToolDefinition[],
   toolContexts: Pick<ToolExecutionContextStore, "require" | "findLatestActiveBySession">,
   invocation: McpInvocationMetadata | null,
@@ -767,6 +767,7 @@ async function handleManagedToolCall(
   logger: Pick<FastifyBaseLogger, "debug" | "warn">,
   captureContext: (context: ToolExecutionContext) => void
 ): Promise<RpcResponse> {
+  const serverId = server.id;
   const params = rpc.params ?? {};
   const toolName = String(params.name ?? "");
   const args =
@@ -905,7 +906,7 @@ async function handleManagedToolCall(
       ],
       structuredContent: result,
       isError: false,
-      ...(tool.appResource ? { _meta: mcpAppResultMeta(tool.appResource.uri, tool.readOnly, context) } : {})
+      ...(tool.appResource ? { _meta: mcpAppResultMeta(tool.appResource.uri, server.hash, tool.readOnly, context) } : {})
     });
   } catch (error) {
     if (error instanceof PolicyBlockedError) {
@@ -964,12 +965,14 @@ function checkUserApproval(
 // sets them; the proxy path strips upstream copies first.
 function mcpAppResultMeta(
   resourceUri: string,
+  sourceHash: string,
   readOnly: boolean,
   context: Pick<ToolExecutionContext, "metadata">
 ): Record<string, unknown> {
   const turnContext = context.metadata.turnContext;
   return {
     cogniplaneAppResourceUri: resourceUri,
+    cogniplaneAppSourceHash: sourceHash,
     cogniplaneAppReadOnly: readOnly,
     cogniplaneAppTurnContext: turnContext === "interactive" || turnContext === "scheduled" ? turnContext : null
   };
@@ -1144,15 +1147,16 @@ async function handleForwardedToolCall(
   const result = response.result;
   const meta = isPlainObject(result._meta) ? result._meta : {};
   const { cogniplaneAppResourceUri: _untrusted, cogniplaneAppReadOnly: _untrustedReadOnly,
-    cogniplaneAppTurnContext: _untrustedTurnContext, ...upstreamMeta } = meta;
+    cogniplaneAppTurnContext: _untrustedTurnContext, cogniplaneAppSourceHash: _untrustedHash, ...upstreamMeta } = meta;
   if (response.error || !Array.isArray(result.content) || !resourceUri) {
-    const hadUntrusted = _untrusted !== undefined || _untrustedReadOnly !== undefined || _untrustedTurnContext !== undefined;
+    const hadUntrusted = _untrusted !== undefined || _untrustedReadOnly !== undefined ||
+      _untrustedTurnContext !== undefined || _untrustedHash !== undefined;
     return hadUntrusted ? { ...response, result: { ...result, _meta: upstreamMeta } } : response;
   }
   const readOnly = proxyToolMetadataCache.isReadOnly(tenantId, server.id, toolName, cacheScope) === true;
   return {
     ...response,
-    result: { ...result, _meta: { ...upstreamMeta, ...mcpAppResultMeta(resourceUri, readOnly, context) } }
+    result: { ...result, _meta: { ...upstreamMeta, ...mcpAppResultMeta(resourceUri, server.hash, readOnly, context) } }
   };
 }
 
