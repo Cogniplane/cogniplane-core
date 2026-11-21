@@ -69,7 +69,7 @@ function makeStores(overrides: DynamicConfigStoreOverrides = {}): DynamicConfigS
     },
     mcpServers: {
       async listMcpServers() { return []; },
-      async getMcpServer() { return null; },
+      async getVisibleMcpServer() { return null; },
       async getAdminMcpServer() { return null; },
       async createMcpServer() { throw new Error("createMcpServer should not be called"); },
       async updateMcpServer() { throw new Error("updateMcpServer should not be called"); },
@@ -849,7 +849,7 @@ test("resolves only the acting member's current personal MCP credential", async 
       mcpServers: {
         // The gateway reads only the target row on each request.
         listMcpServers: async () => { throw new Error("unexpected full server list read"); },
-        getMcpServer: async () => ({ ...server, upstreamAuth: null })
+        getVisibleMcpServer: async () => ({ ...server, upstreamAuth: null })
       }
     }),
     tenantMembers: {

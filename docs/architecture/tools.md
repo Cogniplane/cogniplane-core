@@ -22,6 +22,11 @@ Center](policy-center.md).
   `MCP_UPSTREAM_TIMEOUT_MS` per call, `MCP_UPSTREAM_MAX_RESPONSE_BYTES` per
   response.
 
+When a tenant and the system share a server ID, the runtime catalog and the
+gateway select from the rows visible to the member. Both skip disabled rows.
+Only test users can use unpublished rows. If both rows qualify, the tenant row
+wins. Admins can still open a disabled tenant row to edit it.
+
 Admin setup of a proxy server: [connectors](../connectors.md#proxy-mcp-servers).
 
 Proxy upstreams use public addresses by default. Admission rejects local and
@@ -189,8 +194,11 @@ error, because SDK errors keep request headers and client objects there.
   form asks for the secret again (`mustReenterMcpSecret`). A new path on the
   same origin keeps the secret.
 - A runtime call uses the acting member's credential. Project access never lends
-  another member's credential. A member without a credential sees the connection
-  but gets no runtime tools from it.
+  another member's credential. The capability picker shows a personal
+  connector before sign-in if the member can connect to it. Runtime tools
+  require a current credential. For a legacy ID shared by two rows, the
+  member credential store binds to the tenant copy. If that copy is off or
+  hidden from the member, the picker omits the inherited personal connector.
 - A project chat gets no per-member server and no integration tool that uses a
   personal connection, also with the acting member's own credential. The
   gateway refuses them for a session in a project

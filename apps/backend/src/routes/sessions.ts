@@ -192,6 +192,9 @@ async function registerScopedSessionRoutes(
           !selectedServer || !["proxy", "managed"].includes(selectedServer.mode)) {
         return reply.code(404).send(notFoundError("mcp_app_not_found"));
       }
+      if (call.app.sourceHash ? call.app.sourceHash !== selectedServer.hash : selectedServer.mode === "proxy") {
+        return reply.code(404).send(notFoundError("mcp_app_not_found"));
+      }
       const managedTool = selectedServer.mode === "managed" ? stores.managedToolCatalog?.get(call.toolName) : undefined;
       if (selectedServer.mode === "managed") {
         if (!managedTool?.appResource || managedTool.appResource.uri !== call.app.resourceUri ||
@@ -236,7 +239,7 @@ async function registerScopedSessionRoutes(
     } catch {
       return reply.code(404).send(notFoundError("mcp_app_not_found"));
     }
-    if (server.mode !== "proxy" || !server.upstreamUrl) {
+    if (server.mode !== "proxy" || !server.upstreamUrl || server.hash !== call.app.sourceHash) {
       return reply.code(404).send(notFoundError("mcp_app_not_found"));
     }
     const response = await forwardSignedProxyRpc({

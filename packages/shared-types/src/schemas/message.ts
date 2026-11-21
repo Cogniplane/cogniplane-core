@@ -37,6 +37,7 @@ export const MCP_APP_MESSAGE_MAX_CHARS = 4_000;
 
 export const McpAppCallSchema = z.object({
   resourceUri: z.string().startsWith("ui://"),
+  sourceHash: z.string().min(1).optional(),
   readOnly: z.boolean().optional(),
   turnContext: z.enum(["interactive", "scheduled"]).nullable().optional(),
   input: z.record(z.string(), z.unknown()).optional(),

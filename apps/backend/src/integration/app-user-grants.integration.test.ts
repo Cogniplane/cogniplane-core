@@ -21,12 +21,15 @@ describe.skipIf(!adminDatabaseUrl())("application database privileges", () => {
     await store.create({ type, payload: { allowed: true } });
     expect(await store.listByType(type)).toMatchObject([{ eventType: type, payload: { allowed: true } }]);
     const tenant = await seedTenantGraph();
+    const storageKey = `grants/${randomUUID()}`;
     await withTenantScope(appPool(), tenant.tenantId, async client => {
       expect((await client.query("UPDATE tenants SET tenant_name = 'Allowed' WHERE tenant_id = $1 RETURNING tenant_name", [tenant.tenantId])).rows)
         .toEqual([{ tenant_name: "Allowed" }]);
       await client.query("INSERT INTO session_storage_gc (tenant_id, session_id, storage_key) VALUES ($1, $2, $3)",
-        [tenant.tenantId, tenant.sessionId, `grants/${randomUUID()}`]);
+        [tenant.tenantId, tenant.sessionId, storageKey]);
     });
+    await superuserPool().query("DELETE FROM session_storage_gc WHERE tenant_id=$1 AND session_id=$2 AND storage_key=$3",
+      [tenant.tenantId, tenant.sessionId, storageKey]);
   });
 
   test.each([

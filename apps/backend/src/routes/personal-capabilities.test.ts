@@ -20,8 +20,7 @@ async function setup() {
   const memberMcpCredentials = { list: vi.fn(async (): Promise<McpConnection[]> => []) };
   const dynamicConfig = {
     compilePersonalCatalog: vi.fn(async () => ({ skills: [{ id: "pdf", name: "PDF", description: null }],
-      mcpServers: [{ id: "docs", description: "Read docs" }] })),
-    listMcpServers: vi.fn(async () => [{ serverId: "docs", serverName: "Documents" }])
+      mcpServers: [{ id: "docs", name: "Documents", description: "Read docs" }] }))
   };
   const tenantMembers = { isUserBetaTester: vi.fn(async () => false) };
   await registerPersonalCapabilityRoutes(app, { personalCapabilities, dynamicConfig, tenantMembers, memberMcpCredentials } as unknown as PersonalCapabilityStores);
@@ -113,10 +112,10 @@ it("shows the caller's connection state without hiding an unconnected approved c
   expect(h.memberMcpCredentials.list).toHaveBeenCalledWith("tenant", "member");
 });
 
-it("names a connector without a server record by its ID and flags a suspended credential", async () => {
+it("uses each catalog name and flags a suspended credential", async () => {
   const h = await setup();
   h.dynamicConfig.compilePersonalCatalog.mockResolvedValue({ skills: [],
-    mcpServers: [{ id: "docs", description: "Read docs" }, { id: "unlisted", description: "No record" }] });
+    mcpServers: [{ id: "docs", name: "Documents", description: "Read docs" }, { id: "unlisted", name: "unlisted", description: "No record" }] });
   h.memberMcpCredentials.list.mockResolvedValue([{
     serverId: "docs", serverName: "Documents", description: null, upstreamUrl: "https://docs.example.test/mcp",
     authType: "bearer", authName: null, credentialScope: "personal", serverVersion: 1,

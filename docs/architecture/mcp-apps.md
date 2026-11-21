@@ -51,6 +51,10 @@ JavaScript: ask each model you enable for a small widget before you offer it.
   current Policy Center rules. A newly disabled tool or blocking rule also hides
   saved widgets. Before these checks, the route counts the request against the
   shared `resource_read` rate limit ([data](data.md#rate-limits-and-quotas)).
+- The gateway records the connector's configuration hash with each widget.
+  For older calls, the backend reads the hash from the original turn. It
+  loads proxy HTML only when that hash matches the member's current connector.
+  A changed connector or a missing hash leaves the text result available.
 - A tool view that throws while it loads or renders shows a local notice; the
   reply and the other views stay ([render
   errors](frontend.md#render-errors)).

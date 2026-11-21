@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { describe, expect, test, vi } from "vitest";
-import { AdminPersonAccessResponseSchema, type SessionCapabilitySelection } from "@cogniplane/shared-types";
+import { AdminPersonAccessResponseSchema, PersonalCapabilitiesSchema, type SessionCapabilitySelection } from "@cogniplane/shared-types";
 import { PersonAccessService, PersonAccessMemberNotFound } from "../services/person-access-service.js";
 import { SkillConfigStore } from "../services/skills/skill-config-store.js";
 import { McpServerStore } from "../services/mcp-server-store.js";
@@ -17,7 +17,8 @@ import { ManagedToolCatalog } from "../services/managed-tools/catalog.js";
 import { createTestConfig } from "../test-helpers/test-config.js";
 import { buildSkillsLibraryFiles } from "../services/deep-agents/deep-agents-skills-library.js";
 import * as crypto from "../lib/crypto-utils.js";
-import type { FastifyBaseLogger } from "fastify";
+import Fastify, { type FastifyBaseLogger } from "fastify";
+import { registerPersonalCapabilityRoutes } from "../routes/personal-capabilities.js";
 import { adminDatabaseUrl, appPool, superuserPool } from "./support/database.js";
 import { seedTenant, seedUser, seedMembership, seedSession } from "./support/fixtures.js";
 
@@ -49,17 +50,20 @@ async function skill(tenantId: string, userId: string, options: {
   return id;
 }
 async function server(tenantId: string, userId: string, options: {
-  id?: string; personal?: boolean; enabled?: boolean; published?: boolean; legacy?: boolean; managed?: boolean
+  id?: string; personal?: boolean; enabled?: boolean; published?: boolean; legacy?: boolean; managed?: boolean;
+  bearerSecret?: string; name?: string
 } = {}) {
   const id = options.id ?? `server-${randomUUID()}`;
   await superuserPool().query(`INSERT INTO admin_mcp_servers
     (tenant_id,server_id,server_name,mode,route_path,upstream_url,upstream_auth_type,upstream_auth_name,
-     credential_scope,config_hash,enabled,is_published,created_by)
-    VALUES ($1,$2,$2,$3,$4,$5,$6,$7,$8,'test-hash',$9,$10,$11)`,
+     credential_scope,config_hash,enabled,is_published,created_by,upstream_auth_secret_encrypted)
+    VALUES ($1,$2,$13,$3,$4,$5,$6,$7,$8,'hash-' || $1,$9,$10,$11,$12)`,
   [tenantId, id, options.managed ? "managed" : "proxy", `/mcp/${id}`,
     options.legacy ? "https://vendor.example/mcp?api_key=private-legacy-key" : "https://vendor.example/mcp",
-    options.legacy || !options.personal ? "none" : "header", options.personal && !options.legacy ? "X-API-Key" : null,
-    options.personal ? "personal" : "organization", options.enabled ?? true, options.published ?? true, userId]);
+    options.bearerSecret ? "bearer" : options.personal && !options.legacy ? "header" : "none",
+    options.personal && !options.legacy ? "X-API-Key" : null,
+    options.personal ? "personal" : "organization", options.enabled ?? true, options.published ?? true, userId,
+    options.bearerSecret ? crypto.encrypt(options.bearerSecret, secret) : null, options.name ?? id]);
   return id;
 }
 async function defaults(tenantId: string, userId: string, selection: SessionCapabilitySelection | null) {
@@ -177,6 +181,83 @@ describe.skipIf(!adminDatabaseUrl())("person access explanation", () => {
     expect(result.items.find(row => row.id === id)).toMatchObject({ name: "System winner", status: "included",
       runtimeSource: "system", adminPageSource: "organization" });
     expect(result.items.find(row => row.id === connection)).toMatchObject({ status: "excluded", runtimeSource: "system" });
+  });
+
+  test.each([
+    { tenantAudience: "off", systemEnabled: true, beta: false, winner: "system" },
+    { tenantAudience: "test_users", systemEnabled: true, beta: false, winner: "system" },
+    { tenantAudience: "members", systemEnabled: true, beta: false, winner: "organization" },
+    { tenantAudience: "test_users", systemEnabled: true, beta: true, winner: "organization" },
+    { tenantAudience: "test_users", systemEnabled: false, beta: false, winner: "none" }
+  ])("catalog and dispatch select $winner for tenant audience $tenantAudience, system enabled $systemEnabled, beta $beta",
+    async ({ tenantAudience, systemEnabled, beta, winner }) => {
+      const f = await setup();
+      const id = await server("system", f.userId, { enabled: systemEnabled, bearerSecret: "system-secret" });
+      await server(f.tenantId, f.userId, { id, enabled: tenantAudience !== "off", published: tenantAudience === "members",
+        bearerSecret: "organization-secret" });
+      await f.stores.tenantSettings.upsert(f.tenantId, { enabledMcpServerIds: [id] });
+      await superuserPool().query("UPDATE tenant_memberships SET is_beta_tester=$3 WHERE tenant_id=$1 AND user_id=$2",
+        [f.tenantId, f.userId, beta]);
+      const sessionId = await seedSession(f.tenantId, f.userId);
+      const service = runtime(f);
+      const admin = await f.stores.mcpServers.getAdminMcpServer(f.tenantId, id);
+      expect(admin).toMatchObject({ ownerTenantId: f.tenantId, enabled: tenantAudience !== "off" });
+
+      const decrypt = vi.spyOn(crypto, "decrypt");
+      try {
+        const compiled = await service.compileRuntimeConfig(f.tenantId, beta, { sessionId, userId: f.userId });
+        const catalog = compiled.mcpServers.find(row => row.id === id);
+        expect(decrypt).not.toHaveBeenCalled();
+        const dispatch = service.getMcpServerForUser(f.tenantId, id, f.userId);
+        if (winner === "none") {
+          expect(catalog).toBeUndefined();
+          await expect(dispatch).rejects.toThrow("Unknown MCP server");
+          expect(decrypt).not.toHaveBeenCalled();
+          return;
+        }
+
+        const owner = winner === "system" ? "system" : f.tenantId;
+        const source = { id, hash: `hash-${owner}` };
+        expect(catalog).toMatchObject({ ...source, upstreamAuth: null });
+        expect(compiled.sources.mcpServers).toContainEqual({ ...source, version: 1 });
+        await expect(dispatch).resolves.toMatchObject({ ...source, credentialBindingId: catalog!.credentialBindingId,
+          upstreamAuth: { type: "bearer", secret: `${winner}-secret` } });
+        expect(decrypt).toHaveBeenCalledTimes(1);
+      } finally {
+        decrypt.mockRestore();
+      }
+    });
+
+  test("the member picker uses the visible connector name and offers only usable personal connections", async () => {
+    const f = await setup();
+    const shared = await server("system", f.userId, { name: "System documents" });
+    await server(f.tenantId, f.userId, { id: shared, name: "Test-only documents", published: false });
+    const blocked = await server("system", f.userId, { personal: true });
+    await server(f.tenantId, f.userId, { id: blocked, personal: true });
+    const connectable = await server(f.tenantId, f.userId, { name: "My notes", personal: true });
+    await f.stores.tenantSettings.upsert(f.tenantId, { enabledMcpServerIds: [shared, blocked, connectable] });
+    await f.stores.memberMcpCredentials.save(f.tenantId, f.userId, blocked,
+      { version: 0, serverVersion: 1, secret: "member-test-secret", accountLabel: "Old account" }, null);
+    await superuserPool().query("UPDATE admin_mcp_servers SET enabled=false WHERE tenant_id=$1 AND server_id=$2",
+      [f.tenantId, blocked]);
+
+    const app = Fastify();
+    try {
+      app.addHook("preHandler", async request => {
+        request.auth = { tenantId: f.tenantId, userId: f.userId, isAdmin: false, role: "member" };
+      });
+      await registerPersonalCapabilityRoutes(app, { ...f.stores, dynamicConfig: runtime(f) });
+      const response = await app.inject("/me/capabilities");
+      expect(response.statusCode).toBe(200);
+      const { connectors } = PersonalCapabilitiesSchema.parse(response.json());
+      expect(connectors).toHaveLength(2);
+      expect(connectors).toEqual(expect.arrayContaining([
+        expect.objectContaining({ id: shared, name: "System documents" }),
+        expect.objectContaining({ id: connectable, name: "My notes", connectionStatus: "not_connected" })
+      ]));
+    } finally {
+      await app.close();
+    }
   });
 
   test("does not migrate legacy organization credentials on tenant or system rows", async () => {

@@ -1,5 +1,4 @@
-import { capabilityOptions } from "./capability-options.js";
-import { memberMcpStatuses, type MemberMcpStatusStore } from "./member-mcp-status.js";
+import { capabilityOptions, type MemberMcpStatusStore } from "./capability-options.js";
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { ProjectCapabilitiesSchema, ProjectCapabilitiesUpdateSchema } from "@cogniplane/shared-types";
@@ -13,7 +12,7 @@ import { hasUnavailableAdditions } from "../services/capability-selection.js";
 export type ProjectCapabilityStores = {
   memberMcpCredentials?: MemberMcpStatusStore;
   projects: Pick<AppDependencies["projects"], "getReadable" | "getCapabilities" | "setCapabilities">;
-  dynamicConfig: Pick<AppDependencies["dynamicConfig"], "compileProjectCatalog" | "listMcpServers">;
+  dynamicConfig: Pick<AppDependencies["dynamicConfig"], "compileProjectCatalog">;
   tenantMembers: Pick<AppDependencies["tenantMembers"], "isUserBetaTester">;
 };
 
@@ -29,12 +28,11 @@ export async function registerProjectCapabilityRoutes(app: FastifyInstance, stor
     // Callers check project read access first. Only this project's skills join the catalog.
     const catalog = async (tenantId: string, userId: string, projectId: string) => {
       const beta = await stores.tenantMembers.isUserBetaTester(tenantId, userId);
-      const [bundle, servers, connectionStatuses] = await Promise.all([
+      const [bundle, connections] = await Promise.all([
         stores.dynamicConfig.compileProjectCatalog(tenantId, beta, projectId, userId),
-        stores.dynamicConfig.listMcpServers(tenantId, false),
-        memberMcpStatuses(stores.memberMcpCredentials, tenantId, userId)
+        stores.memberMcpCredentials?.list(tenantId, userId) ?? []
       ]);
-      return capabilityOptions({ skills: bundle.skills, mcpServers: bundle.mcpServers, servers, connectionStatuses });
+      return capabilityOptions({ skills: bundle.skills, mcpServers: bundle.mcpServers, connections });
     };
 
     routes.get("/projects/:projectId/capabilities", async (request, reply) => {

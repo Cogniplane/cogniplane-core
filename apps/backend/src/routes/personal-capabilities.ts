@@ -1,5 +1,4 @@
-import { capabilityOptions } from "./capability-options.js";
-import { memberMcpStatuses, type MemberMcpStatusStore } from "./member-mcp-status.js";
+import { capabilityOptions, type MemberMcpStatusStore } from "./capability-options.js";
 import type { FastifyInstance } from "fastify";
 import { PersonalCapabilitiesSchema, PersonalCapabilitiesUpdateSchema } from "@cogniplane/shared-types";
 import type { AppDependencies } from "../app-dependencies.js";
@@ -12,7 +11,7 @@ import { PersonalCapabilityAccessError } from "../services/personal-capability-s
 export type PersonalCapabilityStores = {
   memberMcpCredentials?: MemberMcpStatusStore;
   personalCapabilities: Pick<AppDependencies["personalCapabilities"], "get" | "save">;
-  dynamicConfig: Pick<AppDependencies["dynamicConfig"], "compilePersonalCatalog" | "listMcpServers">;
+  dynamicConfig: Pick<AppDependencies["dynamicConfig"], "compilePersonalCatalog">;
   tenantMembers: Pick<AppDependencies["tenantMembers"], "isUserBetaTester">;
 };
 
@@ -24,12 +23,11 @@ export async function registerPersonalCapabilityRoutes(app: FastifyInstance, sto
     });
     const catalog = async (tenantId: string, userId: string) => {
       const beta = await stores.tenantMembers.isUserBetaTester(tenantId, userId);
-      const [bundle, servers, connectionStatuses] = await Promise.all([
+      const [bundle, connections] = await Promise.all([
         stores.dynamicConfig.compilePersonalCatalog(tenantId, beta, userId),
-        stores.dynamicConfig.listMcpServers(tenantId, false),
-        memberMcpStatuses(stores.memberMcpCredentials, tenantId, userId)
+        stores.memberMcpCredentials?.list(tenantId, userId) ?? []
       ]);
-      return capabilityOptions({ skills: bundle.skills, mcpServers: bundle.mcpServers, servers, connectionStatuses });
+      return capabilityOptions({ skills: bundle.skills, mcpServers: bundle.mcpServers, connections });
     };
     const conflict = () => apiError("capabilities_conflict", "Your defaults changed. Reload, review your choices, and save again.");
 

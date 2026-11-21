@@ -44,10 +44,13 @@ it("reads only a saved app call in a readable session and filters resource metad
   let structuredInput: Record<string, unknown> | undefined = undefined;
   let readOnly = true;
   let credentialConnected = true;
+  let savedHash: string | undefined = "tenant-hash";
+  let catalogHash = "tenant-hash";
+  let dispatchHash = "tenant-hash";
   let turnContext: "interactive" | "scheduled" | null = null;
   const getMcpAppCall = vi.fn(async (_tenant: string, _session: string, toolCallId: string) =>
     toolCallId === "saved" ? { ...CALL, input: savedInput,
-      app: { ...CALL.app, readOnly, turnContext, ...(structuredInput ? { input: structuredInput } : {}) } } : null);
+      app: { ...CALL.app, sourceHash: savedHash, readOnly, turnContext, ...(structuredInput ? { input: structuredInput } : {}) } } : null);
   const policy = { enabledMcpServers: ["quote-server"], policyEnforcementMode: "enforce" };
   const evaluation = { outcome: "allow" };
   const gateCompletedToolResource = vi.fn(async (input: { enforcementMode: string }) => {
@@ -59,7 +62,7 @@ it("reads only a saved app call in a readable session and filters resource metad
   const compileRuntimeConfig = vi.fn(async (_tenant: string, _beta: boolean, _session: { sessionId: string; userId: string }) => ({
     runtimePolicy: policy,
     mcpServers: policy.enabledMcpServers.includes("quote-server") && (!selection || selection.connectorIds.includes("quote-server"))
-      ? [{ id: "quote-server", mode: "proxy" }] : []
+      ? [{ id: "quote-server", mode: "proxy", hash: catalogHash }] : []
   }));
   const consumeRateLimit = vi.fn(async () => null);
   const app = await sessionRoutesApp({
@@ -69,7 +72,7 @@ it("reads only a saved app call in a readable session and filters resource metad
       getMcpServerForUser: async (_tenantId: string, _serverId: string, userId: string) => {
         expect(userId).toBe("user");
         if (!credentialConnected) throw new Error("Credential unavailable");
-        return { id: "quote-server", mode: "proxy", upstreamUrl,
+        return { id: "quote-server", mode: "proxy", upstreamUrl, hash: dispatchHash,
           credentialScope: "personal", upstreamAuth: { type: "bearer", secret: "viewer-secret" } };
       },
       compileRuntimeConfig
@@ -85,6 +88,15 @@ it("reads only a saved app call in a readable session and filters resource metad
   expect(consumeRateLimit).toHaveBeenLastCalledWith({ resource: "resource_read", userId: "user", tenantId: "tenant" });
   expect((await app.inject(`/sessions/${ALLOWED}/mcp-apps/unknown`)).statusCode).toBe(404);
   expect(consumeRateLimit).toHaveBeenCalledTimes(2);
+  const readSaved = () => app.inject(`/sessions/${ALLOWED}/mcp-apps/saved`);
+  savedHash = undefined;
+  expect((await readSaved()).statusCode).toBe(404);
+  savedHash = "tenant-hash";
+  catalogHash = dispatchHash = "system-hash";
+  expect((await readSaved()).statusCode).toBe(404);
+  catalogHash = "tenant-hash";
+  expect((await readSaved()).statusCode).toBe(404);
+  dispatchHash = "tenant-hash";
   expect(reads).toHaveLength(0);
   policy.enabledMcpServers = [];
   expect((await app.inject(`/sessions/${ALLOWED}/mcp-apps/saved`)).statusCode).toBe(404);

@@ -19,7 +19,7 @@ import { z } from "zod";
 import { McpConnectionSchema, SessionCapabilitiesSchema } from "@cogniplane/shared-types";
 
 import { PasswordHasher } from "../lib/password-hash.js";
-import { memberMcpStatuses } from "../routes/member-mcp-status.js";
+import { capabilityOptions } from "../routes/capability-options.js";
 import { OwnerSecurityVersionChangedError } from "../services/auth/security-change.js";
 import { IGNORE_SECURITY_CHANGE } from "../test-helpers/security-change.js";
 import { bootstrapLocalTenant } from "../scripts/local-auth-commands-lib.js";
@@ -266,10 +266,13 @@ describe.skipIf(!adminDatabaseUrl())("personal connections after a security chan
     // Both the current and the pre-change contracts read the responses.
     expect(McpConnectionSchema.parse(listed)).toMatchObject({ status: "reconnect_required", suspended: true });
     expect(McpConnectionBeforeSchema.parse(listed)).toMatchObject({ status: "reconnect_required", accountLabel: null });
-    const option = (await memberMcpStatuses(members, owner.tenantId, owner.userId)).get(serverId);
-    expect(option).toEqual({ connectionStatus: "reconnect_required", accountLabel: null, connectionSuspended: true });
+    const [option] = capabilityOptions({ skills: [], mcpServers: [{
+      id: serverId, name: server.serverName, description: "", credentialScope: server.credentialScope
+    }], connections: await members.list(owner.tenantId, owner.userId) }).connectors;
+    expect(option).toEqual({ id: serverId, name: "Notes", description: "",
+      connectionStatus: "reconnect_required", accountLabel: null, connectionSuspended: true });
     expect(CapabilityOptionBeforeSchema.parse(option)).toEqual({ connectionStatus: "reconnect_required", accountLabel: null });
-    expect(SessionCapabilitiesSchema.shape.connectors.element.parse({ id: serverId, name: "Notes", description: "", ...option }))
+    expect(SessionCapabilitiesSchema.shape.connectors.element.parse(option))
       .toMatchObject({ connectionStatus: "reconnect_required", connectionSuspended: true });
 
     // A new secret from a current session stores that session's version.

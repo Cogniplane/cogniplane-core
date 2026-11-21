@@ -19,6 +19,7 @@ export function normalizeMcpServer(
 ): McpServerRegistration {
   return {
     id: record.serverId,
+    name: record.serverName,
     description: record.description ?? record.serverName,
     mode: record.mode,
     routePath: record.routePath,

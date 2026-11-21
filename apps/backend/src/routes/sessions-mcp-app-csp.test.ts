@@ -11,7 +11,7 @@ const CALL = {
   serverId: "quote-server",
   toolName: "show_quote_picker",
   input: '{"seats":80}',
-  app: { resourceUri: URI, readOnly: true, result: { content: [{ type: "text", text: "Three quotes" }] } }
+  app: { resourceUri: URI, sourceHash: "quote-hash", readOnly: true, result: { content: [{ type: "text", text: "Three quotes" }] } }
 };
 const ALL_EMPTY = { resourceDomains: [], connectDomains: [], frameDomains: [], baseUriDomains: [] };
 
@@ -37,10 +37,10 @@ async function widget(declared: unknown, mcpAppCsp: Store | undefined) {
     sessions: { getReadable: async () => ({ status: "active" as const, projectId: null, userId: "owner" }) },
     messages: { getMcpAppCall: async () => CALL },
     dynamicConfig: {
-      getMcpServerForUser: async () => ({ id: "quote-server", mode: "proxy", upstreamUrl, credentialScope: "organization" }),
+      getMcpServerForUser: async () => ({ id: "quote-server", mode: "proxy", hash: "quote-hash", upstreamUrl, credentialScope: "organization" }),
       compileRuntimeConfig: async () => ({
         runtimePolicy: { enabledMcpServers: ["quote-server"], policyEnforcementMode: "enforce" },
-        mcpServers: [{ id: "quote-server", mode: "proxy" }]
+        mcpServers: [{ id: "quote-server", mode: "proxy", hash: "quote-hash" }]
       })
     },
     tenantMembers: { isUserBetaTester: async () => false },

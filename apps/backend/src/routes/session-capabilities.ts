@@ -1,5 +1,4 @@
-import { capabilityOptions } from "./capability-options.js";
-import { memberMcpStatuses, type MemberMcpStatusStore } from "./member-mcp-status.js";
+import { capabilityOptions, type MemberMcpStatusStore } from "./capability-options.js";
 import type { FastifyInstance, FastifyRequest, FastifyReply } from "fastify";
 import { SessionCapabilitiesSchema, SessionCapabilitiesUpdateSchema, type SessionCapabilitySelection } from "@cogniplane/shared-types";
 import type { AppDependencies } from "../app-dependencies.js";
@@ -14,7 +13,7 @@ import { hasUnavailableAdditions } from "../services/capability-selection.js";
 export type SessionCapabilityStores = {
   memberMcpCredentials?: MemberMcpStatusStore;
   sessions: Pick<AppDependencies["sessions"], "getOwned" | "getReadable" | "getCapabilities" | "setCapabilities">;
-  dynamicConfig: Pick<AppDependencies["dynamicConfig"], "compileRuntimeConfig" | "compilePersonalCatalog" | "compileProjectCatalog" | "listMcpServers">;
+  dynamicConfig: Pick<AppDependencies["dynamicConfig"], "compileRuntimeConfig" | "compilePersonalCatalog" | "compileProjectCatalog">;
   tenantMembers: Pick<AppDependencies["tenantMembers"], "isUserBetaTester">;
   activeTurns: AppDependencies["activeTurns"];
   runtimeAdapter: Pick<AppDependencies["runtimeAdapter"], "hasActiveTurn">;
@@ -53,19 +52,18 @@ async function registerScopedSessionCapabilityRoutes(app: FastifyInstance, store
     context: { personalUserId: string | null; projectId: string | null }) => {
     const beta = await stores.tenantMembers.isUserBetaTester(tenantId, userId);
     // Build the user's available catalog before applying session defaults.
-    const [bundle, servers, connectionStatuses] = await Promise.all([
+    const [bundle, connections] = await Promise.all([
       context.personalUserId
         ? stores.dynamicConfig.compilePersonalCatalog(tenantId, beta, context.personalUserId)
         : context.projectId
           ? stores.dynamicConfig.compileProjectCatalog(tenantId, beta, context.projectId, userId)
           : stores.dynamicConfig.compileRuntimeConfig(tenantId, beta),
-      stores.dynamicConfig.listMcpServers(tenantId, false),
-      memberMcpStatuses(stores.memberMcpCredentials, tenantId, userId)
+      stores.memberMcpCredentials?.list(tenantId, userId) ?? []
     ]);
     return capabilityOptions({
       skills: bundle.skills.filter((s) => !limit || limit.skillIds.includes(s.id)),
       mcpServers: bundle.mcpServers.filter((s) => !limit || limit.connectorIds.includes(s.id)),
-      servers, connectionStatuses
+      connections
     });
   };
 
