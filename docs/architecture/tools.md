@@ -194,8 +194,11 @@ error, because SDK errors keep request headers and client objects there.
   form asks for the secret again (`mustReenterMcpSecret`). A new path on the
   same origin keeps the secret.
 - A runtime call uses the acting member's credential. Project access never lends
-  another member's credential. A member without a credential sees the connection
-  but gets no runtime tools from it.
+  another member's credential. The capability picker shows a personal
+  connector before sign-in if the member can connect to it. Runtime tools
+  require a current credential. For a legacy ID shared by two rows, the
+  member credential store binds to the tenant copy. If that copy is off or
+  hidden from the member, the picker omits the inherited personal connector.
 - A project chat gets no per-member server and no integration tool that uses a
   personal connection, also with the acting member's own credential. The
   gateway refuses them for a session in a project

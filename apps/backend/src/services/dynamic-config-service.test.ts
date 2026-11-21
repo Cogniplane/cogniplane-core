@@ -69,7 +69,6 @@ function makeStores(overrides: DynamicConfigStoreOverrides = {}): DynamicConfigS
     },
     mcpServers: {
       async listMcpServers() { return []; },
-      async getMcpServer() { return null; },
       async getVisibleMcpServer() { return null; },
       async getAdminMcpServer() { return null; },
       async createMcpServer() { throw new Error("createMcpServer should not be called"); },

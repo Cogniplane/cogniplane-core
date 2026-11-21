@@ -24,11 +24,10 @@ async function setup() {
   });
   const memberMcpCredentials = { list: vi.fn(async (): Promise<McpConnection[]> => []) };
   const dynamicConfig = {
-    compileRuntimeConfig: vi.fn(async () => ({ skills: [{ id: "pdf", name: "PDF", description: null, sourceType: undefined as string | undefined }], mcpServers: [{ id: "docs", description: "Read docs" }] })),
-    compilePersonalCatalog: vi.fn(async () => ({ skills: [{ id: "pdf", name: "PDF", description: null as string | null, sourceType: undefined as string | undefined }], mcpServers: [{ id: "docs", description: "Read docs" }] })),
+    compileRuntimeConfig: vi.fn(async () => ({ skills: [{ id: "pdf", name: "PDF", description: null, sourceType: undefined as string | undefined }], mcpServers: [{ id: "docs", name: "Docs", description: "Read docs" }] })),
+    compilePersonalCatalog: vi.fn(async () => ({ skills: [{ id: "pdf", name: "PDF", description: null as string | null, sourceType: undefined as string | undefined }], mcpServers: [{ id: "docs", name: "Docs", description: "Read docs" }] })),
     compileProjectCatalog: vi.fn(async () => ({ skills: [{ id: "pdf", name: "PDF", description: null as string | null, sourceType: undefined as string | undefined },
-      { id: "project-skill-a", name: "shared-notes", description: "Notes" as string | null, sourceType: "project" as string | undefined }], mcpServers: [] })),
-    listMcpServers: vi.fn(async () => [{ serverId: "docs", serverName: "Docs" }])
+      { id: "project-skill-a", name: "shared-notes", description: "Notes" as string | null, sourceType: "project" as string | undefined }], mcpServers: [] }))
   };
   const activeTurns = new ActiveTurnsRegistry();
   const hasActiveTurn = vi.fn(() => false);
@@ -186,7 +185,7 @@ it("holds an invisible reservation during saves and rejects concurrent saves", a
 
 it("preserves a turn that starts while the catalog loads", async () => {
   const h = await setup();
-  h.dynamicConfig.listMcpServers.mockImplementation(async () => {
+  h.memberMcpCredentials.list.mockImplementation(async () => {
     h.activeTurns.mark(sessionId);
     return [];
   });
@@ -211,10 +210,10 @@ it("shows the caller's connection state without hiding an unconnected approved c
   expect(h.memberMcpCredentials.list).toHaveBeenCalledWith("tenant", "user");
 });
 
-it("names a connector without a server record by its ID and flags a suspended credential", async () => {
+it("uses each catalog name and flags a suspended credential", async () => {
   const h = await setup();
   h.dynamicConfig.compilePersonalCatalog.mockResolvedValue({ skills: [],
-    mcpServers: [{ id: "docs", description: "Read docs" }, { id: "unlisted", description: "No record" }] });
+    mcpServers: [{ id: "docs", name: "Docs", description: "Read docs" }, { id: "unlisted", name: "unlisted", description: "No record" }] });
   h.memberMcpCredentials.list.mockResolvedValue([{
     serverId: "docs", serverName: "Documents", description: null, upstreamUrl: "https://docs.example.test/mcp",
     authType: "bearer", authName: null, credentialScope: "personal", serverVersion: 1,

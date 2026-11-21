@@ -100,7 +100,6 @@ type DynamicConfigStores = {
   mcpServers: Pick<
     McpServerStore,
     | "listMcpServers"
-    | "getMcpServer"
     | "getVisibleMcpServer"
     | "getAdminMcpServer"
     | "createMcpServer"
@@ -185,15 +184,6 @@ export class DynamicConfigService {
   async getRuntimePolicy(tenantId: string): Promise<ResolvedRuntimePolicy> {
     const settings = await this.getOrCreateTenantSettings(tenantId);
     return tenantSettingsToRuntimePolicy(settings);
-  }
-
-  async getMcpServer(tenantId: string, serverId: string): Promise<McpServerRegistration> {
-    const server = await this.stores.mcpServers.getMcpServer(tenantId, serverId);
-    if (!server || !server.enabled) {
-      throw new AdminConfigError(`Unknown MCP server: ${serverId}`);
-    }
-
-    return normalizeMcpServer(server);
   }
 
   async getMcpServerForUser(tenantId: string, serverId: string, userId: string): Promise<McpServerRegistration> {

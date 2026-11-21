@@ -249,6 +249,7 @@ export type RuntimeSkillDefinition = {
 
 export type McpServerRegistration = {
   id: string;
+  name?: string;
   description: string;
   mode: "managed" | "proxy";
   routePath: string;
