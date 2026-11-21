@@ -101,6 +101,7 @@ type DynamicConfigStores = {
     McpServerStore,
     | "listMcpServers"
     | "getMcpServer"
+    | "getVisibleMcpServer"
     | "getAdminMcpServer"
     | "createMcpServer"
     | "updateMcpServer"
@@ -199,17 +200,15 @@ export class DynamicConfigService {
     if (!this.stores.tenantMembers || !await this.stores.tenantMembers.getActiveRole(tenantId, userId)) {
       throw new AdminConfigError(`Unknown MCP server: ${serverId}`);
     }
-    const isBetaTester = await this.stores.tenantMembers.isUserBetaTester(tenantId, userId);
-    // The gateway calls this on every JSON-RPC request, so read only the target
-    // row. getMcpServer prefers the tenant row over the system row, as
-    // listMcpServers does. When that row is enabled and visible to this member,
-    // it is also the row that listMcpServers would return.
-    const [policy, server] = await Promise.all([
-      this.getRuntimePolicy(tenantId),
-      this.stores.mcpServers.getMcpServer(tenantId, serverId)
+    const [isBetaTester, policy] = await Promise.all([
+      this.stores.tenantMembers.isUserBetaTester(tenantId, userId),
+      this.getRuntimePolicy(tenantId)
     ]);
-    if (!server || !server.enabled || (!server.isPublished && !isBetaTester) ||
-        !policy.enabledMcpServers.includes(serverId)) {
+    if (!policy.enabledMcpServers.includes(serverId)) {
+      throw new AdminConfigError(`Unknown MCP server: ${serverId}`);
+    }
+    const server = await this.stores.mcpServers.getVisibleMcpServer(tenantId, serverId, isBetaTester);
+    if (!server || !server.enabled || (!server.isPublished && !isBetaTester)) {
       throw new AdminConfigError(`Unknown MCP server: ${serverId}`);
     }
     const resolved = normalizeMcpServer(server);

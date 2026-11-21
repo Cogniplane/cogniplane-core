@@ -16,6 +16,15 @@ import { MemberMcpCredentialStore } from "./member-mcp-credential-store.js";
 
 type UpstreamAuthType = AdminMcpServerRecord["upstreamAuthType"];
 
+const VISIBLE_MCP_SERVERS_SQL = `
+  SELECT DISTINCT ON (server_id) *
+  FROM admin_mcp_servers
+  WHERE ($1::boolean OR enabled)
+    AND tenant_id IN ($2::text, 'system')
+    AND ($3::boolean OR is_published)
+  ORDER BY server_id, (tenant_id = $2::text) DESC, updated_at DESC
+`;
+
 function computeMcpServerConfigHash(input: {
   serverId: string;
   serverName: string;
@@ -201,14 +210,7 @@ export class McpServerStore {
       const result = await client.query(
         `
           SELECT *
-          FROM (
-            SELECT DISTINCT ON (server_id) *
-            FROM admin_mcp_servers
-            WHERE ($1::boolean = TRUE OR enabled = TRUE)
-              AND ($3::boolean = TRUE OR is_published = TRUE)
-              AND tenant_id IN ($2::text, 'system')
-            ORDER BY server_id, (tenant_id = $2::text) DESC, updated_at DESC
-          ) AS visible_servers
+          FROM (${VISIBLE_MCP_SERVERS_SQL}) AS visible_servers
           ORDER BY server_name ASC, updated_at DESC
         `,
         [includeDisabled, tenantId, isBetaTester]
@@ -218,6 +220,17 @@ export class McpServerStore {
         result.rows.map((row) => this.migrateLegacyQueryAuth(client, row, tenantId))
       );
       return rows.map((row) => mapMcpServer(row));
+    });
+  }
+
+  async getVisibleMcpServer(tenantId: string, serverId: string, isBetaTester: boolean): Promise<RuntimeMcpServerRecord | null> {
+    return withTenantScope(this.db, tenantId, async (client) => {
+      const result = await client.query(
+        `SELECT * FROM (${VISIBLE_MCP_SERVERS_SQL}) AS visible_servers WHERE server_id = $4`,
+        [false, tenantId, isBetaTester, serverId]
+      );
+      if (!result.rows[0]) return null;
+      return this.runtimeRecord(await this.migrateLegacyQueryAuth(client, result.rows[0], tenantId));
     });
   }
 

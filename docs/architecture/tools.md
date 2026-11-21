@@ -22,6 +22,11 @@ Center](policy-center.md).
   `MCP_UPSTREAM_TIMEOUT_MS` per call, `MCP_UPSTREAM_MAX_RESPONSE_BYTES` per
   response.
 
+When a tenant and the system share a server ID, the runtime catalog and the
+gateway select from the rows visible to the member. Both skip disabled rows.
+Only test users can use unpublished rows. If both rows qualify, the tenant row
+wins. Admins can still open a disabled tenant row to edit it.
+
 Admin setup of a proxy server: [connectors](../connectors.md#proxy-mcp-servers).
 
 Proxy upstreams use public addresses by default. Admission rejects local and
