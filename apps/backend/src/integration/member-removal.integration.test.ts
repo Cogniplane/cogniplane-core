@@ -40,7 +40,7 @@ import { InMemoryAuditEventStore } from "../test-helpers/in-memory-audit-events.
 import { IGNORE_SECURITY_CHANGE } from "../test-helpers/security-change.js";
 import { createTestConfig } from "../test-helpers/test-config.js";
 import { adminDatabaseUrl, appPool, maintenancePool, superuserPool } from "./support/database.js";
-import { seedRuntimeSession, seedSession } from "./support/fixtures.js";
+import { seedRuntimeSession, seedScheduledJob, seedSession } from "./support/fixtures.js";
 import { withStagedDatabase } from "./support/staged-migrations.js";
 
 const CONFIG = createTestConfig({ AUTH_MODE: "jwt", AUTH_LOGIN_TYPES: ["workos"] });
@@ -114,8 +114,14 @@ describe.skipIf(!adminDatabaseUrl())("member removal lasts", () => {
     await new ProjectMemberStore(appPool()).setMember(
       { tenantId: tenant.tenantId, userId: tenant.ownerId, projectId: shared.projectId }, admin.userId, "editor");
 
+    const jobId = await seedScheduledJob({ tenantId: tenant.tenantId, userId: admin.userId });
+
     await removeAsOwner(tenant, admin.userId);
 
+    // The member's scheduled job cannot run again without a review.
+    expect((await superuserPool().query(
+      "SELECT enabled, next_run_at, paused_reason FROM scheduled_jobs WHERE tenant_id = $1 AND job_id = $2", [tenant.tenantId, jobId]
+    )).rows).toEqual([{ enabled: false, next_run_at: null, paused_reason: "security_change" }]);
     expect(await count(`SELECT count(*) AS n FROM tenant_memberships WHERE tenant_id = $1 AND user_id = $2`,
       [tenant.tenantId, admin.userId])).toBe(0);
     expect(await count(`SELECT count(*) AS n FROM project_memberships WHERE tenant_id = $1 AND user_id = $2`,

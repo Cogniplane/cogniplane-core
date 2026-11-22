@@ -27,7 +27,7 @@ import type { StepUpRoute } from "../services/auth/step-up-routes.js";
 import { LocalMfaService } from "../services/auth/local-mfa-service.js";
 import type { DataRouteControl } from "../services/data-route-control.js";
 import { currentRole, isManager, lockTenantMembership, mayAssignRole, ownerRoleRefusal } from "../services/member-authority.js";
-import { endTenantMembership, revokeMemberConnections } from "../services/tenant-member-removal.js";
+import { removeTenantMember, revokeMemberConnections } from "../services/tenant-member-removal.js";
 import type { GithubConnectionService } from "../services/integrations/github/github-connection-service.js";
 import { IntegrationRegistry } from "../services/integrations/integration-registry.js";
 import { PiiImportScopeRegistry } from "../services/pii/pii-import-scopes.js";
@@ -580,34 +580,18 @@ export async function registerTenantRoutes(
         return { kind: "only_owner_can_remove_admin" as const };
       }
 
-      // Disable the removed member's scheduled jobs in the same transaction as
-      // the membership delete. Left enabled, they keep firing as synthetic
-      // turns under the removed user's identity, using their stored OAuth
-      // tokens — the membership row is not consulted anywhere on the scheduler
-      // path. `next_run_at = NULL` also drops them out of the due-job query.
-      // The pause reason makes the owner review each job before it runs
-      // again, if a future re-admission brings the member back.
-      await client.query(
-        `UPDATE scheduled_jobs
-         SET enabled = FALSE, next_run_at = NULL, paused_reason = 'security_change', updated_at = NOW()
-         WHERE tenant_id = $1 AND user_id = $2`,
-        [tenantId, targetUserId]
-      );
-
       // A local account has no other tenant: removal ends it for good. The
       // identity row stays, marked removed, for audit references.
       if (target.rows[0].user_auth_source === "local") {
         await markLocalIdentityRemoved(change, targetUserId);
       }
-      // A WorkOS member has no security version; its work stops all the same.
-      change.endActiveWork(targetUserId);
 
-      // The removal lasts (services/tenant-member-removal.ts): it deletes the
-      // member's project roles and the membership, and records the removal.
-      // WorkOS sign-in then refuses the user, and no session that started
-      // before now is admitted again.
-      const { projectRolesRemoved } = await endTenantMembership(client, {
-        tenantId, userId: targetUserId, removedBy: request.auth.userId
+      // The removal lasts (services/tenant-member-removal.ts): it disables the
+      // member's scheduled jobs, deletes the member's project roles and the
+      // membership, and records the removal. WorkOS sign-in then refuses the
+      // user, and no session that started before now is admitted again.
+      const { projectRolesRemoved } = await removeTenantMember(change, {
+        userId: targetUserId, removedBy: request.auth.userId
       });
       await AuditEventStore.createInTransaction(client, tenantAudit(request, "tenant.member.removed", {
         targetUserId,

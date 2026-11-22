@@ -3,7 +3,7 @@ import type { WorkOS } from "@workos-inc/node";
 import type { Pool } from "../../lib/db.js";
 import { AuditEventStore } from "../audit-event-store.js";
 import { lockTenantMembership } from "../member-authority.js";
-import { endTenantMembership } from "../tenant-member-removal.js";
+import { removeTenantMember } from "../tenant-member-removal.js";
 import { type AfterSecurityChange, withSecurityChange } from "./security-change.js";
 
 /** Rechecks WorkOS before refresh, including a cached rotation result. */
@@ -96,14 +96,7 @@ export class WorkOsMembershipRevalidation {
           return;
         }
       }
-      await client.query(
-        `UPDATE scheduled_jobs
-         SET enabled = FALSE, next_run_at = NULL, paused_reason = 'security_change', updated_at = NOW()
-         WHERE tenant_id = $1 AND user_id = $2`,
-        [tenantId, userId]
-      );
-      const { projectRolesRemoved } = await endTenantMembership(client, { tenantId, userId, removedBy: userId });
-      change.endActiveWork(userId);
+      const { projectRolesRemoved } = await removeTenantMember(change, { userId, removedBy: userId });
       await AuditEventStore.createInTransaction(client, {
         tenantId,
         userId,
