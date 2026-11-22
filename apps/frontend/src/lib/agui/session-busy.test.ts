@@ -63,7 +63,7 @@ describe("a send refused as session_busy", () => {
       approvalId: "ap-1", sessionId: "s-1", itemId: "item", kind: "command_execution",
       title: "Run command", summary: "ls", status: "pending", createdAt: "2026-09-22T00:00:00.000Z"
     } as never;
-    const { result } = renderSessionHooks(agent, { initialApprovals: [approval] });
+    const { result } = renderSessionHooks(agent, { savedApprovals: [approval] });
 
     agent.addMessage({ id: "optimistic", role: "user", content: "hi" });
     await act(async () => {

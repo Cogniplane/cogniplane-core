@@ -7,7 +7,6 @@
 
 import { CircleAlertIcon, LoaderCircleIcon } from "lucide-react";
 import { catchError, type ErrorInfo } from "next/error";
-import { useEffect } from "react";
 
 import { Button } from "./ui/button";
 
@@ -22,28 +21,6 @@ export function WorkspaceLoading({ label }: { label: string }) {
         <LoaderCircleIcon aria-hidden="true" className="size-4 shrink-0 motion-safe:animate-spin" />
         {label}
       </p>
-    </section>
-  );
-}
-
-export function WorkspaceLoadError({ message, retrying, onRetry }: {
-  message: string;
-  retrying: boolean;
-  onRetry: () => void;
-}) {
-  return (
-    <section className={NOTICE_FRAME}>
-      <div role="alert" className={NOTICE_CARD}>
-        <CircleAlertIcon aria-hidden="true" className="size-6 text-danger" />
-        <h2 className="text-base font-semibold text-on-surface">This session did not load</h2>
-        <p className="max-w-md text-sm text-on-surface-variant">
-          The chat, its files and its approvals could not be read. Check your connection, then try again.
-        </p>
-        <p className="max-w-md text-xs text-on-surface-faint [overflow-wrap:anywhere]">Error: {message}</p>
-        <Button type="button" className="aria-disabled:opacity-50" onClick={() => { if (!retrying) onRetry(); }} aria-disabled={retrying || undefined} aria-busy={retrying || undefined}>
-          {retrying ? "Retrying…" : "Retry"}
-        </Button>
-      </div>
     </section>
   );
 }
@@ -88,8 +65,6 @@ type ChatRenderErrorProps = {
   onNewSession: () => void;
   /** Opens the session sidebar. Absent while it is already open. */
   onShowSessions?: () => void;
-  /** Runs when the notice replaces the chat. */
-  onFailure?: () => void;
 };
 
 /**
@@ -98,12 +73,9 @@ type ChatRenderErrorProps = {
  * session and the session sidebar are the ways out. The notice never shows
  * the error, which can hold message or tool text.
  */
-export function WorkspaceRenderError({ isCreating, onRetry, onNewSession, onShowSessions, onFailure }: ChatRenderErrorProps & {
+export function WorkspaceRenderError({ isCreating, onRetry, onNewSession, onShowSessions }: ChatRenderErrorProps & {
   onRetry: () => void;
 }) {
-  useEffect(() => {
-    onFailure?.();
-  }, [onFailure]);
   return (
     <section className={NOTICE_FRAME}>
       <div role="alert" className={NOTICE_CARD}>

@@ -53,7 +53,7 @@ afterEach(() => {
 function hostElement() {
   return (
     <CopilotChatHost
-      session={{ id: "s-1", initialToolStatuses: [], initialApprovals: [] }}
+      session={{ id: "s-1" }}
       modelSelection={{
         model: "model-1", effort: null, models: [], showEffortSelector: false,
         onModelChange: () => undefined, onEffortChange: () => undefined

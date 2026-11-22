@@ -15,6 +15,23 @@ principles are in `apps/frontend/PRODUCT.md`.
   (`services/agui-history.ts` on the backend). Tests:
   `copilot-chat-host*.test.tsx`, `services/agui-history.test.ts`.
 - The host mounts a new provider for each session, so no state crosses sessions.
+- Each kind of chat state has one owner:
+
+  | State | Owner |
+  |---|---|
+  | Ordered transcript events, and the live turn state (running, activity, pending approval count) | The session connection (`lib/agui/use-session-connection.ts`, `use-agui-custom-events.ts`). The host writes the live turn state to `LiveTurnStore` (`lib/agui/live-turn-store.ts`). |
+  | Persisted details: saved messages (usage, cost, turn duration), artifacts, pending approvals | The query cache (`hooks/use-session-data.ts`) |
+  | Layout: sidebar, artifacts panel, dialogs | `components/chat-shell.tsx` |
+
+- The host does not wait for the persisted details: the connection shows the
+  history first. The shell gives the details to the host in `session.saved`
+  when they arrive. Saved tool failures, notices and apps only add to the live
+  rows. Each read of the details takes a read order when its request starts
+  (`lib/agui/read-order.ts`), and saved approvals apply only when no live
+  event is newer than that order.
+- The shell reads the `LiveTurnStore` record of the selected session for the
+  header and the sidebar, and keeps no copy. The host removes its record when
+  it unmounts; the shell then shows the saved state.
 - An error boundary keyed by session wraps the host. Tool views and side panel
   views have their own boundaries. See [render
   errors](frontend.md#render-errors).

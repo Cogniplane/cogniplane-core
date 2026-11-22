@@ -9,17 +9,19 @@ import type { Approval } from "@cogniplane/shared-types";
 import type { DeepAgentsBrowserAgent } from "../lib/agui/deep-agents-browser-agent";
 import { useAguiCustomEvents } from "../lib/agui/use-agui-custom-events";
 import { useSessionConnection } from "../lib/agui/use-session-connection";
+import { savedState } from "./saved-side-state";
 
 export function renderSessionHooks(
   agent: DeepAgentsBrowserAgent,
-  options: { initialApprovals?: Approval[]; serverRunning?: boolean } = {}
+  options: { savedApprovals?: Approval[]; serverRunning?: boolean } = {}
 ) {
   const onTurnSettled: Mock<() => void> = vi.fn();
+  const saved = options.savedApprovals ? savedState({ approvals: options.savedApprovals }) : undefined;
   // A test that needs a real connection replaces this.
   const connect: Mock<() => Promise<undefined>> = vi.fn(async () => undefined);
   // `rerender({ serverRunning })` changes the running state of the session list.
   const view = renderHook(({ serverRunning }: { serverRunning: boolean }) => {
-    const events = useAguiCustomEvents(agent, { initialApprovals: options.initialApprovals });
+    const events = useAguiCustomEvents(agent, { saved });
     const connection = useSessionConnection(agent, {
       sessionId: agent.threadId,
       serverRunning,

@@ -20,10 +20,13 @@ import { PiiChip } from "./artifact-pii-chip";
  *  callback that opens the shared preview of one of them. */
 export type ArtifactCardInventory = {
   artifacts: readonly Artifact[];
+  /** False while the artifact list of the session loads. The chat shows its
+   *  history before that list arrives. Default: true. */
+  loaded?: boolean;
   onOpenPreview: (artifactId: string) => void;
 };
 
-type ArtifactCardContextValue = ArtifactCardInventory & { sessionId: string };
+type ArtifactCardContextValue = ArtifactCardInventory & { sessionId: string; loaded: boolean };
 
 const ArtifactCardContext = createContext<ArtifactCardContextValue | null>(null);
 const NO_ARTIFACTS: readonly Artifact[] = [];
@@ -40,10 +43,11 @@ export function ArtifactCardProvider({
 }) {
   const all = inventory?.artifacts ?? NO_ARTIFACTS;
   const onOpenPreview = inventory?.onOpenPreview;
+  const loaded = inventory?.loaded !== false;
   const artifacts = useMemo(() => all.filter((artifact) => artifact.sessionId === sessionId), [all, sessionId]);
   const value = useMemo(
-    () => (onOpenPreview ? { sessionId, artifacts, onOpenPreview } : null),
-    [sessionId, artifacts, onOpenPreview]
+    () => (onOpenPreview ? { sessionId, artifacts, onOpenPreview, loaded } : null),
+    [sessionId, artifacts, onOpenPreview, loaded]
   );
   return <ArtifactCardContext.Provider value={value}>{children}</ArtifactCardContext.Provider>;
 }
@@ -58,7 +62,9 @@ export function GenerativeArtifactCard({ artifactId }: { artifactId: string }) {
     return (
       <div role="note" className={CARD}>
         <FileIcon aria-hidden="true" className="mt-0.5 size-4 shrink-0 text-on-surface-variant" />
-        <p className="m-0 text-on-surface-variant">This file is not available in this chat.</p>
+        <p className="m-0 text-on-surface-variant">
+          {context && !context.loaded ? "Loading file details…" : "This file is not available in this chat."}
+        </p>
       </div>
     );
   }

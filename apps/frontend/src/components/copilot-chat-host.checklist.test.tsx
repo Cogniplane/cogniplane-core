@@ -43,7 +43,7 @@ function hostElement(options: { id?: string; canEdit?: boolean } = {}) {
   return (
     <CopilotChatHost
       key={sessionId}
-      session={{ id: sessionId, initialToolStatuses: [], initialApprovals: [], canEdit: options.canEdit ?? true }}
+      session={{ id: sessionId, canEdit: options.canEdit ?? true }}
       modelSelection={{
         model: "model-1", effort: null, models: [], showEffortSelector: false,
         onModelChange: () => undefined, onEffortChange: () => undefined

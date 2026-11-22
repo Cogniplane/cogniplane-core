@@ -1,10 +1,12 @@
 "use client";
 
 import { isCancelledError, replaceEqualDeep, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useCallback, useEffect } from "react";
+import { useCallback, useEffect, useMemo } from "react";
 
 import type { Approval, Artifact, Message } from "@cogniplane/shared-types";
 
+import { savedSideState, type SavedSideState } from "../components/agui-transcript";
+import { nextReadOrder } from "../lib/agui/read-order";
 import { listArtifacts } from "../lib/artifact-api";
 import { listMessages } from "../lib/message-api";
 import { queryKeys } from "../lib/query-keys";
@@ -14,9 +16,13 @@ type SessionData = {
   messages: Message[];
   artifacts: Artifact[];
   approvals: Approval[];
+  /** The read order of the request, taken before it starts. The chat compares
+   *  it with its live events (lib/agui/read-order.ts). */
+  readOrder: number;
 };
 
 async function loadSessionData(sessionId: string, signal?: AbortSignal): Promise<SessionData> {
+  const readOrder = nextReadOrder();
   const [messagePage, artifacts, approvals] = await Promise.all([
     listMessages(sessionId, signal),
     listArtifacts(sessionId, signal),
@@ -25,14 +31,16 @@ async function loadSessionData(sessionId: string, signal?: AbortSignal): Promise
   return {
     messages: messagePage.messages,
     artifacts,
-    approvals
+    approvals,
+    readOrder
   };
 }
 
 const EMPTY_SESSION_DATA: SessionData = {
   messages: [],
   artifacts: [],
-  approvals: []
+  approvals: [],
+  readOrder: 0
 };
 
 export function useSessionData(input: {
@@ -56,12 +64,25 @@ export function useSessionData(input: {
   const sessionData = selectedSessionId ? sessionDetailQuery.data : undefined;
   const messages = sessionData?.messages ?? EMPTY_SESSION_DATA.messages;
   const artifacts = sessionData?.artifacts ?? EMPTY_SESSION_DATA.artifacts;
-  // Wait for this visit's refetch before seeding the chat with cached history.
-  // If it fails, keep the cached transcript available instead of leaving chat blank.
+  // The chat does not wait for this data: its connection shows the history.
+  // The chat takes the saved side state only from a fetch of this visit, so
+  // that an approval of an earlier visit does not show as open. If that fetch
+  // fails, the cached data applies.
   const isSessionDataReady =
     selectedSessionId !== null &&
     sessionData !== undefined &&
     sessionDetailQuery.isFetchedAfterMount;
+  // An artifact poll writes a new data object with the same messages and
+  // approvals. It must not apply the side state again.
+  const savedMessages = sessionData?.messages;
+  const savedApprovals = sessionData?.approvals;
+  const savedReadOrder = sessionData?.readOrder;
+  const saved = useMemo<SavedSideState | undefined>(
+    () => isSessionDataReady && savedMessages && savedApprovals && savedReadOrder !== undefined
+      ? savedSideState({ messages: savedMessages, approvals: savedApprovals, readOrder: savedReadOrder })
+      : undefined,
+    [isSessionDataReady, savedMessages, savedApprovals, savedReadOrder]
+  );
 
   const loadError = sessionDetailQuery.error && !isCancelledError(sessionDetailQuery.error)
     ? sessionDetailQuery.error instanceof Error
@@ -130,9 +151,12 @@ export function useSessionData(input: {
     loadError,
     messages,
     artifacts,
-    initialApprovals: sessionData?.approvals ?? EMPTY_SESSION_DATA.approvals,
+    /** The pending approvals of the saved data, for the shell while no chat
+     *  reports its own count. */
+    savedApprovals: savedApprovals ?? EMPTY_SESSION_DATA.approvals,
+    /** The side state for the chat, from a fetch of this visit. */
+    saved,
     refreshSessionData,
-    isSessionDataReady,
     /** The session's data is known, from this visit or from the cache. */
     hasSessionData: sessionData !== undefined
   };

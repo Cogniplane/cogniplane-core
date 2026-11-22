@@ -13,6 +13,7 @@ import { useEffortPreference } from "../hooks/use-effort-preference";
 import { useFileSources } from "../hooks/use-file-sources";
 import { useModelPreference } from "../hooks/use-model-preference";
 import { useElementWidth } from "../hooks/use-element-width";
+import { LiveTurnStore, useLiveTurn } from "../lib/agui/live-turn-store";
 import { useAuth } from "../lib/auth-context";
 import { fetchModels } from "../lib/api-client";
 import { keepTabInside, makeBackgroundInert, tabbableWithin } from "../lib/inert-background";
@@ -21,7 +22,7 @@ import { queryKeys } from "../lib/query-keys";
 import { takeDraftResolution, type DraftResolution } from "../lib/project-draft-resolution";
 import { listProjects, setProjectSession } from "../lib/project-api";
 
-import { applyLiveTurn, latestCompletedTurn, resolveSessionStatus, type LiveTurnActivity } from "./session-status.logic";
+import { applyLiveTurn, latestCompletedTurn, resolveSessionStatus } from "./session-status.logic";
 import { SessionSidebar } from "./session-sidebar";
 import { SESSION_DRAWER, WorkspaceSidebarFrame } from "./workspace-sidebar-frame";
 import { SessionCreateDialog } from "./session-create-dialog";
@@ -35,7 +36,7 @@ import { WorkspaceHeader } from "./workspace-header";
 import { useProjectFileSelection } from "../hooks/use-project-library";
 import { MAX_PROJECT_FILE_SELECTIONS, ProjectFileSelection } from "./project-file-selection";
 import { Button } from "./ui/button";
-import { ChatRenderBoundary, WorkspaceLoadError, WorkspaceLoading, WorkspaceNoSession } from "./workspace-main-state";
+import { ChatRenderBoundary, WorkspaceLoading, WorkspaceNoSession } from "./workspace-main-state";
 import { WORKSPACE_DRAWER_BACKDROP, WORKSPACE_DRAWER_SURFACE, WorkspaceDrawerHeader } from "./workspace-drawer";
 
 // CopilotKit + @ag-ui/client are large and browser-only (the chat host drives a
@@ -47,11 +48,6 @@ const CopilotChatHost = dynamic(
   () => import("./copilot-chat-host").then((m) => m.CopilotChatHost),
   { ssr: false, loading: () => <WorkspaceLoading label="Loading chat…" /> }
 );
-import {
-  mcpAppsFromMessages,
-  runtimeNoticesFromMessages,
-  toolStatusesFromMessages
-} from "./agui-transcript";
 import {
   ARTIFACT_PANE_WIDTH,
   clampArtifactPaneWidth,
@@ -98,16 +94,11 @@ export function ChatShell() {
   // Grid-column transitions ease the pane open/closed, but the same transition
   // would rubber-band live drag-resizing — suppress it while a drag is active.
   const [isResizingPane, setIsResizingPane] = useState(false);
-  // Live signals lifted from CopilotChatHost (the AG-UI stream) for the active
-  // session — the shell renders the sidebar/header but the running/approval
-  // state lives inside the host's agent subscription.
-  const [turnActivity, setTurnActivity] = useState<LiveTurnActivity | null>(null);
-  const [turnRunning, setTurnRunning] = useState(false);
-  // True from the end of a turn until the session list reloads. In that time
-  // the saved approval flag can still show an approval that was answered.
-  const [isReloadingAfterTurn, setIsReloadingAfterTurn] = useState(false);
-  const [liveApprovalCount, setLiveApprovalCount] = useState(0);
-  const [signalSessionId, setSignalSessionId] = useState(sessionList.selectedSessionId);
+  // The chat connection owns the live turn state and writes it here. The
+  // shell reads the record of the selected session and keeps no copy, so the
+  // header, the sidebar and the transcript describe the same session.
+  const [liveTurns] = useState(() => new LiveTurnStore());
+  const liveTurn = useLiveTurn(liveTurns, sessionList.selectedSessionId);
   const [selectedProjectFiles, setSelectedProjectFiles] = useState<{
     projectId: string | null;
     ids: string[];
@@ -330,31 +321,21 @@ export function ChatShell() {
     onError: setSessionListError
   });
 
-  if (signalSessionId !== sessionList.selectedSessionId) {
-    // Seed from the persisted response so the attention indicator remains set
-    // during the remount, before the host publishes its live count. The host
-    // is gated on isSessionDataReady below, so this transient shell state is
-    // safe while the new session data loads.
-    setSignalSessionId(sessionList.selectedSessionId);
-    setTurnRunning(false);
-    setIsReloadingAfterTurn(false);
-    // Reset activity with its session identity so it cannot describe the next selection.
-    setTurnActivity(null);
-    setLiveApprovalCount(chatWorkspace.initialApprovals.length);
-  }
-
   const { messages } = chatWorkspace;
 
-  // The chat failed and unmounted, so its stream no longer updates the live
-  // turn state that it lifted here. Go back to the saved state. The session
-  // list still reports a turn that continues on the server.
-  const initialApprovalCount = chatWorkspace.initialApprovals.length;
-  const clearLiveTurn = useCallback(() => {
-    setTurnRunning(false);
-    setIsReloadingAfterTurn(false);
-    setTurnActivity(null);
-    setLiveApprovalCount(initialApprovalCount);
-  }, [initialApprovalCount]);
+  const turnActivity = liveTurn?.activity ?? null;
+  const turnRunning = liveTurn?.running ?? false;
+  // True from the end of a turn until the session list reloads. In that time
+  // the saved approval flag can still show an approval that was answered.
+  const isReloadingAfterTurn = liveTurn?.settling ?? false;
+  // The saved count applies while no chat reports its own: before the chat
+  // has its first approval state, and after the chat failed and unmounted.
+  // The session list still reports a turn that continues on the server.
+  const savedApprovalCount = useMemo(
+    () => chatWorkspace.savedApprovals.filter((approval) => approval.status === "pending").length,
+    [chatWorkspace.savedApprovals]
+  );
+  const liveApprovalCount = liveTurn?.pendingApprovals ?? savedApprovalCount;
 
   const formatSessionForClipboardCallback = useCallback(
     (): string | undefined => formatSessionForClipboard(messages),
@@ -385,8 +366,9 @@ export function ChatShell() {
   const { openPreview } = chatWorkspace.artifactState;
   const artifactInventory = useMemo<ArtifactCardInventory>(() => ({
     artifacts: chatWorkspace.artifacts,
+    loaded: chatWorkspace.hasSessionData,
     onOpenPreview: (artifactId) => void openPreview(artifactId)
-  }), [chatWorkspace.artifacts, openPreview]);
+  }), [chatWorkspace.artifacts, chatWorkspace.hasSessionData, openPreview]);
 
   // The artifacts panel goes beside the chat only when both fit in the
   // measured workspace. Otherwise it is a modal drawer over the chat. The
@@ -442,13 +424,13 @@ export function ChatShell() {
     if (next !== paneLayout.width) resizeArtifactPane(next);
   }, [paneLayout.maxWidth, paneLayout.width, resizeArtifactPane]);
 
-  // Once a newer server turn is observed, forget the old live activity even
-  // after that server turn ends and its timestamp disappears from the list.
+  // A newer server turn makes the live activity old. The connection then
+  // forgets the activity, so it stays forgotten after that server turn ends
+  // and its timestamp disappears from the list.
   const selectedRawSession = sessionList.selectedSession;
   const liveResolution = selectedRawSession && turnActivity
     ? applyLiveTurn(selectedRawSession, turnActivity)
     : null;
-  if (liveResolution && !liveResolution.applied) setTurnActivity(null);
   const selectedDisplaySession = liveResolution?.session ?? selectedRawSession;
   const displaySessions = sessionList.sessions.map((session) =>
     session.sessionId === selectedDisplaySession?.sessionId ? selectedDisplaySession : session
@@ -481,23 +463,10 @@ export function ChatShell() {
   const contextWindow = contextWindowForModel(selectedModel);
   const sessionCost = sessionCostUsd(chatWorkspace.messages);
   // CopilotChat loads the transcript and plan through the session connection.
-  // The saved messages here only seed the side state: failed or declined tool
-  // calls, MCP apps, and runtime notices. The hook re-seeds them when the
-  // session changes.
+  // The saved data arrives through the query cache, also after the chat
+  // mounted. The chat takes its side state from `chatWorkspace.saved`: failed
+  // or declined tool calls, MCP apps, runtime notices, and pending approvals.
   const selectedIsServerRunning = sessionList.selectedSession?.isRunning === true;
-  const initialToolStatuses = useMemo(
-    () => toolStatusesFromMessages(chatWorkspace.messages),
-    [chatWorkspace.messages]
-  );
-  const initialMcpApps = useMemo(
-    () => mcpAppsFromMessages(chatWorkspace.messages),
-    [chatWorkspace.messages]
-  );
-  // Saved runtime notices, re-seeded on session re-key like the tool failures.
-  const initialNotices = useMemo(
-    () => runtimeNoticesFromMessages(chatWorkspace.messages),
-    [chatWorkspace.messages]
-  );
 
   const sidebarColClass = isSidebarOpen
     ? "md:grid-cols-[280px_minmax(0,1fr)]"
@@ -521,9 +490,9 @@ export function ChatShell() {
     && !chatWorkspace.hasSessionData
     && sessionLoadMessage !== null;
   const showsFormatNotice = Boolean(selectedRawSession && selectedRawSession.transcriptFormat !== "current");
-  // The chat area explains a failed first load, so the banner does not repeat it.
-  const loadErrorInMain = sessionLoadFailed && !noModelsAvailable && !showsFormatNotice;
-  const bannerError = sessionList.error ?? modelError ?? (loadErrorInMain ? null : chatWorkspace.loadError);
+  // The chat does not wait for the saved data, so a failed read shows in the
+  // banner. The artifacts panel offers the retry.
+  const bannerError = sessionList.error ?? modelError ?? chatWorkspace.loadError;
   const retrySessionLoad = () => {
     if (!sessionId || isRetryingSession) return;
     const retry = { sessionId, message: sessionLoadMessage ?? "The session is unavailable." };
@@ -758,11 +727,13 @@ export function ChatShell() {
                   void sessionList.createSession(selectedRawSession.canEdit === false ? null : projectId).catch(() => {});
                 }}
               />
-            ) : sessionList.selectedSessionId && chatWorkspace.isSessionDataReady ? (
+            ) : sessionList.selectedSessionId ? (
               // Key on session so switching sessions remounts the host, and an
               // error in the chat of one session does not stay for the next.
-              // The new host connects and loads that session's history. The
-              // sidebar and header are outside the boundary and keep working.
+              // The new host connects and loads that session's history. It
+              // does not wait for the saved session data: the connection is
+              // the one source of the transcript. The sidebar and header are
+              // outside the boundary and keep working.
               <ChatRenderBoundary
                 key={sessionList.selectedSessionId}
                 isCreating={sessionList.isCreatingSession}
@@ -773,16 +744,13 @@ export function ChatShell() {
                   });
                 }}
                 onShowSessions={isSidebarOpen ? undefined : () => setIsSidebarOpen(true)}
-                onFailure={clearLiveTurn}
               >
                 <CopilotChatHost
                   session={{
                     id: sessionList.selectedSessionId,
-                    initialToolStatuses,
-                    initialMcpApps,
-                    initialApprovals: chatWorkspace.initialApprovals,
-                    initialNotices,
+                    saved: chatWorkspace.saved,
                     isRunning: selectedIsServerRunning,
+                    latestTurnSequence: selectedRawSession?.latestTurnSequence,
                     canEdit: selectedDisplaySession?.canEdit !== false,
                     initialPrompt: resolveDraftIntent?.sessionId === sessionId && resolveDraftIntent.projectId === projectId && !resolveDraftIntent.sent
                       ? `Resolve the selected project draft conflict. The selected draft ID is ${resolveDraftIntent.draftId}. First call project_get_conflict_context with that draft ID and compare the base, latest published, and proposed text. If the intended merge is clear, call project_reconcile_conflict with the same draft ID and the merged text. If it is ambiguous, explain the alternatives and do not write a draft. Never promote, delete, or change folders.`
@@ -801,6 +769,7 @@ export function ChatShell() {
                   projectFileIds={confirmedProjectFileIds}
                   artifactInventory={artifactInventory}
                   draftScope={user ? { userId: user.userId, tenantId: user.tenantId } : undefined}
+                  liveTurns={liveTurns}
                   events={{
                     onInitialPromptSent: () => setResolveDraftIntent((current) => current ? { ...current, sent: true } : null),
                     onArtifactsChanged: () => {
@@ -810,8 +779,9 @@ export function ChatShell() {
                       });
                     },
                     onTurnSettled: () => {
-                      setIsReloadingAfterTurn(true);
-                      void sessionList.reload().finally(() => setIsReloadingAfterTurn(false));
+                      // The connection reports the turn as settling until
+                      // the session list has the saved state of the turn.
+                      const listReload = sessionList.reload();
                       if (projectId) void queryClient.invalidateQueries({ queryKey: queryKeys.projects.library(projectId) });
                       // CopilotKit owns the live stream, so persisted state (token
                       // usage, cost) only lands via a REST reload once a turn ends.
@@ -820,21 +790,11 @@ export function ChatShell() {
                           // The session query exposes this failure in the workspace banner.
                         });
                       }
-                    },
-                    onTurnActivityChange: setTurnActivity,
-                    onTurnRunningChange: setTurnRunning,
-                    onPendingApprovalsChange: setLiveApprovalCount
+                      return listReload;
+                    }
                   }}
                 />
               </ChatRenderBoundary>
-            ) : sessionLoadFailed ? (
-              <WorkspaceLoadError
-                message={sessionLoadMessage ?? ""}
-                retrying={isRetryingSession}
-                onRetry={retrySessionLoad}
-              />
-            ) : sessionList.selectedSessionId ? (
-              <WorkspaceLoading label="Loading session…" />
             ) : sessionList.isLoadingSessions ? (
               <WorkspaceLoading label="Loading sessions…" />
             ) : (

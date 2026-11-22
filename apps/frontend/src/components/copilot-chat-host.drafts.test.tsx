@@ -24,7 +24,7 @@ beforeEach(() => {
 afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.unstubAllGlobals(); window.sessionStorage.clear(); });
 const composer = () => screen.getByTestId("copilot-chat-textarea") as HTMLTextAreaElement;
 function host(id = "s-1", scope: DraftScope | undefined = OWNER) {
-  return <CopilotChatHost session={{ id, initialToolStatuses: [], initialApprovals: [] }}
+  return <CopilotChatHost session={{ id }}
     modelSelection={{ model: "model-1", effort: null, models: [], showEffortSelector: false, onModelChange() {}, onEffortChange() {} }}
     usage={{ contextTokens: 0, contextWindow: 1000, sessionCostUsd: 0 }} artifactIds={[]} events={{}} draftScope={scope} />;
 }
@@ -108,7 +108,7 @@ describe("unsent composer recovery", () => {
     type("Stale component event");
     expect(stored()).toBeNull();
     view.unmount();
-    render(<CopilotChatHost session={{ id: "s-1", initialToolStatuses: [], initialApprovals: [] }}
+    render(<CopilotChatHost session={{ id: "s-1" }}
       modelSelection={{ model: "model-1", effort: null, models: [], showEffortSelector: false, onModelChange() {}, onEffortChange() {} }}
       usage={{ contextTokens: 0, contextWindow: 1000, sessionCostUsd: 0 }} artifactIds={[]} events={{}} />);
     await ready(); type("No identity"); expect(stored()).toBeNull();

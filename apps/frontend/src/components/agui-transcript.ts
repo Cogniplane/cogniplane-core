@@ -1,7 +1,7 @@
 // Side state from saved history: MCP apps, tool failures, and runtime notices.
 // The transcript itself comes from the session connection, which the backend
 // converts (services/agui-history.ts).
-import { CogniplaneCustomEventSchema, TurnStopReasonSchema, type McpAppCall, type Message, type TurnStopReason } from "@cogniplane/shared-types";
+import { CogniplaneCustomEventSchema, TurnStopReasonSchema, type Approval, type McpAppCall, type Message, type TurnStopReason } from "@cogniplane/shared-types";
 import type { RuntimeNoticeRow, ToolStatusRow } from "./chat-cards/chat-cards.types";
 
 export function mcpAppsFromMessages(messages: Message[]): Record<string, McpAppCall> {
@@ -107,4 +107,24 @@ export function runtimeNoticesFromMessages(messages: Message[]): RuntimeNoticeRo
     }
   }
   return [...rows.values()];
+}
+
+/** The side state of a saved session: what the transcript events do not
+ *  carry. `readOrder` is the read order of its request (lib/agui/read-order.ts). */
+export type SavedSideState = {
+  toolStatuses: ToolStatusRow[];
+  mcpApps: Record<string, McpAppCall>;
+  notices: RuntimeNoticeRow[];
+  approvals: Approval[];
+  readOrder: number;
+};
+
+export function savedSideState(data: { messages: Message[]; approvals: Approval[]; readOrder: number }): SavedSideState {
+  return {
+    toolStatuses: toolStatusesFromMessages(data.messages),
+    mcpApps: mcpAppsFromMessages(data.messages),
+    notices: runtimeNoticesFromMessages(data.messages),
+    approvals: data.approvals,
+    readOrder: data.readOrder
+  };
 }

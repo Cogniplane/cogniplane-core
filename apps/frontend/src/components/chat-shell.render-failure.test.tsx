@@ -59,8 +59,8 @@ vi.mock("../hooks/use-chat-workspace", () => ({
   useChatWorkspace: () => ({
     messages: [],
     artifacts: [],
-    initialApprovals: [],
-    isSessionDataReady: true,
+    savedApprovals: [],
+    saved: undefined,
     hasSessionData: true,
     loadError: null,
     refreshSessionData: vi.fn(async () => undefined),
@@ -145,9 +145,9 @@ vi.mock("./artifact-panel", () => ({ ArtifactPanel: () => null }));
 vi.mock("./artifact-preview-modal", () => ({ ArtifactPreviewModal: () => null }));
 vi.mock("./file-source-picker", () => ({ FileSourcePicker: () => null }));
 vi.mock("./copilot-chat-host", () => ({
-  CopilotChatHost: ({ session, events }: {
+  CopilotChatHost: ({ session, liveTurns }: {
     session: { id: string };
-    events: { onTurnRunningChange?: (running: boolean) => void; onPendingApprovalsChange?: (count: number) => void };
+    liveTurns: import("../lib/agui/live-turn-store").LiveTurnStore;
   }) => {
     const renders = (hostState.renders.get(session.id) ?? 0) + 1;
     hostState.renders.set(session.id, renders);
@@ -156,10 +156,11 @@ vi.mock("./copilot-chat-host", () => ({
     useEffect(() => {
       if (hostState.effectFails.has(session.id)) throw new Error(SECRET);
       if (hostState.reportsLiveTurn.has(session.id)) {
-        events.onTurnRunningChange?.(true);
-        events.onPendingApprovalsChange?.(2);
+        liveTurns.publish(session.id, { running: true, activity: null, pendingApprovals: 2, settling: false });
       }
-    }, [events, session.id]);
+      // The real host removes its record when it unmounts, also after a failure.
+      return () => liveTurns.clear(session.id);
+    }, [liveTurns, session.id]);
     return <div data-testid="chat-host">{`Chat of ${session.id}`}</div>;
   }
 }));

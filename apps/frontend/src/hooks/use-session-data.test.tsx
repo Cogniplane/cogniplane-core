@@ -9,6 +9,7 @@ afterEach(cleanup);
 
 import type { Approval, Artifact, Message } from "@cogniplane/shared-types";
 
+import { nextReadOrder } from "../lib/agui/read-order";
 import { queryKeys } from "../lib/query-keys";
 import { useSessionData } from "./use-session-data";
 
@@ -119,7 +120,7 @@ async function settleInitialLoad(
     apiState.pendingMessageLoads.shift()?.resolve(resultMessages);
   });
   await waitFor(() => {
-    expect(result.current.isSessionDataReady).toBe(true);
+    expect(result.current.saved).toBeDefined();
     expect(result.current.messages).toHaveLength(resultMessages.length);
   });
 }
@@ -203,11 +204,11 @@ describe("useSessionData: switch-back serves fresh data, not the cached snapshot
     // Switch to B and settle it, so A's entry stays in the cache.
     rerender({ sessionId: "s-2" });
     expect(result.current.messages).toEqual([]);
-    expect(result.current.isSessionDataReady).toBe(false);
+    expect(result.current.saved).toBeUndefined();
     await act(async () => {
       apiState.pendingMessageLoads.shift()?.resolve([serverMessage("m-9", "B turn 1")]);
     });
-    await waitFor(() => expect(result.current.isSessionDataReady).toBe(true));
+    await waitFor(() => expect(result.current.saved).toBeDefined());
 
     // Back to A, well inside the 30s stale window. The cached A entry is
     // returned synchronously, but it predates whatever the agent wrote while
@@ -218,7 +219,7 @@ describe("useSessionData: switch-back serves fresh data, not the cached snapshot
     // must stay false while only the stale snapshot is available. Asserting the
     // query was invalidated would pass here with the bug still on screen.
     await waitFor(() => expect(apiState.pendingMessageLoads).toHaveLength(1));
-    expect(result.current.isSessionDataReady).toBe(false);
+    expect(result.current.saved).toBeUndefined();
 
     // The post-switch fetch lands with the turn that arrived while away.
     await act(async () => {
@@ -228,7 +229,7 @@ describe("useSessionData: switch-back serves fresh data, not the cached snapshot
       ]);
     });
 
-    await waitFor(() => expect(result.current.isSessionDataReady).toBe(true));
+    await waitFor(() => expect(result.current.saved).toBeDefined());
     expect(result.current.messages.map((m) => m.content)).toEqual([
       "A turn 1",
       "A turn 2, written while away"
@@ -244,7 +245,7 @@ describe("useSessionData: switch-back serves fresh data, not the cached snapshot
       refreshDone = result.current.refreshSessionData("s-1");
     });
     await waitFor(() => expect(apiState.pendingMessageLoads).toHaveLength(1));
-    expect(result.current.isSessionDataReady).toBe(true);
+    expect(result.current.saved).toBeDefined();
     await act(async () => {
       apiState.pendingMessageLoads.shift()?.resolve([
         serverMessage("m-1", "turn 1"),
@@ -254,7 +255,7 @@ describe("useSessionData: switch-back serves fresh data, not the cached snapshot
     });
 
     // The refresh writes the cache itself, so its data is newer than the switch.
-    expect(result.current.isSessionDataReady).toBe(true);
+    expect(result.current.saved).toBeDefined();
   });
 });
 
@@ -271,7 +272,7 @@ describe("useSessionData: a failed post-switch refetch falls back to the cache",
     await act(async () => {
       apiState.pendingMessageLoads.shift()?.resolve([serverMessage("m-9", "B turn 1")]);
     });
-    await waitFor(() => expect(result.current.isSessionDataReady).toBe(true));
+    await waitFor(() => expect(result.current.saved).toBeDefined());
 
     // Back to A; the freshness refetch fails (network blip, 5xx, restart).
     rerender({ sessionId: "s-1" });
@@ -282,7 +283,7 @@ describe("useSessionData: a failed post-switch refetch falls back to the cache",
 
     // `dataUpdatedAt` never advances on a failure, so a gate keyed only on it
     // would leave the shell rendering an empty pane over good cached rows.
-    await waitFor(() => expect(result.current.isSessionDataReady).toBe(true));
+    await waitFor(() => expect(result.current.saved).toBeDefined());
     expect(result.current.messages.map((m) => m.content)).toEqual(["A turn 1"]);
   });
 
@@ -294,32 +295,32 @@ describe("useSessionData: a failed post-switch refetch falls back to the cache",
     await act(async () => {
       apiState.pendingMessageLoads.shift()?.resolve([serverMessage("m-2", "B cached")]);
     });
-    await waitFor(() => expect(result.current.isSessionDataReady).toBe(true));
+    await waitFor(() => expect(result.current.saved).toBeDefined());
 
     rerender({ sessionId: "s-1" });
     await waitFor(() => expect(apiState.pendingMessageLoads).toHaveLength(1));
     await act(async () => {
       apiState.pendingMessageLoads.shift()?.reject(new Error("first revisit failed"));
     });
-    await waitFor(() => expect(result.current.isSessionDataReady).toBe(true));
+    await waitFor(() => expect(result.current.saved).toBeDefined());
 
     rerender({ sessionId: "s-2" });
     await waitFor(() => expect(apiState.pendingMessageLoads).toHaveLength(1));
     await act(async () => {
       apiState.pendingMessageLoads.shift()?.resolve([serverMessage("m-2", "B refreshed")]);
     });
-    await waitFor(() => expect(result.current.isSessionDataReady).toBe(true));
+    await waitFor(() => expect(result.current.saved).toBeDefined());
 
     rerender({ sessionId: "s-1" });
     await waitFor(() => expect(apiState.pendingMessageLoads).toHaveLength(1));
 
     expect(result.current.messages.map((message) => message.content)).toEqual(["A cached"]);
-    expect(result.current.isSessionDataReady).toBe(false);
+    expect(result.current.saved).toBeUndefined();
 
     await act(async () => {
       apiState.pendingMessageLoads.shift()?.reject(new Error("second revisit failed"));
     });
-    await waitFor(() => expect(result.current.isSessionDataReady).toBe(true));
+    await waitFor(() => expect(result.current.saved).toBeDefined());
   });
 });
 
@@ -335,14 +336,14 @@ describe("useSessionData: session-scoped ownership", () => {
     apiState.approvals = [pendingApproval];
     const { result, rerender } = renderSessionData();
     await settleInitialLoad(result, [serverMessage("m-1", "loaded")]);
-    expect(result.current.initialApprovals).toEqual([pendingApproval]);
+    expect(result.current.savedApprovals).toEqual([pendingApproval]);
 
     rerender({ sessionId: null });
 
     expect(result.current.messages).toEqual([]);
     expect(result.current.artifacts).toEqual([]);
-    expect(result.current.isSessionDataReady).toBe(false);
-    expect(result.current.initialApprovals).toEqual([]);
+    expect(result.current.saved).toBeUndefined();
+    expect(result.current.savedApprovals).toEqual([]);
   });
 
   it("keeps an uncached failed selection empty and reports the failure", async () => {
@@ -354,7 +355,7 @@ describe("useSessionData: session-scoped ownership", () => {
     await waitFor(() => expect(result.current.loadError).toBe("session unavailable"));
     expect(result.current.messages).toEqual([]);
     expect(result.current.artifacts).toEqual([]);
-    expect(result.current.isSessionDataReady).toBe(false);
+    expect(result.current.saved).toBeUndefined();
   });
 
   it("does not let a refresh for another session supersede the selected session refresh", async () => {
@@ -496,7 +497,7 @@ describe("useSessionData: session-scoped ownership", () => {
     await act(async () => {
       apiState.pendingMessageLoads.shift()?.resolve([serverMessage("b-1", "session B")]);
     });
-    await waitFor(() => expect(result.current.isSessionDataReady).toBe(true));
+    await waitFor(() => expect(result.current.saved).toBeDefined());
 
     const switchBackPoll = deferredArtifacts();
     apiState.artifactResponses.push(
@@ -509,13 +510,13 @@ describe("useSessionData: session-scoped ownership", () => {
       switchBackPoll.resolve([artifact("stale-poll", "ready")]);
     });
 
-    expect(result.current.isSessionDataReady).toBe(false);
+    expect(result.current.saved).toBeUndefined();
     expect(result.current.messages.map((message) => message.content)).toEqual(["cached A"]);
 
     await act(async () => {
       apiState.pendingMessageLoads.shift()?.resolve([serverMessage("a-2", "fresh A")]);
     });
-    await waitFor(() => expect(result.current.isSessionDataReady).toBe(true));
+    await waitFor(() => expect(result.current.saved).toBeDefined());
     expect(result.current.messages.map((message) => message.content)).toEqual(["fresh A"]);
   });
 
@@ -560,5 +561,51 @@ describe("useSessionData: session-scoped ownership", () => {
       await pollRefresh;
     });
     expect(result.current.artifacts.map((item) => item.artifactId)).toEqual(["fresh"]);
+  });
+});
+
+describe("useSessionData: saved side state for the chat", () => {
+  beforeEach(() => {
+    apiState.pendingMessageLoads.length = 0;
+    apiState.artifactResponses.length = 0;
+    apiState.approvals = [];
+  });
+
+  it("gives each read a higher read order, taken when the request starts", async () => {
+    apiState.approvals = [approval("ap-1", "s-1")];
+    const { result } = renderSessionData();
+    // The request is in flight: a live event from now on is newer than its result.
+    await waitFor(() => expect(apiState.pendingMessageLoads).toHaveLength(1));
+    const liveEvent = nextReadOrder();
+    await settleInitialLoad(result, [serverMessage("m-1", "question")]);
+
+    const first = result.current.saved;
+    expect(first?.approvals).toEqual([approval("ap-1", "s-1")]);
+    expect(first?.readOrder).toBeLessThan(liveEvent);
+
+    let refreshDone: Promise<void> | null = null;
+    act(() => {
+      refreshDone = result.current.refreshSessionData("s-1");
+    });
+    await waitFor(() => expect(apiState.pendingMessageLoads).toHaveLength(1));
+    await act(async () => {
+      apiState.pendingMessageLoads.shift()?.resolve([serverMessage("m-1", "question")]);
+      await refreshDone;
+    });
+    await waitFor(() => expect(result.current.saved?.readOrder).toBeGreaterThan(liveEvent));
+  });
+
+  it("keeps the same saved object when only an artifact poll changes the data", async () => {
+    const poll = deferredArtifacts();
+    apiState.artifactResponses.push(Promise.resolve([artifact("a-1", "processing")]), poll.promise);
+    const { result } = renderSessionData();
+    await settleInitialLoad(result, []);
+    const saved = result.current.saved;
+
+    await act(async () => {
+      poll.resolve([artifact("a-1", "ready")]);
+    });
+    await waitFor(() => expect(result.current.artifacts.map((item) => item.status)).toEqual(["ready"]));
+    expect(result.current.saved).toBe(saved);
   });
 });
