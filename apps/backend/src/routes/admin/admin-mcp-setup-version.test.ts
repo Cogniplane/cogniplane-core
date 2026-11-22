@@ -41,9 +41,9 @@ async function buildApp(options: { isAdmin?: boolean; save?: (...args: unknown[]
   });
   await registerAdminMcpServerRoutes(app, {
     dataRoutes: { requireStepUp, ownerNotice: vi.fn(() => undefined) },
-    dynamicConfig: {
+    mcpAdmin: {
       listMcpServers: vi.fn(async () => [SERVER, { ...SERVER, serverId: "shared", ownerTenantId: "system" }]),
-      getOrCreateTenantSettings: vi.fn(async () => ({ enabledMcpServerIds: ["vendor"] })) as never,
+      listAllowedMcpServerIds: vi.fn(async () => ["vendor"]),
       saveMcpServerWithAudience: save as never,
       createMcpServer: vi.fn(),
       updateMcpServer: vi.fn(),

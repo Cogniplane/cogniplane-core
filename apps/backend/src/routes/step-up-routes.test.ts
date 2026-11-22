@@ -222,7 +222,7 @@ function isAccountRoute(route: string): boolean {
  * (WeakerChangeError: the Policy Center and PII stores) changes nothing,
  * because the transaction rolls back; the fakes of those stores record a
  * write only when it commits.
- * `dynamicConfig.listMcpServers`: the MCP routes find the server before the
+ * `mcpAdmin.listMcpServers`: the MCP routes find the server before the
  * step-up check (a missing server answers 404 and spends no token).
  * `dynamicConfig.getOrCreateTenantSettings`: the tenant settings route
  * compares the save with the stored settings (it writes the default row
@@ -230,7 +230,7 @@ function isAccountRoute(route: string): boolean {
  */
 const READS = new Set([
   "accounts.getMemberState", "mfa.hasSecondFactor", "mfa.factorState", "mfa.getPolicy",
-  "customModels.list", "dynamicConfig.listMcpServers", "dynamicConfig.getOrCreateTenantSettings",
+  "customModels.list", "mcpAdmin.listMcpServers", "mcpAdmin.listAllowedMcpServerIds", "dynamicConfig.getOrCreateTenantSettings",
   "integrationStates.get", "integrationRegistry.isReadyToEnable"
 ]);
 
@@ -417,18 +417,21 @@ function adminStores(calls: string[], writes: Array<{ method: string; args: unkn
   const fixed: Record<string, unknown> = { config: CONFIG, dataRoutes, policyRules: policyRuleStore(calls) };
   const fakes: Record<string, Fakes> = {
     customModels: { list: async () => [] },
-    dynamicConfig: {
+    mcpAdmin: {
       listMcpServers: async () => [MCP_SERVER, SHARED_SERVER],
+      listAllowedMcpServerIds: async () => SETTINGS.enabledMcpServerIds,
+      createMcpServer: (...args) => commitChange(args, MCP_SERVER),
+      updateMcpServer: (...args) => commitChange(args, MCP_SERVER),
+      saveMcpServerWithAudience: (...args) => commitChange(args, MCP_SERVER),
+      setInheritedMcpAudience: (...args) => commitChange(args, SHARED_SERVER),
+      setMcpServerPublished: (...args) => commitChange(args, MCP_SERVER)
+    },
+    dynamicConfig: {
       getOrCreateTenantSettings: async () => SETTINGS,
       updateTenantSettings: (...args) => {
         writes.push({ method: "updateTenantSettings", args });
         return commitChange(args, SETTINGS);
       },
-      createMcpServer: (...args) => commitChange(args, MCP_SERVER),
-      updateMcpServer: (...args) => commitChange(args, MCP_SERVER),
-      saveMcpServerWithAudience: (...args) => commitChange(args, MCP_SERVER),
-      setInheritedMcpAudience: (...args) => commitChange(args, SHARED_SERVER),
-      setMcpServerPublished: (...args) => commitChange(args, MCP_SERVER),
       // A release runs the owner notice in its transaction.
       activateSkillRevision: async (_tenantId, input) => {
         await (input as { alsoInTransaction?: (client: unknown) => Promise<void> }).alsoInTransaction?.(CHANGE_TRANSACTION);

@@ -6,6 +6,7 @@ import { encrypt } from "../lib/crypto-utils.js";
 import { registerAdminMcpServerRoutes } from "../routes/admin/admin-mcp-server-routes.js";
 import { DynamicConfigService } from "../services/dynamic-config-service.js";
 import { ManagedToolCatalog } from "../services/managed-tools/catalog.js";
+import { McpAdminService } from "../services/mcp/mcp-admin-service.js";
 import { McpServerStore } from "../services/mcp-server-store.js";
 import { TenantSettingsStore } from "../services/tenant-settings-store.js";
 import { createTestConfig } from "../test-helpers/test-config.js";
@@ -27,13 +28,18 @@ function makeService(failSettingsWrite = false) {
         }
       }
     : settings;
+  return new McpAdminService(createTestConfig(), { mcpServers: servers, tenantSettings });
+}
+
+// Tenant settings stay in DynamicConfigService.
+function settingsService() {
   return new DynamicConfigService(
     createTestConfig(),
     {
       skills: {} as never,
       skillRevisions: {} as never,
-      mcpServers: servers,
-      tenantSettings
+      mcpServers: new McpServerStore(appPool(), ENCRYPTION_SECRET),
+      tenantSettings: new TenantSettingsStore(appPool())
     },
     { async storeBundle() { throw new Error("unused"); }, async deleteBundle() {} },
     new ManagedToolCatalog()
@@ -52,12 +58,12 @@ describe.skipIf(!adminDatabaseUrl())("MCP connection availability", () => {
     );
 
     await service.setInheritedMcpAudience(owner.tenantId, serverId, "off");
-    expect((await service.getOrCreateTenantSettings(owner.tenantId)).enabledMcpServerIds).not.toContain(serverId);
-    expect((await service.getOrCreateTenantSettings(other.tenantId)).enabledMcpServerIds).toContain(serverId);
+    expect((await settingsService().getOrCreateTenantSettings(owner.tenantId)).enabledMcpServerIds).not.toContain(serverId);
+    expect((await settingsService().getOrCreateTenantSettings(other.tenantId)).enabledMcpServerIds).toContain(serverId);
     await expect(service.setInheritedMcpAudience(owner.tenantId, serverId, "test_users"))
       .rejects.toThrow("published for all members");
     await service.setInheritedMcpAudience(owner.tenantId, serverId, "members");
-    expect((await service.getOrCreateTenantSettings(owner.tenantId)).enabledMcpServerIds).toContain(serverId);
+    expect((await settingsService().getOrCreateTenantSettings(owner.tenantId)).enabledMcpServerIds).toContain(serverId);
 
     const after = await superuserPool().query(
       "SELECT enabled, is_published, version FROM admin_mcp_servers WHERE tenant_id = 'system' AND server_id = $1",
@@ -81,7 +87,7 @@ describe.skipIf(!adminDatabaseUrl())("MCP connection availability", () => {
       await expect(service.setInheritedMcpAudience(owner.tenantId, serverId, "members"))
         .rejects.toThrow("only to test users");
       await service.setInheritedMcpAudience(owner.tenantId, serverId, "test_users");
-      expect((await service.getOrCreateTenantSettings(owner.tenantId)).enabledMcpServerIds)
+      expect((await settingsService().getOrCreateTenantSettings(owner.tenantId)).enabledMcpServerIds)
         .toContain(serverId);
     } finally {
       await superuserPool().query(
@@ -115,7 +121,7 @@ describe.skipIf(!adminDatabaseUrl())("MCP connection availability", () => {
       };
     });
     const service = makeService();
-    await registerAdminMcpServerRoutes(app, { dataRoutes: devDataRoutes(), dynamicConfig: service });
+    await registerAdminMcpServerRoutes(app, { dataRoutes: devDataRoutes(), mcpAdmin: service });
     try {
       const saved = await service.setInheritedMcpAudience(owner.tenantId, serverId, "test_users");
       expect(JSON.stringify(saved)).not.toContain(secret);
@@ -160,14 +166,14 @@ describe.skipIf(!adminDatabaseUrl())("MCP connection availability", () => {
 
     const members = await service.saveMcpServerWithAudience(owner.tenantId, input, "members");
     expect(members).toMatchObject({ enabled: true, isPublished: true });
-    expect((await service.getOrCreateTenantSettings(owner.tenantId)).enabledMcpServerIds).toContain(serverId);
+    expect((await settingsService().getOrCreateTenantSettings(owner.tenantId)).enabledMcpServerIds).toContain(serverId);
     expect((await service.listMcpServers(other.tenantId)).some((server) => server.serverId === serverId)).toBe(false);
 
     const off = await service.saveMcpServerWithAudience(owner.tenantId, input, "off",
       { serverId, expectedVersion: members!.version });
     expect(off).toMatchObject({ enabled: false, isPublished: false });
-    expect((await service.getOrCreateTenantSettings(owner.tenantId)).enabledMcpServerIds).not.toContain(serverId);
-    expect((await service.getOrCreateTenantSettings(other.tenantId)).enabledMcpServerIds).not.toContain(serverId);
+    expect((await settingsService().getOrCreateTenantSettings(owner.tenantId)).enabledMcpServerIds).not.toContain(serverId);
+    expect((await settingsService().getOrCreateTenantSettings(other.tenantId)).enabledMcpServerIds).not.toContain(serverId);
   });
 
   test("rolls back registration and disable when the allowlist write fails", async () => {
@@ -215,7 +221,7 @@ describe.skipIf(!adminDatabaseUrl())("MCP connection availability", () => {
     const afterFailedDisable = await new McpServerStore(appPool(), ENCRYPTION_SECRET)
       .getMcpServer(owner.tenantId, serverId);
     expect(afterFailedDisable).toMatchObject({ enabled: true, isPublished: true });
-    expect((await makeService().getOrCreateTenantSettings(owner.tenantId)).enabledMcpServerIds)
+    expect((await settingsService().getOrCreateTenantSettings(owner.tenantId)).enabledMcpServerIds)
       .toContain(serverId);
   });
 
@@ -247,7 +253,7 @@ describe.skipIf(!adminDatabaseUrl())("MCP connection availability", () => {
       actorUserId: owner.userId
     }, "members", undefined, badAudit)).rejects.toThrow();
     expect((await service.listMcpServers(owner.tenantId)).some((server) => server.serverId === serverId)).toBe(false);
-    expect((await service.getOrCreateTenantSettings(owner.tenantId)).enabledMcpServerIds).not.toContain(serverId);
+    expect((await settingsService().getOrCreateTenantSettings(owner.tenantId)).enabledMcpServerIds).not.toContain(serverId);
 
     // Publish, unpublish, disable and the legacy create and update also roll back.
     const legacy = {
@@ -279,13 +285,13 @@ describe.skipIf(!adminDatabaseUrl())("MCP connection availability", () => {
       version: 1
     });
 
-    const before = await service.getOrCreateTenantSettings(owner.tenantId);
+    const before = await settingsService().getOrCreateTenantSettings(owner.tenantId);
     await expect(service.setInheritedMcpAudience(owner.tenantId, "managed-session-context", "off", badAudit))
       .rejects.toThrow();
-    await expect(service.updateTenantSettings(owner.tenantId, {
+    await expect(settingsService().updateTenantSettings(owner.tenantId, {
       policyEnforcementMode: before.policyEnforcementMode === "enforce" ? "monitor" : "enforce"
     }, badAudit)).rejects.toThrow();
-    const after = await service.getOrCreateTenantSettings(owner.tenantId);
+    const after = await settingsService().getOrCreateTenantSettings(owner.tenantId);
     expect(after.version).toBe(before.version);
     expect(after.policyEnforcementMode).toBe(before.policyEnforcementMode);
     expect(after.enabledMcpServerIds).toEqual(before.enabledMcpServerIds);
@@ -300,7 +306,7 @@ describe.skipIf(!adminDatabaseUrl())("MCP connection availability", () => {
     app.addHook("preHandler", async (request) => {
       request.auth = { userId: owner.userId, tenantId: owner.tenantId, isAdmin: true, role: "owner" };
     });
-    await registerAdminMcpServerRoutes(app, { dataRoutes: devDataRoutes(), dynamicConfig: service });
+    await registerAdminMcpServerRoutes(app, { dataRoutes: devDataRoutes(), mcpAdmin: service });
     const base = {
       serverId,
       serverName: "Setup",

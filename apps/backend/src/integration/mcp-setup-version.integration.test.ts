@@ -9,8 +9,7 @@ import { describe, expect, test, vi } from "vitest";
 
 import { registerAdminMcpServerRoutes } from "../routes/admin/admin-mcp-server-routes.js";
 import { DataRouteControl } from "../services/data-route-control.js";
-import { DynamicConfigService } from "../services/dynamic-config-service.js";
-import { ManagedToolCatalog } from "../services/managed-tools/catalog.js";
+import { McpAdminService } from "../services/mcp/mcp-admin-service.js";
 import { MemberMcpCredentialStore } from "../services/member-mcp-credential-store.js";
 import { McpServerStore } from "../services/mcp-server-store.js";
 import { TenantSettingsStore } from "../services/tenant-settings-store.js";
@@ -25,17 +24,10 @@ const CONFLICT = {
 };
 
 function service() {
-  return new DynamicConfigService(
-    createTestConfig(),
-    {
-      skills: {} as never,
-      skillRevisions: {} as never,
-      mcpServers: new McpServerStore(appPool(), ENCRYPTION_SECRET),
-      tenantSettings: new TenantSettingsStore(appPool())
-    },
-    { async storeBundle() { throw new Error("unused"); }, async deleteBundle() {} },
-    new ManagedToolCatalog()
-  );
+  return new McpAdminService(createTestConfig(), {
+    mcpServers: new McpServerStore(appPool(), ENCRYPTION_SECRET),
+    tenantSettings: new TenantSettingsStore(appPool())
+  });
 }
 
 /**
@@ -55,7 +47,7 @@ async function adminApp(tenantId: string, admins: string[]) {
     authMode: "dev-headers",
     ownerNotices: { queueOwnerNotice: vi.fn(async (_client, _tenantId, notice) => { notices.push(notice); return 1; }) }
   });
-  await registerAdminMcpServerRoutes(app, { dataRoutes, dynamicConfig: service() });
+  await registerAdminMcpServerRoutes(app, { dataRoutes, mcpAdmin: service() });
   return { app, notices };
 }
 

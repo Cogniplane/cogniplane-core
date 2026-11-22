@@ -33,16 +33,15 @@ async function setup(isAdmin = true) {
   });
   const run = vi.fn(async () => check);
   const listLatest = vi.fn(async () => new Map([[server.serverId, check]]));
-  const dynamicConfig: Parameters<typeof registerAdminMcpServerRoutes>[1]["dynamicConfig"] = {
+  const mcpAdmin: Parameters<typeof registerAdminMcpServerRoutes>[1]["mcpAdmin"] = {
     listMcpServers: vi.fn(async () => [server]),
-    getOrCreateTenantSettings: vi.fn(),
+    listAllowedMcpServerIds: vi.fn(async () => [server.serverId]),
     createMcpServer: vi.fn(), updateMcpServer: vi.fn(), disableMcpServer: vi.fn(),
     setMcpServerPublished: vi.fn(), saveMcpServerWithAudience: vi.fn(), setInheritedMcpAudience: vi.fn()
   };
-  vi.mocked(dynamicConfig.getOrCreateTenantSettings).mockResolvedValue({ enabledMcpServerIds: [server.serverId] } as Awaited<ReturnType<typeof dynamicConfig.getOrCreateTenantSettings>>);
   await registerAdminMcpServerRoutes(app, {
     dataRoutes: devDataRoutes(),
-    dynamicConfig, mcpConnectionTests: { test: run, listLatest }
+    mcpAdmin, mcpConnectionTests: { test: run, listLatest }
   });
   return { app, run, listLatest };
 }

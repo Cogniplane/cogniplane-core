@@ -46,14 +46,14 @@ async function setup(isAdmin = true) {
       return true;
     })
   };
-  const dynamicConfig: Parameters<typeof registerAdminMcpServerRoutes>[1]["dynamicConfig"] = {
+  const mcpAdmin: Parameters<typeof registerAdminMcpServerRoutes>[1]["mcpAdmin"] = {
     listMcpServers: vi.fn(async () => [server, managed]),
-    getOrCreateTenantSettings: vi.fn(),
+    listAllowedMcpServerIds: vi.fn(async () => []),
     createMcpServer: vi.fn(), updateMcpServer: vi.fn(), disableMcpServer: vi.fn(),
     setMcpServerPublished: vi.fn(), saveMcpServerWithAudience: vi.fn(), setInheritedMcpAudience: vi.fn()
   };
-  await registerAdminMcpServerRoutes(app, { dataRoutes: devDataRoutes(), dynamicConfig, mcpAppCsp });
-  return { app, mcpAppCsp, audits, dynamicConfig };
+  await registerAdminMcpServerRoutes(app, { dataRoutes: devDataRoutes(), mcpAdmin, mcpAppCsp });
+  return { app, mcpAppCsp, audits, mcpAdmin };
 }
 
 test("lists the approved and requested domains of a proxy server, in the response contract", async () => {
@@ -66,7 +66,7 @@ test("lists the approved and requested domains of a proxy server, in the respons
 });
 
 test("rejects a member before any read or change", async () => {
-  const { app, mcpAppCsp, dynamicConfig } = await setup(false);
+  const { app, mcpAppCsp, mcpAdmin } = await setup(false);
   const payload = { directive: "connectDomains", source: "https://api.vendor.com" };
   expect((await app.inject({ method: "GET", url: base })).statusCode).toBe(403);
   expect((await app.inject({ method: "POST", url: `${base}/approve`, payload })).statusCode).toBe(403);
@@ -74,7 +74,7 @@ test("rejects a member before any read or change", async () => {
   expect(mcpAppCsp.listForAdmin).not.toHaveBeenCalled();
   expect(mcpAppCsp.approve).not.toHaveBeenCalled();
   expect(mcpAppCsp.revoke).not.toHaveBeenCalled();
-  expect(dynamicConfig.listMcpServers).not.toHaveBeenCalled();
+  expect(mcpAdmin.listMcpServers).not.toHaveBeenCalled();
 });
 
 test("answers 404 for an unknown server and for a managed server, which has no widget domains", async () => {

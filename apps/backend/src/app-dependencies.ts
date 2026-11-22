@@ -185,6 +185,7 @@ export function buildAppDependencies(input: {
     skillBundleStorage: bootstrap.skillBundleStorage,
     skillMarketplace: bootstrap.skillMarketplace,
     dynamicConfig: bootstrap.dynamicConfig,
+    mcpAdmin: bootstrap.mcpAdmin,
     managedToolCatalog,
     managedToolFactoryRegistry,
     limits: bootstrap.limits,
