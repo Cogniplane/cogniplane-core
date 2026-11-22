@@ -1,6 +1,7 @@
 import type { FastifyBaseLogger } from "fastify";
 import type { PoolClient } from "pg";
 
+import type { SecurityChange } from "./auth/security-change.js";
 import type { IntegrationRegistry } from "./integrations/integration-registry.js";
 
 // A member removal lasts. The tenant table decides membership after the first
@@ -8,12 +9,15 @@ import type { IntegrationRegistry } from "./integrations/integration-registry.js
 // an owner or admin wins over the WorkOS organization from then on. See
 // docs/architecture/auth.md#roles.
 //
-// The removal route (DELETE /tenant/members/:userId) calls
-// endTenantMembership in its transaction, after the tenant's membership lock
-// (services/member-authority.ts). WorkOS sign-in takes the same lock before it
-// calls assertMemberNotRemoved, so a sign-in either commits before the removal
-// starts, and the removal then deletes its membership, or it waits and finds
-// the removal.
+// Two callers remove a member: the removal route
+// (DELETE /tenant/members/:userId) and the WorkOS membership revalidation
+// (services/auth/workos-membership-revalidation.ts). Each one owns its
+// authorization, its locks, its audit event and its cleanup after the commit.
+// Both call removeTenantMember for the writes of the removal, in their
+// transaction, after the tenant's membership lock (services/member-authority.ts).
+// WorkOS sign-in takes the same lock before it calls assertMemberNotRemoved,
+// so a sign-in either commits before the removal starts, and the removal then
+// deletes its membership, or it waits and finds the removal.
 
 /** WorkOS sign-in found a removal of this user by the tenant. */
 export class MemberRemovedError extends Error {
@@ -21,6 +25,45 @@ export class MemberRemovedError extends Error {
     super("The tenant removed this member.");
     this.name = "MemberRemovedError";
   }
+}
+
+/**
+ * The writes of a member removal, in the caller's security change
+ * (`withSecurityChange`). The caller holds the tenant's membership lock, the
+ * locks of the member's chats (`lockChatsBeforeMembership`) and the lock of
+ * the membership row, in that order, and has made its authorization checks.
+ *
+ * - Disables the member's scheduled jobs, first: the update locks the job
+ *   rows, so a claim of a due job (`UserSettingsStore.claimJob`) waits and
+ *   then finds the job disabled, and writes no run for it. The claim also
+ *   requires the membership, but the pause lasts: `next_run_at = NULL` keeps
+ *   the job out of the due-job query, and the pause reason makes the owner
+ *   review each job before it runs again, if a future re-admission brings
+ *   the member back.
+ * - Runs `afterJobsPaused`, when given: what the caller ends with the
+ *   membership, for example the local account.
+ * - Ends the membership (endTenantMembership).
+ * - After the commit, the member's active work stops, and the sandboxes of
+ *   the member's chats are killed (services/auth/security-change.ts). A
+ *   WorkOS member has no security version; its work stops all the same.
+ *
+ * Returns the number of project roles deleted, for the caller's audit event.
+ */
+export async function removeTenantMember(
+  change: SecurityChange,
+  input: { userId: string; removedBy: string; afterJobsPaused?: () => Promise<void> }
+): Promise<{ projectRolesRemoved: number }> {
+  const { client, tenantId } = change;
+  await client.query(
+    `UPDATE scheduled_jobs
+     SET enabled = FALSE, next_run_at = NULL, paused_reason = 'security_change', updated_at = NOW()
+     WHERE tenant_id = $1 AND user_id = $2`,
+    [tenantId, input.userId]
+  );
+  await input.afterJobsPaused?.();
+  const removed = await endTenantMembership(client, { tenantId, userId: input.userId, removedBy: input.removedBy });
+  change.endActiveWork(input.userId);
+  return removed;
 }
 
 /**

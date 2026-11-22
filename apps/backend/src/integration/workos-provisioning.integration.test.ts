@@ -14,6 +14,7 @@ import { createFakeWorkOS } from "../test-helpers/fake-workos.js";
 import { lockTenantMembership, TENANT_MEMBERSHIP_LOCK_SQL } from "../services/member-authority.js";
 import { endTenantMembership, MemberRemovedError } from "../services/tenant-member-removal.js";
 import { adminDatabaseUrl, appPool, maintenancePool, superuserPool } from "./support/database.js";
+import { seedScheduledJob } from "./support/fixtures.js";
 
 function login(organizationId: string, workosUserId: string, email: string, workosRoleSlug: string | null = "member") {
   return provisionTenantIdentity(maintenancePool(), {
@@ -157,9 +158,15 @@ describe.skipIf(!adminDatabaseUrl())("WorkOS provisioning and concurrent role ch
       lookupDb: maintenancePool(), db: appPool(), workos, afterSecurityChange
     });
 
+    const jobId = await seedScheduledJob({ tenantId: t.tenantId, userId: t.userId });
+
     expect(await service.revalidate(t.tenantId, t.userId)).toBe(false);
     expect(await roleOf(t.tenantId, t.userId)).toBeNull();
     expect(await roleOf(t.tenantId, t.ownerId)).toBe("owner");
+    // The same writes as a removal in People: the member's scheduled job is paused.
+    expect((await superuserPool().query(
+      "SELECT enabled, next_run_at, paused_reason FROM scheduled_jobs WHERE tenant_id = $1 AND job_id = $2", [t.tenantId, jobId]
+    )).rows).toEqual([{ enabled: false, next_run_at: null, paused_reason: "security_change" }]);
     expect(await removalOf(t.tenantId, t.userId)).toBe(true);
     expect(afterSecurityChange).toHaveBeenCalledWith({ tenantId: t.tenantId, userIds: [t.userId], releasedSandboxes: [] });
     await expect(login(t.organizationId, t.workosUserId, t.email, "member")).rejects.toBeInstanceOf(MemberRemovedError);
