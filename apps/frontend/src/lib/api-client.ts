@@ -383,7 +383,13 @@ async function readJson<T>(
   let body: unknown;
   try {
     body = await response.json();
-  } catch {
+  } catch (error) {
+    // Only a body that does not parse is "not JSON". A cancelled request or a
+    // connection that fails during the body keeps its own error.
+    if (!(error instanceof SyntaxError)) throw error;
+    // No `cause`: the message of the syntax error quotes the start of the body,
+    // and a body can hold a credential.
+    // eslint-disable-next-line preserve-caught-error
     throw new Error(`Response is not JSON at ${context}`);
   }
   return parseResponse(schema, body, context);

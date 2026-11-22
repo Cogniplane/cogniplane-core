@@ -152,6 +152,24 @@ describe("request: 401 → refresh → retry", () => {
     await expect(requestJson("/no-content", OkSchema)).rejects.toThrow("Response is not JSON at GET /no-content");
   });
 
+  it("requestJson keeps the error of a request that the caller cancels during the body", async () => {
+    const caller = new AbortController();
+    const { fetch } = stubFetch([() => new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode("{\"ok\":"));
+        caller.signal.addEventListener("abort", () => controller.error(caller.signal.reason));
+      }
+    }), { status: 200 })]);
+    // @ts-expect-error — stub
+    global.fetch = fetch;
+
+    const result = requestJson("/sessions", OkSchema, { signal: caller.signal }).catch((error: unknown) => error);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    caller.abort();
+
+    expect(await result).toMatchObject({ name: "AbortError" });
+  });
+
   it("requestJson refuses JSON that the schema does not accept, and returns the parsed value when it does", async () => {
     const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
     const { fetch } = stubFetch([
