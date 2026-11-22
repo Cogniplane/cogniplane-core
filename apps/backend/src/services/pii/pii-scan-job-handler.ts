@@ -1,11 +1,8 @@
-import type {
-  ArtifactPiiDetail,
-  ArtifactRecord,
-  ArtifactStore
-} from "../artifacts/artifact-store.js";
+import type { ArtifactRecord, ArtifactStore } from "../artifacts/artifact-store.js";
 import type { AuditEventStore } from "../audit-event-store.js";
-import type { StorageGc, StorageGcOutcome } from "../storage/storage-gc.js";
+import type { StorageGc } from "../storage/storage-gc.js";
 import type { MessagePiiDetail, MessageStore } from "../message-store.js";
+import { PiiArtifactVerdictWriter } from "./pii-artifact-verdict-writer.js";
 import type { PiiImportScopeRegistry } from "./pii-import-scopes.js";
 import type {
   PiiAppliedPolicy,
@@ -77,18 +74,19 @@ export type PiiScanJobHandlerDeps = {
   importScopes?: Pick<PiiImportScopeRegistry, "findBySubjectKind">;
 };
 
-type SubjectDetail = {
+type MessageVerdict = {
   status: "scanned" | "blocked" | "transformed" | "failed";
   modeApplied: PiiScanMode;
   policyRevision?: number;
   blockReason?: string;
-  findingsCount?: number;
-} & ImageCoverageDetail;
-
-type RejectedObjectCleanup = { objectDeleted: boolean; objectCleanup: StorageGcOutcome };
+};
 
 export class PiiScanJobHandler {
-  constructor(private readonly deps: PiiScanJobHandlerDeps) {}
+  private readonly artifactVerdicts: PiiArtifactVerdictWriter;
+
+  constructor(private readonly deps: PiiScanJobHandlerDeps) {
+    this.artifactVerdicts = new PiiArtifactVerdictWriter(deps);
+  }
 
   /**
    * The job records its decision on the scan run before it applies it. An
@@ -216,7 +214,13 @@ export class PiiScanJobHandler {
       job.tenantId,
       job.scanRunId,
       job.errorMessage ?? "PII scan job failed",
-      () => this.writeSubjectDetail(job, { status: "failed", modeApplied: job.mode })
+      () => job.subjectType === "message"
+        ? this.writeMessageDetail(job, { status: "failed", modeApplied: job.mode })
+        : this.deps.artifacts.setPiiDetail(job.tenantId, job.subjectId, {
+            status: "failed",
+            modeApplied: job.mode,
+            scanRunId: job.scanRunId
+          })
     );
     if (decision) await this.applyDecision(job, decision, true);
   }
@@ -253,7 +257,11 @@ export class PiiScanJobHandler {
 
   private async decide(job: PiiScanJobRecord, subject: PiiSubject): Promise<PiiScanRunDecision> {
     const { decision, appliedPolicy, coverage } = await this.evaluate(job, subject);
-    return scanRunDecision(decision, appliedPolicy, coverage);
+    // An artifact decision keeps its source for the audit events.
+    const source = job.subjectType === "artifact"
+      ? (subject.kind === "import" ? subject.subjectKind : subject.kind)
+      : undefined;
+    return scanRunDecision(decision, appliedPolicy, coverage, source);
   }
 
   // The job applies the policy in force now, not the policy at enqueue time.
@@ -300,23 +308,35 @@ export class PiiScanJobHandler {
    * can run again: when `resumed`, an earlier attempt applied part of this
    * decision, so each audit event is written only if it does not exist. The
    * terminal scan run update is last and clears the recorded decision.
+   *
+   * An artifact decision goes to the writer that the synchronous upload scan
+   * uses. A message has no stored object and no image coverage.
    */
   private async applyDecision(
     job: PiiScanJobRecord,
     decision: PiiScanRunDecision,
     resumed: boolean
   ): Promise<void> {
+    const auditOptions = { once: resumed };
+    if (job.subjectType === "artifact") {
+      await this.artifactVerdicts.apply({
+        tenantId: job.tenantId,
+        artifactId: job.subjectId,
+        scanRunId: job.scanRunId,
+        emitAudit: (eventType, payload) => this.emitAudit(job, eventType, payload, auditOptions),
+        logContext: { jobId: job.jobId }
+      }, decision);
+      return;
+    }
+
     const { action, mode, policyRevision, findings, providerType, providerModel } = decision;
-    // The subject detail names the mode `modeApplied`; the scan run and the
+    // The message detail names the mode `modeApplied`; the scan run and the
     // audit payload name it `mode`.
     const policy = { modeApplied: mode, policyRevision };
     const recorded = { mode, policyRevision };
-    // What the scan read of a PDF's page images, also on a block.
-    const coverage = coverageOf(decision);
-    const auditOptions = { once: resumed };
 
     if (action === "allow") {
-      await this.writeSubjectDetail(job, { status: "scanned", ...policy, findingsCount: 0, ...coverage });
+      await this.writeMessageDetail(job, { status: "scanned", ...policy });
       await this.deps.piiScanRuns.update(job.tenantId, job.scanRunId, {
         status: "completed",
         ...recorded,
@@ -328,12 +348,7 @@ export class PiiScanJobHandler {
     }
 
     if (action === "report") {
-      await this.writeSubjectDetail(job, {
-        status: "scanned",
-        ...policy,
-        findingsCount: findings.length,
-        ...coverage
-      });
+      await this.writeMessageDetail(job, { status: "scanned", ...policy });
       await this.emitAudit(job, "pii_reported", {
         scanRunId: job.scanRunId,
         ...recorded,
@@ -352,21 +367,7 @@ export class PiiScanJobHandler {
     }
 
     if (action === "block") {
-      const blocked = {
-        status: "blocked" as const,
-        ...policy,
-        blockReason: decision.blockReason,
-        findingsCount: findings.length,
-        ...coverage
-      };
-      // Same order as the sync enqueuer. For an artifact, the `blocked`
-      // verdict and the queued object delete commit together, so no failure
-      // after this point loses the key. A resumed block queues and deletes
-      // again: a delete of a missing object succeeds. Messages have no
-      // stored object.
-      let cleanup: RejectedObjectCleanup | undefined;
-      if (job.subjectType === "artifact") cleanup = await this.rejectStoredObject(job, blocked, auditOptions);
-      else await this.writeSubjectDetail(job, blocked);
+      await this.writeMessageDetail(job, { status: "blocked", ...policy, blockReason: decision.blockReason });
       await this.emitAudit(job, "pii_blocked", {
         scanRunId: job.scanRunId,
         ...recorded,
@@ -375,9 +376,7 @@ export class PiiScanJobHandler {
         findingsCount: findings.length,
         providerType,
         providerModel,
-        blockReason: decision.blockReason,
-        objectDeleted: cleanup?.objectDeleted,
-        objectCleanup: cleanup?.objectCleanup
+        blockReason: decision.blockReason
       }, auditOptions);
       await this.deps.piiScanRuns.update(job.tenantId, job.scanRunId, {
         status: "blocked", ...recorded, actionTaken: "block", findings,
@@ -389,12 +388,7 @@ export class PiiScanJobHandler {
 
     // transform path: this records the finding set only, and it does not store
     // the transformed content.
-    await this.writeSubjectDetail(job, {
-      status: "transformed",
-      ...policy,
-      findingsCount: findings.length,
-      ...coverage
-    });
+    await this.writeMessageDetail(job, { status: "transformed", ...policy });
     await this.emitAudit(job, "pii_transformed", {
       scanRunId: job.scanRunId,
       ...recorded,
@@ -409,45 +403,6 @@ export class PiiScanJobHandler {
       providerType, providerModel, pendingDecision: null,
       completedAt: new Date()
     });
-  }
-
-  /**
-   * Blocks an artifact and gives up its object: `rejectStoredObject` writes
-   * the verdict, and queues the key that the row holds now (not the job's
-   * frozen payload: a re-upload or a migration can change it), in one
-   * transaction. Then this call tries the delete; a failure stays queued for
-   * the worker. Undefined when the row is gone or deleted: nothing to
-   * release, and the verdict has no row to go to.
-   */
-  private async rejectStoredObject(
-    job: PiiScanJobRecord,
-    detail: SubjectDetail,
-    auditOptions: { once: boolean }
-  ): Promise<RejectedObjectCleanup | undefined> {
-    const released = await this.deps.artifacts.rejectStoredObject(job.tenantId, job.subjectId, {
-      pii: this.artifactDetail(job, detail)
-    });
-    if (!released) return undefined;
-    const outcome = await this.deps.storageGc.collectArtifactObject({
-      queue: "session_storage_gc",
-      tenantId: job.tenantId,
-      ownerId: released.sessionId,
-      storageKey: released.storageKey
-    });
-    if (outcome === "pending") {
-      this.deps.logger.error(
-        { tenantId: job.tenantId, artifactId: job.subjectId, jobId: job.jobId },
-        "Failed to delete stored object for PII-blocked artifact; it stays queued for retry"
-      );
-      await this.emitAudit(job, "pii_block_object_orphaned", {
-        scanRunId: job.scanRunId,
-        subjectType: "artifact",
-        subjectId: job.subjectId,
-        storageKey: released.storageKey,
-        retry: "queued"
-      }, auditOptions);
-    }
-    return { objectDeleted: outcome === "deleted", objectCleanup: outcome };
   }
 
   private async emitAudit(
@@ -492,44 +447,16 @@ export class PiiScanJobHandler {
     }
   }
 
-  private async writeSubjectDetail(job: PiiScanJobRecord, detail: SubjectDetail): Promise<void> {
-    if (job.subjectType === "message") {
-      const pii: MessagePiiDetail = {
-        status: detail.status,
-        modeApplied: detail.modeApplied,
-        scanRunId: job.scanRunId
-      };
-      if (detail.policyRevision !== undefined) pii.policyRevision = detail.policyRevision;
-      if (detail.blockReason !== undefined) pii.blockReason = detail.blockReason;
-      if (detail.status === "transformed") pii.transformed = true;
-      await this.deps.messages.setPiiDetail(job.tenantId, job.subjectId, pii);
-      return;
-    }
-
-    await this.deps.artifacts.setPiiDetail(job.tenantId, job.subjectId, this.artifactDetail(job, detail));
-  }
-
-  private artifactDetail(
-    job: PiiScanJobRecord,
-    detail: SubjectDetail
-  ): ArtifactPiiDetail {
-    const artifactPii: ArtifactPiiDetail = {
+  private async writeMessageDetail(job: PiiScanJobRecord, detail: MessageVerdict): Promise<void> {
+    const pii: MessagePiiDetail = {
       status: detail.status,
       modeApplied: detail.modeApplied,
       scanRunId: job.scanRunId
     };
-    if (detail.policyRevision !== undefined) artifactPii.policyRevision = detail.policyRevision;
-    // As the synchronous scan writes it, so a block that recovery finishes
-    // shows the same reason.
-    if (detail.blockReason !== undefined) artifactPii.blockReason = detail.blockReason;
-    if (detail.findingsCount !== undefined) {
-      artifactPii.findingsCount = detail.findingsCount;
-    }
-    if (detail.imagesNotScanned) artifactPii.imagesNotScanned = true;
-    if (detail.imageScan !== undefined) artifactPii.imageScan = detail.imageScan;
-    if (detail.imagePagesScanned !== undefined) artifactPii.imagePagesScanned = detail.imagePagesScanned;
-    if (detail.imagePageCount !== undefined) artifactPii.imagePageCount = detail.imagePageCount;
-    return artifactPii;
+    if (detail.policyRevision !== undefined) pii.policyRevision = detail.policyRevision;
+    if (detail.blockReason !== undefined) pii.blockReason = detail.blockReason;
+    if (detail.status === "transformed") pii.transformed = true;
+    await this.deps.messages.setPiiDetail(job.tenantId, job.subjectId, pii);
   }
 }
 
@@ -541,7 +468,9 @@ export class PiiScanJobHandler {
 export function scanRunDecision(
   decision: PiiDecision,
   appliedPolicy: PiiAppliedPolicy,
-  coverage: ImageCoverageDetail
+  coverage: ImageCoverageDetail,
+  /** For an artifact: "upload", or the subject kind of the import source. */
+  source?: string
 ): PiiScanRunDecision {
   const scanned = decision.action === "allow"
     ? { findings: [], providerType: null, providerModel: null }
@@ -552,19 +481,9 @@ export function scanRunDecision(
     policyRevision: appliedPolicy.revision,
     ...scanned,
     ...(decision.action === "block" ? { blockReason: decision.blockReason } : {}),
+    ...(source !== undefined ? { source } : {}),
     // A scan that applied mode off read nothing, so no coverage applies.
     ...(appliedPolicy.mode !== "off" ? coverage : {})
-  };
-}
-
-// The page-image coverage that a recorded decision states. A decision
-// recorded before OCR coverage existed holds only `imagesNotScanned`.
-export function coverageOf(decision: PiiScanRunDecision): ImageCoverageDetail {
-  return {
-    ...(decision.imagesNotScanned ? { imagesNotScanned: true } : {}),
-    ...(decision.imageScan !== undefined ? { imageScan: decision.imageScan } : {}),
-    ...(decision.imagePagesScanned !== undefined ? { imagePagesScanned: decision.imagePagesScanned } : {}),
-    ...(decision.imagePageCount !== undefined ? { imagePageCount: decision.imagePageCount } : {})
   };
 }
 

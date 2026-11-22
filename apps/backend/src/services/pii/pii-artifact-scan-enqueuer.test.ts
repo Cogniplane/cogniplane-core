@@ -748,7 +748,9 @@ test("a synchronous block records its decision, commits the verdict with the que
       findings: dirtyBlockDecision.findings,
       providerType: "openai-compatible",
       providerModel: "google/gemini-3.5-flash-lite",
-      blockReason: "email"
+      blockReason: "email",
+      // The worker has no other record of the source when it finishes this decision.
+      source: "upload"
     }
   }]);
 });

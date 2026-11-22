@@ -768,7 +768,27 @@ test("the job records its decision before it deletes the bytes of a blocked file
 
   const recorded = buildDeps({ decision: { ...blockDecision, findings: reportDecision.findings }, appliedPolicy: { mode: "block", revision: 3 } });
   await new PiiScanJobHandler(recorded.deps).execute(sampleJob());
-  expect(recorded.recordDecisionCalls).toEqual([{ ...recordedBlock, providerType: "openai-compatible", providerModel: "m" }]);
+  expect(recorded.recordDecisionCalls).toEqual([
+    { ...recordedBlock, providerType: "openai-compatible", providerModel: "m", source: "upload" }
+  ]);
+});
+
+test("a recorded block of an interrupted synchronous scan keeps its source in the audit events", async () => {
+  const h = buildDeps({ withAuditEvents: true });
+  h.run().pendingDecision = { ...recordedBlock, source: "sharepoint_import" };
+  h.setStorageDeleteThrows(new Error("s3 down"));
+  // The job that recovery queues has no payload: the decision holds the source.
+  await new PiiScanJobHandler(h.deps).execute(sampleJob({ payload: {} }));
+  expect(h.auditCalls).toEqual([
+    expect.objectContaining({
+      type: "pii_block_object_orphaned",
+      payload: expect.objectContaining({ source: "sharepoint_import" })
+    }),
+    expect.objectContaining({
+      type: "pii_blocked",
+      payload: expect.objectContaining({ source: "sharepoint_import", objectCleanup: "pending" })
+    })
+  ]);
 });
 
 test("a retry after a failed scan run update finishes the recorded block and does not decide again", async () => {
