@@ -89,8 +89,12 @@ Redis.
 ### D14. Step-up and owner notices for sensitive changes
 
 A stolen admin token must not make a lasting change unseen. Step-up blocks it
-for local sessions. Cogniplane cannot ask WorkOS for a fresh proof, so WorkOS
-sessions are not blocked and owner notices make the change visible instead.
+for local sessions: a covered change needs a fresh proof bound to the action.
+Cogniplane has no supported way to get a fresh proof from WorkOS, so a
+protected data-route change, a weaker control and a skill release from a
+WorkOS session are refused (403 `workos_step_up_unavailable`). With email on,
+each covered change that commits queues an owner notice; with email off, the
+audit event is the only record. A notice does not replace the proof.
 Rules and limits: [sensitive changes](architecture/sensitive-changes.md).
 
 ### D15. Model spending is reserved before calls
