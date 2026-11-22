@@ -2,10 +2,10 @@ import { uuidv7 } from "../lib/uuid.js";
 import type { TurnStopReason } from "@cogniplane/shared-types";
 
 import type { ToolExecutionContextStore } from "./auth/tool-execution-context-store.js";
-import { startExecutionHeartbeat, stopLostExecution } from "./execution-heartbeat.js";
 import { RequestLimitsUnavailableError } from "./redis-request-limits.js";
 import type { RequestLimitsInterface } from "./request-limits.js";
 import { SessionExecutionError, type SessionExecution, type SessionExecutionStore } from "./session-execution-store.js";
+import { bindTurnToolContext, TurnExecutionLease } from "./turn-execution.js";
 import type { AuditEventInput, AuditEventStore } from "./audit-event-store.js";
 import { computeNextCronRunAt } from "../lib/cron.js";
 import type { MessageStore } from "./message-store.js";
@@ -227,10 +227,7 @@ type ScheduledTurnHandle = {
   adapter: SchedulerRuntimeAdapter | null;
   timedOut: boolean;
   /** The lease of the turn. Set at admission; the job keeps it until its cleanup ends. */
-  execution: SessionExecution | null;
-  stopHeartbeat: (() => void) | null;
-  /** Stops the heartbeat and releases the lease. Runs once. */
-  releaseLease: (() => Promise<void>) | null;
+  lease: TurnExecutionLease | null;
 };
 
 /**
@@ -823,8 +820,7 @@ export class SchedulerWorker {
     // status="failed" and records the outcome. We therefore never need to
     // invent a second finishJobRun here.
     const turn: ScheduledTurnHandle = {
-      sessionId: null, adapter: null, timedOut: false,
-      execution: null, stopHeartbeat: null, releaseLease: null
+      sessionId: null, adapter: null, timedOut: false, lease: null
     };
     // Tracked on its own: after the abort grace this wrapper returns and frees
     // the slot, but the job can still be writing its outcome.
@@ -863,8 +859,8 @@ export class SchedulerWorker {
         // nothing to abort. The abort names the execution of this job, so it
         // cannot stop a newer turn of the session. It can outlive the grace, so
         // drain() tracks it.
-        if (turn.sessionId && turn.adapter && turn.execution) {
-          const { sessionId, adapter, execution: admitted } = turn;
+        if (turn.sessionId && turn.adapter && turn.lease) {
+          const { sessionId, adapter, lease: { execution: admitted } } = turn;
           void this.track(adapter.abortSession({
             tenantId: job.tenantId, sessionId, userId: job.userId, executionId: admitted.executionId
           }).catch((error: unknown) => {
@@ -885,7 +881,7 @@ export class SchedulerWorker {
             // turn and the session is free. An admission that ends after this
             // point finds `timedOut` and starts no heartbeat
             // (admitScheduledTurn).
-            turn.stopHeartbeat?.();
+            turn.lease?.stopHeartbeat();
             this.deps.logger.error(
               { jobId: job.jobId, sessionId: turn.sessionId, graceMs },
               "Timed-out scheduled job did not settle after abort; releasing slot, its lease ends at expiry"
@@ -1076,22 +1072,18 @@ export class SchedulerWorker {
         execution
       });
 
-      const toolContext = await this.deps.toolContexts.create({
+      // The same binding as an interactive turn, with the same runtimePolicy
+      // snapshot, so the MCP gateway enforces enabled tools and servers for
+      // scheduled tool calls. `turnContext` marks this as an unattended turn,
+      // so a Policy Center rule can gate scheduled actions more strictly.
+      const toolContext = await bindTurnToolContext(this.deps.toolContexts, {
         tenantId: job.tenantId,
         sessionId,
         userId: job.userId,
-        runtimeId: runtimeSession.runtimeId,
-        runtimePolicyId: runtimeSession.runtimePolicy.id,
+        runtimeSession,
         messageId: assistantMessage.messageId,
-        // Mark this as an unattended turn so a Policy Center rule can gate
-        // scheduled actions more strictly. Keep the same runtimePolicy snapshot
-        // as interactive turns so the MCP gateway can enforce enabled tools and
-        // servers for scheduled tool calls.
-        metadata: { runtimePolicy: runtimeSession.runtimePolicy,
-          ...(runtimeSession.mcpServerSources ? { mcpServerSources: runtimeSession.mcpServerSources } : {}),
-          ...(runtimeSession.integrationAccounts ? { integrationAccounts: runtimeSession.integrationAccounts } : {}),
-          executionId: execution.executionId,
-          turnContext: "scheduled" },
+        execution,
+        turnContext: "scheduled",
         // The version that the claim and admitTurn compared. After a security
         // change of the owner, the gateway refuses the turn's tool calls, also
         // when this replica's runtime is not stopped (security-change.ts).
@@ -1156,7 +1148,7 @@ export class SchedulerWorker {
 
       await this.reclaimScheduledSession(job, sessionId, turn);
     } finally {
-      await turn.releaseLease?.();
+      await turn.lease?.release();
     }
 
     // A shutdown refuses new turns and then closes the runtimes, so a run
@@ -1208,50 +1200,37 @@ export class SchedulerWorker {
     stopIfTimedOut: () => void
   ): Promise<SessionExecution> {
     const admission = this.deps.turnAdmission;
-    const leaseStartedAt = performance.now();
-    let execution: SessionExecution;
+    let lease: TurnExecutionLease;
     try {
-      execution = await admission.executions.acquire(
-        { tenantId: job.tenantId, sessionId, userId: job.userId }, admission.leaseMs, admission.caps, "scheduled"
-      );
+      lease = await TurnExecutionLease.acquire({
+        executions: admission.executions,
+        actor: { tenantId: job.tenantId, sessionId, userId: job.userId },
+        settings: admission,
+        turnContext: "scheduled",
+        onReleaseError: (error) =>
+          this.deps.logger.error({ error, jobId: job.jobId, sessionId }, "Failed to release scheduled execution lease")
+      });
     } catch (error) {
       if (error instanceof SessionExecutionError && error.code === "running_turn_limit") {
         throw new TurnLimitRefusal(RUNNING_TURN_LIMIT_RUN_ERROR, { cause: error });
       }
       throw error;
     }
-    turn.execution = execution;
-    const admitted = execution;
-    let released: Promise<void> | null = null;
-    const releaseLease = () => released ??= (async () => {
-      turn.stopHeartbeat?.();
-      try {
-        await admission.executions.release(admitted);
-      } catch (error) {
-        this.deps.logger.error({ error, jobId: job.jobId, sessionId }, "Failed to release scheduled execution lease");
-      }
-    })();
-    turn.releaseLease = releaseLease;
+    turn.lease = lease;
     try {
       stopIfTimedOut();
     } catch (error) {
-      await releaseLease();
+      await lease.release();
       throw error;
     }
-    const leaseExpiresAt = performance.now() + Math.max(0, new Date(admitted.expiresAt).getTime() - Date.now());
-    turn.stopHeartbeat = startExecutionHeartbeat({
-      leaseStartedAt,
-      leaseExpiresAt,
-      leaseMs: admission.leaseMs,
-      intervalMs: admission.heartbeatMs,
-      renew: () => admission.executions.heartbeat(admitted, admission.leaseMs),
+    lease.startHeartbeat({
       onError: (error) => this.deps.logger.warn({ error, jobId: job.jobId, sessionId }, "Scheduled execution heartbeat failed"),
       onLost: async () => {
         this.deps.logger.warn({ jobId: job.jobId, sessionId }, "Scheduled execution lease lost; stopping the turn");
-        await stopLostExecution({ execution: admitted, executions: admission.executions, runtime });
+        await lease.stopRuntime(runtime);
       }
     });
-    return execution;
+    return lease.execution;
   }
 
   /** Spends one unit of the daily turn quota of the owner and the tenant. */
@@ -1332,8 +1311,9 @@ export class SchedulerWorker {
     sessionId: string | null,
     turn: ScheduledTurnHandle
   ): Promise<void> {
-    const { adapter, execution } = turn;
-    if (!sessionId || !adapter || !execution) return;
+    const { adapter, lease } = turn;
+    if (!sessionId || !adapter || !lease) return;
+    const { execution } = lease;
     try {
       await adapter.abortSession({
         tenantId: job.tenantId, sessionId, userId: job.userId, executionId: execution.executionId

@@ -125,6 +125,11 @@ A turn writes checkpoints only while its execution holds the session lease.
   lease is active or stopping. The renewal and the other lease checks of a
   running turn use the turn control pool, not the app pool
   ([database pools](data.md#database-pools)).
+- Interactive and scheduled turns share the lease code
+  (`services/turn-execution.ts`): `TurnExecutionLease` takes the lease, renews
+  it and releases it once, and `bindTurnToolContext` creates the turn's tool
+  execution context. Each entry point keeps its own order around these steps:
+  what it does when the lease is lost, and when it releases.
 - The lease is the only rule for "a turn runs in this session". The local
   registries (`ActiveTurnsRegistry`, the adapter's turn set) only answer
   first on the replica that runs the turn. A session is busy
