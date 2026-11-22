@@ -75,6 +75,12 @@ const workspaceActions = vi.hoisted(() => ({ openPreview: vi.fn() }));
 // What the chat host gives the ArtifactCards. The cards render in the real host test.
 const cardProviders = vi.hoisted(() => ({ props: [] as Array<{ sessionId: string; inventory?: { artifacts: readonly unknown[]; onOpenPreview: (artifactId: string) => void } }> }));
 const eventSeeds = vi.hoisted(() => ({ values: [] as unknown[][] }));
+// The saved side state that the session hook gives the chat: one object for
+// each change of the saved data, as the query cache gives one for each read.
+const savedCache = vi.hoisted(() => ({
+  messages: null as unknown, approvals: null as unknown, value: undefined as unknown,
+  build: (() => undefined) as (messages: unknown, approvals: unknown) => unknown
+}));
 const sessionListActions = vi.hoisted(() => ({ reload: vi.fn(async () => undefined), select: vi.fn(), create: vi.fn(async () => undefined), confirmDelete: vi.fn(), cancelDelete: vi.fn() }));
 const queryActions = vi.hoisted(() => ({ invalidate: vi.fn(), projectRefetch: vi.fn(), refresh: vi.fn(async () => {}) }));
 const shellClient = vi.hoisted(() => ({ invalidateQueries: queryActions.invalidate }));
@@ -175,8 +181,16 @@ vi.mock("../hooks/use-chat-workspace", () => ({
   useChatWorkspace: () => ({
     messages: shellState.messages,
     artifacts: shellState.artifacts,
-    initialApprovals: shellState.initialApprovals,
-    isSessionDataReady: shellState.sessionData === "ready" || shellState.sessionData === "cached-error",
+    savedApprovals: shellState.initialApprovals,
+    saved: (() => {
+      if (shellState.sessionData !== "ready" && shellState.sessionData !== "cached-error") return undefined;
+      if (savedCache.messages !== shellState.messages || savedCache.approvals !== shellState.initialApprovals) {
+        savedCache.messages = shellState.messages;
+        savedCache.approvals = shellState.initialApprovals;
+        savedCache.value = savedCache.build(shellState.messages, shellState.initialApprovals);
+      }
+      return savedCache.value;
+    })(),
     hasSessionData: shellState.sessionData === "ready" || shellState.sessionData === "cached-error",
     loadError: shellState.sessionData === "error" || shellState.sessionData === "cached-error" ? "HTTP 503" : null,
     refreshSessionData: queryActions.refresh,
@@ -284,7 +298,7 @@ vi.mock("../lib/agui/use-agui-custom-events", async (importOriginal) => {
   const original = await importOriginal<typeof import("../lib/agui/use-agui-custom-events")>();
   return {
     useAguiCustomEvents: (...args: Parameters<typeof original.useAguiCustomEvents>) => {
-      eventSeeds.values.push(args[1]?.initialToolStatuses ?? []);
+      eventSeeds.values.push(args[1]?.saved?.toolStatuses ?? []);
       return original.useAguiCustomEvents(...args);
     }
   };
@@ -343,6 +357,15 @@ function pickerEntry(fileId: string, name: string, kind: "published" | "draft" =
 }
 
 beforeAll(async () => {
+  const { nextReadOrder } = await import("../lib/agui/read-order");
+  const transcript = await import("./agui-transcript");
+  savedCache.build = (messages, approvals) => ({
+    toolStatuses: transcript.toolStatusesFromMessages(messages as never),
+    mcpApps: transcript.mcpAppsFromMessages(messages as never),
+    notices: transcript.runtimeNoticesFromMessages(messages as never),
+    approvals,
+    readOrder: nextReadOrder()
+  });
   vi.stubGlobal("matchMedia", () => ({ matches: false, addEventListener() {}, removeEventListener() {} }));
   await import("./copilot-chat-host");
 });
@@ -359,6 +382,8 @@ afterEach(() => {
   cleanup();
   agents.instances = [];
   eventSeeds.values = [];
+  savedCache.messages = null;
+  savedCache.approvals = null;
   hostLifecycle.mounts = 0;
   hostLifecycle.unmounts = 0;
   shellState.selectedId = "session-1";
@@ -431,7 +456,7 @@ describe("ChatShell session host boundary", () => {
     expect(projectApi.listProjects).not.toHaveBeenCalledWith({ archived: true });
   });
 
-  it("preserves the host within a session and remounts it with the next session's seeds", async () => {
+  it("preserves the host within a session and remounts it with the next session's saved state", async () => {
     const view = render(<ChatShell />);
     await waitFor(() => expect(agents.instances).toHaveLength(1));
     const first = agents.instances[0];
@@ -1270,31 +1295,106 @@ describe("ChatShell chat area without a chat", () => {
     expect(screen.getByRole("status").textContent).toBe("Loading sessions…");
   });
 
-  it("says that the session loads, and the artifacts panel does not claim an empty session", () => {
+  it("mounts the chat while the saved session data loads, and the artifacts panel does not claim an empty session", async () => {
     shellState.sessionData = "loading";
-    render(<ChatShell />);
-    expect(screen.getByRole("status").textContent).toBe("Loading session…");
-    expect(hostLifecycle.mounts).toBe(0);
+    const view = render(<ChatShell />);
+    // The connection shows the history. The chat does not wait for the REST read.
+    await waitFor(() => expect(agents.instances).toHaveLength(1));
+    expect(eventSeeds.values.at(-1)).toEqual([]);
     expect(artifactPanelProps.values.at(-1)?.inventory.status).toBe("loading");
+    expect(cardProviders.props.at(-1)?.inventory).toMatchObject({ loaded: false });
+
+    // The late result reaches the same chat: no second host and no second agent.
+    shellState.sessionData = "ready";
+    view.rerender(<ChatShell />);
+    expect(eventSeeds.values.at(-1)).toEqual([{ rowId: "history-1" }]);
+    expect(cardProviders.props.at(-1)?.inventory).toMatchObject({ loaded: true });
+    expect(agents.instances).toHaveLength(1);
+    expect(hostLifecycle).toMatchObject({ mounts: 1, unmounts: 0 });
   });
 
-  it("explains a failed first load once, and retries through the session refresh", async () => {
+  it("keeps a live approval and tool failure when the saved session data arrives after them", async () => {
+    shellState.sessionData = "loading";
+    // The REST read started before the live events. Its result has neither.
+    shellState.messages = [{ marker: "history-1", role: "assistant", toolResults: [] } as (typeof shellState.messages)[number]];
+    const view = render(<ChatShell />);
+    await waitFor(() => expect(agents.instances).toHaveLength(1));
+    // The read of this visit took its order before the chat connected.
+    savedCache.value = savedCache.build(shellState.messages, shellState.initialApprovals);
+    savedCache.messages = shellState.messages;
+    savedCache.approvals = shellState.initialApprovals;
+    const agent = agents.instances[0];
+    // The replay of a running turn makes the chat read the pending approvals.
+    // That read starts after the REST read of the session data.
+    const { listApprovals } = await import("../lib/session-api");
+    vi.mocked(listApprovals).mockResolvedValueOnce([{
+      approvalId: "approval-live", sessionId: "session-1", itemId: "call-live", kind: "mcp_tool",
+      title: "Publish report", summary: "Publish the draft report", status: "pending"
+    }]);
+    // The connection sent the history and stays open: it now streams the turn.
+    const input = { runId: "connect-1", forwardedProps: { cogniplaneReconnect: true }, messages: [] };
+    act(() => {
+      agent.subscriber?.onRunInitialized?.({ input });
+      agent.subscriber?.onCustomEvent?.({ event: { name: "session_connection", value: { activeTurn: "attached", hasMoreHistory: false } }, messages: [], input });
+      agent.subscriber?.onRunFinishedEvent?.({ event: { type: "RUN_FINISHED" }, input });
+    });
+    act(() => {
+      agent.subscriber?.onCustomEvent?.({ event: { name: "approval_required", value: {
+        approvalId: "approval-live", itemId: "call-live", kind: "mcp_tool", title: "Publish report", summary: "Publish the draft report"
+      } }, messages: [], input });
+      agent.subscriber?.onCustomEvent?.({ event: { name: "tool_status", value: { toolCallId: "call-failed", toolName: "search", status: "failed" } }, messages: [], input });
+    });
+    expect(await screen.findByRole("button", { name: "Approve once" })).toBeTruthy();
+    expect(screen.getByTestId("approval-attention").textContent).toBe("pending");
+
+    shellState.sessionData = "ready";
+    view.rerender(<ChatShell />);
+    // The saved rows are added. The live rows stay.
+    expect(eventSeeds.values.at(-1)).toEqual([{ rowId: "history-1" }]);
+    expect(screen.getByRole("button", { name: "Approve once" })).toBeTruthy();
+    expect(screen.getByText(/search/)).toBeTruthy();
+    expect(screen.getByTestId("approval-attention").textContent).toBe("pending");
+  });
+
+  it("shows the next session in the header and the chat when a switch leaves the old read in flight", async () => {
+    const status = () => screen.getByTestId("approval-attention").getAttribute("data-session-status");
+    const view = render(<ChatShell />);
+    await waitFor(() => expect(agents.instances).toHaveLength(1));
+    act(() => agents.instances[0].subscriber?.onRunInitialized?.(runStart));
+    expect(status()).toBe("running");
+
+    // The read of session-2 did not end. The old session's turn still streams.
+    shellState.selectedId = "session-2";
+    shellState.sessionData = "loading";
+    view.rerender(<ChatShell />);
+    // The header describes session-2 at once, from the session list.
+    expect(status()).toBe("ready");
+    await waitFor(() => expect(agents.instances).toHaveLength(2));
+    expect(agents.instances[1].options.sessionId).toBe("session-2");
+    expect(cardProviders.props.at(-1)?.sessionId).toBe("session-2");
+
+    // A late event of the old stream changes nothing for session-2.
+    act(() => agents.instances[0].subscriber?.onRunFailed?.(runFailure));
+    expect(status()).toBe("ready");
+    expect(eventSeeds.values.at(-1)).toEqual([]);
+  });
+
+  it("shows a failed first read in the banner, keeps the chat, and retries from the artifacts panel", async () => {
     shellState.sessionData = "error";
     let fail!: (error: Error) => void;
     queryActions.refresh.mockImplementationOnce(() => new Promise<void>((_, reject) => { fail = reject; }));
     render(<ChatShell />);
-    const alert = screen.getByRole("alert");
-    expect(within(alert).getByRole("heading", { name: "This session did not load" })).toBeTruthy();
-    expect(screen.getAllByText(/HTTP 503/)).toHaveLength(1);
+    await waitFor(() => expect(agents.instances).toHaveLength(1));
+    expect(screen.getByRole("alert").textContent).toBe("HTTP 503");
     expect(artifactPanelProps.values.at(-1)?.inventory.status).toBe("unavailable");
 
-    fireEvent.click(within(alert).getByRole("button", { name: "Retry" }));
+    act(() => artifactPanelProps.values.at(-1)?.inventory.onRetry?.());
     expect(queryActions.refresh).toHaveBeenCalledWith("session-1");
-    expect(within(alert).getByRole("button", { name: "Retrying…" }).getAttribute("aria-disabled")).toBe("true");
-    // A failed retry is caught. The error stays on the query and the card stays.
+    expect(artifactPanelProps.values.at(-1)?.inventory.retrying).toBe(true);
+    // A failed retry is caught. The error stays on the query.
     await act(async () => { fail(new Error("HTTP 503")); });
-    expect(within(alert).getByRole("button", { name: "Retry" })).toBeTruthy();
-    expect(hostLifecycle.mounts).toBe(0);
+    expect(artifactPanelProps.values.at(-1)?.inventory.retrying).toBe(false);
+    expect(hostLifecycle).toMatchObject({ mounts: 1, unmounts: 0 });
   });
 
   it("keeps the cached chat after a failed refetch, with the error in the banner", async () => {
@@ -1302,41 +1402,7 @@ describe("ChatShell chat area without a chat", () => {
     render(<ChatShell />);
     await waitFor(() => expect(agents.instances).toHaveLength(1));
     expect(screen.getByRole("alert").textContent).toBe("HTTP 503");
-    expect(screen.queryByRole("heading", { name: "This session did not load" })).toBeNull();
     expect(artifactPanelProps.values.at(-1)?.inventory.status).toBe("ready");
-  });
-
-  it("keeps the focused recovery button while a real uncached query clears its error during Retry", async () => {
-    const { QueryClient } = await vi.importActual<typeof import("@tanstack/react-query")>("@tanstack/react-query");
-    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    const key = ["retry-focus"];
-    await client.fetchQuery({ queryKey: key, queryFn: () => Promise.reject(new Error("HTTP 503")) }).catch(() => {});
-    shellState.sessionData = "error";
-    const view = render(<ChatShell />);
-    const retry = screen.getByRole("button", { name: "Retry" });
-    retry.focus();
-    let rejectRetry!: (error: Error) => void;
-    queryActions.refresh.mockImplementationOnce(() => {
-      const pending = client.fetchQuery({ queryKey: key, queryFn: () => new Promise<never>((_, reject) => { rejectRetry = reject; }) });
-      expect(client.getQueryState(key)?.error).toBeNull();
-      shellState.sessionData = "loading";
-      return pending;
-    });
-    fireEvent.click(retry);
-    view.rerender(<ChatShell />);
-    expect(screen.getByRole("button", { name: "Retrying…" })).toBe(retry);
-    expect(document.activeElement).toBe(retry);
-    fireEvent.click(retry);
-    expect(queryActions.refresh).toHaveBeenCalledOnce();
-    await act(async () => {
-      rejectRetry(new Error("HTTP 503"));
-      await Promise.resolve();
-      shellState.sessionData = "error";
-    });
-    view.rerender(<ChatShell />);
-    expect(screen.getByRole("button", { name: "Retry" })).toBe(retry);
-    expect(document.activeElement).toBe(retry);
-    client.clear();
   });
 
   it("keeps the no-model notice in front of the load states", () => {
@@ -1344,7 +1410,7 @@ describe("ChatShell chat area without a chat", () => {
     shellState.sessionData = "error";
     render(<ChatShell />);
     expect(screen.getByRole("heading", { name: "No models are available" })).toBeTruthy();
-    expect(screen.queryByRole("heading", { name: "This session did not load" })).toBeNull();
+    expect(hostLifecycle.mounts).toBe(0);
     // The error is not lost: the banner shows it.
     expect(screen.getByRole("alert").textContent).toBe("HTTP 503");
   });

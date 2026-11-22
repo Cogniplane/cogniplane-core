@@ -7,7 +7,17 @@ import type { AbstractAgent } from "@ag-ui/client";
 import { ApiError } from "../api-client";
 import * as sessionApi from "../session-api";
 import type { RuntimeNoticeRow } from "../../components/chat-cards/chat-cards.types";
+import type { SavedSideState } from "../../components/agui-transcript";
+import { savedState } from "../../test-helpers/saved-side-state";
+import { nextReadOrder } from "./read-order";
 import { useAguiCustomEvents } from "./use-agui-custom-events";
+
+// One saved result for the life of the hook, as the query cache gives one
+// object for each read. A new object applies again.
+function renderSaved(agent: AbstractAgent, partial: Partial<SavedSideState>) {
+  const saved = savedState(partial);
+  return renderHook(() => useAguiCustomEvents(agent, { saved }));
+}
 
 // vitest runs with globals:false, so RTL cannot auto-register its cleanup.
 afterEach(cleanup);
@@ -125,9 +135,7 @@ describe("useAguiCustomEvents — tool_status side-channel (R8)", () => {
         durationMs: 5
       }
     ];
-    const { result } = renderHook(() =>
-      useAguiCustomEvents(agent, { initialToolStatuses: seed })
-    );
+    const { result } = renderSaved(agent, { toolStatuses: seed });
 
     expect(result.current.toolStatuses).toEqual(seed);
   });
@@ -145,9 +153,7 @@ describe("useAguiCustomEvents — tool_status side-channel (R8)", () => {
         durationMs: null
       }
     ];
-    const { result } = renderHook(() =>
-      useAguiCustomEvents(agent, { initialToolStatuses: seed })
-    );
+    const { result } = renderSaved(agent, { toolStatuses: seed });
 
     // A live re-run of the same call must replace, not duplicate, the seeded row.
     emit("tool_status", { toolCallId: "c1", toolName: "search", status: "declined", durationMs: 9 });
@@ -302,8 +308,8 @@ describe("persisted approval seeds", () => {
   it("deduplicates REST and live approvals and does not revive expired rows on refresh", () => {
     const { agent, emit } = makeFakeAgent();
     const { result, rerender } = renderHook(
-      ({ seed }) => useAguiCustomEvents(agent, { initialApprovals: seed }),
-      { initialProps: { seed: [approval, approval] } }
+      ({ saved }) => useAguiCustomEvents(agent, { saved }),
+      { initialProps: { saved: savedState({ approvals: [approval, approval] }) } }
     );
     expect(result.current.approvals).toHaveLength(1);
     emit("approval_required", approval);
@@ -313,7 +319,7 @@ describe("persisted approval seeds", () => {
       message: "No decision in time", createdAt: "2026-09-04T12:00:00.000Z"
     });
     expect(result.current.approvals).toEqual([]);
-    rerender({ seed: [approval] });
+    rerender({ saved: savedState({ approvals: [approval] }) });
     expect(result.current.approvals).toEqual([]);
   });
 });
@@ -342,7 +348,7 @@ describe("useAguiCustomEvents — server snapshot for a remote turn", () => {
   it("shows the same turn option after a reload as the live event did", () => {
     const { agent } = makeFakeAgent();
     const seed = [{ ...pending("ap-save"), allowForTurn: false }, { ...pending("ap-run"), allowForTurn: true }, pending("ap-old")];
-    const { result } = renderHook(() => useAguiCustomEvents(agent, { initialApprovals: seed }));
+    const { result } = renderSaved(agent, { approvals: seed });
 
     expect(result.current.approvals.map((a) => [a.approvalId, a.allowForTurn])).toEqual([
       ["ap-save", false], ["ap-run", true], ["ap-old", true]
@@ -352,7 +358,7 @@ describe("useAguiCustomEvents — server snapshot for a remote turn", () => {
   it("removes an approval already answered before replay reaches its request event", async () => {
     const list = vi.spyOn(sessionApi, "listApprovals").mockResolvedValue([]);
     const { agent, run, emit } = makeFakeAgent();
-    const { result } = renderHook(() => useAguiCustomEvents(agent, { initialApprovals: [pending("ap-1")] }));
+    const { result } = renderSaved(agent, { approvals: [pending("ap-1")] });
 
     run.init(true);
     emit("approval_required", {
@@ -389,7 +395,7 @@ describe("useAguiCustomEvents — server snapshot for a remote turn", () => {
       () => new Promise<void>((resolve) => { resolveDecision = resolve; })
     );
     const { agent } = makeFakeAgent();
-    const { result } = renderHook(() => useAguiCustomEvents(agent, { initialApprovals: [pending("ap-1")] }));
+    const { result } = renderSaved(agent, { approvals: [pending("ap-1")] });
 
     act(() => result.current.onApprovalDecision("ap-1", { decision: "approve" }));
     act(() => result.current.syncServerState({
@@ -457,7 +463,7 @@ describe("useAguiCustomEvents — approval reads during other approval changes",
   it("does not bring back A when a read during or after its expiry still lists it", async () => {
     const { answer } = heldReads();
     const { agent, run, emit } = makeFakeAgent();
-    const { result } = renderHook(() => useAguiCustomEvents(agent, { initialApprovals: [pending("A")] }));
+    const { result } = renderSaved(agent, { approvals: [pending("A")] });
 
     run.init(true);
     emit("approval_required", request("B"));
@@ -475,7 +481,7 @@ describe("useAguiCustomEvents — approval reads during other approval changes",
     const { answer } = heldReads();
     const decision = vi.spyOn(sessionApi, "resolveApproval").mockResolvedValue(undefined);
     const { agent, run, emit } = makeFakeAgent();
-    const { result } = renderHook(() => useAguiCustomEvents(agent, { initialApprovals: [pending("A")] }));
+    const { result } = renderSaved(agent, { approvals: [pending("A")] });
 
     run.init(true);
     emit("approval_required", request("B"));
@@ -569,7 +575,7 @@ describe("useAguiCustomEvents — a failed approval decision", () => {
     vi.spyOn(sessionApi, "resolveApproval").mockRejectedValue(new TypeError("Failed to fetch"));
     const list = vi.spyOn(sessionApi, "listApprovals");
     const { agent } = makeFakeAgent();
-    const { result } = renderHook(() => useAguiCustomEvents(agent, { initialApprovals: [pending("A")] }));
+    const { result } = renderSaved(agent, { approvals: [pending("A")] });
 
     await act(async () => result.current.onApprovalDecision("A", { decision: "approve" }));
 
@@ -589,7 +595,7 @@ describe("useAguiCustomEvents — a failed approval decision", () => {
       refused(503, { error: "internal_error", message: "An unexpected error occurred." })
     );
     const { agent } = makeFakeAgent();
-    const { result } = renderHook(() => useAguiCustomEvents(agent, { initialApprovals: [pending("A")] }));
+    const { result } = renderSaved(agent, { approvals: [pending("A")] });
 
     await act(async () => result.current.onApprovalDecision("A", { decision: "reject" }));
     await act(async () => result.current.onApprovalDecision("A", { decision: "reject" }));
@@ -603,7 +609,7 @@ describe("useAguiCustomEvents — a failed approval decision", () => {
   it("removes the notice when a later decision succeeds", async () => {
     const decision = vi.spyOn(sessionApi, "resolveApproval").mockRejectedValueOnce(refused(503, { error: "unavailable" }));
     const { agent } = makeFakeAgent();
-    const { result } = renderHook(() => useAguiCustomEvents(agent, { initialApprovals: [pending("A")] }));
+    const { result } = renderSaved(agent, { approvals: [pending("A")] });
 
     await act(async () => result.current.onApprovalDecision("A", { decision: "approve" }));
     expect(failureNotices(result.current.notices).map((notice) => notice.message)).toEqual([
@@ -620,9 +626,7 @@ describe("useAguiCustomEvents — a failed approval decision", () => {
     const { list, answer } = heldReads();
     vi.spyOn(sessionApi, "resolveApproval").mockRejectedValue(refused(status, { error: "approval_not_found" }));
     const { agent } = makeFakeAgent();
-    const { result } = renderHook(() =>
-      useAguiCustomEvents(agent, { initialApprovals: [pending("A"), pending("B")] })
-    );
+    const { result } = renderSaved(agent, { approvals: [pending("A"), pending("B")] });
 
     await act(async () => result.current.onApprovalDecision("A", { decision: "approve" }));
     expect(list).toHaveBeenCalledWith("s-1", expect.any(AbortSignal));
@@ -642,7 +646,7 @@ describe("useAguiCustomEvents — a failed approval decision", () => {
     const { answer } = heldReads();
     vi.spyOn(sessionApi, "resolveApproval").mockRejectedValue(refused(404, { error: "approval_not_found" }));
     const { agent } = makeFakeAgent();
-    const { result } = renderHook(() => useAguiCustomEvents(agent, { initialApprovals: [pending("A")] }));
+    const { result } = renderSaved(agent, { approvals: [pending("A")] });
 
     await act(async () => result.current.onApprovalDecision("A", { decision: "approve" }));
     await answer(0, [pending("A")]);
@@ -654,7 +658,7 @@ describe("useAguiCustomEvents — a failed approval decision", () => {
     const { list, answer } = heldReads();
     vi.spyOn(sessionApi, "resolveApproval").mockRejectedValue(refused(409, { error: "approval_not_found" }));
     const { agent, run, emit } = makeFakeAgent();
-    const { result } = renderHook(() => useAguiCustomEvents(agent, { initialApprovals: [pending("A")] }));
+    const { result } = renderSaved(agent, { approvals: [pending("A")] });
 
     run.init();
     await act(async () => result.current.onApprovalDecision("A", { decision: "approve" }));
@@ -688,7 +692,7 @@ describe("useAguiCustomEvents — a failed approval decision", () => {
     const { answer } = heldReads();
     vi.spyOn(sessionApi, "resolveApproval").mockRejectedValue(refused(409, { error: "approval_not_found" }));
     const { agent } = makeFakeAgent();
-    const { result } = renderHook(() => useAguiCustomEvents(agent, { initialApprovals: [pending("A")] }));
+    const { result } = renderSaved(agent, { approvals: [pending("A")] });
 
     await act(async () => result.current.onApprovalDecision("A", { decision: "approve" }));
     act(() => replace(result.current));
@@ -702,7 +706,7 @@ describe("useAguiCustomEvents — a failed approval decision", () => {
     const { answer } = heldReads();
     vi.spyOn(sessionApi, "resolveApproval").mockRejectedValue(refused(409, { error: "approval_not_found" }));
     const { agent, run } = makeFakeAgent();
-    const { result } = renderHook(() => useAguiCustomEvents(agent, { initialApprovals: [pending("A")] }));
+    const { result } = renderSaved(agent, { approvals: [pending("A")] });
 
     await act(async () => result.current.onApprovalDecision("A", { decision: "approve" }));
     run.init(true);
@@ -719,8 +723,9 @@ describe("useAguiCustomEvents — a failed approval decision", () => {
     const list = vi.spyOn(sessionApi, "listApprovals");
     const first = makeFakeAgent();
     const second = makeFakeAgent();
+    const saved = savedState({ approvals: [pending("A")] });
     const { result, rerender } = renderHook(
-      ({ agent }) => useAguiCustomEvents(agent, { initialApprovals: [pending("A")] }),
+      ({ agent }) => useAguiCustomEvents(agent, { saved }),
       { initialProps: { agent: first.agent } }
     );
 
@@ -739,7 +744,7 @@ describe("useAguiCustomEvents — a failed approval decision", () => {
     );
     const list = vi.spyOn(sessionApi, "listApprovals");
     const { agent } = makeFakeAgent();
-    const { result, unmount } = renderHook(() => useAguiCustomEvents(agent, { initialApprovals: [pending("A")] }));
+    const { result, unmount } = renderSaved(agent, { approvals: [pending("A")] });
 
     act(() => result.current.onApprovalDecision("A", { decision: "approve" }));
     unmount();
@@ -760,7 +765,7 @@ describe("useAguiCustomEvents — saved runtime notices", () => {
 
   it("shows saved notices and does not add a live notice with the same id", () => {
     const { agent, emit } = makeFakeAgent();
-    const { result } = renderHook(() => useAguiCustomEvents(agent, { initialNotices: [notice("n-1", "Saved")] }));
+    const { result } = renderSaved(agent, { notices: [notice("n-1", "Saved")] });
 
     emit("runtime_notice", liveNotice("n-1"));
     emit("runtime_notice", liveNotice("n-2"));
@@ -831,7 +836,7 @@ describe("useAguiCustomEvents — MCP apps", () => {
 
   it("keeps saved apps and adds live and polled ones", () => {
     const { agent, emit } = makeFakeAgent();
-    const { result } = renderHook(() => useAguiCustomEvents(agent, { initialMcpApps: { "tc-1": app("ui://saved") } }));
+    const { result } = renderSaved(agent, { mcpApps: { "tc-1": app("ui://saved") } });
 
     emit("tool_mcp_app", { toolCallId: "tc-2", app: app("ui://live") });
     act(() => result.current.syncServerState({
@@ -858,5 +863,115 @@ describe("useAguiCustomEvents — refused sends", () => {
 
     run.init();
     expect(result.current.notices).toEqual([]);
+  });
+});
+
+describe("useAguiCustomEvents: saved side state that arrives late", () => {
+  const pending = (approvalId: string) => ({
+    approvalId, sessionId: "s-1", itemId: `item-${approvalId}`, kind: "command_execution",
+    title: "Run command", summary: "ls", status: "pending", createdAt: "2026-09-22T00:00:00.000Z"
+  }) as unknown as Approval;
+  const live = (approvalId: string) => ({ approvalId, itemId: `item-${approvalId}`, kind: "command_execution", title: "Run command", summary: "ls" });
+  const toolRow = (toolCallId: string, status: "failed" | "declined") => ({
+    type: "tool-status" as const, rowId: `tool:${toolCallId}`, toolCallId, toolName: "search", status, server: null, durationMs: null
+  });
+  const renderLate = (agent: AbstractAgent) => renderHook(
+    ({ saved }: { saved?: SavedSideState }) => useAguiCustomEvents(agent, { saved }),
+    { initialProps: {} }
+  );
+
+  it("does not know the approvals before a saved result or a live event", () => {
+    const { agent, emit } = makeFakeAgent();
+    const { result } = renderLate(agent);
+    expect(result.current.approvalsKnown).toBe(false);
+
+    emit("approval_required", live("A"));
+    expect(result.current.approvalsKnown).toBe(true);
+  });
+
+  it("keeps a live approval and a live tool failure when an older saved result arrives", () => {
+    const { agent, emit, run } = makeFakeAgent();
+    const { result, rerender } = renderLate(agent);
+    // The REST read started before the turn. Its result has an older failure only.
+    const saved = savedState({ toolStatuses: [toolRow("c-old", "failed"), toolRow("c-live", "failed")] });
+
+    run.init();
+    emit("approval_required", live("A"));
+    emit("tool_status", { toolCallId: "c-live", toolName: "search", status: "declined", durationMs: 9 });
+    rerender({ saved });
+
+    expect(result.current.approvals.map((row) => row.approvalId)).toEqual(["A"]);
+    // The saved rows keep the order of the history. The live row wins for its call.
+    expect(result.current.toolStatuses.map((row) => [row.toolCallId, row.status])).toEqual([
+      ["c-old", "failed"], ["c-live", "declined"]
+    ]);
+  });
+
+  it("does not bring back an approval that the end of the turn cleared", () => {
+    const { agent } = makeFakeAgent();
+    const { result, rerender } = renderLate(agent);
+    const stale = savedState({ approvals: [pending("A")] });
+
+    act(() => result.current.clearApprovals());
+    rerender({ saved: stale });
+
+    expect(result.current.approvals).toEqual([]);
+  });
+
+  it("replaces the approvals with a saved result that is newer than the live events", () => {
+    const { agent, emit } = makeFakeAgent();
+    const { result, rerender } = renderLate(agent);
+
+    emit("approval_required", live("A"));
+    // The refresh started after the event. Another tab answered A, and B is pending.
+    rerender({ saved: savedState({ approvals: [pending("B")] }) });
+
+    expect(result.current.approvals.map((row) => row.approvalId)).toEqual(["B"]);
+  });
+
+  it("ignores an approval read that started before the saved result", async () => {
+    let finishRead!: (approvals: Approval[]) => void;
+    vi.spyOn(sessionApi, "listApprovals").mockImplementation(() => new Promise((resolve) => { finishRead = resolve; }));
+    const { agent, emit, run } = makeFakeAgent();
+    const { result, rerender } = renderLate(agent);
+
+    // The replay of a running turn starts a read of the pending approvals.
+    run.init(true);
+    emit("approval_required", live("A"));
+    rerender({ saved: savedState({ approvals: [pending("B")] }) });
+    await act(async () => finishRead([pending("A")]));
+
+    expect(result.current.approvals.map((row) => row.approvalId)).toEqual(["B"]);
+  });
+
+  it("keeps a dismissed tool failure hidden when a refresh carries it again", () => {
+    const { agent, emit } = makeFakeAgent();
+    const { result, rerender } = renderLate(agent);
+    rerender({ saved: savedState({ toolStatuses: [toolRow("c-1", "failed")] }) });
+    expect(result.current.toolStatuses).toHaveLength(1);
+
+    act(() => result.current.dismissStatusRows());
+    // The refresh at the end of the next turn has the same saved failure.
+    rerender({ saved: savedState({ toolStatuses: [toolRow("c-1", "failed"), toolRow("c-2", "failed")] }) });
+    expect(result.current.toolStatuses.map((row) => row.toolCallId)).toEqual(["c-2"]);
+
+    // A new outcome of the dismissed call shows again.
+    emit("tool_status", { toolCallId: "c-1", toolName: "search", status: "declined" });
+    expect(result.current.toolStatuses.map((row) => row.toolCallId)).toEqual(["c-2", "c-1"]);
+  });
+
+  it("applies one saved result once, whatever the number of renders", () => {
+    const { agent, emit } = makeFakeAgent();
+    const { result, rerender } = renderLate(agent);
+    const saved = savedState({ approvals: [pending("A")] });
+    rerender({ saved });
+    emit("runtime_notice", {
+      noticeId: "approval-expired:A", level: "warning", title: "Expired", message: "No decision in time", createdAt: "2026-09-04T12:00:00.000Z"
+    });
+    emit("approval_required", live("B"));
+    rerender({ saved });
+
+    expect(result.current.approvals.map((row) => row.approvalId)).toEqual(["B"]);
+    expect(nextReadOrder()).toBeGreaterThan(saved.readOrder);
   });
 });

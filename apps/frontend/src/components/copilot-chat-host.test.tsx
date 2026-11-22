@@ -13,7 +13,7 @@ import { CopilotChat, CopilotKitProvider, MCPAppsActivityContentSchema, MCPAppsA
 import { standardUI, useGenerativeUIRuntime } from "@copilotkit/react-core/v2/generative-ui";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { StrictMode } from "react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { GENERATIVE_UI_PANEL_TARGET, type Artifact, type McpAppCall } from "@cogniplane/shared-types";
 
 type DraftSeam = import("./widget-draft").WidgetDraftSeam;
@@ -62,6 +62,8 @@ vi.mock("./model-effort-selector", () => ({
 }));
 vi.mock("./context-window-meter", () => ({ ContextWindowMeter: () => null }));
 
+import { LiveTurnStore } from "../lib/agui/live-turn-store";
+import { savedState } from "../test-helpers/saved-side-state";
 import { DeepAgentsBrowserAgent } from "../lib/agui/deep-agents-browser-agent";
 import { API_URL } from "../lib/api-client";
 import { ev, FixtureServer, idleHistory, installBrowserLayoutStubs, savedApproval, type FixtureStream, type JsonReply } from "../test-helpers/agui-fixture-server";
@@ -118,7 +120,7 @@ function hostElement(options: HostOptions = {}) {
   return (
     <CopilotChatHost
       key={sessionId}
-      session={{ id: sessionId, initialToolStatuses: [], initialApprovals: [], ...options.session }}
+      session={{ id: sessionId, ...options.session }}
       modelSelection={{
         model: options.model ?? "model-1",
         effort: null,
@@ -132,21 +134,30 @@ function hostElement(options: HostOptions = {}) {
       projectFileIds={options.projectFileIds}
       artifactInventory={options.artifactInventory}
       draftScope={options.draftScope}
+      liveTurns={liveTurns}
       events={options.events ?? {}}
     />
   );
 }
 
-/** Callbacks of the host, recorded in order. */
+// Where every host of this file writes its live turn state.
+const liveTurns = new LiveTurnStore();
+
+/** Callbacks of the host, and the running state that it writes for session
+ *  s-1, recorded in order. */
 function recordEvents() {
   const running: boolean[] = [];
   const events = {
     onTurnSettled: vi.fn(),
-    onInitialPromptSent: vi.fn(),
-    onTurnRunningChange: (value: boolean) => { running.push(value); },
-    onPendingApprovalsChange: vi.fn(),
-    onTurnActivityChange: vi.fn()
+    onInitialPromptSent: vi.fn()
   };
+  let last: boolean | undefined;
+  onTestFinished(liveTurns.subscribe(() => {
+    const value = liveTurns.read("s-1")?.running;
+    if (value === undefined || value === last) return;
+    last = value;
+    running.push(value);
+  }));
   return { events, running };
 }
 
@@ -528,7 +539,7 @@ describe("CopilotChatHost approvals", () => {
       ...ev.history({ messages: [RUNNING_USER], activeTurn: "attached" }),
       ...REPLAY_OPENING
     ));
-    render(hostElement({ session: { initialApprovals: [savedApproval("ap-2", "pending") as never] } }));
+    render(hostElement({ session: { saved: savedState({ approvals: [savedApproval("ap-2", "pending") as never] }) } }));
     await screen.findByText("Run ap-2");
 
     await act(async () => {
@@ -565,7 +576,7 @@ describe("CopilotChatHost approvals", () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     server.approvalReplies = Array.from({ length: 10 }, () => READ_FAILED);
     server.connect("s-1", attachedWithRequest("ap-2"));
-    render(hostElement({ session: { initialApprovals: [savedApproval("ap-2", "pending") as never] } }));
+    render(hostElement({ session: { saved: savedState({ approvals: [savedApproval("ap-2", "pending") as never] }) } }));
 
     await screen.findByText("Working");
     await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
@@ -595,7 +606,7 @@ describe("CopilotChatHost approvals", () => {
       answerRead = () => resolve({ status: 200, body: { approvals: [savedApproval("ap-a", "pending"), savedApproval("ap-b", "pending")] } });
     })];
     server.connect("s-1", attachedWithRequest("ap-b"));
-    render(hostElement({ session: { initialApprovals: [savedApproval("ap-a", "pending") as never] } }));
+    render(hostElement({ session: { saved: savedState({ approvals: [savedApproval("ap-a", "pending") as never] }) } }));
     await screen.findByText("Working");
     await waitFor(() => expect(server.count("GET /sessions/s-1/approvals")).toBe(1));
 
@@ -620,7 +631,7 @@ describe("CopilotChatHost approvals", () => {
       })
     ];
     server.connect("s-1", attachedWithRequest("ap-4"));
-    render(hostElement({ session: { initialApprovals: [savedApproval("ap-4", "pending") as never] } }));
+    render(hostElement({ session: { saved: savedState({ approvals: [savedApproval("ap-4", "pending") as never] }) } }));
     await screen.findByText("Working");
     await act(async () => { await vi.advanceTimersByTimeAsync(2_100); });
     await waitFor(() => expect(server.count("GET /sessions/s-1/approvals")).toBe(2));
@@ -1184,7 +1195,7 @@ describe("CopilotChatHost message slots", () => {
       { type: "TOOL_CALL_END", toolCallId: "tc-2" },
       ev.custom("tool_mcp_app", { toolCallId: "tc-2", app })
     ));
-    render(hostElement({ session: { initialMcpApps: { "tc-1": app } } }));
+    render(hostElement({ session: { saved: savedState({ mcpApps: { "tc-1": app } }) } }));
 
     await waitFor(() => expect(screen.getAllByTestId("mcp-app-frame").map((frame) => frame.dataset.callId)).toEqual(["tc-1", "tc-2"]));
     // Streamdown renders reply text in a React transition, after the frames.
@@ -1208,7 +1219,7 @@ describe("CopilotChatHost message slots", () => {
       { id: "tc-bad:result", role: "tool", toolCallId: "tc-bad", content: "Quotes" },
       { id: "tc-good:result", role: "tool", toolCallId: "tc-good", content: "Chart" }
     ]));
-    render(hostElement({ session: { initialMcpApps: { "tc-bad": app, "tc-good": app } } }));
+    render(hostElement({ session: { saved: savedState({ mcpApps: { "tc-bad": app, "tc-good": app } }) } }));
 
     await waitFor(() => expect(screen.getAllByTestId("mcp-app-frame").map((frame) => frame.dataset.callId)).toEqual(["tc-good"]));
     expect(await screen.findByText("Here they are.")).toBeTruthy();
@@ -1348,12 +1359,12 @@ describe("CopilotChatHost readiness across connections", () => {
       stream.push(ev.runStarted("a3"), ev.textStart("r-3"), ev.text("r-3", "Third answer"), ev.textEnd("r-3"), ev.runFinished("a3"));
       stream.finish();
     }];
-    const view = render(hostElement({ session: { initialMcpApps: { "tc-1": app } }, events }));
+    const view = render(hostElement({ session: { saved: savedState({ mcpApps: { "tc-1": app } }) }, events }));
     await screen.findByText("Earlier answer");
     await waitFor(() => expect(appBusy()).toBe("false"));
 
     // Another tab starts a turn. The host connects again.
-    view.rerender(hostElement({ session: { initialMcpApps: { "tc-1": app }, isRunning: true }, events }));
+    view.rerender(hostElement({ session: { saved: savedState({ mcpApps: { "tc-1": app } }), isRunning: true }, events }));
     await waitFor(() => expect(server.count("GET /sessions/s-1/connect")).toBe(2));
     await typeAndSend("Too early");
 
@@ -1384,18 +1395,18 @@ describe("CopilotChatHost readiness across connections", () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     let held!: FixtureStream;
     server.connect("s-1", idleHistory(APP_HISTORY), idleHistory(APP_HISTORY), (stream) => { held = stream; });
-    const view = render(hostElement({ session: { initialMcpApps: { "tc-1": app } } }));
+    const view = render(hostElement({ session: { saved: savedState({ mcpApps: { "tc-1": app } }) } }));
     await screen.findByText("Earlier answer");
     // A first start: the host connects at once, and the turn has ended.
-    view.rerender(hostElement({ session: { initialMcpApps: { "tc-1": app }, isRunning: true } }));
+    view.rerender(hostElement({ session: { saved: savedState({ mcpApps: { "tc-1": app } }), isRunning: true } }));
     await waitFor(() => expect(server.count("GET /sessions/s-1/connect")).toBe(2));
-    view.rerender(hostElement({ session: { initialMcpApps: { "tc-1": app }, isRunning: false } }));
+    view.rerender(hostElement({ session: { saved: savedState({ mcpApps: { "tc-1": app } }), isRunning: false } }));
     await waitFor(() => expect(appBusy()).toBe("false"));
     fireEvent.change(composer(), { target: { value: "Not yet" } });
     await waitFor(() => expect(sendDisabled()).toBe(false));
 
     // A second start within the interval: the connection waits for it.
-    view.rerender(hostElement({ session: { initialMcpApps: { "tc-1": app }, isRunning: true } }));
+    view.rerender(hostElement({ session: { saved: savedState({ mcpApps: { "tc-1": app } }), isRunning: true } }));
     await waitFor(() => expect(sendDisabled()).toBe(true));
     expect(appBusy()).toBe("true");
     await act(async () => {
@@ -1559,7 +1570,7 @@ describe("CopilotChatHost drafts from a tool view", () => {
       stream.push(ev.runStarted("a3"), ev.userPersisted("u3", String(body!.text)), ev.textStart("r-3"), ev.text("r-3", "Reply to the draft"), ev.textEnd("r-3"), ev.runFinished("a3"));
       stream.finish();
     }];
-    const view = render(hostElement({ session: { initialMcpApps: { "tc-1": app } }, ...options }));
+    const view = render(hostElement({ session: { saved: savedState({ mcpApps: { "tc-1": app } }) }, ...options }));
     await screen.findByText("Earlier answer");
     await waitFor(() => expect(frames.draft).not.toBeNull());
     return view;
@@ -1731,7 +1742,7 @@ describe("CopilotChatHost drafts from a tool view", () => {
 
   it("takes no draft in a read-only session, where there is no message box", async () => {
     server.connect("s-1", idleHistory(APP_HISTORY));
-    render(hostElement({ session: { initialMcpApps: { "tc-1": app }, canEdit: false } }));
+    render(hostElement({ session: { saved: savedState({ mcpApps: { "tc-1": app } }), canEdit: false } }));
     await screen.findByText("Earlier answer");
     await waitFor(() => expect(frames.draft).not.toBeNull());
 
@@ -1746,7 +1757,7 @@ describe("CopilotChatHost drafts from a tool view", () => {
     server.connect("s-1", (stream) => stream.push(...attachedTurn(
       [...APP_HISTORY, RUNNING_USER], "Working on it"
     )));
-    render(hostElement({ session: { initialMcpApps: { "tc-1": app } } }));
+    render(hostElement({ session: { saved: savedState({ mcpApps: { "tc-1": app } }) } }));
     await screen.findByText("Working on it");
     await waitFor(() => expect(frames.draft).not.toBeNull());
     await waitFor(() => expect(screen.getByRole("button", { name: "Stop" })).toBeTruthy());
@@ -1765,7 +1776,7 @@ describe("CopilotChatHost drafts from a tool view", () => {
       stream.push(...ev.history({ messages: [...APP_HISTORY, RUNNING_USER], activeTurn: "unavailable" }));
       stream.finish();
     });
-    render(hostElement({ session: { initialMcpApps: { "tc-1": app }, isRunning: true } }));
+    render(hostElement({ session: { saved: savedState({ mcpApps: { "tc-1": app } }), isRunning: true } }));
     await waitFor(() => expect(screen.getByRole("status").textContent).toContain("The agent is still working on this chat"));
     await waitFor(() => expect(frames.draft).not.toBeNull());
 

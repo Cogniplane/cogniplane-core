@@ -12,7 +12,7 @@ import {
 } from "./use-session-connection";
 
 const AT = "2026-10-12T10:00:00.000Z";
-const idle = (): ConnectionState => ({ ...initialConnectionState(false), view: "ready" });
+const idle = (): ConnectionState => ({ ...initialConnectionState({ running: false }), view: "ready" });
 const streaming = (): ConnectionState => connectionReducer(idle(), { type: "send_started", at: AT });
 const remote = (): ConnectionState => connectionReducer(streaming(), { type: "stream_lost" });
 
@@ -22,11 +22,11 @@ describe("connectionReducer transitions", () => {
   it.each<[string, () => ConnectionState, ConnectionEvent, Partial<ConnectionState>]>([
     ["a connection starts loading", idle, { type: "connect_started" }, { view: "loading", pending: false }],
     ["a refused view stays refused", () => ({ ...idle(), view: "refused" }), { type: "connect_started" }, { view: "refused" }],
-    ["an idle history restores", () => initialConnectionState(false), { type: "history", activeTurn: "none", hasMoreHistory: true },
+    ["an idle history restores", () => initialConnectionState({ running: false }), { type: "history", activeTurn: "none", hasMoreHistory: true },
       { view: "ready", turn: "none", truncated: true, settles: 0 }],
-    ["an attached history streams", () => initialConnectionState(false), { type: "history", activeTurn: "attached", hasMoreHistory: false },
+    ["an attached history streams", () => initialConnectionState({ running: false }), { type: "history", activeTurn: "attached", hasMoreHistory: false },
       { view: "ready", turn: "streaming", settles: 0 }],
-    ["an unavailable turn polls", () => initialConnectionState(false), { type: "history", activeTurn: "unavailable", hasMoreHistory: false },
+    ["an unavailable turn polls", () => initialConnectionState({ running: false }), { type: "history", activeTurn: "unavailable", hasMoreHistory: false },
       { view: "ready", turn: "remote", poll: 1 }],
     ["a history without a turn ends a remote turn", remote, { type: "history", activeTurn: "none", hasMoreHistory: false },
       { turn: "none", settles: 1 }],
@@ -53,11 +53,11 @@ describe("connectionReducer transitions", () => {
     ["the end of a remote turn loads the final state", remote, { type: "remote_ended" },
       { turn: "none", settles: 1, pending: true }],
     ["a late remote end does nothing", idle, { type: "remote_ended" }, { settles: 0, pending: false }],
-    ["another tab's start connects", idle, { type: "server_running", running: true },
+    ["another tab's start connects", idle, { type: "server_turn", running: true, sequence: undefined },
       { serverRunning: true, pending: true, nextConnection: { failures: 0 } }],
-    ["the saved end polls at once", () => ({ ...remote(), serverRunning: true }), { type: "server_running", running: false },
+    ["the saved end polls at once", () => ({ ...remote(), serverRunning: true }), { type: "server_turn", running: false, sequence: undefined },
       { serverRunning: false, poll: 2 }],
-    ["a refused view plans nothing", () => ({ ...idle(), view: "refused" }), { type: "server_running", running: true },
+    ["a refused view plans nothing", () => ({ ...idle(), view: "refused" }), { type: "server_turn", running: true, sequence: undefined },
       { pending: false, nextConnection: null }]
   ])("%s", (_, from, event, expected) => {
     expect(connectionReducer(from(), event)).toMatchObject(expected);
@@ -65,14 +65,14 @@ describe("connectionReducer transitions", () => {
 
   it("returns the same state for a repeated running state", () => {
     const state = idle();
-    expect(connectionReducer(state, { type: "server_running", running: false })).toBe(state);
+    expect(connectionReducer(state, { type: "server_turn", running: false, sequence: undefined })).toBe(state);
   });
 
   describe.each([
     ["403", { status: 403, message: null }],
     ["unsupported-format 409", { status: 409, message: "Not supported." }]
   ] as const)("a %s refusal of the reconnect after an attached stream drops", (_, refusal) => {
-    const refused = () => run(initialConnectionState(true),
+    const refused = () => run(initialConnectionState({ running: true }),
       { type: "connect_started" }, { type: "history", activeTurn: "attached", hasMoreHistory: false },
       { type: "stream_lost" }, { type: "connect_started" }, { type: "connection_refused", refusal });
 
@@ -99,9 +99,9 @@ describe("connectionReducer transitions", () => {
     });
 
     it("keeps the running state of the session list without a poll or a connection", () => {
-      const stopped = run(refused(), { type: "server_running", running: false });
+      const stopped = run(refused(), { type: "server_turn", running: false, sequence: undefined });
       expect(stopped).toEqual({ ...refused(), serverRunning: false });
-      expect(run(stopped, { type: "server_running", running: true })).toEqual(refused());
+      expect(run(stopped, { type: "server_turn", running: true, sequence: undefined })).toEqual(refused());
     });
   });
 
@@ -121,8 +121,55 @@ describe("connectionReducer transitions", () => {
   });
 });
 
+describe("the turn state of the session list", () => {
+  const ended = (sequence?: number): ConnectionState => run(streaming(),
+    ...(sequence === undefined ? [] : [{ type: "turn_identified", turnId: "t-1", sequence } as const]),
+    { type: "turn_ended", failed: true });
+
+  it("forgets the ended turn of this tab when the list reports a newer turn", () => {
+    const state = connectionReducer(ended(4), { type: "server_turn", running: false, sequence: 5 });
+    expect(state).toMatchObject({ activity: null, serverSequence: 5 });
+    // The list stops reporting the newer turn. The old turn stays forgotten.
+    expect(connectionReducer(state, { type: "server_turn", running: false, sequence: undefined }).activity).toBeNull();
+  });
+
+  it("keeps the ended turn while the list reports the same turn or an older one", () => {
+    expect(connectionReducer(ended(4), { type: "server_turn", running: false, sequence: 4 }).activity)
+      .toMatchObject({ failed: true, turnSequence: 4 });
+  });
+
+  it("forgets an ended turn without a sequence when the list reports a running turn", () => {
+    expect(connectionReducer(ended(), { type: "server_turn", running: true, sequence: undefined }))
+      .toMatchObject({ activity: null, serverRunning: true, pending: true });
+  });
+
+  it("keeps the turn that this tab streams", () => {
+    const state = run(streaming(), { type: "turn_identified", turnId: "t-1", sequence: 4 });
+    expect(connectionReducer(state, { type: "server_turn", running: true, sequence: 9 }).activity)
+      .toMatchObject({ isRunning: true });
+  });
+
+  it("follows the sequence of the list after a refusal, with no connection", () => {
+    const refused = run(idle(), { type: "connection_refused", refusal: { status: 403, message: null } });
+    const next = connectionReducer(refused, { type: "server_turn", running: false, sequence: 7 });
+    expect(next).toMatchObject({ serverSequence: 7, pending: false, nextConnection: null });
+    expect(connectionReducer(next, { type: "server_turn", running: false, sequence: 7 })).toBe(next);
+  });
+});
+
+describe("the refresh at the end of a turn", () => {
+  it("counts the refreshes that did not end, also after a refusal", () => {
+    const refreshing = run(idle(), { type: "refresh_started" }, { type: "refresh_started" });
+    expect(refreshing.refreshes).toBe(2);
+    expect(run(refreshing, { type: "refresh_ended" }).refreshes).toBe(1);
+
+    const refused = run(refreshing, { type: "connection_refused", refusal: { status: 403, message: null } });
+    expect(run(refused, { type: "refresh_ended" }, { type: "refresh_ended" }, { type: "refresh_ended" }).refreshes).toBe(0);
+  });
+});
+
 describe("one refresh per turn", () => {
-  const settlesOf = (...events: ConnectionEvent[]) => run(initialConnectionState(false), ...events).settles;
+  const settlesOf = (...events: ConnectionEvent[]) => run(initialConnectionState({ running: false }), ...events).settles;
   const restored: ConnectionEvent[] = [{ type: "connect_started" }, { type: "history", activeTurn: "none", hasMoreHistory: false }];
 
   it.each<[string, ConnectionEvent[], number]>([

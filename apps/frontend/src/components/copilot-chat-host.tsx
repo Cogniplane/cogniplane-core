@@ -16,6 +16,14 @@
 // the same CopilotKit connection path. The host never writes messages or
 // state into the agent.
 //
+// The host mounts before the saved session data arrives. The shell reads
+// that data through the query cache and gives its side state in
+// `session.saved`: tool failures, notices, apps and pending approvals, which
+// the transcript events do not carry. A saved result can arrive after live
+// events, so it only adds to them (useAguiCustomEvents). The host writes the
+// live turn state of its session to `liveTurns`, where the shell reads it for
+// the header and the sidebar.
+//
 // Text, reasoning, and tool calls render natively. The custom AG-UI events
 // (approvals, notices, MCP status) render through useAguiCustomEvents, the tool
 // card and plan through copilot-render-slots. A pending approval that names its
@@ -90,7 +98,7 @@ import {
 } from "react";
 import { Loader2Icon, SquareIcon } from "lucide-react";
 import { randomUUID, type Message as AGUIMessage } from "@ag-ui/client";
-import type { Approval, EffortLevel, McpAppCall, Model } from "@cogniplane/shared-types";
+import type { EffortLevel, McpAppCall, Model } from "@cogniplane/shared-types";
 
 import {
   DeepAgentsBrowserAgent,
@@ -98,6 +106,7 @@ import {
   isSessionBusyError
 } from "../lib/agui/deep-agents-browser-agent";
 import { useAguiCustomEvents } from "../lib/agui/use-agui-custom-events";
+import type { LiveTurnStore } from "../lib/agui/live-turn-store";
 import { useInspectorOptIn } from "../lib/copilotkit-inspector";
 import { readServerRunning } from "../lib/agui/use-remote-turn";
 import { isAbortError, useSessionConnection } from "../lib/agui/use-session-connection";
@@ -105,7 +114,6 @@ import { ApiError } from "../lib/api-client";
 import { cn } from "../lib/cn";
 import { SHORTCUTS, useShortcut } from "../lib/keyboard-shortcuts";
 import { interruptSession } from "../lib/session-api";
-import type { LiveTurnActivity } from "./session-status.logic";
 import { ArtifactCardProvider, type ArtifactCardInventory } from "./artifact-card";
 import { useComposerDraft } from "./composer-drafts";
 import { ChatScrollView } from "./chat-scroll-view";
@@ -130,7 +138,7 @@ import { watchReadingOverflow } from "../lib/reading-overflow";
 import { WidgetDraftNotice, useWidgetDraft, type WidgetDraftComposer, type WidgetDraftSeam } from "./widget-draft";
 import { Button } from "./ui/button";
 import type { ApprovalRow, RuntimeNoticeRow, ToolStatusRow } from "./chat-cards/chat-cards.types";
-import { runtimeNoticeRow } from "./agui-transcript";
+import { runtimeNoticeRow, type SavedSideState } from "./agui-transcript";
 import {
   RuntimeNoticeRowView,
   ToolStatusRowView
@@ -737,18 +745,17 @@ const COMPOSER_SLOT = asSlot<typeof CopilotChatInput>(ChatComposer);
 
 export type ChatSessionModel = {
   id: string;
-  /** Failed/declined tool-status rows from saved history, shown in the
-   *  notification list. */
-  initialToolStatuses: ToolStatusRow[];
-  initialMcpApps?: Record<string, McpAppCall>;
-  /** Pending REST approvals seed the live owner when this session opens. */
-  initialApprovals: Approval[];
-  /** Runtime notices saved on the assistant rows of the loaded history. */
-  initialNotices?: RuntimeNoticeRow[];
+  /** The side state of the saved session, from the query cache: failed and
+   *  declined tool calls, notices, apps and pending approvals. Undefined
+   *  until this visit has a result. The chat does not wait for it. */
+  saved?: SavedSideState;
   /** Saved running state from the session list. When it changes to true
    *  while this chat is open, another tab started a turn, and the host loads
    *  the session again to show it. */
   isRunning?: boolean;
+  /** The sequence of the newest saved turn, from the session list. A value
+   *  above the sequence of this tab's ended turn makes that turn old. */
+  latestTurnSequence?: number;
   canEdit?: boolean;
   /** Optional one-shot instruction attached to an explicit project action. */
   initialPrompt?: string;
@@ -771,13 +778,10 @@ export type ChatUsageModel = {
 
 export type ChatEventHandlers = {
   onInitialPromptSent?: () => void;
-  onTurnSettled?: () => void;
+  /** A turn ended. A returned promise ends when the saved turn state is
+   *  refreshed; the live turn state reports `settling` until then. */
+  onTurnSettled?: () => Promise<unknown> | void;
   onArtifactsChanged?: () => void;
-  onTurnActivityChange?: (activity: LiveTurnActivity | null) => void;
-  /** True while a turn runs: this tab streams it, or it runs on the server
-   *  without this tab's stream. */
-  onTurnRunningChange?: (isRunning: boolean) => void;
-  onPendingApprovalsChange?: (count: number) => void;
 };
 
 type ChatHostProps = {
@@ -794,6 +798,8 @@ type ChatHostProps = {
    *  in this tab's sessionStorage for this person and session. Without it,
    *  nothing is kept. */
   draftScope?: DraftScope;
+  /** Where the host writes the live turn state of its session. */
+  liveTurns?: LiveTurnStore;
   events: ChatEventHandlers;
 };
 
@@ -877,10 +883,10 @@ function ScopedChatHost(props: ChatHostProps) {
   );
 }
 
-function ChatSession({ session, modelSelection, usage, events, agent, draftScope }: ChatHostProps & { agent: DeepAgentsBrowserAgent }) {
-  const { id: sessionId, initialToolStatuses, initialMcpApps, initialApprovals, initialNotices, initialPrompt, isRunning: serverRunning = false, canEdit = true } = session;
+function ChatSession({ session, modelSelection, usage, events, agent, draftScope, liveTurns }: ChatHostProps & { agent: DeepAgentsBrowserAgent }) {
+  const { id: sessionId, saved, initialPrompt, isRunning: serverRunning = false, latestTurnSequence: serverSequence, canEdit = true } = session;
   const { model, effort, models, showEffortSelector, onModelChange, onEffortChange } = modelSelection;
-  const { onInitialPromptSent, onTurnSettled, onArtifactsChanged, onTurnRunningChange, onPendingApprovalsChange, onTurnActivityChange } = events;
+  const { onInitialPromptSent, onTurnSettled, onArtifactsChanged } = events;
   const { copilotkit } = useCopilotKit();
 
   const [isStopping, setIsStopping] = useState(false);
@@ -893,9 +899,9 @@ function ChatSession({ session, modelSelection, usage, events, agent, draftScope
   const sidePanelToggleRef = useRef<HTMLButtonElement | null>(null);
 
   const {
-    approvals, notices, toolStatuses, mcpApps,
+    approvals, approvalsKnown, notices, toolStatuses, mcpApps,
     onApprovalDecision, syncServerState, addNotice, clearApprovals, dismissStatusRows
-  } = useAguiCustomEvents(agent, { initialToolStatuses, initialApprovals, initialNotices, initialMcpApps });
+  } = useAguiCustomEvents(agent, { saved });
 
   // The tool cards that show a decision. One registry for the life of the session's agent.
   const [toolCards] = useState(() => new MountedToolCards());
@@ -906,11 +912,12 @@ function ChatSession({ session, modelSelection, usage, events, agent, draftScope
   const connect = useCallback(() => copilotkit.connectAgent({ agent }), [agent, copilotkit]);
   const settleTurn = useCallback(() => {
     setStopError(null);
-    onTurnSettled?.();
+    return onTurnSettled?.();
   }, [onTurnSettled]);
   const connection = useSessionConnection(agent, {
     sessionId,
     serverRunning,
+    serverSequence,
     connect,
     onTurnSettled: settleTurn,
     onTurnEnded: clearApprovals,
@@ -1081,20 +1088,18 @@ function ChatSession({ session, modelSelection, usage, events, agent, draftScope
     }).finally(() => subscription.unsubscribe());
   }, [addNotice, agent, busy, canEdit, clearBusyRefusal, copilotkit, initialPrompt, onInitialPromptSent]);
 
-  // Lift the live turn-running + pending-approval signals to the shell so the
-  // sidebar streaming dot and header attention dot track the AG-UI stream in
-  // real time (the shell can't read this state directly — the agent instance
-  // that the hooks subscribe to lives only in this host).
+  // The live turn state of this session, for the header and the sidebar of
+  // the shell. The record leaves the store with the host: after a session
+  // switch or a render failure, the shell falls back to the saved state.
   const turnRunning = running || remoteRunning;
+  const pendingApprovals = approvalsKnown ? approvals.length : null;
+  const { activity, settling } = connection;
   useEffect(() => {
-    onTurnRunningChange?.(turnRunning);
-  }, [turnRunning, onTurnRunningChange]);
+    liveTurns?.publish(sessionId, { running: turnRunning, activity, pendingApprovals, settling });
+  }, [liveTurns, sessionId, turnRunning, activity, pendingApprovals, settling]);
   useEffect(() => {
-    onPendingApprovalsChange?.(approvals.length);
-  }, [approvals.length, onPendingApprovalsChange]);
-  useEffect(() => {
-    onTurnActivityChange?.(connection.activity);
-  }, [connection.activity, onTurnActivityChange]);
+    return () => liveTurns?.clear(sessionId);
+  }, [liveTurns, sessionId]);
 
   return (
     <div ref={chatRef} data-chat-host className="flex min-h-0 flex-1 flex-col overflow-y-auto overscroll-contain scroll-py-2">

@@ -13,6 +13,11 @@
 // server-side), so CopilotKit's `useHumanInTheLoop` (which waits for a response
 // delivered back through the run) is the wrong fit here.
 //
+// The saved side state of the session comes from the query cache, and it can
+// arrive after the connection started. Saved rows only add to the live rows.
+// A live row wins over the saved row of the same tool call, and saved
+// approvals apply only when no live event is newer than their read.
+//
 // The session lifecycle (history, running state, reconnects) is in
 // useSessionConnection. The emit side is `agui-events.ts`; these value shapes
 // mirror it.
@@ -37,6 +42,7 @@ import type {
 import {
   mcpAppsFromMessages,
   runtimeNoticeRow,
+  type SavedSideState,
   runtimeNoticesFromMessages,
   toolStatusesFromMessages,
   turnStoppedNotice,
@@ -45,6 +51,7 @@ import {
 import { ApiError } from "../api-client";
 import { listApprovals, resolveApproval } from "../session-api";
 import { isReconnectRun } from "./deep-agents-browser-agent";
+import { nextReadOrder } from "./read-order";
 import type { RemoteTurnSnapshot } from "./use-remote-turn";
 import { SEND_REFUSED_NOTICE_PREFIX } from "./use-session-connection";
 
@@ -54,6 +61,8 @@ export { expiredApprovalIdFromNotice };
 export type AguiCustomEvents = {
   dismissStatusRows: () => void;
   approvals: ApprovalRow[];
+  // False until a saved result, a live event, or a poll set the approvals.
+  approvalsKnown: boolean;
   notices: RuntimeNoticeRow[];
   // Tool calls that failed or were declined. The tool cards read these by
   // toolCallId, and the notification list shows them.
@@ -73,21 +82,12 @@ export type AguiCustomEvents = {
 };
 
 export type AguiCustomEventsOptions = {
-  // Failed/declined tool-status rows reconstructed from persisted history so a
-  // reloaded session shows tool failures the native card can't render. Live
-  // `tool_status` events append to this on top.
-  initialToolStatuses?: ToolStatusRow[];
-  initialApprovals?: Approval[];
-  // Runtime notices saved on the assistant rows. Live `runtime_notice` events
-  // with the same noticeId do not add a second row.
-  initialNotices?: RuntimeNoticeRow[];
-  initialMcpApps?: Record<string, McpAppCall>;
+  // The side state of the saved history and the pending approvals, from the
+  // query cache. Undefined until this visit has a result. A reloaded session
+  // then shows the tool failures, notices and apps that the transcript
+  // events do not carry. Each new object applies once.
+  saved?: SavedSideState;
 };
-
-const EMPTY_TOOL_STATUSES: ToolStatusRow[] = [];
-const EMPTY_APPROVALS: Approval[] = [];
-const EMPTY_NOTICES: RuntimeNoticeRow[] = [];
-const EMPTY_MCP_APPS: Record<string, McpAppCall> = {};
 
 // A failed approval read is tried again after 2 s, 4 s, and 6 s.
 const APPROVAL_READ_RETRY_MS = 2_000;
@@ -151,6 +151,18 @@ function pendingApprovalRow(approval: ApprovalRequiredValue): ApprovalRow {
   };
 }
 
+// The saved rows in the order of the history, then the other rows. A row that
+// is already shown stays as it is: a live row is newer than the saved one.
+function withSavedToolStatuses(prev: ToolStatusRow[], saved: ToolStatusRow[]): ToolStatusRow[] {
+  const shown = new Map(prev.map((row) => [row.toolCallId, row]));
+  if (saved.every((row) => shown.has(row.toolCallId))) return prev;
+  const savedIds = new Set(saved.map((row) => row.toolCallId));
+  return [
+    ...saved.map((row) => shown.get(row.toolCallId) ?? row),
+    ...prev.filter((row) => !savedIds.has(row.toolCallId))
+  ];
+}
+
 // Replace the rows with the pending approvals of the server, except those
 // that this tab saw close. Keep the local decision state of a row, so a read
 // that lands while the decision request is in flight does not re-enable its
@@ -171,16 +183,12 @@ function pendingApprovalRows(approvals: Approval[]): ApprovalRow[] {
 }
 
 export function useAguiCustomEvents(agent: AbstractAgent, options: AguiCustomEventsOptions = {}): AguiCustomEvents {
-  const {
-    initialToolStatuses = EMPTY_TOOL_STATUSES,
-    initialApprovals = EMPTY_APPROVALS,
-    initialNotices = EMPTY_NOTICES,
-    initialMcpApps = EMPTY_MCP_APPS
-  } = options;
-  const [approvals, setApprovals] = useState(() => pendingApprovalRows(initialApprovals));
-  const [notices, setNotices] = useState<RuntimeNoticeRow[]>(initialNotices);
-  const [toolStatuses, setToolStatuses] = useState<ToolStatusRow[]>(initialToolStatuses);
-  const [mcpApps, setMcpApps] = useState(initialMcpApps);
+  const { saved } = options;
+  const [approvals, setApprovals] = useState<ApprovalRow[]>([]);
+  const [approvalsKnown, setApprovalsKnown] = useState(false);
+  const [notices, setNotices] = useState<RuntimeNoticeRow[]>([]);
+  const [toolStatuses, setToolStatuses] = useState<ToolStatusRow[]>([]);
+  const [mcpApps, setMcpApps] = useState<Record<string, McpAppCall>>({});
   // A saved-state snapshot, a run transition, or a clean end outranks an
   // older approval read.
   const approvalRevisionRef = useRef(0);
@@ -188,8 +196,14 @@ export function useAguiCustomEvents(agent: AbstractAgent, options: AguiCustomEve
   // an expiry notice before it saves the expiry, so a read can still list
   // such an approval as pending. A server read does not bring it back.
   const closedApprovalIdsRef = useRef<Set<string>>(new Set());
+  // The read order of the newest approval state that is shown. A saved result
+  // or an approval read that started before it does not apply.
+  const approvalsAsOfRef = useRef(0);
   // A dismissed notice stays hidden when a later poll or event carries it again.
   const dismissedNoticeIdsRef = useRef<Set<string>>(new Set());
+  // The same for a dismissed tool failure. Each refresh of the saved data
+  // carries it again.
+  const dismissedToolCallIdsRef = useRef<Set<string>>(new Set());
   // tool_meta (server attribution) seen for a toolCallId before its tool_status
   // failure arrives. Not state — it only feeds the row built on tool_status.
   const toolMetaRef = useRef<Map<string, { server: string | null }>>(new Map());
@@ -231,6 +245,7 @@ export function useAguiCustomEvents(agent: AbstractAgent, options: AguiCustomEve
     const readServerApprovals = (attempt = 1) => {
       clearTimeout(approvalRetry);
       const read = ++latestApprovalRead;
+      const order = nextReadOrder();
       const revision = approvalRevisionRef.current;
       const isLatest = () => !approvalReads.signal.aborted && read === latestApprovalRead;
       approvalReadRunning = true;
@@ -238,7 +253,9 @@ export function useAguiCustomEvents(agent: AbstractAgent, options: AguiCustomEve
         (serverApprovals) => {
           if (!isLatest()) return;
           approvalReadRunning = false;
-          if (revision === approvalRevisionRef.current) {
+          if (revision === approvalRevisionRef.current && order > approvalsAsOfRef.current) {
+            approvalsAsOfRef.current = order;
+            setApprovalsKnown(true);
             setApprovals((prev) => withServerApprovals(prev, serverApprovals, closedApprovalIdsRef.current));
           }
         },
@@ -290,6 +307,8 @@ export function useAguiCustomEvents(agent: AbstractAgent, options: AguiCustomEve
               readServerApprovals();
               break;
             }
+            approvalsAsOfRef.current = nextReadOrder();
+            setApprovalsKnown(true);
             setApprovals((prev) =>
               prev.some((a) => a.approvalId === v.approvalId) ? prev : [...prev, pendingApprovalRow(v)]
             );
@@ -330,6 +349,8 @@ export function useAguiCustomEvents(agent: AbstractAgent, options: AguiCustomEve
             // toolCallId: the tool card reads it to show the outcome.
             const v = customEvent.value;
             const meta = toolMetaRef.current.get(v.toolCallId);
+            // A new outcome of a dismissed call shows again.
+            dismissedToolCallIdsRef.current.delete(v.toolCallId);
             setToolStatuses((prev) => [
               ...prev.filter((s) => s.toolCallId !== v.toolCallId),
               {
@@ -401,23 +422,51 @@ export function useAguiCustomEvents(agent: AbstractAgent, options: AguiCustomEve
     []
   );
 
-  const syncServerState = useCallback((snapshot: RemoteTurnSnapshot) => {
-    const key = JSON.stringify(snapshot);
-    if (key === lastSnapshotRef.current) return;
-    lastSnapshotRef.current = key;
-    approvalRevisionRef.current += 1;
-    setApprovals((prev) => withServerApprovals(prev, snapshot.approvals, closedApprovalIdsRef.current));
-    setToolStatuses(toolStatusesFromMessages(snapshot.messages));
-    setMcpApps((current) => ({ ...current, ...mcpAppsFromMessages(snapshot.messages) }));
-    const saved = runtimeNoticesFromMessages(snapshot.messages);
+  // Adds the saved notices and apps that are not shown. Both only grow.
+  const addSavedRows = useCallback((notices: RuntimeNoticeRow[], apps: Record<string, McpAppCall>) => {
+    setMcpApps((current) => {
+      const added = Object.entries(apps).filter(([toolCallId]) => !(toolCallId in current));
+      return added.length > 0 ? { ...current, ...Object.fromEntries(added) } : current;
+    });
     setNotices((prev) => {
       const shown = new Set(prev.map((notice) => notice.noticeId));
-      const added = saved.filter((notice) =>
+      const added = notices.filter((notice) =>
         !shown.has(notice.noticeId) && !dismissedNoticeIdsRef.current.has(notice.noticeId)
       );
       return added.length > 0 ? [...prev, ...added] : prev;
     });
   }, []);
+
+  // The saved side state arrives from the query cache: after the connection
+  // started, and again after each refresh. It is an external source, so an
+  // effect applies it.
+  useEffect(() => {
+    if (!saved) return;
+    // A live event or a poll can be newer than this read. Then the approvals
+    // that are shown stay: a late result must not remove a live card or bring
+    // back a card that the end of the turn cleared.
+    if (saved.readOrder > approvalsAsOfRef.current) {
+      approvalsAsOfRef.current = saved.readOrder;
+      setApprovalsKnown(true);
+      setApprovals((prev) => withServerApprovals(prev, saved.approvals, closedApprovalIdsRef.current));
+    }
+    const statuses = saved.toolStatuses.filter((row) => !dismissedToolCallIdsRef.current.has(row.toolCallId));
+    setToolStatuses((prev) => withSavedToolStatuses(prev, statuses));
+    addSavedRows(saved.notices, saved.mcpApps);
+  }, [saved, addSavedRows]);
+
+  const syncServerState = useCallback((snapshot: RemoteTurnSnapshot) => {
+    const key = JSON.stringify(snapshot);
+    if (key === lastSnapshotRef.current) return;
+    lastSnapshotRef.current = key;
+    approvalRevisionRef.current += 1;
+    approvalsAsOfRef.current = nextReadOrder();
+    setApprovalsKnown(true);
+    setApprovals((prev) => withServerApprovals(prev, snapshot.approvals, closedApprovalIdsRef.current));
+    setToolStatuses(toolStatusesFromMessages(snapshot.messages)
+      .filter((row) => !dismissedToolCallIdsRef.current.has(row.toolCallId)));
+    addSavedRows(runtimeNoticesFromMessages(snapshot.messages), mcpAppsFromMessages(snapshot.messages));
+  }, [addSavedRows]);
 
   const addNotice = useCallback((notice: RuntimeNoticeRow) => {
     setNotices((prev) => [...prev, notice]);
@@ -425,6 +474,8 @@ export function useAguiCustomEvents(agent: AbstractAgent, options: AguiCustomEve
 
   const clearApprovals = useCallback(() => {
     approvalRevisionRef.current += 1;
+    approvalsAsOfRef.current = nextReadOrder();
+    setApprovalsKnown(true);
     setApprovals([]);
   }, []);
 
@@ -433,11 +484,14 @@ export function useAguiCustomEvents(agent: AbstractAgent, options: AguiCustomEve
       for (const notice of prev) dismissedNoticeIdsRef.current.add(notice.noticeId);
       return [];
     });
-    setToolStatuses([]);
+    setToolStatuses((prev) => {
+      for (const row of prev) dismissedToolCallIdsRef.current.add(row.toolCallId);
+      return [];
+    });
   }, []);
 
   return {
-    approvals, notices, toolStatuses, mcpApps,
+    approvals, approvalsKnown, notices, toolStatuses, mcpApps,
     onApprovalDecision, syncServerState, addNotice, clearApprovals, dismissStatusRows
   };
 }

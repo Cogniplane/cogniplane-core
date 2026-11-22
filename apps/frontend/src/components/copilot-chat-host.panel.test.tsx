@@ -48,7 +48,7 @@ function hostElement(options: { id?: string; scope?: DraftScope | null } = {}) {
   return (
     <CopilotChatHost
       key={sessionId}
-      session={{ id: sessionId, initialToolStatuses: [], initialApprovals: [] }}
+      session={{ id: sessionId }}
       modelSelection={{
         model: "model-1", effort: null, models: [], showEffortSelector: false,
         onModelChange: () => undefined, onEffortChange: () => undefined

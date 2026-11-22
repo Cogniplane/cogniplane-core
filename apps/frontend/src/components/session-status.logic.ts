@@ -34,16 +34,21 @@ export type LiveTurnActivity = {
   turnSequence?: number;
 };
 
+/** The saved state of the session list that tells if a live turn is old. */
+export type ServerTurn = { isRunning?: boolean; latestTurnSequence?: number };
+
+/** True when the server reports a turn that is newer than an ended live turn.
+ *  Both sequences come from persisted assistant rows. Browser clocks only
+ *  drive the timer and never decide which turn is newer. */
+export function isLiveTurnSuperseded(server: ServerTurn, activity: LiveTurnActivity): boolean {
+  if (activity.isRunning) return false;
+  const serverSequence = server.latestTurnSequence;
+  return (serverSequence !== undefined && activity.turnSequence !== undefined && serverSequence > activity.turnSequence) ||
+    (activity.turnSequence === undefined && server.isRunning === true);
+}
+
 export function applyLiveTurn(session: Session, activity: LiveTurnActivity): { session: Session; applied: boolean } {
-  // Both sequences come from persisted assistant rows. Browser clocks only
-  // drive the timer and never decide which turn is newer.
-  const serverSequence = session.latestTurnSequence;
-  if (!activity.isRunning && (
-    (serverSequence !== undefined && activity.turnSequence !== undefined && serverSequence > activity.turnSequence) ||
-    (activity.turnSequence === undefined && session.isRunning)
-  )) {
-    return { session, applied: false };
-  }
+  if (isLiveTurnSuperseded(session, activity)) return { session, applied: false };
   return {
     session: {
       ...session,

@@ -63,6 +63,20 @@ describe("GenerativeArtifactCard", () => {
     expect(preview()).toBeNull();
   });
 
+  it("says that the file details load until the artifact list of the session arrives", () => {
+    const onOpenPreview = vi.fn();
+    const view = render(cardIn("s-1", { artifacts: [], loaded: false, onOpenPreview }));
+    expect(screen.getByRole("note").textContent).toBe("Loading file details…");
+    expect(preview()).toBeNull();
+
+    view.rerender(cardIn("s-1", { artifacts: [artifact()], loaded: true, onOpenPreview }));
+    expect(screen.getByRole("article", { name: "Quarterly report.csv" })).toBeTruthy();
+
+    // The list arrived without the file: the file is not in this chat.
+    view.rerender(cardIn("s-1", { artifacts: [], loaded: true, onOpenPreview }));
+    expect(screen.getByRole("note").textContent).toBe("This file is not available in this chat.");
+  });
+
   it("shows no file without a provider or a preview action", () => {
     render(<GenerativeArtifactCard artifactId={ID} />);
     expect(screen.getByRole("note")).toBeTruthy();

@@ -24,7 +24,7 @@ import {
 import { CogniplaneCustomEventSchema, type CustomEventValue } from "@cogniplane/shared-types";
 
 import type { RuntimeNoticeRow } from "../../components/chat-cards/chat-cards.types";
-import type { LiveTurnActivity } from "../../components/session-status.logic";
+import { isLiveTurnSuperseded, type LiveTurnActivity } from "../../components/session-status.logic";
 import { runtimeNoticeRow } from "../../components/agui-transcript";
 import { httpFailure, isReconnectRun, isSessionBusyError, type DeepAgentsBrowserAgent } from "./deep-agents-browser-agent";
 import { REMOTE_TURN_POLL_MS, useRemoteTurnPoll, type RemoteTurnSnapshot } from "./use-remote-turn";
@@ -63,6 +63,11 @@ export type ConnectionState = {
   activity: LiveTurnActivity | null;
   /** The running state of the session list. */
   serverRunning: boolean;
+  /** The sequence of the newest turn in the session list. */
+  serverSequence: number | undefined;
+  /** Refreshes of the saved data that started at the end of a turn and did
+   *  not end yet. */
+  refreshes: number;
 };
 
 export type ConnectionEvent =
@@ -79,10 +84,12 @@ export type ConnectionEvent =
   | { type: "stream_closed" }
   | { type: "remote_ended" }
   | { type: "poll" }
-  | { type: "server_running"; running: boolean }
+  | { type: "server_turn"; running: boolean; sequence: number | undefined }
+  | { type: "refresh_started" }
+  | { type: "refresh_ended" }
   | { type: "busy_refusal_cleared" };
 
-export function initialConnectionState(serverRunning: boolean): ConnectionState {
+export function initialConnectionState(server: { running: boolean; sequence?: number }): ConnectionState {
   return {
     view: "loading",
     turn: "none",
@@ -95,7 +102,9 @@ export function initialConnectionState(serverRunning: boolean): ConnectionState 
     truncated: false,
     refusal: null,
     activity: null,
-    serverRunning
+    serverRunning: server.running,
+    serverSequence: server.sequence,
+    refreshes: 0
   };
 }
 
@@ -116,11 +125,13 @@ function pollRemote(state: ConnectionState): ConnectionState {
 export function connectionReducer(state: ConnectionState, event: ConnectionEvent): ConnectionState {
   // A refused connection is final. Late events of earlier runs and polls change
   // nothing, and nothing plans a connection or a poll. The hook dispatches the
-  // running state of the session list during render until the state agrees,
-  // so that fact still follows the list.
+  // turn state of the session list during render until the state agrees, so
+  // those facts still follow the list. A refresh that started before the
+  // refusal still ends.
   if (state.view === "refused") {
-    return event.type === "server_running" && event.running !== state.serverRunning
-      ? { ...state, serverRunning: event.running }
+    if (event.type === "refresh_ended") return { ...state, refreshes: Math.max(0, state.refreshes - 1) };
+    return event.type === "server_turn" && (event.running !== state.serverRunning || event.sequence !== state.serverSequence)
+      ? { ...state, serverRunning: event.running, serverSequence: event.sequence }
       : state;
   }
   switch (event.type) {
@@ -187,13 +198,25 @@ export function connectionReducer(state: ConnectionState, event: ConnectionEvent
       return state.turn === "remote" ? planConnection(endTurn(state)) : state;
     case "poll":
       return { ...state, poll: state.poll + 1 };
-    case "server_running":
-      if (event.running === state.serverRunning) return state;
+    case "server_turn": {
+      if (event.running === state.serverRunning && event.sequence === state.serverSequence) return state;
+      // The list reports a turn that is newer than the ended turn of this
+      // tab. Forget that turn for good: the list can stop reporting the newer
+      // turn when it ends.
+      const superseded = state.activity !== null &&
+        isLiveTurnSuperseded({ isRunning: event.running, latestTurnSequence: event.sequence }, state.activity);
+      const next = { ...state, serverSequence: event.sequence, activity: superseded ? null : state.activity };
+      if (event.running === state.serverRunning) return next;
       // Another tab started a turn: connect again to show it. When the
       // saved state reports the end, poll at once.
       return event.running
-        ? planConnection({ ...state, serverRunning: true })
-        : { ...state, serverRunning: false, poll: state.poll + 1 };
+        ? planConnection({ ...next, serverRunning: true })
+        : { ...next, serverRunning: false, poll: state.poll + 1 };
+    }
+    case "refresh_started":
+      return { ...state, refreshes: state.refreshes + 1 };
+    case "refresh_ended":
+      return { ...state, refreshes: Math.max(0, state.refreshes - 1) };
     case "busy_refusal_cleared":
       return { ...state, busyRefused: false };
   }
@@ -314,10 +337,13 @@ export type SessionConnectionOptions = {
   sessionId: string;
   /** The running state of the session list. */
   serverRunning: boolean;
+  /** The sequence of the newest turn in the session list. */
+  serverSequence?: number;
   /** Starts a session connection through CopilotKit. */
   connect: () => Promise<unknown>;
-  /** Called once when a turn ended and the saved data can change. */
-  onTurnSettled?: () => void;
+  /** Called once when a turn ended and the saved data can change. A returned
+   *  promise ends when the caller refreshed the saved turn state. */
+  onTurnSettled?: () => Promise<unknown> | void;
   /** Called when the backend ended the turn that this tab streamed. */
   onTurnEnded?: () => void;
   /** Called when the backend refused a send before its stream opened. */
@@ -341,6 +367,8 @@ export type SessionConnection = {
   /** Set when the server refused the connection. */
   refusal: ConnectionRefusal | null;
   activity: LiveTurnActivity | null;
+  /** A turn ended, and the refresh of the saved turn state did not end yet. */
+  settling: boolean;
   /** Closes this tab's stream after Stop, then polls until the turn ends. */
   closeStream: () => void;
   /** Polls at once while the turn is remote. */
@@ -349,9 +377,13 @@ export type SessionConnection = {
 };
 
 export function useSessionConnection(agent: DeepAgentsBrowserAgent, options: SessionConnectionOptions): SessionConnection {
-  const { sessionId, serverRunning } = options;
-  const [state, dispatch] = useReducer(connectionReducer, serverRunning, initialConnectionState);
-  if (serverRunning !== state.serverRunning) dispatch({ type: "server_running", running: serverRunning });
+  const { sessionId, serverRunning, serverSequence } = options;
+  const [state, dispatch] = useReducer(
+    connectionReducer, { running: serverRunning, sequence: serverSequence }, initialConnectionState
+  );
+  if (serverRunning !== state.serverRunning || serverSequence !== state.serverSequence) {
+    dispatch({ type: "server_turn", running: serverRunning, sequence: serverSequence });
+  }
 
   const callbacks = useRef(options);
   useEffect(() => {
@@ -510,7 +542,12 @@ export function useSessionConnection(agent: DeepAgentsBrowserAgent, options: Ses
   }, [agent, nextConnection]);
 
   useEffect(() => {
-    if (state.settles > 0) callbacks.current.onTurnSettled?.();
+    if (state.settles === 0) return;
+    const refresh = callbacks.current.onTurnSettled?.();
+    if (!refresh) return;
+    dispatch({ type: "refresh_started" });
+    const end = () => dispatch({ type: "refresh_ended" });
+    void refresh.then(end, end);
   }, [state.settles]);
 
   const onRemoteSnapshot = useCallback((snapshot: RemoteTurnSnapshot) => callbacks.current.onRemoteSnapshot(snapshot), []);
@@ -541,6 +578,7 @@ export function useSessionConnection(agent: DeepAgentsBrowserAgent, options: Ses
     truncated: state.truncated,
     refusal: state.refusal,
     activity: state.activity,
+    settling: state.refreshes > 0,
     closeStream,
     pollNow,
     clearBusyRefusal

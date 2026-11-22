@@ -10,6 +10,7 @@
 
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { savedState } from "../test-helpers/saved-side-state";
 
 vi.mock("next/dynamic", () => ({ default: () => () => null }));
 vi.mock("./model-effort-selector", () => ({ ModelEffortSelector: () => null }));
@@ -40,7 +41,7 @@ type SessionOverrides = Partial<Parameters<typeof CopilotChatHost>[0]["session"]
 function hostElement(session: SessionOverrides = {}) {
   return (
     <CopilotChatHost
-      session={{ id: "s-1", initialToolStatuses: [], initialApprovals: [], canEdit: true, ...session }}
+      session={{ id: "s-1", canEdit: true, ...session }}
       modelSelection={{
         model: "model-1", effort: null, models: [], showEffortSelector: false,
         onModelChange: () => undefined, onEffortChange: () => undefined
@@ -279,7 +280,7 @@ describe("pending approvals beside tool cards", () => {
   it("keeps an approval that names no call in the notification list, with its own decision controls, and posts the id of that approval", async () => {
     server.connect("s-1", idleHistory([call("tc-1", "execute", { command: "pnpm test" }), result("tc-1", "ok")]));
     server.approvals.set("s-1", [savedApproval("ap-1", "pending")]);
-    render(hostElement({ initialApprovals: [savedApproval("ap-1", "pending")] as never }));
+    render(hostElement({ saved: savedState({ approvals: [savedApproval("ap-1", "pending")] as never }) }));
 
     const article = await waitFor(() => card(/Run command/));
     const list = screen.getByLabelText("Session notifications");
@@ -406,7 +407,7 @@ describe("pending approvals in the card of their call", () => {
       stream.push(...ev.history({ messages: pending.unavailable, activeTurn: "unavailable" }));
       stream.finish();
     });
-    render(hostElement({ isRunning: true, initialApprovals: pending.approvals as never }));
+    render(hostElement({ isRunning: true, saved: savedState({ approvals: pending.approvals as never }) }));
 
     await waitFor(() => expect(within(card(/Write file/)).getByText("needs approval")).toBeTruthy());
     expect(within(card(/Write file/)).getByText("Approve write_file")).toBeTruthy();
@@ -427,7 +428,7 @@ describe("pending approvals in the card of their call", () => {
 
   it("lists the controls of an approval whose card already has a result", async () => {
     server.connect("s-1", idleHistory([call("card-9", "execute", { command: "make" }), result("card-9", "ok")]));
-    render(hostElement({ initialApprovals: [savedApproval("ap-9", "pending", "s-1", "card-9")] as never }));
+    render(hostElement({ saved: savedState({ approvals: [savedApproval("ap-9", "pending", "s-1", "card-9")] as never }) }));
 
     await waitFor(() => expect(within(card(/Run command/)).getByText("done")).toBeTruthy());
     expect(within(list()!).getByRole("button", { name: "Approve once" })).toBeTruthy();
