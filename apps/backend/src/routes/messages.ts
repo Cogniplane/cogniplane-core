@@ -1,4 +1,4 @@
-import { startExecutionHeartbeat, stopLostExecution, waitAtMost } from "../services/execution-heartbeat.js";
+import { waitAtMost } from "../services/execution-heartbeat.js";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { z } from "zod";
 
@@ -19,7 +19,8 @@ import { resolveRuntimeModel } from "../services/runtime/runtime-model-resolver.
 import { streamAssistantReplyAGUI } from "../services/sse-stream-writer-agui.js";
 import { requestSecurityVersion } from "../services/auth/security-change.js";
 import type { TurnEventLog } from "../services/turn-event-log.js";
-import { SessionExecutionError, type SessionExecution } from "../services/session-execution-store.js";
+import { SessionExecutionError } from "../services/session-execution-store.js";
+import { TurnExecutionLease } from "../services/turn-execution.js";
 import { ProjectAccessError } from "../services/project-access.js";
 import { UNSUPPORTED_TRANSCRIPT_ERROR } from "../services/session-access.js";
 import { ProjectFileError, type ProjectRuntimeFileSnapshot } from "../services/project-file-store.js";
@@ -221,15 +222,10 @@ export async function registerMessageRoutes(
       slotReserved = true;
     }
 
-    let execution: SessionExecution | undefined;
-    let stopHeartbeat: (() => void) | undefined;
+    let lease: TurnExecutionLease | undefined;
     let releaseAdmissionPromise: Promise<void> | undefined;
     const releaseAdmission = () => releaseAdmissionPromise ??= (async () => {
-      stopHeartbeat?.();
-      if (execution) {
-        try { await stores.executions.release(execution); }
-        catch (error) { request.log.error({ err: error, sessionId: input.sessionId }, "Failed to release execution lease"); }
-      }
+      await lease?.release();
       try {
         await runtimeAdapter.finishTurnAdmission?.({ tenantId, sessionId: input.sessionId, userId });
       } catch (error) {
@@ -246,11 +242,8 @@ export async function registerMessageRoutes(
       markSettled();
       return releaseAdmission();
     };
-    // Set when this replica lost the lease. Setup stops at its next step.
-    let leaseLost = false;
-    const assertLeaseHeld = () => {
-      if (leaseLost) throw new SessionExecutionError("execution_stopped", 403);
-    };
+    // When this replica lost the lease, setup stops at its next step.
+    const assertLeaseHeld = () => lease?.assertHeld();
     // Everything past the reservation releases the slot on early exit or after
     // the AG-UI stream finishes.
     try {
@@ -261,35 +254,33 @@ export async function registerMessageRoutes(
         return notFoundError("session_not_found");
       }
       if (stores.executions) {
-        const leaseStartedAt = performance.now();
-        execution = await stores.executions.acquire(
-          { tenantId, sessionId: input.sessionId, userId }, app.config.SESSION_EXECUTION_LEASE_MS,
-          { perUser: app.config.MAX_RUNNING_TURNS_PER_USER, perTenant: app.config.MAX_RUNNING_TURNS_PER_TENANT }
-        );
-        stores.activeTurns?.setExecution(input.sessionId, execution.executionId);
+        const admitted = lease = await TurnExecutionLease.acquire({
+          executions: stores.executions,
+          actor: { tenantId, sessionId: input.sessionId, userId },
+          settings: {
+            leaseMs: app.config.SESSION_EXECUTION_LEASE_MS,
+            heartbeatMs: app.config.SESSION_EXECUTION_HEARTBEAT_MS,
+            caps: { perUser: app.config.MAX_RUNNING_TURNS_PER_USER, perTenant: app.config.MAX_RUNNING_TURNS_PER_TENANT }
+          },
+          onReleaseError: error => request.log.error({ err: error, sessionId: input.sessionId }, "Failed to release execution lease")
+        });
+        const { executionId } = admitted.execution;
+        stores.activeTurns?.setExecution(input.sessionId, executionId);
         if (eventLog && stores.turnBus) {
-          const key = { tenantId, sessionId: input.sessionId, executionId: execution.executionId };
+          const key = { tenantId, sessionId: input.sessionId, executionId };
           eventLog.setMirror(
             entry => stores.turnBus!.append(key, entry),
             (reason, error) => request.log.warn({ err: error, reason, sessionId: input.sessionId },
               "Remote turn event mirror unavailable")
           );
         }
-        const admitted = execution;
-        const leaseExpiresAt = performance.now() + Math.max(0, new Date(admitted.expiresAt).getTime() - Date.now());
-        stopHeartbeat = startExecutionHeartbeat({
-          leaseStartedAt,
-          leaseExpiresAt,
-          leaseMs: app.config.SESSION_EXECUTION_LEASE_MS,
-          intervalMs: app.config.SESSION_EXECUTION_HEARTBEAT_MS,
-          renew: () => stores.executions.heartbeat(admitted, app.config.SESSION_EXECUTION_LEASE_MS),
+        admitted.startHeartbeat({
           onError: error => request.log.warn({ err: error, sessionId: input.sessionId }, "Execution heartbeat failed"),
           onLost: async () => {
-            leaseLost = true;
             // Ask the runtime to stop. `abortSession` resolves when the runtime
             // is disposed, and the turn's stream can still run after that. So
             // its result does not release the admission.
-            void stopLostExecution({ execution: admitted, executions: stores.executions, runtime: runtimeAdapter })
+            void admitted.stopRuntime(runtimeAdapter)
               .catch(error => request.log.error({ err: error }, "Failed to stop expired execution"));
             // The release comes when this request's work ends. Until then a
             // stopped lease stays `stopping` and the session stays busy on every
@@ -442,7 +433,7 @@ export async function registerMessageRoutes(
       await streamAssistantReplyAGUI({
         eventLog,
         persistedUserMessage,
-        execution,
+        execution: lease?.execution,
         cancelSignal: stores.activeTurns?.cancelSignal(input.sessionId),
         startedAt: stores.activeTurns?.startedAt(input.sessionId),
         // After a forced release the slot can belong to a newer turn.

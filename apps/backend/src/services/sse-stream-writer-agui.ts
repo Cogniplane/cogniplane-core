@@ -40,6 +40,7 @@ import { syncArtifactsToWorkspace } from "./artifacts/artifact-workspace-sync.js
 import { SseWriter, type RawSseResponse } from "./sse-writer.js";
 import { interruptedResult } from "./deep-agents/agui-events.js";
 import type { TurnEventLog } from "./turn-event-log.js";
+import { bindTurnToolContext } from "./turn-execution.js";
 import { TurnTranscript, classifyTurnFailure, type TurnOutcome } from "./turn-transcript.js";
 
 const SSE_HEARTBEAT_INTERVAL_MS = 20_000;
@@ -316,15 +317,17 @@ export async function streamAssistantReplyAGUI(input: StreamAssistantReplyAGUIIn
       execution: input.execution
     });
 
-    const toolContext = await input.toolContexts.create({
+    const toolContext = await bindTurnToolContext(input.toolContexts, {
       tenantId: input.tenantId,
       sessionId: input.sessionId,
       userId: input.userId,
-      runtimeId: session.runtimeId,
-      runtimePolicyId: session.runtimePolicy.id,
+      runtimeSession: session,
       messageId: assistantMessageId,
+      execution: input.execution,
+      turnContext: input.turnContext,
+      ownerSecurityVersion: input.ownerSecurityVersion,
+      ttlMs: input.toolContextTtlMs ?? 15 * 60 * 1000,
       metadata: {
-        ...(input.execution ? { executionId: input.execution.executionId } : {}),
         selectedArtifactIds: input.selectedArtifactIds ?? [],
         ...(input.projectId && input.projectFileSnapshot ? {
           projectContext: {
@@ -332,14 +335,8 @@ export async function streamAssistantReplyAGUI(input: StreamAssistantReplyAGUIIn
             agentFileMode: input.projectAgentFileMode ?? "read-only",
             snapshot: input.projectFileSnapshot
           }
-        } : {}),
-        runtimePolicy: session.runtimePolicy,
-        ...(session.mcpServerSources ? { mcpServerSources: session.mcpServerSources } : {}),
-        ...(session.integrationAccounts ? { integrationAccounts: session.integrationAccounts } : {}),
-        ...(input.turnContext ? { turnContext: input.turnContext } : {})
-      },
-      ownerSecurityVersion: input.ownerSecurityVersion,
-      ttlMs: input.toolContextTtlMs ?? 15 * 60 * 1000
+        } : {})
+      }
     });
     if (input.cancelSignal?.aborted) throw new Error("Turn stopped during setup");
 
