@@ -1,8 +1,10 @@
-import { expect, it, vi } from "vitest";
+import { beforeEach, expect, it, vi } from "vitest";
 import { listMessages } from "./message-api";
-import { request } from "./api-client";
+import { wireRequest as request } from "../test-helpers/api-client-mock";
 
-vi.mock("./api-client", () => ({ request: vi.fn(async () => ({ messages: [], hasMore: false })) }));
+vi.mock("./api-client", async () => (await import("../test-helpers/api-client-mock")).apiClientMock());
+
+beforeEach(() => { request.mockReset().mockResolvedValue({ messages: [], hasMore: false }); });
 
 it("sends a message anchor on tail reads", async () => {
   const signal = new AbortController().signal;

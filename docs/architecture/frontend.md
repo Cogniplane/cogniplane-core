@@ -28,8 +28,12 @@ this Next.js version differs from older ones.
   and resends a request once after step-up. Its token, refresh and session
   changes run in the session coordinator (`lib/session-coordinator.ts`); import
   them from `lib/api-client.ts`. Per-domain clients are `lib/*-api.ts`.
-- Parse every response with its shared schema through `parseResponse`
-  (`lib/validate-response.ts`); do not cast JSON to a type.
+- `lib/api-client.ts` has one function for each kind of answer. A JSON answer
+  goes through `requestJson`, which needs the shared schema of the answer and
+  refuses a body that is not JSON or that the schema does not accept
+  (`parseResponse`, `lib/validate-response.ts`). An answer whose body the
+  caller does not use goes through `requestEmpty`. A stream or a download uses
+  `fetchWithAuthRetry` and reads the `Response`. Do not cast JSON to a type.
 - `AuthGuard` (`lib/auth-guard.tsx`) and `middleware.ts` only control rendering
   and redirects ([security](../security.md#frontend)).
 
@@ -74,7 +78,7 @@ error text or stack, because they can hold message, tool or server details.
 
 - Core route: a folder under `src/app/` with `page.tsx`. A client page fetches
   with TanStack Query (a key from `lib/query-keys.ts`) through a `lib/*-api.ts`
-  client that calls `parseResponse`.
+  client that calls `requestJson` with the shared schema.
 - Admin section: add it to `ADMIN_LIVE_SECTIONS` (`app/admin/admin-sections.ts`)
   and create `app/admin/<id>/page.tsx`. A moved page keeps its old URL in
   `ADMIN_SECTION_ALIASES`.

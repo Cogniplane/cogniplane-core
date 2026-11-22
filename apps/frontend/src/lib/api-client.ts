@@ -3,7 +3,8 @@ import {
   ModelsListResponseSchema,
   StepUpRefusalSchema,
   type ModelsListResponse,
-  type StepUpAction
+  type StepUpAction,
+  type ZodType
 } from "@cogniplane/shared-types";
 
 import { SessionCoordinator, type TokenRefresher } from "./session-coordinator";
@@ -148,16 +149,19 @@ export function refreshAccessToken(): Promise<string | null> {
   return session.requestRefresh();
 }
 
-/** `request` for the calls in changeSession: it holds the gate. */
-export type SessionChangeRequest = <T>(path: string, init?: RequestInit) => Promise<T>;
+/** The requests for the calls in changeSession: they hold the gate. */
+export type SessionChangeRequest = {
+  json<T>(path: string, schema: ZodType<T>, init?: RequestInit): Promise<T>;
+  empty(path: string, init?: RequestInit): Promise<void>;
+};
 
 /**
  * Runs `send`, a call whose answer sets or deletes the refresh cookie, while
  * it holds the session-change gate. Session changes run one at a time.
  *
- * Inside `send`, use the `request` that it receives, not the module `request`:
- * a 401 then refreshes at once. The module `request` would wait for the gate
- * that this call holds. This refresh is safe: a 401 answer changed no session,
+ * Inside `send`, use the requests that it receives, not `requestJson` or
+ * `requestEmpty`: a 401 then refreshes at once. The module requests would wait
+ * for the gate that this call holds. This refresh is safe: a 401 answer changed no session,
  * and no other session change runs. A plain fetch in `send` must use the
  * `signal` that it receives.
  *
@@ -195,13 +199,18 @@ export function changeSession<T>(
 }
 
 /**
- * The `request` of a session change: its fetch aborts at the time limit or
+ * The requests of a session change: a fetch aborts at the time limit or
  * when the caller's signal aborts. A 401 refreshes without the gate, the
  * request goes once more when the refresh gives a token, and no step-up
  * prompt opens.
  */
 function gatedRequest(limit: AbortSignal, refreshNow: () => Promise<string | null>): SessionChangeRequest {
-  return (path, init) => requestWithRefresh(path, { ...init, signal: eitherSignal(init?.signal, limit) }, refreshNow);
+  const send = (path: string, init?: RequestInit) =>
+    sendWithRefresh(path, { ...init, signal: eitherSignal(init?.signal, limit) }, refreshNow);
+  return {
+    json: async (path, schema, init) => readJson(await send(path, init), schema, path, init),
+    empty: async (path, init) => discardBody(await send(path, init))
+  };
 }
 
 /** A signal that aborts when the caller's signal or the time limit aborts. */
@@ -317,18 +326,32 @@ async function retryWithStepUp(path: string, init: RequestInit | undefined, refu
   }
 }
 
-export function request<T>(path: string, init?: RequestInit): Promise<T> {
-  return requestWithRefresh<T>(path, init, refreshAccessToken, true);
+/**
+ * A JSON request. `schema` checks the answer, so the result type is never a
+ * claim about a shape that nothing checked. An answer that is not JSON, or
+ * that the schema refuses, throws.
+ *
+ * For an answer whose body the caller does not use, use `requestEmpty`. For a
+ * stream or a download, use `fetchWithAuthRetry` and read the `Response`.
+ */
+export async function requestJson<T>(path: string, schema: ZodType<T>, init?: RequestInit): Promise<T> {
+  return readJson(await sendWithRefresh(path, init, refreshAccessToken, true), schema, path, init);
 }
 
-async function requestWithRefresh<T>(
+/** A request whose answer has no body that the caller uses. The body is not read. */
+export async function requestEmpty(path: string, init?: RequestInit): Promise<void> {
+  await discardBody(await sendWithRefresh(path, init, refreshAccessToken, true));
+}
+
+// Sends the request and returns the successful response. Any other status throws ApiError.
+async function sendWithRefresh(
   path: string,
   init: RequestInit | undefined,
   refresh: () => Promise<string | null>,
-  // Only the module `request` asks for step-up. A call in changeSession holds
+  // Only the module requests ask for step-up. A call in changeSession holds
   // the session gate and must not wait for a person.
   askStepUp = false
-): Promise<T> {
+): Promise<Response> {
   let response = await fetchWithRefresh(path, init, refresh);
 
   if (askStepUp && response.status === 403) {
@@ -346,17 +369,48 @@ async function requestWithRefresh<T>(
     });
   }
 
-  if (response.status === 204) {
-    return undefined as T;
-  }
+  return response;
+}
 
-  return (await response.json()) as T;
+async function readJson<T>(
+  response: Response,
+  schema: ZodType<T>,
+  path: string,
+  init: RequestInit | undefined
+): Promise<T> {
+  // The query string can hold a search text or an ID list, so the context omits it.
+  const context = `${init?.method ?? "GET"} ${path.split("?")[0]}`;
+  let body: unknown;
+  try {
+    body = await response.json();
+  } catch (error) {
+    // Only a body that does not parse is "not JSON". A cancelled request or a
+    // connection that fails during the body keeps its own error.
+    if (!(error instanceof SyntaxError)) throw error;
+    // No `cause`: the message of the syntax error quotes the start of the body,
+    // and a body can hold a credential.
+    // eslint-disable-next-line preserve-caught-error
+    throw new Error(`Response is not JSON at ${context}`);
+  }
+  return parseResponse(schema, body, context);
+}
+
+async function discardBody(response: Response): Promise<void> {
+  try {
+    await response.body?.cancel();
+  } catch {
+    // The request succeeded. A body that cannot be cancelled changes nothing.
+  }
 }
 
 // A 404 returns undefined so callers can distinguish it from a successful JSON null.
-export async function requestOptionalOn404<T>(path: string, init?: RequestInit): Promise<T | undefined> {
+export async function requestJsonOptionalOn404<T>(
+  path: string,
+  schema: ZodType<T>,
+  init?: RequestInit
+): Promise<T | undefined> {
   try {
-    return await request<T>(path, init);
+    return await requestJson(path, schema, init);
   } catch (error) {
     if (error instanceof ApiError && error.status === 404) return undefined;
     throw error;
@@ -396,7 +450,6 @@ export async function buildErrorMessage(response: Response): Promise<string> {
   return formatErrorMessage(response.status, await readErrorPayload(response));
 }
 
-export async function fetchModels(): Promise<ModelsListResponse> {
-  const raw = await request<unknown>("/models");
-  return parseResponse(ModelsListResponseSchema, raw, "GET /models");
+export function fetchModels(): Promise<ModelsListResponse> {
+  return requestJson("/models", ModelsListResponseSchema);
 }

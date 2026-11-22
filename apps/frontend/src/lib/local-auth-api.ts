@@ -1,5 +1,6 @@
 import {
   AuthConfigResponseSchema,
+  type ZodType,
   AuthSessionResponseSchema,
   EnrollmentCompleteResponseSchema,
   LocalSignInResponseSchema,
@@ -35,7 +36,7 @@ import {
   type StepUpAction
 } from "@cogniplane/shared-types";
 
-import { API_URL, ApiError, changeSession, request } from "./api-client";
+import { API_URL, ApiError, changeSession, requestJson, requestEmpty } from "./api-client";
 import { assertWithPasskey, createPasskey, PasskeyCeremonyError } from "./passkey-browser";
 
 // Client for local accounts (docs/architecture/local-accounts.md).
@@ -70,9 +71,9 @@ function postPublicSessionChange(path: string, body?: unknown): Promise<unknown>
 function requestNewSession<T extends { accessToken?: string }>(
   path: string,
   init: RequestInit,
-  schema: { parse: (raw: unknown) => T }
+  schema: ZodType<T>
 ): Promise<T> {
-  return changeSession(async (gated) => schema.parse(await gated<unknown>(path, init)), (result) => result.accessToken);
+  return changeSession((gated) => gated.json(path, schema, init), (result) => result.accessToken);
 }
 
 async function postPublic(path: string, body?: unknown, signal?: AbortSignal): Promise<unknown> {
@@ -190,24 +191,20 @@ export type StepUpProof = { password: string } | { totpCode: string } | { passke
 
 export async function stepUp(action: StepUpAction, proof: StepUpProof): Promise<string> {
   if ("passkey" in proof) {
-    const begin = PasskeyOptionsResponseSchema.parse(
-      await request<unknown>("/auth/step-up/passkey/options", { method: "POST", body: JSON.stringify({ action }) })
-    );
+    const begin = await requestJson("/auth/step-up/passkey/options", PasskeyOptionsResponseSchema, { method: "POST", body: JSON.stringify({ action }) });
     const credential = await assertWithPasskey(begin.options);
-    const raw = await request<unknown>("/auth/step-up/passkey", {
+    return (await requestJson("/auth/step-up/passkey", StepUpResponseSchema, {
       method: "POST",
       body: JSON.stringify({ action, challengeId: begin.challengeId, credential })
-    });
-    return StepUpResponseSchema.parse(raw).stepUpToken;
+    })).stepUpToken;
   }
-  const raw = await request<unknown>("/auth/step-up", { method: "POST", body: JSON.stringify({ action, ...proof }) });
-  return StepUpResponseSchema.parse(raw).stepUpToken;
+  return (await requestJson("/auth/step-up", StepUpResponseSchema, { method: "POST", body: JSON.stringify({ action, ...proof }) })).stepUpToken;
 }
 
 const withStepUp = (token?: string) => (token ? { headers: { "X-Step-Up": token } } : {});
 
 export async function fetchMySecurity(): Promise<MySecurityResponse> {
-  return MySecurityResponseSchema.parse(await request<unknown>("/me/security"));
+  return await requestJson("/me/security", MySecurityResponseSchema);
 }
 
 /**
@@ -228,8 +225,7 @@ export function changeMyPassword(currentPassword: string, newPassword: string, s
  * factor, from a second factor when it has one.
  */
 export async function startMyTotp(stepUpToken: string): Promise<TotpEnrollmentResponse> {
-  const raw = await request<unknown>("/me/security/totp/start", { method: "POST", body: "{}", ...withStepUp(stepUpToken) });
-  return TotpEnrollmentResponseSchema.parse(raw);
+  return await requestJson("/me/security/totp/start", TotpEnrollmentResponseSchema, { method: "POST", body: "{}", ...withStepUp(stepUpToken) });
 }
 
 /** Confirms the app; every session ends and this one is replaced. */
@@ -242,12 +238,11 @@ export function removeMyTotp(stepUpToken: string): Promise<AuthSessionResponse> 
 }
 
 export async function regenerateMyRecoveryCodes(stepUpToken: string): Promise<string[]> {
-  const raw = await request<unknown>("/me/security/recovery-codes", { method: "POST", body: "{}", ...withStepUp(stepUpToken) });
-  return RecoveryCodesResponseSchema.parse(raw).recoveryCodes;
+  return (await requestJson("/me/security/recovery-codes", RecoveryCodesResponseSchema, { method: "POST", body: "{}", ...withStepUp(stepUpToken) })).recoveryCodes;
 }
 
 export async function listMyPasskeys(): Promise<PasskeySummary[]> {
-  return PasskeyListResponseSchema.parse(await request<unknown>("/me/security/passkeys")).passkeys;
+  return (await requestJson("/me/security/passkeys", PasskeyListResponseSchema)).passkeys;
 }
 
 /**
@@ -257,9 +252,7 @@ export async function listMyPasskeys(): Promise<PasskeySummary[]> {
  * returns a new session and recovery codes.
  */
 export async function addMyPasskey(name: string, stepUpToken: string): Promise<MyPasskeyAddedResponse> {
-  const begin = PasskeyOptionsResponseSchema.parse(
-    await request<unknown>("/me/security/passkeys/options", { method: "POST", body: "{}", ...withStepUp(stepUpToken) })
-  );
+  const begin = await requestJson("/me/security/passkeys/options", PasskeyOptionsResponseSchema, { method: "POST", body: "{}", ...withStepUp(stepUpToken) });
   const credential = await createPasskey(begin.options);
   // Only a first second factor answers with a new session.
   return requestNewSession("/me/security/passkeys/verify", {
@@ -271,7 +264,7 @@ export async function addMyPasskey(name: string, stepUpToken: string): Promise<M
 const passkeyPath = (id: string) => `/me/security/passkeys/${encodeURIComponent(id)}`;
 
 export async function renameMyPasskey(id: string, name: string): Promise<PasskeySummary> {
-  return PasskeySummarySchema.parse(await request<unknown>(passkeyPath(id), { method: "PATCH", body: JSON.stringify({ name }) }));
+  return await requestJson(passkeyPath(id), PasskeySummarySchema, { method: "PATCH", body: JSON.stringify({ name }) });
 }
 
 /** Removes a passkey; every session ends and this one is replaced. */
@@ -286,7 +279,7 @@ export function removeMyPasskey(id: string, stepUpToken: string): Promise<AuthSe
  */
 export async function signOutEverywhere(): Promise<void> {
   await changeSession(
-    (gated) => gated<unknown>("/me/security/sessions/revoke", { method: "POST", body: "{}" }),
+    (gated) => gated.empty("/me/security/sessions/revoke", { method: "POST", body: "{}" }),
     () => null,
     { stopRefresh: true }
   );
@@ -294,57 +287,52 @@ export async function signOutEverywhere(): Promise<void> {
 
 /** Needs the manager's step-up token (`member.create`). */
 export async function createLocalMember(input: CreateLocalMemberRequest, stepUpToken: string): Promise<CreateLocalMemberResponse> {
-  const raw = await request<unknown>("/tenant/members", { method: "POST", body: JSON.stringify(input), ...withStepUp(stepUpToken) });
-  return CreateLocalMemberResponseSchema.parse(raw);
+  return await requestJson("/tenant/members", CreateLocalMemberResponseSchema, { method: "POST", body: JSON.stringify(input), ...withStepUp(stepUpToken) });
 }
 
 const memberPath = (userId: string, action: string) => `/tenant/members/${encodeURIComponent(userId)}/${action}`;
 
 /** The link goes to the person by email (email on), or to the manager to pass on. */
 export async function resetMemberPassword(userId: string, stepUpToken: string): Promise<MemberLinkResponse> {
-  const raw = await request<unknown>(memberPath(userId, "password-reset"), {
+  return await requestJson(memberPath(userId, "password-reset"), MemberLinkResponseSchema, {
     method: "POST",
     body: "{}",
     headers: { "X-Step-Up": stepUpToken }
   });
-  return MemberLinkResponseSchema.parse(raw);
 }
 
 /** Email on only: emails the person a new link. No step-up; the manager never sees the link. */
 export async function resendMemberLink(userId: string): Promise<EmailedLink> {
-  const raw = await request<unknown>(memberPath(userId, "link/resend"), { method: "POST", body: "{}" });
-  return ResendMemberLinkResponseSchema.parse(raw).email;
+  return (await requestJson(memberPath(userId, "link/resend"), ResendMemberLinkResponseSchema, { method: "POST", body: "{}" })).email;
 }
 
 export async function disableMember(userId: string, stepUpToken: string): Promise<void> {
-  await request<unknown>(memberPath(userId, "disable"), { method: "POST", body: "{}", headers: { "X-Step-Up": stepUpToken } });
+  await requestEmpty(memberPath(userId, "disable"), { method: "POST", body: "{}", headers: { "X-Step-Up": stepUpToken } });
 }
 
 export async function enableMember(userId: string, stepUpToken: string): Promise<LocalAccountStatus> {
-  const raw = await request<unknown>(memberPath(userId, "enable"), { method: "POST", body: "{}", ...withStepUp(stepUpToken) });
-  return MemberStatusResponseSchema.parse(raw).status;
+  return (await requestJson(memberPath(userId, "enable"), MemberStatusResponseSchema, { method: "POST", body: "{}", ...withStepUp(stepUpToken) })).status;
 }
 
 export async function resetMemberMfa(userId: string, stepUpToken: string): Promise<void> {
-  await request<unknown>(memberPath(userId, "mfa-reset"), { method: "POST", body: "{}", headers: { "X-Step-Up": stepUpToken } });
+  await requestEmpty(memberPath(userId, "mfa-reset"), { method: "POST", body: "{}", headers: { "X-Step-Up": stepUpToken } });
 }
 
 export async function fetchTenantMfaPolicy(): Promise<MfaPolicy> {
-  return TenantSecuritySettingsSchema.parse(await request<unknown>("/tenant/settings/security")).mfaPolicy;
+  return (await requestJson("/tenant/settings/security", TenantSecuritySettingsSchema)).mfaPolicy;
 }
 
 /** A weaker policy needs an owner's strong step-up token. */
 export async function saveTenantMfaPolicy(mfaPolicy: MfaPolicy, stepUpToken?: string): Promise<MfaPolicy> {
-  const raw = await request<unknown>("/tenant/settings/security", {
+  return (await requestJson("/tenant/settings/security", TenantSecuritySettingsSchema, {
     method: "PUT",
     body: JSON.stringify({ mfaPolicy }),
     ...withStepUp(stepUpToken)
-  });
-  return TenantSecuritySettingsSchema.parse(raw).mfaPolicy;
+  })).mfaPolicy;
 }
 
 export async function signOutMember(userId: string): Promise<void> {
-  await request<unknown>(memberPath(userId, "sessions/revoke"), { method: "POST", body: "{}" });
+  await requestEmpty(memberPath(userId, "sessions/revoke"), { method: "POST", body: "{}" });
 }
 
 /**

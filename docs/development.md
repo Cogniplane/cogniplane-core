@@ -88,7 +88,8 @@ The `pre-push` hook (`.husky/pre-push`) runs gitleaks on the pushed commits
   `packages/shared-types/src/index.ts`. Backend and frontend import the package
   name, which resolves to the built `dist/`: rebuild it ([commands](#commands))
   before you test consumers. The backend serializes responses with the schema
-  (`serialize`); the frontend parses them with `parseResponse`.
+  (`serialize`); the frontend parses them with `requestJson`
+  ([frontend](architecture/frontend.md)).
 - New HTTP route:
   - Validate input with `parseRequestInput` and a Zod schema.
   - Guard: wrap `/admin/*` handlers in `withAdmin`

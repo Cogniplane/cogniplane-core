@@ -170,6 +170,10 @@ Limits:
   same function to decide which files it selects automatically, and which
   files it lets the user select, preview or download. The backend is the
   boundary: it checks each request again.
+- The artifact routes answer with `toArtifactResponse`
+  (`services/artifacts/artifact-response.ts`), which names each public field.
+  A field added to the stored record reaches clients only when it is added
+  there.
 - Download: `POST /artifacts/:artifactId/download-token` issues a short-lived
   opaque token (`ARTIFACT_DOWNLOAD_TTL_MS`). `GET /downloads/:token` is public;
   it checks the token's user, current membership and session access, then

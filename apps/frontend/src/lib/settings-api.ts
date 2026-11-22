@@ -1,4 +1,5 @@
 import {
+  z,
   GithubAllowedRepositoriesResponseSchema,
   GithubConnectionStatusSchema,
   GithubRepositoryListResponseSchema,
@@ -22,8 +23,7 @@ import {
   type ScheduledJobRequest
 } from "@cogniplane/shared-types";
 
-import { request } from "./api-client";
-import { parseResponse } from "./validate-response";
+import { requestJson, requestEmpty } from "./api-client";
 
 import type {
   GithubConnectionStatus,
@@ -43,27 +43,19 @@ import type {
 } from "@cogniplane/shared-types";
 
 export async function listUserSettingsSections(): Promise<UserSettingsSection[]> {
-  const raw = await request<unknown>("/me/settings");
-  return parseResponse(UserSettingsSectionsResponseSchema, raw, "GET /me/settings").sections;
+  return (await requestJson("/me/settings", UserSettingsSectionsResponseSchema)).sections;
 }
 
 export async function fetchGithubConnectionStatus(): Promise<GithubConnectionStatus> {
-  const raw = await request<unknown>("/me/github-connection");
-  return parseResponse(GithubConnectionStatusSchema, raw, "GET /me/github-connection");
+  return await requestJson("/me/github-connection", GithubConnectionStatusSchema);
 }
 
 export async function createGithubAuthorizationUrl(): Promise<string> {
-  const raw = await request<unknown>("/me/github-connection/authorize", { method: "POST" });
-  return parseResponse(
-    OAuthAuthorizationUrlResponseSchema,
-    raw,
-    "POST /me/github-connection/authorize"
-  ).url;
+  return (await requestJson("/me/github-connection/authorize", OAuthAuthorizationUrlResponseSchema, { method: "POST" })).url;
 }
 
 export async function listGithubRepositories(): Promise<GithubRepositoryListResponse> {
-  const raw = await request<unknown>("/me/github-connection/repositories");
-  return parseResponse(GithubRepositoryListResponseSchema, raw, "GET /me/github-connection/repositories");
+  return await requestJson("/me/github-connection/repositories", GithubRepositoryListResponseSchema);
 }
 
 /** `githubUserId` is the account that the member saw when they chose the list. */
@@ -71,154 +63,126 @@ export async function updateGithubAllowedRepositories(
   githubUserId: string,
   repositories: string[]
 ): Promise<string[]> {
-  const raw = await request<unknown>("/me/github-connection/repositories", {
+  return (await requestJson("/me/github-connection/repositories", GithubAllowedRepositoriesResponseSchema, {
     method: "PUT",
     body: JSON.stringify({ githubUserId, repositories })
-  });
-  return parseResponse(
-    GithubAllowedRepositoriesResponseSchema,
-    raw,
-    "PUT /me/github-connection/repositories"
-  ).allowedRepositories;
+  })).allowedRepositories;
 }
 
 /** Confirms a suspended connection. `githubUserId` is the account that the page shows. */
 export async function confirmGithubConnection(githubUserId: string): Promise<GithubUserConnection> {
-  const raw = await request<{ userConnection: unknown }>("/me/github-connection/confirm", {
+  return (await requestJson("/me/github-connection/confirm", z.object({ userConnection: GithubUserConnectionSchema }), {
     method: "POST",
     body: JSON.stringify({ githubUserId })
-  });
-  return parseResponse(GithubUserConnectionSchema, raw.userConnection, "POST /me/github-connection/confirm");
+  })).userConnection;
 }
 
 export async function deleteGithubConnection(): Promise<void> {
-  await request<void>("/me/github-connection", {
+  await requestEmpty("/me/github-connection", {
     method: "DELETE"
   });
 }
 
 export async function fetchNotionConnectionStatus(): Promise<NotionConnectionStatus> {
-  const raw = await request<unknown>("/me/notion-connection");
-  return parseResponse(NotionConnectionStatusSchema, raw, "GET /me/notion-connection");
+  return await requestJson("/me/notion-connection", NotionConnectionStatusSchema);
 }
 
 export async function createNotionAuthorizationUrl(): Promise<string> {
-  const raw = await request<unknown>("/me/notion-connection/authorize", { method: "POST" });
-  return parseResponse(
-    OAuthAuthorizationUrlResponseSchema,
-    raw,
-    "POST /me/notion-connection/authorize"
-  ).url;
+  return (await requestJson("/me/notion-connection/authorize", OAuthAuthorizationUrlResponseSchema, { method: "POST" })).url;
 }
 
 /** Confirms a suspended connection for the Notion user and workspace that the page shows. */
 export async function confirmNotionConnection(input: NotionConnectionConfirmRequest): Promise<NotionUserConnection> {
-  const raw = await request<{ userConnection: unknown }>("/me/notion-connection/confirm", {
+  return (await requestJson("/me/notion-connection/confirm", z.object({ userConnection: NotionUserConnectionSchema }), {
     method: "POST",
     body: JSON.stringify(input)
-  });
-  return parseResponse(NotionUserConnectionSchema, raw.userConnection, "POST /me/notion-connection/confirm");
+  })).userConnection;
 }
 
 export async function deleteNotionConnection(): Promise<void> {
-  await request<void>("/me/notion-connection", {
+  await requestEmpty("/me/notion-connection", {
     method: "DELETE"
   });
 }
 
 export async function fetchJiraConnectionStatus(): Promise<JiraConnectionStatus> {
-  const raw = await request<unknown>("/me/jira-connection");
-  return parseResponse(JiraConnectionStatusSchema, raw, "GET /me/jira-connection");
+  return await requestJson("/me/jira-connection", JiraConnectionStatusSchema);
 }
 
 export async function createJiraAuthorizationUrl(): Promise<string> {
-  const raw = await request<unknown>("/me/jira-connection/authorize", { method: "POST" });
-  return parseResponse(OAuthAuthorizationUrlResponseSchema, raw, "POST /me/jira-connection/authorize").url;
+  return (await requestJson("/me/jira-connection/authorize", OAuthAuthorizationUrlResponseSchema, { method: "POST" })).url;
 }
 
 export async function listJiraAccountCandidates(): Promise<JiraAccountCandidate[]> {
-  const raw = await request<unknown>("/me/jira-connection/accounts");
-  return parseResponse(JiraAccountCandidatesResponseSchema, raw, "GET /me/jira-connection/accounts").accounts;
+  return (await requestJson("/me/jira-connection/accounts", JiraAccountCandidatesResponseSchema)).accounts;
 }
 
 export async function listJiraAccountSites(accountId: string): Promise<JiraSite[]> {
   const path = `/me/jira-connection/accounts/${encodeURIComponent(accountId)}/sites`;
-  const raw = await request<unknown>(path);
-  return parseResponse(JiraAccountSitesResponseSchema, raw, "GET /me/jira-connection/accounts/:accountId/sites").sites;
+  return (await requestJson(path, JiraAccountSitesResponseSchema)).sites;
 }
 
 export async function selectJiraConnection(input: JiraConnectionSelectRequest): Promise<JiraUserConnection> {
-  const raw = await request<{ userConnection: unknown }>("/me/jira-connection", {
+  return (await requestJson("/me/jira-connection", z.object({ userConnection: JiraUserConnectionSchema }), {
     method: "PUT",
     body: JSON.stringify(input)
-  });
-  return parseResponse(JiraUserConnectionSchema, raw.userConnection, "PUT /me/jira-connection");
+  })).userConnection;
 }
 
 export async function deleteJiraConnection(): Promise<void> {
-  await request<void>("/me/jira-connection", { method: "DELETE" });
+  await requestEmpty("/me/jira-connection", { method: "DELETE" });
 }
 
 export async function updateUserSettingsSection(
   sectionKey: UserSettingsSection["sectionKey"],
   config: Record<string, unknown>
 ): Promise<UserSettingsSection> {
-  const raw = await request<unknown>(`/me/settings/${sectionKey}`, {
+  return (await requestJson(`/me/settings/${sectionKey}`, UserSettingsSectionEnvelopeSchema, {
     method: "PUT",
     body: JSON.stringify({ config })
-  });
-  return parseResponse(UserSettingsSectionEnvelopeSchema, raw, "PUT /me/settings/:sectionKey")
-    .section;
+  })).section;
 }
 
 export async function listScheduledJobs(): Promise<ScheduledJob[]> {
-  const raw = await request<unknown>("/me/scheduled-jobs");
-  return parseResponse(ScheduledJobsListResponseSchema, raw, "GET /me/scheduled-jobs")
-    .scheduledJobs;
+  return (await requestJson("/me/scheduled-jobs", ScheduledJobsListResponseSchema)).scheduledJobs;
 }
 
 export async function previewScheduledJob(input: ScheduledJobPreviewRequest): Promise<string | null> {
-  const raw = await request<unknown>("/me/scheduled-jobs/preview", {
+  return (await requestJson("/me/scheduled-jobs/preview", ScheduledJobPreviewResponseSchema, {
     method: "POST",
     body: JSON.stringify(input)
-  });
-  return parseResponse(ScheduledJobPreviewResponseSchema, raw, "POST /me/scheduled-jobs/preview").nextRunAt;
+  })).nextRunAt;
 }
 
 export async function createScheduledJob(input: ScheduledJobRequest): Promise<ScheduledJob> {
-  const raw = await request<unknown>("/me/scheduled-jobs", {
+  return (await requestJson("/me/scheduled-jobs", ScheduledJobEnvelopeSchema, {
     method: "POST",
     body: JSON.stringify(input)
-  });
-  return parseResponse(ScheduledJobEnvelopeSchema, raw, "POST /me/scheduled-jobs").scheduledJob;
+  })).scheduledJob;
 }
 
 export async function updateScheduledJob(
   jobId: string,
   input: ScheduledJobRequest
 ): Promise<ScheduledJob> {
-  const raw = await request<unknown>(`/me/scheduled-jobs/${jobId}`, {
+  return (await requestJson(`/me/scheduled-jobs/${jobId}`, ScheduledJobEnvelopeSchema, {
     method: "PUT",
     body: JSON.stringify(input)
-  });
-  return parseResponse(ScheduledJobEnvelopeSchema, raw, "PUT /me/scheduled-jobs/:id").scheduledJob;
+  })).scheduledJob;
 }
 
 export async function deleteScheduledJob(jobId: string): Promise<void> {
-  await request<void>(`/me/scheduled-jobs/${jobId}`, {
+  await requestEmpty(`/me/scheduled-jobs/${jobId}`, {
     method: "DELETE"
   });
 }
 
 export async function listScheduledJobRuns(jobId: string): Promise<ScheduledJobRun[]> {
-  const raw = await request<unknown>(`/me/scheduled-jobs/${jobId}/runs`);
-  return parseResponse(ScheduledJobRunsListResponseSchema, raw, "GET /me/scheduled-jobs/:id/runs")
-    .runs;
+  return (await requestJson(`/me/scheduled-jobs/${jobId}/runs`, ScheduledJobRunsListResponseSchema)).runs;
 }
 
 export async function fetchPersonalTokenUsage(days: number): Promise<PersonalTokenUsageSeries> {
-  const raw = await request<unknown>(`/me/token-usage?days=${days}`);
-  return parseResponse(PersonalTokenUsageResponseSchema, raw, "GET /me/token-usage").usage;
+  return (await requestJson(`/me/token-usage?days=${days}`, PersonalTokenUsageResponseSchema)).usage;
 }
 
 export type { PersonalTokenUsageSeries } from "@cogniplane/shared-types";

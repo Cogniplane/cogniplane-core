@@ -1,14 +1,10 @@
 import { PersonalCapabilitiesSchema, type PersonalCapabilitiesUpdate } from "@cogniplane/shared-types";
-import { request } from "./api-client";
-import { parseResponse } from "./validate-response";
+import { requestJson } from "./api-client";
 
 export async function getPersonalCapabilities() {
-  return parseResponse(PersonalCapabilitiesSchema,
-    await request<unknown>("/me/capabilities"), "GET /me/capabilities");
+  return await requestJson("/me/capabilities", PersonalCapabilitiesSchema);
 }
 
 export async function updatePersonalCapabilities(input: PersonalCapabilitiesUpdate) {
-  return parseResponse(PersonalCapabilitiesSchema,
-    await request<unknown>("/me/capabilities", { method: "PUT", body: JSON.stringify(input) }),
-    "PUT /me/capabilities");
+  return await requestJson("/me/capabilities", PersonalCapabilitiesSchema, { method: "PUT", body: JSON.stringify(input) });
 }

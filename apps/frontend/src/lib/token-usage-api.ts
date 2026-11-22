@@ -4,8 +4,7 @@ import {
   type TokenUsageSeries
 } from "@cogniplane/shared-types";
 
-import { request } from "./api-client";
-import { parseResponse } from "./validate-response";
+import { requestJson } from "./api-client";
 
 export type {
   TokenUsageDayPoint,
@@ -15,8 +14,7 @@ export type {
 } from "@cogniplane/shared-types";
 
 export async function fetchTokenUsage(days: number): Promise<TokenUsageSeries> {
-  const raw = await request<unknown>(`/admin/token-usage?days=${days}`);
-  return parseResponse(TokenUsageResponseSchema, raw, "GET /admin/token-usage").usage;
+  return (await requestJson(`/admin/token-usage?days=${days}`, TokenUsageResponseSchema)).usage;
 }
 
 export type MemberMonthUsage = {
@@ -31,8 +29,7 @@ export type MemberMonthUsage = {
  */
 export async function fetchMemberMonthUsage(userId: string): Promise<MemberMonthUsage> {
   const search = new URLSearchParams({ userId, period: "current_month" });
-  const raw = await request<unknown>(`/admin/token-usage?${search.toString()}`);
-  const response = parseResponse(TokenUsageResponseSchema, raw, "GET /admin/token-usage");
+  const response = await requestJson(`/admin/token-usage?${search.toString()}`, TokenUsageResponseSchema);
   if (response.userId !== userId || response.period !== "current_month" || !response.range) {
     throw new Error("This server cannot report usage for one person yet.");
   }

@@ -3,24 +3,21 @@ import {
   MemberMcpCredentialRemoveResponseSchema,
   type MemberMcpCredentialSave, type MemberMcpCredentialRemove
 } from "@cogniplane/shared-types";
-import { request } from "./api-client";
-import { parseResponse } from "./validate-response";
+import { requestJson } from "./api-client";
 
 const path = "/me/mcp-connections";
 const credentialsPath = (serverId: string) => `${path}/${encodeURIComponent(serverId)}/credentials`;
 
 export async function getMemberMcpConnections() {
-  return parseResponse(MemberMcpConnectionsResponseSchema, await request<unknown>(path), `GET ${path}`);
+  return await requestJson(path, MemberMcpConnectionsResponseSchema);
 }
 
 export async function saveMemberMcpCredentials(serverId: string, input: MemberMcpCredentialSave) {
   const url = credentialsPath(serverId);
-  return parseResponse(MemberMcpConnectionResponseSchema,
-    await request<unknown>(url, { method: "PUT", body: JSON.stringify(input) }), `PUT ${url}`);
+  return await requestJson(url, MemberMcpConnectionResponseSchema, { method: "PUT", body: JSON.stringify(input) });
 }
 
 export async function removeMemberMcpCredentials(serverId: string, input: MemberMcpCredentialRemove) {
   const url = credentialsPath(serverId);
-  return parseResponse(MemberMcpCredentialRemoveResponseSchema,
-    await request<unknown>(url, { method: "DELETE", body: JSON.stringify(input) }), `DELETE ${url}`);
+  return await requestJson(url, MemberMcpCredentialRemoveResponseSchema, { method: "DELETE", body: JSON.stringify(input) });
 }

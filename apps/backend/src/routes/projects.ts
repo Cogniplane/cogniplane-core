@@ -1,3 +1,4 @@
+import { toArtifactResponse } from "../services/artifacts/artifact-response.js";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { z } from "zod";
 import {
@@ -246,7 +247,7 @@ async function registerScopedProjectRoutes(app: FastifyInstance, stores: Project
     if (!project) return reply.code(404).send(notFoundError("project_not_found"));
     reply.header("cache-control", "private, no-store");
     return serialize(ArtifactsListResponseSchema, {
-      artifacts: await stores.artifacts.listByProject(tenantId, userId, project.projectId)
+      artifacts: (await stores.artifacts.listByProject(tenantId, userId, project.projectId)).map(toArtifactResponse)
     });
   });
   app.get("/projects/:projectId", async (request, reply) => {

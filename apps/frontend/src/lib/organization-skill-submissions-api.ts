@@ -7,8 +7,7 @@ import {
   type AdminSkillReleaseSnapshot,
   type PersonalSkillScope
 } from "@cogniplane/shared-types";
-import { request } from "./api-client";
-import { parseResponse } from "./validate-response";
+import { requestJson } from "./api-client";
 
 const memberPath = "/me/skill-submissions";
 const adminPath = "/admin/skill-submissions";
@@ -24,55 +23,47 @@ export type SubmissionDecision = {
   expectedOrganizationVersion: number | null;
 };
 
-function parseList(raw: unknown, context: string) {
-  return parseResponse(OrganizationSkillSubmissionsResponseSchema, raw, context);
-}
-function parseDetail(raw: unknown, context: string) {
-  return parseResponse(OrganizationSkillSubmissionResponseSchema, raw, context);
-}
-
 export async function listMySkillSubmissions() {
-  return parseList(await request<unknown>(memberPath), `GET ${memberPath}`);
+  return await requestJson(memberPath, OrganizationSkillSubmissionsResponseSchema);
 }
 export async function getMySkillSubmission(id: string) {
   const path = submissionPath(memberPath, id);
-  return parseDetail(await request<unknown>(path), `GET ${path}`);
+  return await requestJson(path, OrganizationSkillSubmissionResponseSchema);
 }
 export async function listMySkillSubmissionUpdates(before?: string) {
   const path = `/me/skill-submission-updates?limit=20${before ? `&before=${encodeURIComponent(before)}` : ""}`;
-  return parseResponse(OrganizationSkillSubmissionUpdatesResponseSchema, await request<unknown>(path), `GET ${path}`);
+  return await requestJson(path, OrganizationSkillSubmissionUpdatesResponseSchema);
 }
 export async function readMySkillSubmissionUpdate(id: string, scope: PersonalSkillScope) {
   const path = `/me/skill-submission-updates/${encodeURIComponent(id)}/read`;
-  return parseResponse(OrganizationSkillSubmissionUpdateReadResponseSchema,
-    await request<unknown>(path, { method: "POST", body: JSON.stringify({ scope }) }), `POST ${path}`);
+  return await requestJson(path, OrganizationSkillSubmissionUpdateReadResponseSchema, { method: "POST", body: JSON.stringify({ scope }) });
 }
 export async function submitPersonalSkill(input: {
   scope: PersonalSkillScope; personalSkillId: string; sourceRevision: number; note: string;
   targetOrganizationSkillId: string | null;
 }) {
-  return parseDetail(await request<unknown>(memberPath, { method: "POST", body: JSON.stringify(input) }), `POST ${memberPath}`);
+  return await requestJson(memberPath, OrganizationSkillSubmissionResponseSchema, { method: "POST", body: JSON.stringify(input) });
 }
 export async function withdrawSkillSubmission(id: string, input: { scope: PersonalSkillScope; version: number }) {
   const path = `${submissionPath(memberPath, id)}/withdraw`;
-  return parseDetail(await request<unknown>(path, { method: "POST", body: JSON.stringify(input) }), `POST ${path}`);
+  return await requestJson(path, OrganizationSkillSubmissionResponseSchema, { method: "POST", body: JSON.stringify(input) });
 }
 export async function resubmitSkillSubmission(id: string, input: {
   scope: PersonalSkillScope; version: number; sourceRevision: number; note: string;
 }) {
   const path = `${submissionPath(memberPath, id)}/resubmit`;
-  return parseDetail(await request<unknown>(path, { method: "POST", body: JSON.stringify(input) }), `POST ${path}`);
+  return await requestJson(path, OrganizationSkillSubmissionResponseSchema, { method: "POST", body: JSON.stringify(input) });
 }
 export async function listAdminSkillSubmissions() {
-  return parseList(await request<unknown>(adminPath), `GET ${adminPath}`);
+  return await requestJson(adminPath, OrganizationSkillSubmissionsResponseSchema);
 }
 export async function getAdminSkillSubmission(id: string): Promise<{ scope: PersonalSkillScope; submission: OrganizationSkillSubmissionDetail }> {
   const path = submissionPath(adminPath, id);
-  return parseDetail(await request<unknown>(path), `GET ${path}`);
+  return await requestJson(path, OrganizationSkillSubmissionResponseSchema);
 }
 export async function decideSkillSubmission(id: string, input: SubmissionDecision) {
   const path = `${submissionPath(adminPath, id)}/decision`;
-  return parseDetail(await request<unknown>(path, { method: "POST", body: JSON.stringify(input) }), `POST ${path}`);
+  return await requestJson(path, OrganizationSkillSubmissionResponseSchema, { method: "POST", body: JSON.stringify(input) });
 }
 export async function releaseSkillSubmission(id: string, input: {
   scope: PersonalSkillScope;
@@ -83,5 +74,5 @@ export async function releaseSkillSubmission(id: string, input: {
   expectedSnapshot: AdminSkillReleaseSnapshot;
 }) {
   const path = `${submissionPath(adminPath, id)}/release`;
-  return parseDetail(await request<unknown>(path, { method: "POST", body: JSON.stringify(input) }), `POST ${path}`);
+  return await requestJson(path, OrganizationSkillSubmissionResponseSchema, { method: "POST", body: JSON.stringify(input) });
 }

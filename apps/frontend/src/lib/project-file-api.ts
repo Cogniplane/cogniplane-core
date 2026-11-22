@@ -1,4 +1,5 @@
 import {
+  ArtifactPreviewTextResponseSchema,
   ProjectFileSchema,
   ProjectFileHistorySchema,
   ProjectFilePickerPageSchema,
@@ -8,8 +9,7 @@ import {
   ProjectLibraryFilesPageSchema,
   type ProjectFileCreate,
 } from "@cogniplane/shared-types";
-import { request, fetchWithAuthRetry, buildErrorMessage } from "./api-client";
-import { parseResponse } from "./validate-response";
+import { fetchWithAuthRetry, buildErrorMessage, requestJson, requestEmpty } from "./api-client";
 const path = (projectId: string) =>
   `/projects/${encodeURIComponent(projectId)}/library`;
 const filePath = (projectId: string, fileId: string) =>
@@ -40,11 +40,7 @@ export async function listProjectLibraryFiles(
   input: ProjectLibraryFilesParams,
   signal?: AbortSignal,
 ) {
-  return parseResponse(
-    ProjectLibraryFilesPageSchema,
-    await request(withQuery(`${path(projectId)}/files`, searchParams(input)), { signal }),
-    "GET project library files",
-  );
+  return await requestJson(withQuery(`${path(projectId)}/files`, searchParams(input)), ProjectLibraryFilesPageSchema, { signal });
 }
 export type ProjectFolderListParams = {
   parentId?: string | null;
@@ -57,22 +53,14 @@ export async function listProjectFolders(
   input: ProjectFolderListParams,
   signal?: AbortSignal,
 ) {
-  return parseResponse(
-    ProjectFolderPageSchema,
-    await request(withQuery(`${path(projectId)}/folders`, searchParams(input)), { signal }),
-    "GET project folders",
-  );
+  return await requestJson(withQuery(`${path(projectId)}/folders`, searchParams(input)), ProjectFolderPageSchema, { signal });
 }
 export async function getProjectFolder(
   projectId: string,
   folderId: string,
   signal?: AbortSignal,
 ) {
-  return parseResponse(
-    ProjectFolderDetailSchema,
-    await request(`${path(projectId)}/folders/${encodeURIComponent(folderId)}`, { signal }),
-    "GET project folder",
-  );
+  return await requestJson(`${path(projectId)}/folders/${encodeURIComponent(folderId)}`, ProjectFolderDetailSchema, { signal });
 }
 export type ProjectFilePickerParams = {
   q?: string;
@@ -85,11 +73,7 @@ export async function listProjectFilePicker(
   input: ProjectFilePickerParams,
   signal?: AbortSignal,
 ) {
-  return parseResponse(
-    ProjectFilePickerPageSchema,
-    await request(withQuery(`${path(projectId)}/picker`, searchParams(input)), { signal }),
-    "GET project file picker",
-  );
+  return await requestJson(withQuery(`${path(projectId)}/picker`, searchParams(input)), ProjectFilePickerPageSchema, { signal });
 }
 /** Returns the live published files and drafts among `fileIds`. Missing IDs are deleted or inaccessible. */
 export async function getProjectFilePickerSelection(
@@ -99,31 +83,19 @@ export async function getProjectFilePickerSelection(
 ) {
   const params = new URLSearchParams();
   for (const fileId of fileIds) params.append("ids", fileId);
-  return parseResponse(
-    ProjectFilePickerSelectionSchema,
-    await request(withQuery(`${path(projectId)}/picker/selection`, params), { signal }),
-    "GET project file selection",
-  );
+  return await requestJson(withQuery(`${path(projectId)}/picker/selection`, params), ProjectFilePickerSelectionSchema, { signal });
 }
 export async function saveProjectFile(
   projectId: string,
   input: ProjectFileCreate,
 ) {
-  return parseResponse(
-    ProjectFileSchema,
-    await request(`${path(projectId)}/files`, {
+  return await requestJson(`${path(projectId)}/files`, ProjectFileSchema, {
       method: "POST",
       body: JSON.stringify(input),
-    }),
-    "POST project file",
-  );
+    });
 }
 export async function promoteProjectDraft(projectId: string, fileId: string) {
-  return parseResponse(
-    ProjectFileSchema,
-    await request(`${filePath(projectId, fileId)}/promote`, { method: "POST" }),
-    "POST draft promotion",
-  );
+  return await requestJson(`${filePath(projectId, fileId)}/promote`, ProjectFileSchema, { method: "POST" });
 }
 export async function changeProjectFileLocation(
   projectId: string,
@@ -131,20 +103,20 @@ export async function changeProjectFileLocation(
   input: { name: string; folderId: string | null },
   action: "location" | "restore" | "save-as-new" = "location",
 ) {
-  await request(`${filePath(projectId, fileId)}/${action}`, {
+  await requestEmpty(`${filePath(projectId, fileId)}/${action}`, {
     method: "PUT",
     body: JSON.stringify(input),
   });
 }
 export async function trashProjectFile(projectId: string, fileId: string) {
-  await request(filePath(projectId, fileId), { method: "DELETE" });
+  await requestEmpty(filePath(projectId, fileId), { method: "DELETE" });
 }
 export async function createProjectFolder(
   projectId: string,
   name: string,
   parentId: string | null,
 ) {
-  await request(`${path(projectId)}/folders`, {
+  await requestEmpty(`${path(projectId)}/folders`, {
     method: "POST",
     body: JSON.stringify({ name, parentId }),
   });
@@ -154,22 +126,18 @@ export async function renameProjectFolder(
   folderId: string,
   name: string,
 ) {
-  await request(`${path(projectId)}/folders/${encodeURIComponent(folderId)}`, {
+  await requestEmpty(`${path(projectId)}/folders/${encodeURIComponent(folderId)}`, {
     method: "PUT",
     body: JSON.stringify({ name }),
   });
 }
 export async function removeProjectFolder(projectId: string, folderId: string) {
-  await request(`${path(projectId)}/folders/${encodeURIComponent(folderId)}`, {
+  await requestEmpty(`${path(projectId)}/folders/${encodeURIComponent(folderId)}`, {
     method: "DELETE",
   });
 }
 export async function getProjectFileHistory(projectId: string, fileId: string) {
-  return parseResponse(
-    ProjectFileHistorySchema,
-    await request(`${filePath(projectId, fileId)}/versions`),
-    "GET file history",
-  );
+  return await requestJson(`${filePath(projectId, fileId)}/versions`, ProjectFileHistorySchema);
 }
 export async function restoreProjectFileVersion(
   projectId: string,
@@ -177,7 +145,7 @@ export async function restoreProjectFileVersion(
   versionId: string,
   expectedVersionId: string,
 ) {
-  await request(`${versionPath(projectId, fileId, versionId)}/restore`, {
+  await requestEmpty(`${versionPath(projectId, fileId, versionId)}/restore`, {
     method: "POST",
     body: JSON.stringify({ expectedVersionId }),
   });
@@ -198,8 +166,9 @@ export async function getProjectVersionPdfText(
   fileId: string,
   versionId: string,
 ) {
-  const result = await request<{ text: string }>(
+  const result = await requestJson(
     `${versionPath(projectId, fileId, versionId)}/preview-text`,
+    ArtifactPreviewTextResponseSchema,
   );
   return result.text;
 }

@@ -2,16 +2,18 @@
 
 import { useEffect, useState } from "react";
 
-import { request } from "../lib/api-client";
+import { z } from "@cogniplane/shared-types";
+
+import { requestJson } from "../lib/api-client";
 
 export type OrganizationSummary = {
   id: string;
   name: string;
 };
 
-type OrganizationsResponse = {
-  organizations: OrganizationSummary[];
-};
+const OrganizationsResponseSchema = z.object({
+  organizations: z.array(z.object({ id: z.string(), name: z.string() }))
+});
 
 export function useOrganizations(enabled: boolean): OrganizationSummary[] {
   const [organizations, setOrganizations] = useState<OrganizationSummary[]>([]);
@@ -21,7 +23,7 @@ export function useOrganizations(enabled: boolean): OrganizationSummary[] {
     let cancelled = false;
     (async () => {
       try {
-        const data = await request<OrganizationsResponse>("/auth/organizations");
+        const data = await requestJson("/auth/organizations", OrganizationsResponseSchema);
         if (!cancelled) setOrganizations(data.organizations);
       } catch {
         if (!cancelled) setOrganizations([]);

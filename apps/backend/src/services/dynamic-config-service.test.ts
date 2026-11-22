@@ -70,18 +70,11 @@ function makeStores(overrides: DynamicConfigStoreOverrides = {}): DynamicConfigS
     mcpServers: {
       async listMcpServers() { return []; },
       async getVisibleMcpServer() { return null; },
-      async getAdminMcpServer() { return null; },
-      async createMcpServer() { throw new Error("createMcpServer should not be called"); },
-      async updateMcpServer() { throw new Error("updateMcpServer should not be called"); },
-      async disableMcpServer() { return null; },
-      async setMcpServerPublished() { return null; },
-      async withTransaction(_tenantId, run) { return run({} as Parameters<typeof run>[0]); },
       ...overrides.mcpServers
     },
     tenantSettings: {
       async get() { return null; },
       async upsert() { throw new Error("upsert should not be called"); },
-      async setMcpServerAllowed() { throw new Error("setMcpServerAllowed should not be called"); },
       ...overrides.tenantSettings
     },
     ...(overrides.storageGc ? { storageGc: overrides.storageGc as DynamicConfigStores["storageGc"] } : {})
@@ -635,31 +628,6 @@ test("DynamicConfigService cleans up inactive skill revisions after the retentio
   expect(deletedBundles).toEqual([`file://${path.join(root, "cache", "pdf-processing", "hash-old")}`]);
   expect(report.deletedRevisionIds).toEqual([1]);
   expect(report.keptRevisionDecisions.some((decision) => decision.skillRevisionId === 2)).toBeTruthy();
-});
-
-test("DynamicConfigService blocks disabling default MCP servers before tenant settings exist", async () => {
-  let disableCalls = 0;
-  const service = new DynamicConfigService(
-    createTestConfig(),
-    makeStores({
-      mcpServers: {
-        async disableMcpServer() {
-          disableCalls += 1;
-          return null;
-        }
-      },
-      tenantSettings: {
-        async get() {
-          return null;
-        }
-      }
-    }),
-    unusedSkillBundleStorage,
-    makeManagedToolCatalog()
-  );
-
-  await expect(() => service.disableMcpServer("tenant-1", "managed-session-context")).rejects.toThrow(/referenced by the tenant's active settings/);
-  expect(disableCalls).toBe(0);
 });
 
 test("DynamicConfigService rejects unknown tenant tool IDs before persisting settings", async () => {

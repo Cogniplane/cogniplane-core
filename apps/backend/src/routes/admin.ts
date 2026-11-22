@@ -79,6 +79,7 @@ export function buildAdminRouteStores(
     config: extras.config,
     dataRoutes: extras.dataRoutes,
     dynamicConfig: deps.dynamicConfig,
+    mcpAdmin: deps.mcpAdmin,
     skillMarketplace: deps.skillMarketplace,
     auditEvents: deps.auditEvents,
     skillBundleStorage: deps.skillBundleStorage,
@@ -214,7 +215,7 @@ export async function registerAdminRoutes(
   });
 
   await registerAdminMcpServerRoutes(app, {
-    dynamicConfig: stores.dynamicConfig,
+    mcpAdmin: stores.mcpAdmin,
     activations: stores.activations,
     mcpConnectionTests: stores.mcpConnectionTests,
     mcpAppCsp: stores.mcpAppCsp,

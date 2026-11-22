@@ -1,4 +1,5 @@
 import {
+  z,
   AdminManagedToolsListResponseSchema,
   AdminMcpServerEnvelopeSchema,
   AdminMcpConnectionTestResponseSchema,
@@ -44,15 +45,13 @@ import {
 } from "@cogniplane/shared-types";
 
 import { buildMetricsQuery } from "./admin-pii-utils";
-import { request, requestOptionalOn404 } from "./api-client";
-import { parseResponse } from "./validate-response";
+import { requestJson, requestEmpty, requestJsonOptionalOn404 } from "./api-client";
 
 import type {
   AdminMcpServer,
   AdminMcpConnectionTest,
   AdminMcpServerCreateRequest,
   AdminMcpServerSetupEdit,
-  AdminMcpServerUpdateRequest,
   AdminMcpWidgetDomainChangeRequest,
   AdminMcpWidgetDomains,
   AdminRuntimeConfig,
@@ -118,14 +117,11 @@ function toQueryString(params: Record<string, string | number | boolean | readon
 }
 
 export async function listAdminSkills(): Promise<AdminSkill[]> {
-  const raw = await request<unknown>("/admin/skills");
-  return parseResponse(AdminSkillsListResponseSchema, raw, "GET /admin/skills").skills;
+  return (await requestJson("/admin/skills", AdminSkillsListResponseSchema)).skills;
 }
 
 export async function getSkillMarketplace(): Promise<SkillMarketplaceCatalog> {
-  const raw = await request<unknown>("/admin/skills/marketplace");
-  return parseResponse(SkillMarketplaceResponseSchema, raw, "GET /admin/skills/marketplace")
-    .marketplace;
+  return (await requestJson("/admin/skills/marketplace", SkillMarketplaceResponseSchema)).marketplace;
 }
 
 export async function previewAdminSkillRelease(skillId: string, input: {
@@ -134,34 +130,29 @@ export async function previewAdminSkillRelease(skillId: string, input: {
   audience: "off" | "test-users" | "members";
 }): Promise<AdminSkillReleaseImpact> {
   const path = `/admin/skills/${encodeURIComponent(skillId)}/release-impact`;
-  return parseResponse(AdminSkillReleaseImpactResponseSchema,
-    await request<unknown>(path, { method: "POST", body: JSON.stringify(input) }), `POST ${path}`);
+  return await requestJson(path, AdminSkillReleaseImpactResponseSchema, { method: "POST", body: JSON.stringify(input) });
 }
 
 export async function disableAdminSkill(skillId: string, expectedSnapshot: AdminSkillReleaseSnapshot): Promise<AdminSkill> {
-  const raw = await request<unknown>(`/admin/skills/${skillId}/disable`, { method: "POST", body: JSON.stringify({ expectedSnapshot }) });
-  return parseResponse(AdminSkillEnvelopeSchema, raw, "POST /admin/skills/:id/disable").skill;
+  return (await requestJson(`/admin/skills/${skillId}/disable`, AdminSkillEnvelopeSchema, { method: "POST", body: JSON.stringify({ expectedSnapshot }) })).skill;
 }
 
 export async function publishAdminSkill(skillId: string, expectedSnapshot: AdminSkillReleaseSnapshot): Promise<AdminSkill> {
-  const raw = await request<unknown>(`/admin/skills/${skillId}/publish`, { method: "POST", body: JSON.stringify({ expectedSnapshot }) });
-  return parseResponse(AdminSkillEnvelopeSchema, raw, "POST /admin/skills/:id/publish").skill;
+  return (await requestJson(`/admin/skills/${skillId}/publish`, AdminSkillEnvelopeSchema, { method: "POST", body: JSON.stringify({ expectedSnapshot }) })).skill;
 }
 
 export async function unpublishAdminSkill(skillId: string, expectedSnapshot: AdminSkillReleaseSnapshot): Promise<AdminSkill> {
-  const raw = await request<unknown>(`/admin/skills/${skillId}/unpublish`, { method: "POST", body: JSON.stringify({ expectedSnapshot }) });
-  return parseResponse(AdminSkillEnvelopeSchema, raw, "POST /admin/skills/:id/unpublish").skill;
+  return (await requestJson(`/admin/skills/${skillId}/unpublish`, AdminSkillEnvelopeSchema, { method: "POST", body: JSON.stringify({ expectedSnapshot }) })).skill;
 }
 
 export async function importAdminSkillZip(file: File): Promise<SkillImportResponse> {
   const form = new FormData();
   form.set("file", file);
 
-  const raw = await request<unknown>("/admin/skills/import/zip", {
+  return await requestJson("/admin/skills/import/zip", SkillImportResponseSchema, {
     method: "POST",
     body: form
   });
-  return parseResponse(SkillImportResponseSchema, raw, "POST /admin/skills/import/zip");
 }
 
 export async function importAdminSkillGithub(input: {
@@ -169,11 +160,10 @@ export async function importAdminSkillGithub(input: {
   ref?: string;
   subdirectory?: string;
 }): Promise<SkillImportResponse> {
-  const raw = await request<unknown>("/admin/skills/import/github", {
+  return await requestJson("/admin/skills/import/github", SkillImportResponseSchema, {
     method: "POST",
     body: JSON.stringify(input)
   });
-  return parseResponse(SkillImportResponseSchema, raw, "POST /admin/skills/import/github");
 }
 
 export async function importAdminSkillInline(input: {
@@ -182,17 +172,14 @@ export async function importAdminSkillInline(input: {
   description: string;
   instructions: string;
 }): Promise<SkillImportResponse> {
-  const raw = await request<unknown>("/admin/skills/import/inline", {
+  return await requestJson("/admin/skills/import/inline", SkillImportResponseSchema, {
     method: "POST",
     body: JSON.stringify(input)
   });
-  return parseResponse(SkillImportResponseSchema, raw, "POST /admin/skills/import/inline");
 }
 
 export async function listSkillRevisions(skillId: string): Promise<SkillRevision[]> {
-  const raw = await request<unknown>(`/admin/skills/${skillId}/revisions`);
-  return parseResponse(SkillRevisionsListResponseSchema, raw, "GET /admin/skills/:id/revisions")
-    .revisions;
+  return (await requestJson(`/admin/skills/${skillId}/revisions`, SkillRevisionsListResponseSchema)).revisions;
 }
 
 export async function getSkillRevisionFile(input: {
@@ -201,14 +188,7 @@ export async function getSkillRevisionFile(input: {
   path: string;
 }): Promise<{ file: SkillRevisionFilePreview; limitBytes: number }> {
   const query = new URLSearchParams({ path: input.path });
-  const raw = await request<unknown>(
-    `/admin/skills/${input.skillId}/revisions/${input.skillRevisionId}/files?${query.toString()}`
-  );
-  return parseResponse(
-    SkillRevisionFileResponseSchema,
-    raw,
-    "GET /admin/skills/:id/revisions/:rid/files"
-  );
+  return await requestJson(`/admin/skills/${input.skillId}/revisions/${input.skillRevisionId}/files?${query.toString()}`, SkillRevisionFileResponseSchema);
 }
 
 export async function activateSkillRevision(input: {
@@ -218,23 +198,14 @@ export async function activateSkillRevision(input: {
   audience?: "test-users" | "members";
   expectedSnapshot: AdminSkillReleaseSnapshot;
 }): Promise<SkillImportResponse> {
-  const raw = await request<unknown>(
-    `/admin/skills/${input.skillId}/revisions/${input.skillRevisionId}/activate`,
-    {
+  return await requestJson(`/admin/skills/${input.skillId}/revisions/${input.skillRevisionId}/activate`, SkillImportResponseSchema, {
       method: "POST",
       body: JSON.stringify({ reviewNotes: input.reviewNotes ?? null, audience: input.audience, expectedSnapshot: input.expectedSnapshot })
-    }
-  );
-  return parseResponse(
-    SkillImportResponseSchema,
-    raw,
-    "POST /admin/skills/:id/revisions/:rid/activate"
-  );
+    });
 }
 
 export async function listAdminMcpServers(): Promise<AdminMcpServer[]> {
-  const raw = await request<unknown>("/admin/mcp-servers");
-  return parseResponse(AdminMcpServersListResponseSchema, raw, "GET /admin/mcp-servers").mcpServers;
+  return (await requestJson("/admin/mcp-servers", AdminMcpServersListResponseSchema)).mcpServers;
 }
 
 export async function testAdminMcpConnection(serverId: string, input: {
@@ -242,14 +213,12 @@ export async function testAdminMcpConnection(serverId: string, input: {
   expectedConfigHash: string;
 }): Promise<AdminMcpConnectionTest> {
   const path = `/admin/mcp-servers/${encodeURIComponent(serverId)}/connection-test`;
-  const raw = await request<unknown>(path, { method: "POST", body: JSON.stringify(input) });
-  return parseResponse(AdminMcpConnectionTestResponseSchema, raw, `POST ${path}`).connectionTest;
+  return (await requestJson(path, AdminMcpConnectionTestResponseSchema, { method: "POST", body: JSON.stringify(input) })).connectionTest;
 }
 
 export async function getAdminMcpWidgetDomains(serverId: string): Promise<AdminMcpWidgetDomains> {
   const path = `/admin/mcp-servers/${encodeURIComponent(serverId)}/widget-domains`;
-  const raw = await request<unknown>(path);
-  return parseResponse(AdminMcpWidgetDomainsResponseSchema, raw, `GET ${path}`).widgetDomains;
+  return (await requestJson(path, AdminMcpWidgetDomainsResponseSchema)).widgetDomains;
 }
 
 export async function changeAdminMcpWidgetDomain(
@@ -258,23 +227,11 @@ export async function changeAdminMcpWidgetDomain(
   input: AdminMcpWidgetDomainChangeRequest
 ): Promise<AdminMcpWidgetDomains> {
   const path = `/admin/mcp-servers/${encodeURIComponent(serverId)}/widget-domains/${action}`;
-  const raw = await request<unknown>(path, { method: "POST", body: JSON.stringify(input) });
-  return parseResponse(AdminMcpWidgetDomainsResponseSchema, raw, `POST ${path}`).widgetDomains;
+  return (await requestJson(path, AdminMcpWidgetDomainsResponseSchema, { method: "POST", body: JSON.stringify(input) })).widgetDomains;
 }
 
 export async function listAdminManagedTools() {
-  const raw = await request<unknown>("/admin/managed-tools");
-  return parseResponse(AdminManagedToolsListResponseSchema, raw, "GET /admin/managed-tools").tools;
-}
-
-export async function createAdminMcpServer(
-  input: AdminMcpServerCreateRequest
-): Promise<AdminMcpServer> {
-  const raw = await request<unknown>("/admin/mcp-servers", {
-    method: "POST",
-    body: JSON.stringify(input)
-  });
-  return parseResponse(AdminMcpServerEnvelopeSchema, raw, "POST /admin/mcp-servers").mcpServer;
+  return (await requestJson("/admin/managed-tools", AdminManagedToolsListResponseSchema)).tools;
 }
 
 export type McpAudience = "off" | "test_users" | "members";
@@ -294,94 +251,53 @@ export async function saveAdminMcpConnection(
   const path = editing
     ? `/admin/mcp-servers/${encodeURIComponent(editing.serverId)}/setup`
     : "/admin/mcp-servers/setup";
-  const raw = await request<unknown>(path, {
+  return (await requestJson(path, AdminMcpServerEnvelopeSchema, {
     method: editing ? "PUT" : "POST",
     body: JSON.stringify(editing ? { ...input, expectedVersion: editing.expectedVersion } : input)
-  });
-  return parseResponse(AdminMcpServerEnvelopeSchema, raw, `${editing ? "PUT" : "POST"} ${path}`)
-    .mcpServer;
+  })).mcpServer;
 }
 
 export async function setInheritedAdminMcpAudience(
   serverId: string,
   audience: McpAudience
 ): Promise<AdminMcpServer> {
-  const raw = await request<unknown>(
-    `/admin/mcp-servers/${encodeURIComponent(serverId)}/inherited-availability`,
-    { method: "PUT", body: JSON.stringify({ audience }) }
-  );
-  return parseResponse(AdminMcpServerEnvelopeSchema, raw, "PUT /admin/mcp-servers/:id/inherited-availability")
-    .mcpServer;
-}
-
-export async function updateAdminMcpServer(
-  serverId: string,
-  input: AdminMcpServerUpdateRequest
-): Promise<AdminMcpServer> {
-  const raw = await request<unknown>(`/admin/mcp-servers/${serverId}`, {
+  const path = `/admin/mcp-servers/${encodeURIComponent(serverId)}/inherited-availability`;
+  return (await requestJson(path, AdminMcpServerEnvelopeSchema, {
     method: "PUT",
-    body: JSON.stringify(input)
-  });
-  return parseResponse(AdminMcpServerEnvelopeSchema, raw, "PUT /admin/mcp-servers/:id").mcpServer;
-}
-
-export async function disableAdminMcpServer(serverId: string): Promise<AdminMcpServer> {
-  const raw = await request<unknown>(`/admin/mcp-servers/${serverId}/disable`, { method: "POST" });
-  return parseResponse(AdminMcpServerEnvelopeSchema, raw, "POST /admin/mcp-servers/:id/disable")
-    .mcpServer;
-}
-
-export async function publishAdminMcpServer(serverId: string): Promise<AdminMcpServer> {
-  const raw = await request<unknown>(`/admin/mcp-servers/${serverId}/publish`, { method: "POST" });
-  return parseResponse(AdminMcpServerEnvelopeSchema, raw, "POST /admin/mcp-servers/:id/publish")
-    .mcpServer;
-}
-
-export async function unpublishAdminMcpServer(serverId: string): Promise<AdminMcpServer> {
-  const raw = await request<unknown>(`/admin/mcp-servers/${serverId}/unpublish`, { method: "POST" });
-  return parseResponse(AdminMcpServerEnvelopeSchema, raw, "POST /admin/mcp-servers/:id/unpublish")
-    .mcpServer;
+    body: JSON.stringify({ audience })
+  })).mcpServer;
 }
 
 export async function listAdminSessions(
   params: AdminSessionsListParams = {}
 ): Promise<AdminSessionsListResponse> {
-  const raw = await request<unknown>(`/admin/sessions${toQueryString(params)}`);
-  return parseResponse(AdminSessionsListResponseSchema, raw, "GET /admin/sessions");
+  return await requestJson(`/admin/sessions${toQueryString(params)}`, AdminSessionsListResponseSchema);
 }
 
 export async function getAdminSessionDetail(
   sessionId: string
 ): Promise<AdminSessionDetailResponse> {
-  const raw = await request<unknown>(`/admin/sessions/${sessionId}`);
-  return parseResponse(AdminSessionDetailResponseSchema, raw, "GET /admin/sessions/:id");
+  return await requestJson(`/admin/sessions/${sessionId}`, AdminSessionDetailResponseSchema);
 }
 
 export async function createAdminArtifactDownload(artifactId: string) {
-  const raw = await request<unknown>(`/admin/artifacts/${artifactId}/download-token`, {
+  return (await requestJson(`/admin/artifacts/${artifactId}/download-token`, DownloadHandleEnvelopeSchema, {
     method: "POST"
-  });
-  return parseResponse(
-    DownloadHandleEnvelopeSchema,
-    raw,
-    "POST /admin/artifacts/:id/download-token"
-  ).download;
+  })).download;
 }
 
 export async function listAdminUsers(): Promise<AdminUser[]> {
-  const raw = await request<unknown>("/admin/users");
-  return parseResponse(AdminUsersListResponseSchema, raw, "GET /admin/users").users;
+  return (await requestJson("/admin/users", AdminUsersListResponseSchema)).users;
 }
 
 export async function setUserBetaTester(
   userId: string,
   isBetaTester: boolean
 ): Promise<AdminUser> {
-  const raw = await request<unknown>(`/admin/users/${userId}/set-beta-tester`, {
+  return (await requestJson(`/admin/users/${userId}/set-beta-tester`, AdminUserEnvelopeSchema, {
     method: "POST",
     body: JSON.stringify({ isBetaTester })
-  });
-  return parseResponse(AdminUserEnvelopeSchema, raw, "POST /admin/users/:id/set-beta-tester").user;
+  })).user;
 }
 
 /**
@@ -394,7 +310,7 @@ export async function getAdminPersonAccess(
   expected: { tenantId: string }
 ): Promise<AdminPersonAccessResponse> {
   const path = `/admin/users/${encodeURIComponent(userId)}/skills-connections`;
-  const result = parseResponse(AdminPersonAccessResponseSchema, await request<unknown>(path), "GET /admin/users/:id/skills-connections");
+  const result = await requestJson(path, AdminPersonAccessResponseSchema);
   if (result.userId !== userId || result.tenantId !== expected.tenantId) {
     throw new Error("The server returned a result for a different person or organization.");
   }
@@ -406,7 +322,7 @@ export async function getAdminPersonAccess(
 // permitted actions and map the error codes for the rest.
 /** `stepUpToken`: required to change the role of a local account. */
 export async function changeMemberRole(userId: string, role: AdminUser["role"], stepUpToken?: string): Promise<void> {
-  await request<unknown>(`/tenant/members/${encodeURIComponent(userId)}/role`, {
+  await requestEmpty(`/tenant/members/${encodeURIComponent(userId)}/role`, {
     method: "PUT",
     body: JSON.stringify({ role }),
     ...(stepUpToken ? { headers: { "X-Step-Up": stepUpToken } } : {})
@@ -415,42 +331,37 @@ export async function changeMemberRole(userId: string, role: AdminUser["role"], 
 
 /** `stepUpToken`: required to remove a member of a tenant with local login. */
 export async function removeMember(userId: string, stepUpToken?: string): Promise<void> {
-  await request<unknown>(`/tenant/members/${encodeURIComponent(userId)}`, {
+  await requestEmpty(`/tenant/members/${encodeURIComponent(userId)}`, {
     method: "DELETE",
     ...(stepUpToken ? { headers: { "X-Step-Up": stepUpToken } } : {})
   });
 }
 
 export async function getTenantSettings(): Promise<TenantSettings> {
-  const raw = await request<unknown>("/admin/tenant-settings");
-  return parseResponse(TenantSettingsEnvelopeSchema, raw, "GET /admin/tenant-settings").settings;
+  return (await requestJson("/admin/tenant-settings", TenantSettingsEnvelopeSchema)).settings;
 }
 
 /** Full model catalog + per-provider key sources (admin-only, unfiltered). */
 export async function getAdminModelCatalog(): Promise<AdminModelCatalogResponse> {
-  const raw = await request<unknown>("/admin/models");
-  return parseResponse(AdminModelCatalogResponseSchema, raw, "GET /admin/models");
+  return await requestJson("/admin/models", AdminModelCatalogResponseSchema);
 }
 
 /** Slim OpenRouter catalog for the custom-model picker (server-proxied). */
 export async function getOpenRouterModels(): Promise<OpenRouterModelOption[]> {
-  const raw = await request<unknown>("/admin/openrouter-models");
-  return parseResponse(OpenRouterModelsResponseSchema, raw, "GET /admin/openrouter-models").models;
+  return (await requestJson("/admin/openrouter-models", OpenRouterModelsResponseSchema)).models;
 }
 
 export async function createCustomModel(input: CustomModelCreateRequest): Promise<Model> {
-  const raw = await request<unknown>("/admin/custom-models", {
+  return (await requestJson("/admin/custom-models", CustomModelEnvelopeSchema, {
     method: "POST",
     body: JSON.stringify(input)
-  });
-  return parseResponse(CustomModelEnvelopeSchema, raw, "POST /admin/custom-models").model;
+  })).model;
 }
 
 export async function deleteCustomModel(modelId: string): Promise<TenantSettings> {
-  const raw = await request<unknown>(`/admin/custom-models?modelId=${encodeURIComponent(modelId)}`, {
+  return (await requestJson(`/admin/custom-models?modelId=${encodeURIComponent(modelId)}`, TenantSettingsEnvelopeSchema, {
     method: "DELETE"
-  });
-  return parseResponse(TenantSettingsEnvelopeSchema, raw, "DELETE /admin/custom-models").settings;
+  })).settings;
 }
 
 // Both settings pages send a subset of the shared request schema
@@ -481,105 +392,84 @@ export type TenantAgentSettingsUpdate =
  * concurrent edits to the broader Agent Settings form.
  */
 export async function updateTenantModelAvailability(input: TenantModelAvailabilityUpdate): Promise<TenantSettings> {
-  const raw = await request<unknown>("/admin/tenant-settings", {
+  return (await requestJson("/admin/tenant-settings", TenantSettingsEnvelopeSchema, {
     method: "PUT",
     body: JSON.stringify(input)
-  });
-  return parseResponse(TenantSettingsEnvelopeSchema, raw, "PUT /admin/tenant-settings").settings;
+  })).settings;
 }
 
 export async function updateTenantAgentSettings(input: TenantAgentSettingsUpdate): Promise<TenantSettings> {
-  const raw = await request<unknown>("/admin/tenant-settings", {
+  return (await requestJson("/admin/tenant-settings", TenantSettingsEnvelopeSchema, {
     method: "PUT",
     body: JSON.stringify(input)
-  });
-  return parseResponse(TenantSettingsEnvelopeSchema, raw, "PUT /admin/tenant-settings").settings;
+  })).settings;
 }
 
 export async function listRuntimeSessions(): Promise<RuntimeSessionSummary[]> {
-  const raw = await request<unknown>("/admin/runtime-sessions");
-  return parseResponse(RuntimeSessionsListResponseSchema, raw, "GET /admin/runtime-sessions")
-    .runtimeSessions;
+  return (await requestJson("/admin/runtime-sessions", RuntimeSessionsListResponseSchema)).runtimeSessions;
 }
 
 export async function rolloutRuntimeSessions(action: "drain_idle" | "refresh_idle") {
-  const raw = await request<unknown>("/admin/runtime-sessions/rollout", {
+  return await requestJson("/admin/runtime-sessions/rollout", RuntimeRolloutResponseSchema, {
     method: "POST",
     body: JSON.stringify({ action })
   });
-  return parseResponse(RuntimeRolloutResponseSchema, raw, "POST /admin/runtime-sessions/rollout");
 }
 
 export async function getRuntimeConfig(): Promise<AdminRuntimeConfig> {
-  const raw = await request<unknown>("/admin/runtime-config");
-  return parseResponse(AdminRuntimeConfigSchema, raw, "GET /admin/runtime-config");
+  return await requestJson("/admin/runtime-config", AdminRuntimeConfigSchema);
 }
 
 export type BackendBuild = { sha: string; buildDate: string };
 
+// `version` is optional: a backend older than this frontend can answer without it.
+const BackendBuildResponseSchema = z.object({
+  version: z.object({ sha: z.string(), buildDate: z.string() }).optional()
+});
+
 /** The backend build, from the admin-only diagnostics. The public health
  *  check does not report it. */
 export async function getBackendBuild(): Promise<BackendBuild> {
-  const raw = await request<unknown>("/admin/diagnostics");
-  const version = (raw as { version?: Partial<BackendBuild> } | null)?.version;
-  if (typeof version?.sha !== "string" || typeof version.buildDate !== "string") {
-    throw new Error("GET /admin/diagnostics returned no build.");
-  }
+  const { version } = await requestJson("/admin/diagnostics", BackendBuildResponseSchema);
+  if (!version) throw new Error("GET /admin/diagnostics returned no build.");
   return { sha: version.sha, buildDate: version.buildDate };
 }
 
 export async function getTenantDetails(): Promise<TenantDetails> {
-  const raw = await request<unknown>("/tenant");
-  return parseResponse(TenantDetailsSchema, raw, "GET /tenant");
+  return await requestJson("/tenant", TenantDetailsSchema);
 }
 
 export async function updateTenantProviderKey(input: TenantProviderKeyUpdateRequest) {
-  const raw = await request<unknown>("/tenant/settings", {
+  return await requestJson("/tenant/settings", TenantProviderKeyUpdateResponseSchema, {
     method: "PUT",
     body: JSON.stringify(input)
   });
-  return parseResponse(
-    TenantProviderKeyUpdateResponseSchema,
-    raw,
-    `PUT /tenant/settings (${input.provider})`
-  );
 }
 
 export async function updateTenantMarketplaceManifestUrl(
   skillMarketplaceManifestUrl: string | null
 ) {
-  const raw = await request<unknown>("/tenant/settings/marketplace", {
+  return await requestJson("/tenant/settings/marketplace", TenantMarketplaceManifestUrlUpdateResponseSchema, {
     method: "PUT",
     body: JSON.stringify({ skillMarketplaceManifestUrl })
   });
-  return parseResponse(
-    TenantMarketplaceManifestUrlUpdateResponseSchema,
-    raw,
-    "PUT /tenant/settings/marketplace"
-  );
 }
 
 // Send the revision that the form loaded. The server then refuses the save with
 // 409 `pii_settings_conflict` when another session saved first. A server older
 // than the revision sends none, so the save then has no revision.
 export async function updateTenantPiiProtection(input: PiiProtectionSettings, expectedRevision?: number) {
-  const raw = await request<unknown>("/tenant/settings/pii", {
+  return await requestJson("/tenant/settings/pii", TenantPiiProtectionUpdateResponseSchema, {
     method: "PUT",
     body: JSON.stringify(expectedRevision === undefined ? input : { ...input, expectedRevision })
   });
-  return parseResponse(
-    TenantPiiProtectionUpdateResponseSchema,
-    raw,
-    "PUT /tenant/settings/pii"
-  );
 }
 
 export async function getPiiProviderStatus(): Promise<PiiProviderStatus | null> {
   // 404 means the breaker isn't wired (PII_BREAKER_ENABLED=false). Treat
   // that as "no status to show" rather than an error so the UI can hide
   // the indicator instead of bleeding red.
-  const raw = await requestOptionalOn404<unknown>("/admin/pii/provider-status");
-  return raw === undefined ? null : parseResponse(PiiProviderStatusSchema, raw, "GET /admin/pii/provider-status");
+  return (await requestJsonOptionalOn404("/admin/pii/provider-status", PiiProviderStatusSchema)) ?? null;
 }
 
 export async function getAdminPiiMetrics(input: {
@@ -588,8 +478,7 @@ export async function getAdminPiiMetrics(input: {
   to?: string;
 }): Promise<PiiActivityMetrics | null> {
   const params = buildMetricsQuery(input.range, input.from, input.to);
-  const raw = await requestOptionalOn404<unknown>(`/admin/pii/metrics?${params.toString()}`);
-  return raw === undefined ? null : parseResponse(PiiActivityMetricsSchema, raw, "GET /admin/pii/metrics");
+  return (await requestJsonOptionalOn404(`/admin/pii/metrics?${params.toString()}`, PiiActivityMetricsSchema)) ?? null;
 }
 
 export async function getAdminPiiTop(input: {
@@ -602,8 +491,7 @@ export async function getAdminPiiTop(input: {
   const params = buildMetricsQuery(input.range, input.from, input.to);
   params.set("groupBy", input.groupBy);
   if (input.limit !== undefined) params.set("limit", String(input.limit));
-  const raw = await requestOptionalOn404<unknown>(`/admin/pii/top?${params.toString()}`);
-  return raw === undefined ? null : parseResponse(PiiTopResponseSchema, raw, "GET /admin/pii/top");
+  return (await requestJsonOptionalOn404(`/admin/pii/top?${params.toString()}`, PiiTopResponseSchema)) ?? null;
 }
 
 export async function getAdminPiiJobsStats(input: {
@@ -612,8 +500,7 @@ export async function getAdminPiiJobsStats(input: {
   to?: string;
 }): Promise<PiiJobsStatsResponse | null> {
   const params = buildMetricsQuery(input.range, input.from, input.to);
-  const raw = await requestOptionalOn404<unknown>(`/admin/pii/jobs/stats?${params.toString()}`);
-  return raw === undefined ? null : parseResponse(PiiJobsStatsResponseSchema, raw, "GET /admin/pii/jobs/stats");
+  return (await requestJsonOptionalOn404(`/admin/pii/jobs/stats?${params.toString()}`, PiiJobsStatsResponseSchema)) ?? null;
 }
 
 export async function getAdminPiiRecent(input: {
@@ -628,47 +515,42 @@ export async function getAdminPiiRecent(input: {
     params.set("actions", input.actions.join(","));
   }
   if (input.limit !== undefined) params.set("limit", String(input.limit));
-  const raw = await requestOptionalOn404<unknown>(`/admin/pii/recent?${params.toString()}`);
-  return raw === undefined ? null : parseResponse(PiiRecentResponseSchema, raw, "GET /admin/pii/recent");
+  return (await requestJsonOptionalOn404(`/admin/pii/recent?${params.toString()}`, PiiRecentResponseSchema)) ?? null;
 }
 
 
 // ── Policy Center ────────────────────────────────────────────────────────────
 
 export async function listPolicyRules(): Promise<PolicyRule[]> {
-  const raw = await request<unknown>("/admin/policy/rules");
-  return parseResponse(PolicyRulesListResponseSchema, raw, "GET /admin/policy/rules").rules;
+  return (await requestJson("/admin/policy/rules", PolicyRulesListResponseSchema)).rules;
 }
 
 export async function createPolicyRule(input: PolicyRuleInput): Promise<PolicyRule> {
-  const raw = await request<unknown>("/admin/policy/rules", {
+  return (await requestJson("/admin/policy/rules", PolicyRuleEnvelopeSchema, {
     method: "POST",
     body: JSON.stringify(input)
-  });
-  return parseResponse(PolicyRuleEnvelopeSchema, raw, "POST /admin/policy/rules").rule;
+  })).rule;
 }
 
 export async function updatePolicyRule(
   ruleId: string,
   input: PolicyRulePatch
 ): Promise<PolicyRule> {
-  const raw = await request<unknown>(`/admin/policy/rules/${ruleId}`, {
+  return (await requestJson(`/admin/policy/rules/${ruleId}`, PolicyRuleEnvelopeSchema, {
     method: "PATCH",
     body: JSON.stringify(input)
-  });
-  return parseResponse(PolicyRuleEnvelopeSchema, raw, "PATCH /admin/policy/rules/:id").rule;
+  })).rule;
 }
 
 export async function deletePolicyRule(ruleId: string): Promise<void> {
-  await request<void>(`/admin/policy/rules/${ruleId}`, { method: "DELETE" });
+  await requestEmpty(`/admin/policy/rules/${ruleId}`, { method: "DELETE" });
 }
 
 export async function simulatePolicy(input: PolicySimulateRequest): Promise<PolicySimulateResponse> {
-  const raw = await request<unknown>("/admin/policy/simulate", {
+  return await requestJson("/admin/policy/simulate", PolicySimulateResponseSchema, {
     method: "POST",
     body: JSON.stringify(input)
   });
-  return parseResponse(PolicySimulateResponseSchema, raw, "POST /admin/policy/simulate");
 }
 
 // The list params accept arrays for the multi-value dimensions; they're serialized
@@ -692,30 +574,25 @@ export type PolicyDecisionsListParams = Pick<
 export async function listPolicyDecisions(
   params: PolicyDecisionsListParams = {}
 ): Promise<PolicyDecisionsListResponse> {
-  const raw = await request<unknown>(`/admin/policy/decisions${toQueryString(params)}`);
-  return parseResponse(PolicyDecisionsListResponseSchema, raw, "GET /admin/policy/decisions");
+  return await requestJson(`/admin/policy/decisions${toQueryString(params)}`, PolicyDecisionsListResponseSchema);
 }
 
 export async function getPolicyMonitorSummary(): Promise<PolicyMonitorSummaryResponse> {
-  const raw = await request<unknown>("/admin/policy/monitor-summary");
-  return parseResponse(PolicyMonitorSummaryResponseSchema, raw, "GET /admin/policy/monitor-summary");
+  return await requestJson("/admin/policy/monitor-summary", PolicyMonitorSummaryResponseSchema);
 }
 
 export async function getPolicyDecision(decisionId: string): Promise<PolicyDecisionDetail> {
-  const raw = await request<unknown>(`/admin/policy/decisions/${encodeURIComponent(decisionId)}`);
-  return parseResponse(PolicyDecisionDetailResponseSchema, raw, "GET /admin/policy/decisions/:id").decision;
+  return (await requestJson(`/admin/policy/decisions/${encodeURIComponent(decisionId)}`, PolicyDecisionDetailResponseSchema)).decision;
 }
 
 
 export async function listPolicyLintWarnings(): Promise<PolicyLintWarning[]> {
-  const raw = await request<unknown>("/admin/policy/lint");
-  return parseResponse(PolicyLintResponseSchema, raw, "GET /admin/policy/lint").warnings;
+  return (await requestJson("/admin/policy/lint", PolicyLintResponseSchema)).warnings;
 }
 
 export async function reorderPolicyRules(ruleIds: string[]): Promise<PolicyRule[]> {
-  const raw = await request<unknown>("/admin/policy/rules/order", {
+  return (await requestJson("/admin/policy/rules/order", PolicyRulesListResponseSchema, {
     method: "PUT",
     body: JSON.stringify({ ruleIds })
-  });
-  return parseResponse(PolicyRulesListResponseSchema, raw, "PUT /admin/policy/rules/order").rules;
+  })).rules;
 }

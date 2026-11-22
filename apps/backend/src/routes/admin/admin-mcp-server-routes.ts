@@ -27,7 +27,7 @@ import type { AuditEventInput } from "../../services/audit-event-store.js";
 import type { AuditEventType } from "../../services/audit-event-types.js";
 import type { DataRouteControl } from "../../services/data-route-control.js";
 import type { DataSettingChange } from "../../services/mail/setting-change-notices.js";
-import type { DynamicConfigService } from "../../services/dynamic-config-service.js";
+import type { McpAdminService } from "../../services/mcp/mcp-admin-service.js";
 import type { McpAppCspStore } from "../../services/mcp/mcp-app-csp-store.js";
 import { MCP_SERVER_CONFLICT_MESSAGE, McpServerVersionConflictError } from "../../services/mcp-server-store.js";
 import {
@@ -47,16 +47,16 @@ function respondMcpServerConflict(reply: FastifyReply) {
 export async function registerAdminMcpServerRoutes(
   app: FastifyInstance,
   stores: {
-    dynamicConfig: Pick<
-      DynamicConfigService,
+    mcpAdmin: Pick<
+      McpAdminService,
       | "listMcpServers"
+      | "listAllowedMcpServerIds"
       | "createMcpServer"
       | "updateMcpServer"
       | "disableMcpServer"
       | "setMcpServerPublished"
       | "saveMcpServerWithAudience"
       | "setInheritedMcpAudience"
-      | "getOrCreateTenantSettings"
     >;
     // Optional: when present, the server list is decorated with activation
     // counts (last 30 days) per server. Failures are swallowed — counts are
@@ -139,11 +139,11 @@ export async function registerAdminMcpServerRoutes(
   }
 
   app.get("/admin/mcp-servers", withAdmin(app, async (request) => {
-    const [servers, settings] = await Promise.all([
-      stores.dynamicConfig.listMcpServers(request.auth.tenantId, true),
-      stores.dynamicConfig.getOrCreateTenantSettings(request.auth.tenantId)
+    const [servers, allowedIds] = await Promise.all([
+      stores.mcpAdmin.listMcpServers(request.auth.tenantId),
+      stores.mcpAdmin.listAllowedMcpServerIds(request.auth.tenantId)
     ]);
-    const allowed = new Set(settings.enabledMcpServerIds);
+    const allowed = new Set(allowedIds);
     const latest = stores.mcpConnectionTests
       ? await stores.mcpConnectionTests.listLatest(
         request.auth.tenantId,
@@ -216,7 +216,7 @@ export async function registerAdminMcpServerRoutes(
   // Widget domains belong to a proxy server. Only a proxy server serves a widget
   // that declares its own domains.
   async function findProxyServer(request: FastifyRequest, serverId: string) {
-    const servers = await stores.dynamicConfig.listMcpServers(request.auth.tenantId, true);
+    const servers = await stores.mcpAdmin.listMcpServers(request.auth.tenantId);
     return servers.find((server) => server.serverId === serverId && server.mode === "proxy") ?? null;
   }
 
@@ -225,7 +225,7 @@ export async function registerAdminMcpServerRoutes(
   // `own`: the tenant's own server, which an edit changes. `inherited`: a
   // shared system server, whose availability the tenant chooses.
   async function findServer(request: FastifyRequest, serverId: string, owner: "own" | "inherited") {
-    const servers = await stores.dynamicConfig.listMcpServers(request.auth.tenantId, true);
+    const servers = await stores.mcpAdmin.listMcpServers(request.auth.tenantId);
     return servers.find((server) => server.serverId === serverId &&
       (owner === "own" ? server.ownerTenantId === request.auth.tenantId : server.ownerTenantId === "system")) ?? null;
   }
@@ -348,7 +348,7 @@ export async function registerAdminMcpServerRoutes(
     try {
       // The audit event and the owner notice commit in the same transaction
       // as the change.
-      const mcpServer = await stores.dynamicConfig.saveMcpServerWithAudience(
+      const mcpServer = await stores.mcpAdmin.saveMcpServerWithAudience(
         request.auth.tenantId,
         {
           ...body,
@@ -408,7 +408,7 @@ export async function registerAdminMcpServerRoutes(
     try {
       // The audit event and the owner notice commit in the same transaction
       // as the change.
-      const mcpServer = await stores.dynamicConfig.setInheritedMcpAudience(
+      const mcpServer = await stores.mcpAdmin.setInheritedMcpAudience(
         request.auth.tenantId,
         paramsResult.value.serverId,
         bodyResult.value.audience,
@@ -460,7 +460,7 @@ export async function registerAdminMcpServerRoutes(
     const body = bodyResult.value;
     if (!(await stores.dataRoutes.requireStepUp(request, reply, "POST /admin/mcp-servers"))) return reply;
     try {
-      const mcpServer = await stores.dynamicConfig.createMcpServer(request.auth.tenantId, {
+      const mcpServer = await stores.mcpAdmin.createMcpServer(request.auth.tenantId, {
         ...body,
         serverId: body.serverId,
         description: body.description ?? null,
@@ -497,7 +497,7 @@ export async function registerAdminMcpServerRoutes(
     if (!(await stores.dataRoutes.requireStepUp(request, reply, "PUT /admin/mcp-servers/:serverId"))) return reply;
 
     try {
-      const mcpServer = await stores.dynamicConfig.updateMcpServer(request.auth.tenantId, {
+      const mcpServer = await stores.mcpAdmin.updateMcpServer(request.auth.tenantId, {
         serverId: paramsResult.value.serverId,
         serverName: body.serverName,
         description: body.description ?? null,
@@ -526,7 +526,7 @@ export async function registerAdminMcpServerRoutes(
     }
 
     try {
-      const mcpServer = await stores.dynamicConfig.disableMcpServer(
+      const mcpServer = await stores.mcpAdmin.disableMcpServer(
         request.auth.tenantId,
         paramsResult.value.serverId,
         auditBuilder(request, "admin.mcp_server.disabled", false)
@@ -564,7 +564,7 @@ export async function registerAdminMcpServerRoutes(
       }
 
       try {
-        const mcpServer = await stores.dynamicConfig.setMcpServerPublished(
+        const mcpServer = await stores.mcpAdmin.setMcpServerPublished(
           request.auth.tenantId,
           paramsResult.value.serverId,
           isPublished,

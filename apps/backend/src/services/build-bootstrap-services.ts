@@ -9,6 +9,7 @@ import { getRedis } from "../lib/redis.js";
 import { ArtifactProcessor } from "./artifacts/artifact-processor.js";
 import { createArtifactStorage } from "./artifacts/artifact-storage.js";
 import { DynamicConfigService } from "./dynamic-config-service.js";
+import { McpAdminService } from "./mcp/mcp-admin-service.js";
 import type { ManagedToolCatalog } from "./managed-tools/catalog.js";
 import { RedisRequestLimits } from "./redis-request-limits.js";
 import { RequestLimits, type RequestLimitsInterface } from "./request-limits.js";
@@ -55,6 +56,10 @@ export function buildBootstrapServices(input: {
     skillBundleStorage,
     managedToolCatalog
   );
+  const mcpAdmin = new McpAdminService(config, {
+    mcpServers: stores.mcpServers,
+    tenantSettings: stores.tenantSettings
+  });
   const redis = getRedis(config, logger);
   const limits: RequestLimitsInterface = redis
     ? RedisRequestLimits.fromAppConfig(redis, config, logger)
@@ -100,6 +105,7 @@ export function buildBootstrapServices(input: {
     storageGc,
     skillMarketplace,
     dynamicConfig,
+    mcpAdmin,
     redis,
     limits,
     artifactProcessor,

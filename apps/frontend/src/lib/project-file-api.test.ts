@@ -1,5 +1,5 @@
 import { beforeEach, expect, it, vi } from "vitest";
-import { request } from "./api-client";
+import { wireRequest as request } from "../test-helpers/api-client-mock";
 import {
   getProjectFilePickerSelection,
   getProjectFolder,
@@ -7,8 +7,7 @@ import {
   listProjectFolders,
   listProjectLibraryFiles,
 } from "./project-file-api";
-vi.mock("./api-client", () => ({
-  request: vi.fn(),
+vi.mock("./api-client", async () => (await import("../test-helpers/api-client-mock")).apiClientMock({
   fetchWithAuthRetry: vi.fn(),
   buildErrorMessage: vi.fn(),
 }));

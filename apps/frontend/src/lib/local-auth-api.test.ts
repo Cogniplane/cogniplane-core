@@ -1,11 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { ApiError, request } from "./api-client";
+import { ApiError } from "./api-client";
+import { wireRequest as request } from "../test-helpers/api-client-mock";
 import { createLocalMember, enableMember, isStepUpRefusal, LocalAuthError } from "./local-auth-api";
 
 vi.mock("./api-client", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./api-client")>();
-  return { ...actual, request: vi.fn() };
+  return { ...actual, ...(await import("../test-helpers/api-client-mock")).apiClientMock() };
 });
 beforeEach(() => {
   vi.mocked(request).mockReset();

@@ -9,6 +9,7 @@ import { handleAppError } from "../../app.js";
 import type { Pool } from "../../lib/db.js";
 import { AdminConfigError } from "../../services/admin-config-error.js";
 import type { DynamicConfigService } from "../../services/dynamic-config-service.js";
+import type { McpAdminService } from "../../services/mcp/mcp-admin-service.js";
 import { TenantSettingsConflictError } from "../../services/tenant-settings-store.js";
 import type { RuntimeManifest } from "../../domain/runtime-manifest.js";
 import type {
@@ -181,6 +182,8 @@ async function registerTestAdminRoutes(
         throw new Error("Unexpected integration config clear");
       }
     },
+    // The fake of the tests serves the settings and the MCP administration.
+    mcpAdmin: stores.dynamicConfig as unknown as AdminRouteStores["mcpAdmin"],
     ...stores,
     piiCircuitBreaker: undefined,
     piiProtection: undefined,
@@ -189,7 +192,7 @@ async function registerTestAdminRoutes(
   });
 }
 
-type AdminDynamicConfig = AdminRouteStores["dynamicConfig"];
+type AdminDynamicConfig = AdminRouteStores["dynamicConfig"] & AdminRouteStores["mcpAdmin"];
 
 class InMemoryAdminConfig implements AdminDynamicConfig {
   // Receives the audit events that the real service writes inside the change
@@ -607,7 +610,7 @@ class InMemoryAdminConfig implements AdminDynamicConfig {
   async createMcpServer(
     _tenantId: string,
     _input?: unknown,
-    audit?: Parameters<DynamicConfigService["createMcpServer"]>[2]
+    audit?: Parameters<McpAdminService["createMcpServer"]>[2]
   ) {
     const saved = {
       serverId: "unused",
@@ -652,10 +655,10 @@ class InMemoryAdminConfig implements AdminDynamicConfig {
 
   async saveMcpServerWithAudience(
     _tenantId: string,
-    input: Parameters<DynamicConfigService["saveMcpServerWithAudience"]>[1],
-    audience: Parameters<DynamicConfigService["saveMcpServerWithAudience"]>[2],
-    _editing?: Parameters<DynamicConfigService["saveMcpServerWithAudience"]>[3],
-    audit?: Parameters<DynamicConfigService["saveMcpServerWithAudience"]>[4]
+    input: Parameters<McpAdminService["saveMcpServerWithAudience"]>[1],
+    audience: Parameters<McpAdminService["saveMcpServerWithAudience"]>[2],
+    _editing?: Parameters<McpAdminService["saveMcpServerWithAudience"]>[3],
+    audit?: Parameters<McpAdminService["saveMcpServerWithAudience"]>[4]
   ) {
     const saved = {
       serverId: input.serverId,
@@ -686,8 +689,8 @@ class InMemoryAdminConfig implements AdminDynamicConfig {
   async setInheritedMcpAudience(
     _tenantId: string,
     _serverId: string,
-    _audience: Parameters<DynamicConfigService["setInheritedMcpAudience"]>[2],
-    audit?: Parameters<DynamicConfigService["setInheritedMcpAudience"]>[3]
+    _audience: Parameters<McpAdminService["setInheritedMcpAudience"]>[2],
+    audit?: Parameters<McpAdminService["setInheritedMcpAudience"]>[3]
   ) {
     const server = {
       serverId: _serverId,
@@ -713,6 +716,10 @@ class InMemoryAdminConfig implements AdminDynamicConfig {
     };
     if (audit) await this.transactionAudits?.create(audit(server));
     return server;
+  }
+
+  async listAllowedMcpServerIds(tenantId: string) {
+    return (await this.getOrCreateTenantSettings(tenantId)).enabledMcpServerIds;
   }
 
   async getOrCreateTenantSettings(_tenantId: string) {

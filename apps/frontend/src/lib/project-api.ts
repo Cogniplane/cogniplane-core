@@ -12,19 +12,16 @@ import {
 import { ProjectCapabilitiesSchema, type ProjectCapabilitiesUpdate } from "@cogniplane/shared-types";
 import { ArtifactsListResponseSchema } from "@cogniplane/shared-types";
 import type { ProjectAgentFileMode, ProjectApprovalMode, ProjectSharingUpdate } from "@cogniplane/shared-types";
-import { request } from "./api-client";
-import { parseResponse } from "./validate-response";
+import { requestJson, requestEmpty } from "./api-client";
 import type { SessionList } from "./session-api";
 const projectPath = (id: string) => `/projects/${encodeURIComponent(id)}`;
 export async function getProjectCapabilities(id: string) {
-  return parseResponse(ProjectCapabilitiesSchema,
-    await request<unknown>(`${projectPath(id)}/capabilities`), "GET /projects/:id/capabilities");
+  return await requestJson(`${projectPath(id)}/capabilities`, ProjectCapabilitiesSchema);
 }
 export async function updateProjectCapabilities(id: string, input: ProjectCapabilitiesUpdate) {
-  return parseResponse(ProjectCapabilitiesSchema,
-    await request<unknown>(`${projectPath(id)}/capabilities`, {
+  return await requestJson(`${projectPath(id)}/capabilities`, ProjectCapabilitiesSchema, {
       method: "PUT", body: JSON.stringify(input)
-    }), "PUT /projects/:id/capabilities");
+    });
 }
 export async function listProjectSessions(id: string, options: {
   status: "active" | "archived" | "deleted";
@@ -33,9 +30,7 @@ export async function listProjectSessions(id: string, options: {
 }): Promise<SessionList> {
   const query = new URLSearchParams({ status: options.status });
   if (options.cursor) query.set("cursor", options.cursor);
-  const response = parseResponse(SessionsListResponseSchema,
-    await request<unknown>(`${projectPath(id)}/sessions?${query}`, { signal: options.signal }),
-    "GET /projects/:id/sessions");
+  const response = await requestJson(`${projectPath(id)}/sessions?${query}`, SessionsListResponseSchema, { signal: options.signal });
   return { ...response, trashRetentionDays: response.trashRetentionDays ?? SESSION_TRASH_RETENTION_DAYS };
 }
 export async function listProjects(options: { archived?: boolean; q?: string } = {}) {
@@ -43,95 +38,66 @@ export async function listProjects(options: { archived?: boolean; q?: string } =
     archived: String(options.archived ?? false)
   });
   if (options.q?.trim()) query.set("q", options.q.trim());
-  return parseResponse(
-    ProjectsResponseSchema,
-    await request<unknown>(`/projects?${query}`),
-    "GET /projects"
-  ).projects;
+  return (await requestJson(`/projects?${query}`, ProjectsResponseSchema)).projects;
 }
 export async function createProject(name: string) {
-  return parseResponse(
-    ProjectSchema,
-    await request<unknown>("/projects", { method: "POST", body: JSON.stringify({ name }) }),
-    "POST /projects"
-  );
+  return await requestJson("/projects", ProjectSchema, { method: "POST", body: JSON.stringify({ name }) });
 }
 export async function getProject(id: string) {
-  return parseResponse(
-    ProjectDetailSchema,
-    await request<unknown>(projectPath(id)),
-    "GET /projects/:id"
-  );
+  return await requestJson(projectPath(id), ProjectDetailSchema);
 }
 export async function listProjectArtifacts(id: string, signal?: AbortSignal) {
-  return parseResponse(
-    ArtifactsListResponseSchema,
-    await request<unknown>(projectPath(id) + "/artifacts", { signal }),
-    "GET /projects/:id/artifacts"
-  ).artifacts;
+  return (await requestJson(projectPath(id) + "/artifacts", ArtifactsListResponseSchema, { signal })).artifacts;
 }
 export async function renameProject(id: string, name: string) {
-  return parseResponse(
-    ProjectSchema,
-    await request<unknown>(projectPath(id), { method: "PUT", body: JSON.stringify({ name }) }),
-    "PUT /projects/:id"
-  );
+  return await requestJson(projectPath(id), ProjectSchema, { method: "PUT", body: JSON.stringify({ name }) });
 }
 export async function setProjectSession(id: string, sessionId: string) {
-  await request(projectPath(id) + "/sessions", {
+  await requestEmpty(projectPath(id) + "/sessions", {
     method: "PUT",
     body: JSON.stringify({ sessionId, confirmAudience: true })
   });
 }
 export async function createProjectSession(id: string, name = "New session") {
-  return parseResponse(
-    SessionEnvelopeSchema,
-    await request<unknown>(projectPath(id) + "/sessions", {
+  return (await requestJson(projectPath(id) + "/sessions", SessionEnvelopeSchema, {
       method: "POST",
       body: JSON.stringify({ name })
-    }),
-    "POST /projects/:id/sessions"
-  ).session;
+    })).session;
 }
 
 export async function archiveProject(id: string, archived: boolean) {
-  await request(projectPath(id) + "/archive", {
+  await requestEmpty(projectPath(id) + "/archive", {
     method: "PUT",
     body: JSON.stringify({ archived })
   });
 }
 export async function getProjectInstructionsStatus(id: string) {
-  return parseResponse(ProjectInstructionsStatusSchema, await request<unknown>(projectPath(id) + "/instructions/status"),
-    "GET /projects/:id/instructions/status");
+  return await requestJson(projectPath(id) + "/instructions/status", ProjectInstructionsStatusSchema);
 }
 export async function updateProjectInstructions(id: string, instructions: string, expectedRevision: number) {
-  return parseResponse(ProjectSchema, await request<unknown>(projectPath(id) + "/instructions", {
+  return await requestJson(projectPath(id) + "/instructions", ProjectSchema, {
     method: "PUT", body: JSON.stringify({ instructions, expectedRevision })
-  }), "PUT /projects/:id/instructions");
+  });
 }
 export async function updateProjectApprovalMode(id: string, approvalMode: ProjectApprovalMode) {
-  return parseResponse(ProjectSchema, await request<unknown>(projectPath(id) + "/approval-mode", {
+  return await requestJson(projectPath(id) + "/approval-mode", ProjectSchema, {
     method: "PUT", body: JSON.stringify({ approvalMode })
-  }), "PUT /projects/:id/approval-mode");
+  });
 }
 export async function updateProjectAgentFileMode(id: string, agentFileMode: ProjectAgentFileMode) {
-  return parseResponse(ProjectSchema, await request<unknown>(projectPath(id) + "/agent-file-mode", {
+  return await requestJson(projectPath(id) + "/agent-file-mode", ProjectSchema, {
     method: "PUT", body: JSON.stringify({ agentFileMode })
-  }), "PUT /projects/:id/agent-file-mode");
+  });
 }
 
 export async function getProjectAccess(id: string) {
-  return parseResponse(
-    ProjectMembersResponseSchema,
-    await request<unknown>(projectPath(id) + "/members"),
-    "GET /projects/:id/members"
-  );
+  return await requestJson(projectPath(id) + "/members", ProjectMembersResponseSchema);
 }
 
 /** `input.expected` is the saved access that the owner saw and confirmed. The
  *  backend returns 409 `project_sharing_conflict` when the saved access is different. */
 export async function updateProjectSharing(id: string, input: ProjectSharingUpdate) {
-  await request(projectPath(id) + "/sharing", {
+  await requestEmpty(projectPath(id) + "/sharing", {
     method: "PUT",
     body: JSON.stringify({ ...input, confirmAudience: input.confirmAudience ?? false })
   });
@@ -148,12 +114,8 @@ export async function updateProjectMember(id: string, userId: string, input: {
   confirmRetainedRole?: "viewer" | "editor";
   confirmNoOwner?: boolean;
 }) {
-  return parseResponse(
-    ProjectMemberUpdateResponseSchema,
-    await request<unknown>(`${projectPath(id)}/members/${encodeURIComponent(userId)}`, {
+  return await requestJson(`${projectPath(id)}/members/${encodeURIComponent(userId)}`, ProjectMemberUpdateResponseSchema, {
       method: "PUT",
       body: JSON.stringify(input)
-    }),
-    "PUT /projects/:id/members/:userId"
-  );
+    });
 }

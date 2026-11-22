@@ -1,7 +1,6 @@
 import { MessagesListResponseSchema } from "@cogniplane/shared-types";
 
-import { request } from "./api-client";
-import { parseResponse } from "./validate-response";
+import { requestJson } from "./api-client";
 
 import type { Message } from "@cogniplane/shared-types";
 
@@ -18,8 +17,7 @@ export type ListMessagesResult = {
 export async function listMessages(sessionId: string, signal?: AbortSignal,
   options?: { since?: string }): Promise<ListMessagesResult> {
   const suffix = options?.since ? `?${new URLSearchParams({ since: options.since })}` : "";
-  const raw = await request<unknown>(`/sessions/${sessionId}/messages${suffix}`, { signal });
-  const result = parseResponse(MessagesListResponseSchema, raw, "GET /sessions/:id/messages");
+  const result = await requestJson(`/sessions/${sessionId}/messages${suffix}`, MessagesListResponseSchema, { signal });
   // Defensive default in case an older backend doesn't return these fields yet.
   return {
     messages: result.messages.map((m) => ({

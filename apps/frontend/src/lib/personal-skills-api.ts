@@ -3,45 +3,40 @@ import {
   PersonalSkillResponseSchema, PersonalSkillsResponseSchema,
   type PersonalSkillAction, type PersonalSkillCreate, type PersonalSkillUpdate
 } from "@cogniplane/shared-types";
-import { request } from "./api-client";
-import { parseResponse } from "./validate-response";
+import { requestJson } from "./api-client";
 
 const path = "/me/skills";
 const skillPath = (id: string) => `${path}/${encodeURIComponent(id)}`;
 
 export async function getPersonalSkills() {
-  return parseResponse(PersonalSkillsResponseSchema, await request<unknown>(path), `GET ${path}`);
+  return await requestJson(path, PersonalSkillsResponseSchema);
 }
 
 export async function createPersonalSkill(input: PersonalSkillCreate) {
-  return parseResponse(PersonalSkillResponseSchema,
-    await request<unknown>(path, { method: "POST", body: JSON.stringify(input) }), `POST ${path}`);
+  return await requestJson(path, PersonalSkillResponseSchema, { method: "POST", body: JSON.stringify(input) });
 }
 
 export async function updatePersonalSkill(id: string, input: PersonalSkillUpdate) {
   const url = skillPath(id);
-  return parseResponse(PersonalSkillResponseSchema,
-    await request<unknown>(url, { method: "PUT", body: JSON.stringify(input) }), `PUT ${url}`);
+  return await requestJson(url, PersonalSkillResponseSchema, { method: "PUT", body: JSON.stringify(input) });
 }
 
 export async function actOnPersonalSkill(id: string, input: PersonalSkillAction) {
   const url = `${skillPath(id)}/action`;
-  return parseResponse(PersonalSkillResponseSchema,
-    await request<unknown>(url, { method: "POST", body: JSON.stringify(input) }), `POST ${url}`);
+  return await requestJson(url, PersonalSkillResponseSchema, { method: "POST", body: JSON.stringify(input) });
 }
 
 export async function deletePersonalSkill(id: string, input: { scope: PersonalSkillAction["scope"]; version: number }) {
   const url = skillPath(id);
-  return parseResponse(PersonalSkillDeleteResponseSchema,
-    await request<unknown>(url, { method: "DELETE", body: JSON.stringify(input) }), `DELETE ${url}`);
+  return await requestJson(url, PersonalSkillDeleteResponseSchema, { method: "DELETE", body: JSON.stringify(input) });
 }
 
 export async function getPersonalSkillHistory(id: string) {
   const url = `${skillPath(id)}/history`;
-  return parseResponse(PersonalSkillHistoryResponseSchema, await request<unknown>(url), `GET ${url}`);
+  return await requestJson(url, PersonalSkillHistoryResponseSchema);
 }
 
 export async function getPersonalSkill(id: string) {
   const url = skillPath(id);
-  return parseResponse(PersonalSkillResponseSchema, await request<unknown>(url), `GET ${url}`);
+  return await requestJson(url, PersonalSkillResponseSchema);
 }

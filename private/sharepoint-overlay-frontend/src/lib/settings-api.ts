@@ -1,13 +1,18 @@
-import type { MicrosoftConnectionStatus } from "../../../sharepoint-overlay-contracts/src/index";
+import { OAuthAuthorizationUrlResponseSchema } from "@cogniplane/shared-types";
 
-import { request } from "../../../../apps/frontend/src/lib/api-client";
+import {
+  MicrosoftConnectionStatusSchema,
+  type MicrosoftConnectionStatus
+} from "../../../sharepoint-overlay-contracts/src/index";
+
+import { requestEmpty, requestJson } from "../../../../apps/frontend/src/lib/api-client";
 
 export async function fetchMicrosoftConnectionStatus(): Promise<MicrosoftConnectionStatus> {
-  return request<MicrosoftConnectionStatus>("/me/microsoft-connection");
+  return requestJson("/me/microsoft-connection", MicrosoftConnectionStatusSchema);
 }
 
 export async function createMicrosoftAuthorizationUrl(): Promise<string> {
-  const result = await request<{ url: string }>("/me/microsoft-connection/authorize", {
+  const result = await requestJson("/me/microsoft-connection/authorize", OAuthAuthorizationUrlResponseSchema, {
     method: "POST"
   });
   return result.url;
@@ -15,14 +20,14 @@ export async function createMicrosoftAuthorizationUrl(): Promise<string> {
 
 /** Confirms a suspended connection. `microsoftUserId` is the account that the page shows. */
 export async function confirmMicrosoftConnection(microsoftUserId: string): Promise<void> {
-  await request<unknown>("/me/microsoft-connection/confirm", {
+  await requestEmpty("/me/microsoft-connection/confirm", {
     method: "POST",
     body: JSON.stringify({ microsoftUserId })
   });
 }
 
 export async function deleteMicrosoftConnection(): Promise<void> {
-  await request<void>("/me/microsoft-connection", {
+  await requestEmpty("/me/microsoft-connection", {
     method: "DELETE"
   });
 }

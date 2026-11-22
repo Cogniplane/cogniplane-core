@@ -3,6 +3,7 @@ import { Readable } from "node:stream";
 import { z } from "zod";
 import { ArtifactListQuerySchema } from "@cogniplane/shared-types";
 import { attachmentContentDisposition, validateArtifactFilename } from "../services/artifacts/artifact-filename.js";
+import { toArtifactResponse } from "../services/artifacts/artifact-response.js";
 import { ArtifactCursorError, isArtifactPiiEligible } from "../services/artifacts/artifact-store.js";
 import { ProjectAccessError } from "../services/project-access.js";
 import { SessionUploadAccessError } from "../services/session-upload-access.js";
@@ -127,7 +128,7 @@ export async function registerArtifactRoutes(
         limit: query.limit,
         cursor: query.cursor
       });
-      return { items, nextCursor };
+      return { items: items.map(toArtifactResponse), nextCursor };
     } catch (error) {
       if (error instanceof ArtifactCursorError) {
         reply.code(400);
@@ -154,9 +155,9 @@ export async function registerArtifactRoutes(
     reply.header("cache-control", "private, no-store");
     return {
       session,
-      artifacts: (await stores.artifacts.listBySession(tenantId, sessionId, userId)).filter(
-        (artifact) => artifact.artifactType !== "derived"
-      )
+      artifacts: (await stores.artifacts.listBySession(tenantId, sessionId, userId))
+        .filter((artifact) => artifact.artifactType !== "derived")
+        .map(toArtifactResponse)
     };
   });
 
@@ -279,7 +280,7 @@ export async function registerArtifactRoutes(
     }
     reply.code(201);
     reply.header("cache-control", "private, no-store");
-    return { artifact: result.artifact };
+    return { artifact: toArtifactResponse(result.artifact) };
   });
 
   app.post("/artifacts/:artifactId/download-token", async (request, reply) => {

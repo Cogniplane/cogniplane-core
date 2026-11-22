@@ -29,6 +29,15 @@ wins. Admins can still open a disabled tenant row to edit it.
 
 Admin setup of a proxy server: [connectors](../connectors.md#proxy-mcp-servers).
 
+Server administration is in `McpAdminService`
+(`services/mcp/mcp-admin-service.ts`). Admin > Connections uses two operations.
+`POST /admin/mcp-servers/setup` and `PUT /admin/mcp-servers/:serverId/setup`
+save a connection and its audience in one transaction.
+`PUT /admin/mcp-servers/:serverId/inherited-availability` sets the audience of
+an inherited system connection. The single-step routes (create, update,
+disable, publish, unpublish) stay for other HTTP clients. The browser client
+does not call them.
+
 Proxy upstreams use public addresses by default. Admission rejects local and
 reserved hosts, and each DNS lookup rejects any private or reserved answer.
 The backend connects to that checked DNS result. For self-hosted LAN servers,

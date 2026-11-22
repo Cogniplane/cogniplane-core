@@ -6,9 +6,8 @@ import {
   DownloadHandleEnvelopeSchema
 } from "@cogniplane/shared-types";
 
-import { createApiHeaders, request } from "./api-client";
+import { createApiHeaders, requestJson } from "./api-client";
 import { ArtifactPreviewTooLargeError } from "./artifact-preview";
-import { parseResponse } from "./validate-response";
 
 import type {
   Artifact,
@@ -18,8 +17,7 @@ import type {
 } from "@cogniplane/shared-types";
 
 export async function listArtifacts(sessionId: string, signal?: AbortSignal): Promise<Artifact[]> {
-  const raw = await request<unknown>(`/sessions/${sessionId}/artifacts`, { signal });
-  return parseResponse(ArtifactsListResponseSchema, raw, "GET /sessions/:id/artifacts").artifacts;
+  return (await requestJson(`/sessions/${sessionId}/artifacts`, ArtifactsListResponseSchema, { signal })).artifacts;
 }
 
 // Query params accepted by the cross-session browser. Cursor is supplied by the
@@ -49,8 +47,7 @@ export async function browseArtifacts(
   params: ArtifactBrowseParams
 ): Promise<ArtifactBrowseResponse> {
   const qs = buildArtifactBrowseQuery(params);
-  const raw = await request<unknown>(`/artifacts${qs ? `?${qs}` : ""}`);
-  return parseResponse(ArtifactBrowseResponseSchema, raw, "GET /artifacts");
+  return await requestJson(`/artifacts${qs ? `?${qs}` : ""}`, ArtifactBrowseResponseSchema);
 }
 
 export async function uploadArtifact(input: {
@@ -65,19 +62,16 @@ export async function uploadArtifact(input: {
     form.set("name", input.name);
   }
 
-  const raw = await request<unknown>("/artifacts", {
+  return (await requestJson("/artifacts", ArtifactEnvelopeSchema, {
     method: "POST",
     body: form
-  });
-  return parseResponse(ArtifactEnvelopeSchema, raw, "POST /artifacts").artifact;
+  })).artifact;
 }
 
 export async function createArtifactDownload(artifactId: string): Promise<DownloadHandle> {
-  const raw = await request<unknown>(`/artifacts/${artifactId}/download-token`, {
+  return (await requestJson(`/artifacts/${artifactId}/download-token`, DownloadHandleEnvelopeSchema, {
     method: "POST"
-  });
-  return parseResponse(DownloadHandleEnvelopeSchema, raw, "POST /artifacts/:id/download-token")
-    .download;
+  })).download;
 }
 
 /**
@@ -125,7 +119,5 @@ async function readTextWithinLimit(response: Response, maxBytes: number): Promis
 }
 
 export async function fetchArtifactPreviewText(artifactId: string): Promise<string> {
-  const raw = await request<unknown>(`/artifacts/${artifactId}/preview-text`);
-  return parseResponse(ArtifactPreviewTextResponseSchema, raw, "GET /artifacts/:id/preview-text")
-    .text;
+  return (await requestJson(`/artifacts/${artifactId}/preview-text`, ArtifactPreviewTextResponseSchema)).text;
 }
