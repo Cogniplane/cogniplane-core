@@ -126,7 +126,8 @@ export class TurnExecutionLease {
       try {
         await this.input.executions.release(this.execution);
       } catch (error) {
-        this.input.onReleaseError(error);
+        // A reporter that throws must not stop the caller's cleanup.
+        try { this.input.onReleaseError(error); } catch { /* nothing more to report to */ }
       }
     })();
   }
@@ -155,8 +156,8 @@ export async function bindTurnToolContext(
     /** Null for a WorkOS owner. */
     ownerSecurityVersion: number | null;
     ttlMs: number;
-    /** What only one kind of turn has, for example the selected artifacts. */
-    metadata?: Record<string, unknown>;
+    /** What only an interactive turn has. No other key is copied. */
+    metadata?: { selectedArtifactIds?: string[]; projectContext?: Record<string, unknown> };
   }
 ): Promise<ToolExecutionContext> {
   const { runtimeSession } = input;
@@ -168,8 +169,9 @@ export async function bindTurnToolContext(
     runtimePolicyId: runtimeSession.runtimePolicy.id,
     messageId: input.messageId,
     metadata: {
-      // First, so that it cannot replace a bound field below.
-      ...input.metadata,
+      // Only these keys, so that a caller cannot supply a bound field below.
+      ...(input.metadata?.selectedArtifactIds ? { selectedArtifactIds: input.metadata.selectedArtifactIds } : {}),
+      ...(input.metadata?.projectContext ? { projectContext: input.metadata.projectContext } : {}),
       ...(input.execution ? { executionId: input.execution.executionId } : {}),
       runtimePolicy: runtimeSession.runtimePolicy,
       ...(runtimeSession.mcpServerSources ? { mcpServerSources: runtimeSession.mcpServerSources } : {}),

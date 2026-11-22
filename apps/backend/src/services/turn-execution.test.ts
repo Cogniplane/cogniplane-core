@@ -133,6 +133,25 @@ describe("TurnExecutionLease", () => {
     expect(h.onReleaseError).toHaveBeenCalledExactlyOnceWith(failure);
   });
 
+  test("a reporter that throws does not make release reject", async () => {
+    const h = harness();
+    const lease = await h.acquire();
+    h.executions.release.mockRejectedValueOnce(new Error("database unavailable"));
+    h.onReleaseError.mockImplementationOnce(() => { throw new Error("logger failed"); });
+    await expect(lease.release()).resolves.toBeUndefined();
+  });
+
+  test("a second startHeartbeat starts no second renewal loop", async () => {
+    const h = harness();
+    const lease = await h.acquire();
+    const handlers = { onLost: async () => {}, onError: vi.fn() };
+    lease.startHeartbeat(handlers);
+    lease.startHeartbeat(handlers);
+    await vi.advanceTimersByTimeAsync(SETTINGS.heartbeatMs + 10);
+    expect(h.executions.heartbeat).toHaveBeenCalledTimes(1);
+    await lease.release();
+  });
+
   test("stopHeartbeat keeps the lease, and no heartbeat starts after a release", async () => {
     const h = harness();
     const kept = await h.acquire();
@@ -195,12 +214,17 @@ describe("bindTurnToolContext", () => {
       ...base,
       ownerSecurityVersion: null,
       turnContext: "interactive",
-      metadata: { selectedArtifactIds: ["a"], runtimePolicy: { id: "other" }, turnContext: "scheduled" }
+      // A caller that gets past the type: bound keys and unknown keys are not copied.
+      metadata: {
+        selectedArtifactIds: ["a"], runtimePolicy: { id: "other" }, turnContext: "scheduled",
+        integrationAccounts: { github: "other" }, executionId: "other"
+      } as never
     });
     expect(create.mock.calls[0]![0]).toMatchObject({
       ownerSecurityVersion: null,
       metadata: { selectedArtifactIds: ["a"], runtimePolicy, turnContext: "interactive" }
     });
     expect(create.mock.calls[0]![0].metadata).not.toHaveProperty("executionId");
+    expect(create.mock.calls[0]![0].metadata).not.toHaveProperty("integrationAccounts");
   });
 });
