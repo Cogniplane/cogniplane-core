@@ -1,6 +1,7 @@
 import multipart from "@fastify/multipart";
 import Fastify from "fastify";
 import { describe, test, expect, vi } from "vitest";
+import { ArtifactEnvelopeSchema } from "@cogniplane/shared-types";
 
 import { handleAppError } from "../app.js";
 import { registerArtifactRoutes } from "./artifacts.js";
@@ -752,15 +753,27 @@ describe("POST /artifacts upload validation", () => {
       put: [] as string[],
       createUpload: [] as Array<{ artifactName: string }>
     };
+    // A whole stored record, with one field (`scanNote`) that is not public.
     const record = (artifactName: string) => ({
+      id: 7,
       artifactId: "artifact-1",
       sessionId,
       userId: "user-1",
       artifactType: "upload",
+      sourceArtifactId: null,
       artifactName,
       mimeType: "text/plain",
+      storageBackend: "local",
+      storageKey: "tenant-A/artifact-1",
+      fileSizeBytes: 5,
+      checksumSha256: "sum",
       status: "pending",
-      detail: {}
+      createdByType: "user",
+      createdByRef: "user-1",
+      detail: {},
+      createdAt: "2026-11-01T10:00:00.000Z",
+      updatedAt: "2026-11-01T10:00:00.000Z",
+      scanNote: "internal"
     });
     let lastName = "";
     const auditEvents = new InMemoryAuditEventStore();
@@ -833,6 +846,40 @@ describe("POST /artifacts upload validation", () => {
     expect(response.statusCode).toBe(201);
     expect(calls.put).toHaveLength(1);
     expect(calls.createUpload).toEqual([{ artifactName: "notes.txt" }]);
+    await app.close();
+  });
+
+  test("answers with the public artifact fields, and with no other field of the stored record", async () => {
+    const { app, upload } = await buildUploadApp();
+
+    const response = await upload(multipartBody({ filename: "notes.txt" }));
+
+    expect(response.statusCode).toBe(201);
+    expect(response.headers["cache-control"]).toBe("private, no-store");
+    // The upload response as clients receive it today. Change it on purpose only.
+    expect(response.json()).toEqual({
+      artifact: {
+        id: 7,
+        artifactId: "artifact-1",
+        sessionId,
+        userId: "user-1",
+        artifactType: "upload",
+        sourceArtifactId: null,
+        artifactName: "notes.txt",
+        mimeType: "text/plain",
+        storageBackend: "local",
+        storageKey: "tenant-A/artifact-1",
+        fileSizeBytes: 5,
+        checksumSha256: "sum",
+        status: "pending",
+        createdByType: "user",
+        createdByRef: "user-1",
+        detail: {},
+        createdAt: "2026-11-01T10:00:00.000Z",
+        updatedAt: "2026-11-01T10:00:00.000Z"
+      }
+    });
+    expect(ArtifactEnvelopeSchema.safeParse(response.json()).success).toBe(true);
     await app.close();
   });
 
