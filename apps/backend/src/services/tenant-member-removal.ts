@@ -33,12 +33,15 @@ export class MemberRemovedError extends Error {
  * locks of the member's chats (`lockChatsBeforeMembership`) and the lock of
  * the membership row, in that order, and has made its authorization checks.
  *
- * - Disables the member's scheduled jobs. Left enabled, they keep firing as
- *   synthetic turns under the removed user's identity, with the stored OAuth
- *   tokens: the scheduler path does not read the membership row.
- *   `next_run_at = NULL` also drops them out of the due-job query. The pause
- *   reason makes the owner review each job before it runs again, if a future
- *   re-admission brings the member back.
+ * - Disables the member's scheduled jobs, first: the update locks the job
+ *   rows, so a claim of a due job (`UserSettingsStore.claimJob`) waits and
+ *   then finds the job disabled, and writes no run for it. The claim also
+ *   requires the membership, but the pause lasts: `next_run_at = NULL` keeps
+ *   the job out of the due-job query, and the pause reason makes the owner
+ *   review each job before it runs again, if a future re-admission brings
+ *   the member back.
+ * - Runs `afterJobsPaused`, when given: what the caller ends with the
+ *   membership, for example the local account.
  * - Ends the membership (endTenantMembership).
  * - After the commit, the member's active work stops, and the sandboxes of
  *   the member's chats are killed (services/auth/security-change.ts). A
@@ -48,7 +51,7 @@ export class MemberRemovedError extends Error {
  */
 export async function removeTenantMember(
   change: SecurityChange,
-  input: { userId: string; removedBy: string }
+  input: { userId: string; removedBy: string; afterJobsPaused?: () => Promise<void> }
 ): Promise<{ projectRolesRemoved: number }> {
   const { client, tenantId } = change;
   await client.query(
@@ -57,6 +60,7 @@ export async function removeTenantMember(
      WHERE tenant_id = $1 AND user_id = $2`,
     [tenantId, input.userId]
   );
+  await input.afterJobsPaused?.();
   const removed = await endTenantMembership(client, { tenantId, userId: input.userId, removedBy: input.removedBy });
   change.endActiveWork(input.userId);
   return removed;

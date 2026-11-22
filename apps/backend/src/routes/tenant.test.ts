@@ -698,6 +698,12 @@ test.each(["workos", "local"] as const)("DELETE member: a %s member's local acco
   // sandbox release at the end locks the chats again (they are already held).
   const order = ["lock_tenant", "lock_identity", "lock_chats", "lock_membership", "disable_jobs", "delete_project_roles", "delete_membership", "record_removal"];
   expect(tracked.statements.filter((step) => order.includes(step))).toEqual([...order, "lock_chats"]);
+  // The jobs are paused before the local account ends, so a claim of a due
+  // job waits on the job row and then finds the job disabled.
+  if (authSource === "local") {
+    expect(tracked.statements.indexOf("disable_jobs")).toBeLessThan(tracked.statements.indexOf("mark_local_removed"));
+    expect(tracked.statements.indexOf("mark_local_removed")).toBeLessThan(tracked.statements.indexOf("delete_project_roles"));
+  }
   if (authSource === "local") {
     expect(tracked.statements.indexOf("mark_local_removed")).toBeLessThan(tracked.statements.indexOf("delete_membership"));
   }

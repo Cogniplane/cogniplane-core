@@ -580,18 +580,17 @@ export async function registerTenantRoutes(
         return { kind: "only_owner_can_remove_admin" as const };
       }
 
-      // A local account has no other tenant: removal ends it for good. The
-      // identity row stays, marked removed, for audit references.
-      if (target.rows[0].user_auth_source === "local") {
-        await markLocalIdentityRemoved(change, targetUserId);
-      }
-
       // The removal lasts (services/tenant-member-removal.ts): it disables the
       // member's scheduled jobs, deletes the member's project roles and the
       // membership, and records the removal. WorkOS sign-in then refuses the
       // user, and no session that started before now is admitted again.
+      const isLocal = target.rows[0].user_auth_source === "local";
       const { projectRolesRemoved } = await removeTenantMember(change, {
-        userId: targetUserId, removedBy: request.auth.userId
+        userId: targetUserId,
+        removedBy: request.auth.userId,
+        // A local account has no other tenant: removal ends it for good. The
+        // identity row stays, marked removed, for audit references.
+        ...(isLocal ? { afterJobsPaused: () => markLocalIdentityRemoved(change, targetUserId) } : {})
       });
       await AuditEventStore.createInTransaction(client, tenantAudit(request, "tenant.member.removed", {
         targetUserId,
