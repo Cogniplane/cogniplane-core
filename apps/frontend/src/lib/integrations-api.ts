@@ -4,8 +4,7 @@ import {
   UserIntegrationsAvailabilityResponseSchema
 } from "@cogniplane/shared-types";
 
-import { request } from "./api-client";
-import { parseResponse } from "./validate-response";
+import { requestJson } from "./api-client";
 
 import type { AdminIntegrationView, UserIntegrationView } from "@cogniplane/shared-types";
 
@@ -16,38 +15,27 @@ export type UpdateIntegrationInput = {
 };
 
 export async function fetchAdminIntegrations(): Promise<AdminIntegrationView[]> {
-  const raw = await request<unknown>("/admin/integrations");
-  return parseResponse(AdminIntegrationsListResponseSchema, raw, "GET /admin/integrations")
-    .integrations;
+  return (await requestJson("/admin/integrations", AdminIntegrationsListResponseSchema)).integrations;
 }
 
 export async function updateIntegration(
   integrationId: string,
   input: UpdateIntegrationInput
 ): Promise<AdminIntegrationView> {
-  const raw = await request<unknown>(`/admin/integrations/${integrationId}`, {
+  return (await requestJson(`/admin/integrations/${integrationId}`, AdminIntegrationEnvelopeSchema, {
     method: "PUT",
     body: JSON.stringify(input)
-  });
-  return parseResponse(AdminIntegrationEnvelopeSchema, raw, "PUT /admin/integrations/:id")
-    .integration;
+  })).integration;
 }
 
 export async function deleteIntegrationConfig(
   integrationId: string
 ): Promise<AdminIntegrationView> {
-  const raw = await request<unknown>(`/admin/integrations/${integrationId}/config`, {
+  return (await requestJson(`/admin/integrations/${integrationId}/config`, AdminIntegrationEnvelopeSchema, {
     method: "DELETE"
-  });
-  return parseResponse(AdminIntegrationEnvelopeSchema, raw, "DELETE /admin/integrations/:id/config")
-    .integration;
+  })).integration;
 }
 
 export async function fetchIntegrationsAvailability(): Promise<UserIntegrationView[]> {
-  const raw = await request<unknown>("/me/integrations-availability");
-  return parseResponse(
-    UserIntegrationsAvailabilityResponseSchema,
-    raw,
-    "GET /me/integrations-availability"
-  ).enabled;
+  return (await requestJson("/me/integrations-availability", UserIntegrationsAvailabilityResponseSchema)).enabled;
 }

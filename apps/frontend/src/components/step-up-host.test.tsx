@@ -3,7 +3,9 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { request, setAccessToken } from "../lib/api-client";
+import { z } from "@cogniplane/shared-types";
+
+import { requestEmpty, requestJson, setAccessToken } from "../lib/api-client";
 
 const api = vi.hoisted(() => ({ stepUp: vi.fn(), fetchMySecurity: vi.fn() }));
 const SECURITY = { loginType: "local", passwordChangedAt: null, totpEnabled: false, recoveryCodesRemaining: 0, mfaRequired: false };
@@ -13,6 +15,8 @@ vi.mock("../lib/local-auth-api", async (importOriginal) => {
 });
 
 import { StepUpHost } from "./step-up-host";
+
+const OkSchema = z.object({ ok: z.boolean() });
 
 const REFUSAL = { error: "step_up_required", action: "tenant.provider_key" };
 
@@ -58,7 +62,7 @@ describe("StepUpHost", () => {
     mountHost();
     const stepUpHeaders = stubFetch([json(403, REFUSAL), json(200, { ok: true })]);
 
-    const saved = request<{ ok: boolean }>("/tenant/settings", { method: "PUT", body: JSON.stringify({ provider: "openai", apiKey: "sk-x" }) });
+    const saved = requestJson("/tenant/settings", OkSchema, { method: "PUT", body: JSON.stringify({ provider: "openai", apiKey: "sk-x" }) });
     const dialog = await screen.findByRole("dialog", { name: "Change the provider API key" });
     expect(dialog.textContent).toContain("All owners get an email about this change.");
 
@@ -74,7 +78,7 @@ describe("StepUpHost", () => {
     mountHost();
     const stepUpHeaders = stubFetch([json(403, REFUSAL)]);
 
-    const saved = request("/tenant/settings", { method: "PUT", body: "{}" });
+    const saved = requestEmpty("/tenant/settings", { method: "PUT", body: "{}" });
     const dialog = await screen.findByRole("dialog", { name: "Change the provider API key" });
     fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
 
@@ -87,7 +91,7 @@ describe("StepUpHost", () => {
     mountHost();
     stubFetch([json(403, REFUSAL), json(403, { error: "strong_step_up_required", action: "tenant.provider_key" }), json(200, { ok: true })]);
 
-    const saved = request<{ ok: boolean }>("/tenant/settings", { method: "PUT", body: "{}" });
+    const saved = requestJson("/tenant/settings", OkSchema, { method: "PUT", body: "{}" });
     const dialog = await screen.findByRole("dialog", { name: "Change the provider API key" });
     await confirmWithPassword(dialog, "Save key");
 
@@ -114,7 +118,7 @@ describe("StepUpHost", () => {
     mountHost();
     const stepUpHeaders = stubFetch([json(403, { error: "step_up_required", action }), json(200, { ok: true })]);
 
-    const saved = request<{ ok: boolean }>(path, { method: "POST", body: "{}" });
+    const saved = requestJson(path, OkSchema, { method: "POST", body: "{}" });
     const dialog = await screen.findByRole("dialog", { name: title });
     expect(dialog.textContent).toContain(what);
     expect(dialog.textContent).toContain("All owners get an email about this change.");

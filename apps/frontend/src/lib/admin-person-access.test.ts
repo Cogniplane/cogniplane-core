@@ -2,9 +2,9 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { AdminPersonAccessResponseSchema } from "@cogniplane/shared-types";
 
 import { getAdminPersonAccess } from "./admin-api";
-import { request } from "./api-client";
+import { wireRequest as request } from "../test-helpers/api-client-mock";
 
-vi.mock("./api-client", () => ({ request: vi.fn(), requestOptionalOn404: vi.fn() }));
+vi.mock("./api-client", async () => (await import("../test-helpers/api-client-mock")).apiClientMock());
 
 const excludedSkill = {
   kind: "skill", id: "contract-review", name: "Contract review",

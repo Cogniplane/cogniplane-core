@@ -1,14 +1,18 @@
-import { request } from "../../../../apps/frontend/src/lib/api-client";
+import { requestJson } from "../../../../apps/frontend/src/lib/api-client";
 
-import type { Artifact } from "@cogniplane/shared-types";
-import type {
-  MicrosoftConnectionStatus,
-  MicrosoftFile,
-  MicrosoftSite
+import { ArtifactEnvelopeSchema, type Artifact } from "@cogniplane/shared-types";
+import {
+  MicrosoftConnectionStatusSchema,
+  MicrosoftFilesListResponseSchema,
+  MicrosoftFilesSearchResponseSchema,
+  MicrosoftSitesListResponseSchema,
+  type MicrosoftConnectionStatus,
+  type MicrosoftFile,
+  type MicrosoftSite
 } from "../../../sharepoint-overlay-contracts/src/index";
 
 export async function getMicrosoftConnectionStatus(): Promise<MicrosoftConnectionStatus> {
-  return request<MicrosoftConnectionStatus>("/me/microsoft-connection");
+  return requestJson("/me/microsoft-connection", MicrosoftConnectionStatusSchema);
 }
 
 export async function listMicrosoftSites(search?: string): Promise<MicrosoftSite[]> {
@@ -18,7 +22,7 @@ export async function listMicrosoftSites(search?: string): Promise<MicrosoftSite
   }
 
   const suffix = params.toString() ? `?${params.toString()}` : "";
-  const result = await request<{ sites: MicrosoftSite[] }>(`/integrations/microsoft/sites${suffix}`);
+  const result = await requestJson(`/integrations/microsoft/sites${suffix}`, MicrosoftSitesListResponseSchema);
   return result.sites;
 }
 
@@ -33,7 +37,7 @@ export async function listMicrosoftFiles(input?: {
   if (input?.folderId) params.set("folderId", input.folderId);
 
   const suffix = params.toString() ? `?${params.toString()}` : "";
-  const result = await request<{ items: MicrosoftFile[] }>(`/integrations/microsoft/files${suffix}`);
+  const result = await requestJson(`/integrations/microsoft/files${suffix}`, MicrosoftFilesListResponseSchema);
   return result.items;
 }
 
@@ -43,8 +47,9 @@ export async function searchMicrosoftFiles(query: string, maxResults = 10): Prom
     maxResults: String(maxResults)
   });
 
-  const result = await request<{ results: MicrosoftFile[] }>(
-    `/integrations/microsoft/files/search?${params.toString()}`
+  const result = await requestJson(
+    `/integrations/microsoft/files/search?${params.toString()}`,
+    MicrosoftFilesSearchResponseSchema
   );
   return result.results;
 }
@@ -55,8 +60,9 @@ export async function importMicrosoftFileToSession(input: {
   itemId: string;
   artifactName?: string;
 }): Promise<Artifact> {
-  const result = await request<{ artifact: Artifact }>(
+  const result = await requestJson(
     `/sessions/${input.sessionId}/import-microsoft-file`,
+    ArtifactEnvelopeSchema,
     {
       method: "POST",
       body: JSON.stringify({

@@ -1,8 +1,8 @@
 import { beforeEach, expect, it, vi } from "vitest";
 import { SESSION_TRASH_RETENTION_DAYS } from "@cogniplane/shared-types";
-import { request } from "./api-client";
+import { wireRequest as request } from "../test-helpers/api-client-mock";
 import { archiveProject, createProjectSession, getProjectAccess, listProjectSessions, listProjects, setProjectSession, updateProjectAgentFileMode, updateProjectApprovalMode, updateProjectSharing } from "./project-api";
-vi.mock("./api-client", () => ({ request: vi.fn() }));
+vi.mock("./api-client", async () => (await import("../test-helpers/api-client-mock")).apiClientMock());
 beforeEach(() => vi.resetAllMocks());
 
 it("omits blank search terms and URL-encodes nonempty query parameters", async () => {

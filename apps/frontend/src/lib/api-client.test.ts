@@ -1,4 +1,4 @@
-import { DEFAULT_PII_PROTECTION } from "@cogniplane/shared-types";
+import { DEFAULT_PII_PROTECTION, z } from "@cogniplane/shared-types";
 import { describe, it, vi, beforeEach, expect, expectTypeOf } from "vitest";
 
 import {
@@ -10,8 +10,9 @@ import {
   installedSessionEpoch,
   refreshAccessToken,
   replaceSession,
-  request,
-  requestOptionalOn404,
+  requestEmpty,
+  requestJson,
+  requestJsonOptionalOn404,
   REFRESH_TIME_LIMIT_MS,
   SESSION_CHANGE_TIME_LIMIT_MS,
   SessionChangeTimeoutError,
@@ -24,15 +25,17 @@ import {
   buildErrorMessage
 } from "./api-client";
 import {
-  createAdminMcpServer,
-  updateAdminMcpServer,
   getRuntimeConfig,
   getTenantDetails,
+  saveAdminMcpConnection,
   updateTenantProviderKey
 } from "./admin-api";
 import { createScheduledJob, updateScheduledJob } from "./settings-api";
 
 type FetchCall = { url: string; init: RequestInit | undefined };
+
+const OkSchema = z.object({ ok: z.boolean() });
+const TokenSchema = z.object({ accessToken: z.string() });
 
 // The API client keeps the session and its gate in module state.
 beforeEach(() => {
@@ -52,14 +55,6 @@ describe("shared API request types", () => {
 
     expectTypeOf(minimal).toMatchTypeOf<ScheduledInput>();
     expectTypeOf(minimal).toMatchTypeOf<ScheduledUpdateInput>();
-  });
-
-  it("uses distinct MCP create and update inputs", () => {
-    type CreateInput = Parameters<typeof createAdminMcpServer>[0];
-    type UpdateInput = Parameters<typeof updateAdminMcpServer>[1];
-
-    expectTypeOf<CreateInput>().toMatchTypeOf<{ serverId: string }>();
-    expectTypeOf<Pick<UpdateInput, "serverId">>().toEqualTypeOf<{ serverId?: string }>();
   });
 });
 
@@ -105,7 +100,7 @@ describe("request: 401 → refresh → retry", () => {
     // @ts-expect-error — stub
     global.fetch = fetch;
 
-    const result = await request<{ ok: boolean }>("/test");
+    const result = await requestJson("/test", OkSchema);
 
     expect(result).toEqual({ ok: true });
     expect(calls.length).toBe(2);
@@ -126,21 +121,55 @@ describe("request: 401 → refresh → retry", () => {
     // @ts-expect-error — stub
     global.fetch = fetch;
 
-    await expect(() => request("/test")).rejects.toThrow();
+    await expect(() => requestEmpty("/test")).rejects.toThrow();
     expect(calls.length).toBe(1);
   });
 
-  it("returns undefined for a 204 No Content response", async () => {
-    // A raw 204 Response has no body; request() must short-circuit before
-    // calling response.json() (which would throw on an empty body).
-    const { calls, fetch } = stubFetch([() => new Response(null, { status: 204 })]);
+  it("requestEmpty does not read the body: a 204, or a body that is not JSON, succeeds", async () => {
+    const { calls, fetch } = stubFetch([
+      () => new Response(null, { status: 204 }),
+      () => new Response("<html>ok</html>", { status: 200 })
+    ]);
     // @ts-expect-error — stub
     global.fetch = fetch;
 
-    const result = await request<void>("/no-content");
+    await expect(requestEmpty("/no-content", { method: "DELETE" })).resolves.toBeUndefined();
+    await expect(requestEmpty("/not-json", { method: "POST" })).resolves.toBeUndefined();
+    expect(calls.length).toBe(2);
+  });
 
-    expect(result).toBeUndefined();
-    expect(calls.length).toBe(1);
+  it("requestJson refuses an answer that is not JSON, and names the request without its query", async () => {
+    const { fetch } = stubFetch([
+      () => new Response("<html>Bad gateway</html>", { status: 200 }),
+      () => new Response("{\"ok\": tru", { status: 200 }),
+      () => new Response(null, { status: 204 })
+    ]);
+    // @ts-expect-error — stub
+    global.fetch = fetch;
+
+    await expect(requestJson("/test?q=secret", OkSchema)).rejects.toThrow("Response is not JSON at GET /test");
+    await expect(requestJson("/test", OkSchema, { method: "POST" })).rejects.toThrow("Response is not JSON at POST /test");
+    await expect(requestJson("/no-content", OkSchema)).rejects.toThrow("Response is not JSON at GET /no-content");
+  });
+
+  it("requestJson refuses JSON that the schema does not accept, and returns the parsed value when it does", async () => {
+    const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const { fetch } = stubFetch([
+      () => jsonResponse(200, { ok: "yes" }),
+      () => jsonResponse(200, null),
+      () => jsonResponse(200, { ok: true, extra: 1 })
+    ]);
+    // @ts-expect-error — stub
+    global.fetch = fetch;
+
+    try {
+      await expect(requestJson("/test", OkSchema)).rejects.toThrow("Schema mismatch at GET /test: ok:");
+      await expect(requestJson("/test", OkSchema)).rejects.toThrow("Schema mismatch at GET /test");
+      // The result is the schema's output, not the wire body.
+      await expect(requestJson("/test", OkSchema)).resolves.toEqual({ ok: true });
+    } finally {
+      errors.mockRestore();
+    }
   });
 
   it("throws on a non-401 error without refreshing or retrying", async () => {
@@ -157,7 +186,7 @@ describe("request: 401 → refresh → retry", () => {
     // @ts-expect-error — stub
     global.fetch = fetch;
 
-    await expect(() => request("/test")).rejects.toThrow("boom");
+    await expect(() => requestEmpty("/test")).rejects.toThrow("boom");
     // A 5xx flows straight to the throw: no refresh, single fetch.
     expect(refreshed).toBe(false);
     expect(calls.length).toBe(1);
@@ -170,7 +199,7 @@ describe("request: 401 → refresh → retry", () => {
     // @ts-expect-error — stub
     global.fetch = fetch;
 
-    await expect(request("/items", { method: "POST" })).rejects.toMatchObject({
+    await expect(requestEmpty("/items", { method: "POST" })).rejects.toMatchObject({
       name: "ApiError",
       status: 422,
       code: "validation_error",
@@ -180,6 +209,29 @@ describe("request: 401 → refresh → retry", () => {
     });
   });
 
+  it("gives the caller the version conflict of a connection save", async () => {
+    const { calls, fetch } = stubFetch([
+      () => jsonResponse(409, { error: "mcp_server_conflict", message: "This connection changed after you opened it." })
+    ]);
+    // @ts-expect-error — stub
+    global.fetch = fetch;
+    const input = {
+      serverId: "vendor", serverName: "Vendor", description: null, mode: "proxy" as const, routePath: "/mcp/vendor",
+      upstreamUrl: "https://vendor.example/mcp", upstreamAuthType: "none" as const, credentialScope: "organization" as const,
+      upstreamAuthName: null, audience: "members" as const
+    };
+
+    await expect(saveAdminMcpConnection(input, { serverId: "vendor", expectedVersion: 3 })).rejects.toMatchObject({
+      name: "ApiError",
+      status: 409,
+      code: "mcp_server_conflict",
+      method: "PUT",
+      path: "/admin/mcp-servers/vendor/setup"
+    });
+    expect(calls).toHaveLength(1);
+    expect(JSON.parse(String(calls[0]!.init?.body))).toMatchObject({ serverId: "vendor", expectedVersion: 3, audience: "members" });
+  });
+
   it("throws an ApiError when the error response is not JSON", async () => {
     const { fetch } = stubFetch([
       () => new Response("<html>oops</html>", { status: 502 })
@@ -187,7 +239,7 @@ describe("request: 401 → refresh → retry", () => {
     // @ts-expect-error — stub
     global.fetch = fetch;
 
-    await expect(request("/unavailable")).rejects.toMatchObject({
+    await expect(requestEmpty("/unavailable")).rejects.toMatchObject({
       name: "ApiError",
       status: 502,
       message: "Request failed: 502"
@@ -199,7 +251,7 @@ describe("request: 401 → refresh → retry", () => {
     // @ts-expect-error — stub
     global.fetch = fetch;
 
-    await expect(request("/null-error")).rejects.toMatchObject({
+    await expect(requestEmpty("/null-error")).rejects.toMatchObject({
       name: "ApiError",
       status: 500,
       message: "Request failed: 500"
@@ -296,7 +348,7 @@ describe("the session-change gate", () => {
     global.fetch = fetch;
 
     const result = await changeSession(
-      (gated) => gated<{ accessToken: string }>("/me/security/password", { method: "POST", body: "{}" }),
+      (gated) => gated.json("/me/security/password", TokenSchema, { method: "POST", body: "{}" }),
       (answer) => answer.accessToken
     );
 
@@ -361,13 +413,13 @@ describe("the session-change gate", () => {
         });
       });
 
-      const timedOut = changeSession((gated) => gated("/me/security/password", { method: "POST", body: "{}" })).catch((error: unknown) => error);
+      const timedOut = changeSession((gated) => gated.empty("/me/security/password", { method: "POST", body: "{}" })).catch((error: unknown) => error);
       await vi.advanceTimersByTimeAsync(SESSION_CHANGE_TIME_LIMIT_MS);
       expect(await timedOut).toBeInstanceOf(SessionChangeTimeoutError);
       expect(signals[0].aborted).toBe(true);
 
       const caller = new AbortController();
-      const cancelled = changeSession((gated) => gated("/me/security/password", { method: "POST", body: "{}", signal: caller.signal })).catch((error: unknown) => error);
+      const cancelled = changeSession((gated) => gated.empty("/me/security/password", { method: "POST", body: "{}", signal: caller.signal })).catch((error: unknown) => error);
       await vi.advanceTimersByTimeAsync(0);
       caller.abort(new Error("the person cancelled"));
       expect(await cancelled).toEqual(new Error("the person cancelled"));
@@ -396,7 +448,7 @@ describe("the session-change gate", () => {
     const epoch = getSessionEpoch();
 
     const change = changeSession(
-      (gated) => gated<{ accessToken: string }>("/me/security/password", { method: "POST", body: "{}" }),
+      (gated) => gated.json("/me/security/password", TokenSchema, { method: "POST", body: "{}" }),
       (answer) => answer.accessToken
     );
     const held = refreshAccessToken();
@@ -442,13 +494,13 @@ describe("the session-change gate", () => {
   });
 });
 
-describe("requestOptionalOn404", () => {
+describe("requestJsonOptionalOn404", () => {
   it("returns null for an HTTP 404 even when the message has no status", async () => {
     const { fetch } = stubFetch([() => jsonResponse(404, { message: "Route missing" })]);
     // @ts-expect-error — stub
     global.fetch = fetch;
 
-    await expect(requestOptionalOn404("/missing")).resolves.toBeUndefined();
+    await expect(requestJsonOptionalOn404("/missing", OkSchema)).resolves.toBeUndefined();
   });
 
   it("preserves a successful JSON null response", async () => {
@@ -456,7 +508,7 @@ describe("requestOptionalOn404", () => {
     // @ts-expect-error — stub
     global.fetch = fetch;
 
-    await expect(requestOptionalOn404("/nullable")).resolves.toBeNull();
+    await expect(requestJsonOptionalOn404("/nullable", z.null())).resolves.toBeNull();
   });
 
   it("rethrows non-404 ApiErrors", async () => {
@@ -464,7 +516,7 @@ describe("requestOptionalOn404", () => {
     // @ts-expect-error — stub
     global.fetch = fetch;
 
-    const result = requestOptionalOn404("/broken");
+    const result = requestJsonOptionalOn404("/broken", OkSchema);
     await expect(result).rejects.toBeInstanceOf(ApiError);
     await expect(result).rejects.toMatchObject({ status: 500 });
   });
@@ -615,7 +667,7 @@ describe("request: 403 step_up_required → proof → the same request once more
     setStepUpPrompt(prompt);
 
     const body = JSON.stringify({ showEffortSelector: true });
-    const result = await request<{ ok: boolean }>("/admin/tenant-settings", { method: "PUT", body });
+    const result = await requestJson("/admin/tenant-settings", OkSchema, { method: "PUT", body });
 
     expect(result).toEqual({ ok: true });
     expect(prompt).toHaveBeenCalledTimes(1);
@@ -635,7 +687,7 @@ describe("request: 403 step_up_required → proof → the same request once more
     global.fetch = fetch;
     setStepUpPrompt(async (_action, resend) => resend("step-up-1"));
 
-    await expect(request("/admin/tenant-settings", { method: "PUT", body: "{}" })).rejects.toMatchObject({ status: 409, code: "settings_conflict" });
+    await expect(requestEmpty("/admin/tenant-settings", { method: "PUT", body: "{}" })).rejects.toMatchObject({ status: 409, code: "settings_conflict" });
   });
 
   it("does not send the request again when the user cancels", async () => {
@@ -644,7 +696,7 @@ describe("request: 403 step_up_required → proof → the same request once more
     global.fetch = fetch;
     setStepUpPrompt(async () => { throw new StepUpCancelledError(); });
 
-    const error = await request("/admin/tenant-settings", { method: "PUT", body: "{}" }).catch((caught: unknown) => caught);
+    const error = await requestEmpty("/admin/tenant-settings", { method: "PUT", body: "{}" }).catch((caught: unknown) => caught);
     expect(error).toBeInstanceOf(ApiError);
     expect(error).toMatchObject({ status: 403, code: "step_up_cancelled" });
     expect(calls).toHaveLength(1);
@@ -660,7 +712,7 @@ describe("request: 403 step_up_required → proof → the same request once more
     const prompt = vi.fn();
     setStepUpPrompt(prompt);
 
-    await expect(changeSession((send) => send("/me/security/password", { method: "POST", body: "{}" })))
+    await expect(changeSession((send) => send.empty("/me/security/password", { method: "POST", body: "{}" })))
       .rejects.toMatchObject({ status: 403, code: "step_up_required" });
     expect(prompt).not.toHaveBeenCalled();
     expect(calls).toHaveLength(1);
@@ -678,7 +730,7 @@ describe("request: 403 step_up_required → proof → the same request once more
       const { calls, fetch } = stubFetch([() => response]);
       // @ts-expect-error — stub
       global.fetch = fetch;
-      await expect(request("/admin/tenant-settings", init)).rejects.toBeInstanceOf(ApiError);
+      await expect(requestEmpty("/admin/tenant-settings", init)).rejects.toBeInstanceOf(ApiError);
       expect(calls).toHaveLength(1);
     }
     expect(prompt).not.toHaveBeenCalled();
@@ -773,7 +825,7 @@ describe("the shared refresh", () => {
     global.fetch = fetch;
 
     const change = changeSession(
-      (gated) => gated<{ accessToken: string }>("/me/security/password", { method: "POST", body: "{}" }),
+      (gated) => gated.json("/me/security/password", TokenSchema, { method: "POST", body: "{}" }),
       (answer) => answer.accessToken
     );
     const held = refreshAccessToken().then((token) => ({ token, inMemory: getAccessToken() }));
@@ -796,7 +848,7 @@ describe("the shared refresh", () => {
     global.fetch = fetch;
     const epoch = getSessionEpoch();
 
-    const change = changeSession((gated) => gated("/me/security/totp", { method: "POST", body: "{}" }));
+    const change = changeSession((gated) => gated.empty("/me/security/totp", { method: "POST", body: "{}" }));
     const held = refreshAccessToken();
 
     await change;
@@ -1034,7 +1086,7 @@ describe("sign-out in the session-change queue", () => {
         setTimeout(() => resolve(jsonResponse(401, { error: "invalid_token" })), SESSION_CHANGE_TIME_LIMIT_MS - 1_000);
       }));
 
-      const holder = changeSession((gated) => gated("/me/security/password", { method: "POST", body: "{}" })).catch((error: unknown) => error);
+      const holder = changeSession((gated) => gated.empty("/me/security/password", { method: "POST", body: "{}" })).catch((error: unknown) => error);
       const signOutSend = vi.fn(async () => undefined);
       const signOut = changeSession(signOutSend, () => null, { stopRefresh: true });
 

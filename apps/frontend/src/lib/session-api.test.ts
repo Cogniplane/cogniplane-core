@@ -1,8 +1,8 @@
 import { beforeEach, expect, it, vi } from "vitest";
 import { listArchivedSessions, listSessions } from "./session-api";
-import { request } from "./api-client";
+import { wireRequest as request } from "../test-helpers/api-client-mock";
 
-vi.mock("./api-client", () => ({ request: vi.fn() }));
+vi.mock("./api-client", async () => (await import("../test-helpers/api-client-mock")).apiClientMock());
 beforeEach(() => { vi.mocked(request).mockReset().mockResolvedValue({ sessions: [] }); });
 
 it("requests the same normal and skill-improvement scope for active and archived chat lists", async () => {

@@ -1,11 +1,11 @@
 import { beforeEach, expect, it, vi } from "vitest";
 
 import { browseArtifacts } from "./artifact-api";
-import { request } from "./api-client";
+import { wireRequest as request } from "../test-helpers/api-client-mock";
 
 // A separate file, because mocking request here would also replace it for
 // the fetch-based tests in artifact-api.test.ts.
-vi.mock("./api-client", () => ({ request: vi.fn() }));
+vi.mock("./api-client", async () => (await import("../test-helpers/api-client-mock")).apiClientMock());
 beforeEach(() => { vi.mocked(request).mockReset().mockResolvedValue({ items: [], nextCursor: null }); });
 
 const requested = () => new URL(vi.mocked(request).mock.calls[0]![0], "http://localhost");

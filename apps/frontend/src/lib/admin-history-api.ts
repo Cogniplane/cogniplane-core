@@ -1,6 +1,5 @@
 import { AdminHistoryDetailResponseSchema, AdminHistoryListResponseSchema, type AdminHistoryEvent, type AdminHistoryListQuery } from "@cogniplane/shared-types";
-import { request } from "./api-client";
-import { parseResponse } from "./validate-response";
+import { requestJson } from "./api-client";
 
 export type HistoryFilters = Pick<AdminHistoryListQuery, "category" | "type" | "section">;
 function normalizeDestination(event: AdminHistoryEvent): AdminHistoryEvent {
@@ -14,11 +13,11 @@ export async function listAdminHistory(filters: HistoryFilters & { limit?: numbe
   const params = new URLSearchParams();
   for (const [key, value] of Object.entries(filters)) if (value !== undefined) params.set(key, String(value));
   const path = `/admin/history${params.size ? `?${params}` : ""}`;
-  const response = parseResponse(AdminHistoryListResponseSchema, await request<unknown>(path, { signal }), "GET /admin/history");
+  const response = await requestJson(path, AdminHistoryListResponseSchema, { signal });
   return { ...response, items: response.items.map(normalizeDestination) };
 }
 export async function getAdminHistoryEvent(eventId: string, compareTo?: string, signal?: AbortSignal) {
   const path = `/admin/history/${encodeURIComponent(eventId)}${compareTo ? `?${new URLSearchParams({ compareTo })}` : ""}`;
-  const response = parseResponse(AdminHistoryDetailResponseSchema, await request<unknown>(path, { signal }), "GET /admin/history/:eventId");
+  const response = await requestJson(path, AdminHistoryDetailResponseSchema, { signal });
   return { ...response, event: normalizeDestination(response.event) };
 }

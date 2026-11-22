@@ -7,8 +7,7 @@ import {
   type SessionCapabilitiesUpdate
 } from "@cogniplane/shared-types";
 
-import { request } from "./api-client";
-import { parseResponse } from "./validate-response";
+import { requestJson, requestEmpty } from "./api-client";
 
 import type { Approval, ApprovalDecisionRequest, Session } from "@cogniplane/shared-types";
 
@@ -23,15 +22,13 @@ export type SessionListOptions = {
 };
 
 export async function getSessionCapabilities(sessionId: string) {
-  return parseResponse(SessionCapabilitiesSchema,
-    await request<unknown>(`/sessions/${encodeURIComponent(sessionId)}/capabilities`), "GET /sessions/:id/capabilities");
+  return await requestJson(`/sessions/${encodeURIComponent(sessionId)}/capabilities`, SessionCapabilitiesSchema);
 }
 
 export async function updateSessionCapabilities(sessionId: string, input: SessionCapabilitiesUpdate) {
-  return parseResponse(SessionCapabilitiesSchema,
-    await request<unknown>(`/sessions/${encodeURIComponent(sessionId)}/capabilities`, {
+  return await requestJson(`/sessions/${encodeURIComponent(sessionId)}/capabilities`, SessionCapabilitiesSchema, {
       method: "PUT", body: JSON.stringify(input)
-    }), "PUT /sessions/:id/capabilities");
+    });
 }
 
 async function fetchSessionPage(status: "active" | "archived", options: SessionListOptions): Promise<SessionList> {
@@ -41,8 +38,7 @@ async function fetchSessionPage(status: "active" | "archived", options: SessionL
   if (options.search) params.set("search", options.search);
   if (options.ids) { params.set("ids", options.ids.join(",")); params.set("limit", "100"); }
   if (options.personalOnly) params.set("personalOnly", "true");
-  const raw = await request<unknown>(`/sessions?${params}`, { signal: options.signal });
-  const response = parseResponse(SessionsListResponseSchema, raw, "GET /sessions");
+  const response = await requestJson(`/sessions?${params}`, SessionsListResponseSchema, { signal: options.signal });
   return { sessions: response.sessions, nextCursor: response.nextCursor ?? null,
     trashRetentionDays: response.trashRetentionDays ?? SESSION_TRASH_RETENTION_DAYS };
 }
@@ -56,44 +52,39 @@ export function listArchivedSessions(options: SessionListOptions = {}): Promise<
 }
 
 export async function archiveSession(sessionId: string): Promise<Session> {
-  const raw = await request<unknown>(`/sessions/${sessionId}/archive`, { method: "POST" });
-  return parseResponse(SessionEnvelopeSchema, raw, "POST /sessions/:id/archive").session;
+  return (await requestJson(`/sessions/${sessionId}/archive`, SessionEnvelopeSchema, { method: "POST" })).session;
 }
 
 export async function restoreSession(sessionId: string): Promise<Session> {
-  const raw = await request<unknown>(`/sessions/${sessionId}/restore`, { method: "POST" });
-  return parseResponse(SessionEnvelopeSchema, raw, "POST /sessions/:id/restore").session;
+  return (await requestJson(`/sessions/${sessionId}/restore`, SessionEnvelopeSchema, { method: "POST" })).session;
 }
 
 export async function createSession(name?: string): Promise<Session> {
-  const raw = await request<unknown>("/sessions", {
+  return (await requestJson("/sessions", SessionEnvelopeSchema, {
     method: "POST",
     body: JSON.stringify(name ? { name } : {})
-  });
-  return parseResponse(SessionEnvelopeSchema, raw, "POST /sessions").session;
+  })).session;
 }
 
 export async function renameSession(sessionId: string, name: string): Promise<Session> {
-  const raw = await request<unknown>(`/sessions/${sessionId}/name`, {
+  return (await requestJson(`/sessions/${sessionId}/name`, SessionEnvelopeSchema, {
     method: "PUT",
     body: JSON.stringify({ name })
-  });
-  return parseResponse(SessionEnvelopeSchema, raw, "PUT /sessions/:id/name").session;
+  })).session;
 }
 
 export async function deleteSession(sessionId: string): Promise<void> {
-  await request<void>(`/sessions/${sessionId}`, {
+  await requestEmpty(`/sessions/${sessionId}`, {
     method: "DELETE"
   });
 }
 
 export async function interruptSession(sessionId: string): Promise<void> {
-  await request(`/sessions/${encodeURIComponent(sessionId)}/interrupt`, { method: "POST" });
+  await requestEmpty(`/sessions/${encodeURIComponent(sessionId)}/interrupt`, { method: "POST" });
 }
 
 export async function listApprovals(sessionId: string, signal?: AbortSignal): Promise<Approval[]> {
-  const raw = await request<unknown>(`/sessions/${sessionId}/approvals`, { signal });
-  return parseResponse(ApprovalsListResponseSchema, raw, "GET /sessions/:id/approvals").approvals;
+  return (await requestJson(`/sessions/${sessionId}/approvals`, ApprovalsListResponseSchema, { signal })).approvals;
 }
 
 export async function resolveApproval(
@@ -104,7 +95,7 @@ export async function resolveApproval(
   const body: ApprovalDecisionRequest = rememberForTurn
     ? { decision, rememberForTurn: true }
     : { decision };
-  await request(`/approvals/${approvalId}/decision`, {
+  await requestEmpty(`/approvals/${approvalId}/decision`, {
     method: "POST",
     body: JSON.stringify(body)
   });

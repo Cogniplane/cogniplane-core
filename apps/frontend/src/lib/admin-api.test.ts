@@ -3,9 +3,9 @@ import { beforeEach, expect, it, vi } from "vitest";
 import { DEFAULT_PII_PROTECTION, type PiiRecentResponse } from "@cogniplane/shared-types";
 
 import { changeAdminMcpWidgetDomain, changeMemberRole, getAdminMcpWidgetDomains, getAdminPiiRecent, listAdminSessions, listPolicyDecisions, saveAdminMcpConnection, updateTenantPiiProtection } from "./admin-api";
-import { request, requestOptionalOn404 } from "./api-client";
+import { wireRequest as request, wireRequestOptionalOn404 as requestOptionalOn404 } from "../test-helpers/api-client-mock";
 
-vi.mock("./api-client", () => ({ request: vi.fn(), requestOptionalOn404: vi.fn() }));
+vi.mock("./api-client", async () => (await import("../test-helpers/api-client-mock")).apiClientMock());
 beforeEach(() => {
   vi.mocked(request).mockReset();
   vi.mocked(requestOptionalOn404).mockReset();

@@ -1,7 +1,6 @@
 import { MessageFeedbackResponseSchema } from "@cogniplane/shared-types";
 
-import { request } from "./api-client";
-import { parseResponse } from "./validate-response";
+import { requestJson } from "./api-client";
 
 import type {
   MessageFeedbackStats
@@ -14,6 +13,5 @@ export type {
 } from "@cogniplane/shared-types";
 
 export async function fetchMessageFeedback(days: number): Promise<MessageFeedbackStats> {
-  const raw = await request<unknown>(`/admin/message-feedback?days=${days}`);
-  return parseResponse(MessageFeedbackResponseSchema, raw, "GET /admin/message-feedback").stats;
+  return (await requestJson(`/admin/message-feedback?days=${days}`, MessageFeedbackResponseSchema)).stats;
 }

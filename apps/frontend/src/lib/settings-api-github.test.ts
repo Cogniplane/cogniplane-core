@@ -1,10 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const api = vi.hoisted(() => ({ request: vi.fn() }));
-
-vi.mock("./api-client", () => api);
+vi.mock("./api-client", async () => (await import("../test-helpers/api-client-mock")).apiClientMock());
 
 import { listGithubRepositories, updateGithubAllowedRepositories } from "./settings-api";
+import { wireRequest } from "../test-helpers/api-client-mock";
+
+const api = { request: wireRequest };
 
 beforeEach(() => {
   api.request.mockReset();

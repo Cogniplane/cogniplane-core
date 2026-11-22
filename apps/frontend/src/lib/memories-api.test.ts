@@ -1,9 +1,9 @@
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 
 import { deleteMemory, listMemories, updateMemory } from "./memories-api";
+import { wireRequest as request } from "../test-helpers/api-client-mock";
 
-const request = vi.hoisted(() => vi.fn());
-vi.mock("./api-client", () => ({ request }));
+vi.mock("./api-client", async () => (await import("../test-helpers/api-client-mock")).apiClientMock());
 
 const scope = { tenantId: "tenant-a", userId: "member-1" };
 const memory = {

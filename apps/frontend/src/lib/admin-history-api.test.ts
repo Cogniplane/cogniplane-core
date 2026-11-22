@@ -1,9 +1,9 @@
 import { afterEach, expect, test, vi } from "vitest";
 import type { AdminHistoryEvent } from "@cogniplane/shared-types";
 import { getAdminHistoryEvent, listAdminHistory } from "./admin-history-api";
-import { request } from "./api-client";
+import { wireRequest as request } from "../test-helpers/api-client-mock";
 
-vi.mock("./api-client", () => ({ request: vi.fn() }));
+vi.mock("./api-client", async () => (await import("../test-helpers/api-client-mock")).apiClientMock());
 const privacy: AdminHistoryEvent = {
   eventId: "9007199254740993", type: "tenant.pii_protection.updated", category: "policies",
   title: "Privacy protection changed", createdAt: "2026-11-04T14:30:00.000001Z",
