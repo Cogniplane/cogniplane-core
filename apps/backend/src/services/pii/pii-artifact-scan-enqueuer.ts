@@ -1,6 +1,11 @@
 import type { ArtifactPiiDetail, ArtifactStore } from "../artifacts/artifact-store.js";
 import type { AuditEventStore } from "../audit-event-store.js";
-import type { StorageGc, StorageGcOutcome } from "../storage/storage-gc.js";
+import type { StorageGc } from "../storage/storage-gc.js";
+import {
+  PiiArtifactVerdictWriter,
+  type PiiArtifactVerdictAuditEvent,
+  type PiiArtifactVerdictTarget
+} from "./pii-artifact-verdict-writer.js";
 import { piiSubjectForSource, type PiiImportScopeRegistry } from "./pii-import-scopes.js";
 import { PII_POLICY_INVALID_CODE, PII_POLICY_INVALID_MESSAGE } from "./pii-policy.js";
 import type { PiiFinding } from "./pii-provider.js";
@@ -11,7 +16,7 @@ import {
   type PiiProtectionService,
   type PiiScanArtifactInput
 } from "./pii-protection-service.js";
-import { coverageOf, PERMANENT_PII_ERROR_CODES, scanRunDecision } from "./pii-scan-job-handler.js";
+import { PERMANENT_PII_ERROR_CODES, scanRunDecision } from "./pii-scan-job-handler.js";
 import { PII_SCAN_INTERRUPTED, type PiiScanJobMode, type PiiScanJobStore } from "./pii-scan-job-store.js";
 import type { PiiScanRunDecision, PiiScanRunStore } from "./pii-scan-run-store.js";
 import { imageCoverageDetail } from "./scannable-text.js";
@@ -93,6 +98,7 @@ type PiiArtifactScanLogger = {
  * finishes a synchronous decision that was recorded but not applied.
  */
 export class PiiArtifactScanEnqueuer {
+  private readonly verdicts: PiiArtifactVerdictWriter;
 
   constructor(
     private readonly deps: {
@@ -107,7 +113,9 @@ export class PiiArtifactScanEnqueuer {
       auditEvents?: Pick<AuditEventStore, "create">;
       logger?: PiiArtifactScanLogger;
     }
-  ) {}
+  ) {
+    this.verdicts = new PiiArtifactVerdictWriter(deps);
+  }
 
   // One policy read routes the upload. The synchronous scan evaluates and
   // records with the same read. A queued scan applies the policy in force
@@ -213,7 +221,12 @@ export class PiiArtifactScanEnqueuer {
         { tenantId: input.tenantId, artifact: subject, subject: piiSubjectForSource(input.source) },
         input.read
       );
-      decision = scanRunDecision(evaluation.decision, evaluation.appliedPolicy, imageCoverageDetail(subject.imageCoverage?.()));
+      decision = scanRunDecision(
+        evaluation.decision,
+        evaluation.appliedPolicy,
+        imageCoverageDetail(subject.imageCoverage?.()),
+        input.source
+      );
     } catch (error) {
       return this.handleProviderError(input, scanRunId, error);
     }
@@ -230,12 +243,10 @@ export class PiiArtifactScanEnqueuer {
       };
     }
 
+    // The writer that the job handler uses, so a decision that recovery
+    // finishes ends the same way.
     try {
-      if (decision.action === "block") {
-        await this.applyBlockDecision(input, scanRunId, decision);
-      } else {
-        await this.applyAllowDecision(input, scanRunId, decision);
-      }
+      await this.verdicts.apply(this.verdictTarget(input, scanRunId), decision);
     } catch (error) {
       this.deps.logger?.error?.(
         { err: error, tenantId: input.tenantId, artifactId: input.artifactId, scanRunId },
@@ -265,123 +276,6 @@ export class PiiArtifactScanEnqueuer {
     };
   }
 
-  // Same order as PiiScanJobHandler.applyDecision, so a decision that
-  // recovery finishes ends the same way. The detail write moves the pending
-  // upload to `failed`. The terminal scan run update is last and clears the
-  // recorded decision.
-  private async applyBlockDecision(
-    input: SyncScanInput,
-    scanRunId: string,
-    decision: PiiScanRunDecision
-  ): Promise<void> {
-    // The `blocked` verdict and the queued object delete commit together, so
-    // no failure after this point loses the key. A failure of this write
-    // leaves the recorded decision for recovery.
-    const { objectDeleted, objectCleanup } = await this.rejectStoredObject(input, scanRunId, {
-      status: "blocked",
-      modeApplied: decision.mode,
-      policyRevision: decision.policyRevision,
-      scanRunId,
-      blockReason: decision.blockReason,
-      findingsCount: decision.findings.length,
-      ...coverageOf(decision)
-    });
-    await this.emitAudit(input, "pii_blocked", {
-      scanRunId,
-      mode: decision.mode,
-      policyRevision: decision.policyRevision,
-      subjectType: "artifact",
-      subjectId: input.artifactId,
-      source: input.source,
-      findingsCount: decision.findings.length,
-      providerType: decision.providerType,
-      providerModel: decision.providerModel,
-      blockReason: decision.blockReason,
-      objectDeleted,
-      objectCleanup
-    });
-    // Record the mode that the evaluation applied. The scan run was created
-    // with the routed mode, from the same read.
-    await this.deps.piiScanRuns.update(input.tenantId, scanRunId, {
-      status: "blocked",
-      mode: decision.mode,
-      providerType: decision.providerType,
-      providerModel: decision.providerModel,
-      findings: decision.findings,
-      actionTaken: "block",
-      pendingDecision: null,
-      completedAt: new Date()
-    });
-  }
-
-  /**
-   * Rejects the upload and gives up its object (a block, or a permanent scan
-   * error): `ArtifactStore.rejectStoredObject` writes `pii` and queues the
-   * current key in one transaction, then this call tries the delete. The
-   * delete keeps an object that a live row of any tenant still references.
-   * A failed delete stays queued: the scheduler worker retries it, and the
-   * `pii_block_object_orphaned` audit event records the failure.
-   */
-  private async rejectStoredObject(
-    input: SyncScanInput,
-    scanRunId: string,
-    pii: ArtifactPiiDetail,
-    status?: "failed"
-  ): Promise<{ objectDeleted: boolean; objectCleanup: StorageGcOutcome | "row_gone" }> {
-    const released = await this.deps.artifacts.rejectStoredObject(input.tenantId, input.artifactId, {
-      pii,
-      ...(status ? { status } : {})
-    });
-    if (!released) return { objectDeleted: false, objectCleanup: "row_gone" };
-    const outcome = await this.deps.storageGc.collectArtifactObject({
-      queue: "session_storage_gc",
-      tenantId: input.tenantId,
-      ownerId: released.sessionId,
-      storageKey: released.storageKey
-    });
-    if (outcome === "pending") {
-      this.deps.logger?.error?.(
-        { tenantId: input.tenantId, artifactId: input.artifactId, scanRunId },
-        "Failed to delete stored object for PII-rejected artifact; it stays queued for retry"
-      );
-      await this.emitAudit(input, "pii_block_object_orphaned", {
-        scanRunId,
-        subjectType: "artifact",
-        subjectId: input.artifactId,
-        storageKey: released.storageKey,
-        source: input.source,
-        retry: "queued"
-      });
-    }
-    return { objectDeleted: outcome === "deleted", objectCleanup: outcome };
-  }
-
-  private async applyAllowDecision(
-    input: SyncScanInput,
-    scanRunId: string,
-    decision: PiiScanRunDecision
-  ): Promise<void> {
-    // The detail write moves the pending upload to `ready`.
-    await this.deps.artifacts.setPiiDetail(input.tenantId, input.artifactId, {
-      status: "scanned",
-      modeApplied: decision.mode,
-      policyRevision: decision.policyRevision,
-      scanRunId,
-      findingsCount: decision.findings.length,
-      ...coverageOf(decision)
-    });
-    await this.deps.piiScanRuns.update(input.tenantId, scanRunId, {
-      status: "completed",
-      mode: decision.mode,
-      providerType: decision.providerType,
-      providerModel: decision.providerModel,
-      findings: decision.findings,
-      actionTaken: "allow",
-      pendingDecision: null,
-      completedAt: new Date()
-    });
-  }
-
   private async handleProviderError(
     input: SyncScanInput,
     scanRunId: string,
@@ -395,7 +289,11 @@ export class PiiArtifactScanEnqueuer {
     // error is not a verdict: the content was never scanned, so keep it.
     if (PERMANENT_PII_ERROR_CODES.has(errorCode)) {
       // The failed verdict and the queued delete commit together.
-      await this.rejectStoredObject(input, scanRunId, this.failedDetail(input, scanRunId, errorMessage), "failed");
+      await this.verdicts.rejectStoredObject(
+        this.verdictTarget(input, scanRunId),
+        this.failedDetail(input, scanRunId, errorMessage),
+        { status: "failed", source: input.source }
+      );
       await this.deps.piiScanRuns.update(input.tenantId, scanRunId, {
         status: "failed",
         errorMessage,
@@ -472,9 +370,18 @@ export class PiiArtifactScanEnqueuer {
     }
   }
 
+  private verdictTarget(input: EnqueueArtifactPiiScanInput, scanRunId: string): PiiArtifactVerdictTarget {
+    return {
+      tenantId: input.tenantId,
+      artifactId: input.artifactId,
+      scanRunId,
+      emitAudit: (eventType, payload) => this.emitAudit(input, eventType, payload)
+    };
+  }
+
   private async emitAudit(
     input: EnqueueArtifactPiiScanInput,
-    eventType: "pii_blocked" | "pii_transformed" | "pii_reported" | "pii_block_object_orphaned" | "pii_policy_invalid",
+    eventType: PiiArtifactVerdictAuditEvent | "pii_policy_invalid",
     payload: Record<string, unknown>
   ): Promise<void> {
     if (!this.deps.auditEvents) return;

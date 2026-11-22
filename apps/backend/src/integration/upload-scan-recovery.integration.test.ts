@@ -173,13 +173,18 @@ async function setup(mode: PiiProtectionSettings["mode"] = "block") {
     "SELECT COUNT(*) AS n FROM audit_events WHERE tenant_id = $1 AND event_type = $2",
     [tenantId, type]
   )).rows[0].n);
+  // Oldest first.
+  const auditPayloads = async (type: string) => (await superuserPool().query<{ payload: Record<string, unknown> }>(
+    "SELECT payload FROM audit_events WHERE tenant_id = $1 AND event_type = $2 ORDER BY created_at, id",
+    [tenantId, type]
+  )).rows.map((row) => row.payload);
   const newestArtifactId = async () => (await superuserPool().query(
     "SELECT artifact_id FROM artifacts WHERE tenant_id = $1 AND artifact_name = 'notes.txt' ORDER BY created_at DESC LIMIT 1",
     [tenantId]
   )).rows[0].artifact_id as string;
   return {
     ...graph, artifacts, runs, jobs, storage, deleted, faults, enqueuer, upload, tick, age, artifactState, scanState,
-    auditCount, newestArtifactId, evaluateArtifactWithPolicy, logger, queuedKeys, objects
+    auditCount, auditPayloads, newestArtifactId, evaluateArtifactWithPolicy, logger, queuedKeys, objects
   };
 }
 
@@ -347,6 +352,21 @@ describe.skipIf(!adminDatabaseUrl())("synchronous block decision recovery", () =
     expect(h.evaluateArtifactWithPolicy).toHaveBeenCalledTimes(1);
     expect(h.deleted).toHaveLength(1);
     expect(await h.queuedKeys()).toEqual([]);
+
+    // The worker's audit event states what an ordinary synchronous block states.
+    expect(await h.upload(h.enqueuer())).toMatchObject({ kind: "blocked" });
+    const ordinaryId = await h.newestArtifactId();
+    const runIdOf = async (id: string) => (await h.scanState(id)).runs[0].scan_run_id as string;
+    const events = await h.auditPayloads("pii_blocked");
+    expect(events).toHaveLength(2);
+    // Each event names its own upload and scan run; the other fields are equal.
+    const [{ subjectId: recoveredSubject, scanRunId: recoveredRun, ...recovered },
+      { subjectId: ordinarySubject, scanRunId: ordinaryRun, ...ordinary }] = events;
+    expect([recoveredSubject, recoveredRun]).toEqual([artifactId, await runIdOf(artifactId)]);
+    expect([ordinarySubject, ordinaryRun]).toEqual([ordinaryId, await runIdOf(ordinaryId)]);
+    expect(ordinaryId).not.toBe(artifactId);
+    expect(recovered).toMatchObject({ source: "upload", subjectType: "artifact", objectDeleted: true });
+    expect(recovered).toEqual(ordinary);
   });
 
   test("fault: the verdict write of an allow throws; one tick makes the upload ready with the recorded verdict", async () => {

@@ -88,6 +88,12 @@ export type PiiScanRunDecision = {
   providerModel: string | null;
   /** Set for a block. */
   blockReason?: string;
+  /**
+   * Set for an artifact: "upload", or the subject kind of the import source.
+   * The audit events of the decision store it as `source`. A decision
+   * recorded before this field existed does not hold it.
+   */
+  source?: string;
   /** The scan did not read all page images of the file (a PDF). */
   imagesNotScanned?: boolean;
   /** Set when OCR ran on a PDF. */
@@ -110,6 +116,7 @@ const PendingDecisionSchema = z.object({
   providerType: z.string().nullable(),
   providerModel: z.string().nullable(),
   blockReason: z.string().optional(),
+  source: z.string().optional(),
   imagesNotScanned: z.boolean().optional(),
   imageScan: z.enum(["complete", "partial", "failed"]).optional(),
   imagePagesScanned: z.number().int().nonnegative().optional(),

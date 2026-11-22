@@ -75,6 +75,11 @@ shows provider status, scan metrics, queue state and the breaker timeline (`GET
   as a queued scan does. Then it writes the verdict, and closes the scan run
   last. A write that fails after the record does not turn into "not scanned":
   recovery finishes the decision.
+- One writer applies a recorded file decision
+  (`PiiArtifactVerdictWriter.apply`, `pii-artifact-verdict-writer.ts`): the
+  synchronous scan and the job handler both call it. The decision holds the
+  file's `source` ("upload", or the subject kind of the import), so the audit
+  events have the same payload when the worker finishes a decision.
 - A block, and a permanent scan error of the synchronous scan, give up the
   object (`ArtifactStore.rejectStoredObject`). One transaction writes the
   verdict, marks the artifact released (`storage_released_at`) and queues the
