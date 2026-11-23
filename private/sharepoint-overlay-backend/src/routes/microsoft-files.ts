@@ -4,11 +4,16 @@ import { z } from "zod";
 import { ArtifactEnvelopeSchema } from "@cogniplane/shared-types";
 
 import type { AttachOverlaysInput } from "../../../../apps/backend/src/overlay-contracts.js";
-import { apiError } from "../../../../apps/backend/src/lib/http-errors.js";
-import type { RequestLimitsInterface } from "../../../../apps/backend/src/services/request-limits.js";
-import { parseRequestInput } from "../../../../apps/backend/src/lib/route-validation.js";
-import { sessionIdParams } from "../../../../apps/backend/src/lib/route-schemas.js";
-import { serialize } from "../../../../apps/backend/src/lib/serialize-response.js";
+import {
+  apiError,
+  parseRequestInput,
+  PERMANENT_PII_ERROR_CODES,
+  ProjectAccessError,
+  type RequestLimitsInterface,
+  serialize,
+  sessionIdParams,
+  SessionUploadAccessError
+} from "../../../../apps/backend/src/overlay-sdk.js";
 import {
   MicrosoftFilesListResponseSchema,
   MicrosoftFilesSearchResponseSchema,
@@ -24,9 +29,6 @@ import {
   MicrosoftUnsupportedImportError
 } from "../services/microsoft-files-service.js";
 import { MicrosoftInvalidIdError } from "../services/graph-id-validation.js";
-import { PERMANENT_PII_ERROR_CODES } from "../../../../apps/backend/src/services/pii/pii-scan-job-handler.js";
-import { ProjectAccessError } from "../../../../apps/backend/src/services/project-access.js";
-import { SessionUploadAccessError } from "../../../../apps/backend/src/services/session-upload-access.js";
 
 const microsoftSitesQuerySchema = z.object({
   search: z.string().trim().max(120).optional()

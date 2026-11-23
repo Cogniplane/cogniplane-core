@@ -5,7 +5,7 @@ import {
   type MicrosoftConnectionStatus
 } from "../../../sharepoint-overlay-contracts/src/index";
 
-import { requestEmpty, requestJson } from "../../../../apps/frontend/src/lib/api-client";
+import { requestEmpty, requestJson } from "../../../../apps/frontend/src/overlay-sdk/data";
 
 export async function fetchMicrosoftConnectionStatus(): Promise<MicrosoftConnectionStatus> {
   return requestJson("/me/microsoft-connection", MicrosoftConnectionStatusSchema);

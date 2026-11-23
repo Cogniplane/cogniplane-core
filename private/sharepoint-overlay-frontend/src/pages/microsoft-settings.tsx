@@ -3,7 +3,7 @@
 import { useMemo } from "react";
 import { useSearchParams } from "next/navigation";
 
-import { buildOAuthFlashMessage } from "../../../../apps/frontend/src/components/oauth-settings-page";
+import { buildOAuthFlashMessage } from "../../../../apps/frontend/src/overlay-sdk/oauth-settings";
 import { MicrosoftConnectionSection } from "../components/microsoft-connection-section";
 import { useMicrosoftConnection } from "../hooks/use-microsoft-connection";
 

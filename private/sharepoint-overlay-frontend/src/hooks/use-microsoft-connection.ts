@@ -9,7 +9,7 @@ import {
   deleteMicrosoftConnection,
   fetchMicrosoftConnectionStatus
 } from "../lib/settings-api";
-import { toErrorMessage } from "../../../../apps/frontend/src/lib/error-utils";
+import { toErrorMessage } from "../../../../apps/frontend/src/overlay-sdk/data";
 import { microsoftQueryKeys } from "../lib/query-keys";
 
 export function useMicrosoftConnection() {

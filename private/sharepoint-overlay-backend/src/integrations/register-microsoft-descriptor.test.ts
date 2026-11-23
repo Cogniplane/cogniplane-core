@@ -1,8 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { getIntegrationDescriptor } from "../../../../apps/backend/src/overlay-sdk.js";
 import {
-  __resetIntegrationRegistryForTesting,
-  getIntegrationDescriptor
-} from "../../../../apps/backend/src/services/integrations/integration-registry.js";
+  __resetIntegrationRegistryForTesting
+} from "../../../../apps/backend/src/test-helpers/overlay-testing.js";
 import { registerMicrosoftDescriptor } from "./register-microsoft-descriptor.js";
 
 describe("registerMicrosoftDescriptor", () => {

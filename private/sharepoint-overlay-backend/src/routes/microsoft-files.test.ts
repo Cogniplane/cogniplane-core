@@ -11,8 +11,7 @@ import {
   MicrosoftUnsupportedImportError
 } from "../services/microsoft-files-service.js";
 import { MicrosoftInvalidIdError } from "../services/graph-id-validation.js";
-import { ProjectAccessError } from "../../../../apps/backend/src/services/project-access.js";
-import { SessionUploadAccessError } from "../../../../apps/backend/src/services/session-upload-access.js";
+import { ProjectAccessError, SessionUploadAccessError } from "../../../../apps/backend/src/overlay-sdk.js";
 
 import { registerMicrosoftFileRoutes, replyForMicrosoftError } from "./microsoft-files.js";
 

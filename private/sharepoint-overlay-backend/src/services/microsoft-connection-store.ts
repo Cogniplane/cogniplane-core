@@ -1,9 +1,11 @@
-import { withTenantScope, type Pool } from "../../../../apps/backend/src/lib/db.js";
-import { AuditEventStore, type AuditEventInput } from "../../../../apps/backend/src/services/audit-event-store.js";
 import {
   assertOwnerSecurityVersion,
-  ownerSecurityVersionSql
-} from "../../../../apps/backend/src/services/auth/security-change.js";
+  type AuditEventInput,
+  AuditEventStore,
+  ownerSecurityVersionSql,
+  type Pool,
+  withTenantScope
+} from "../../../../apps/backend/src/overlay-sdk.js";
 import type {} from "../audit-event-types.js";
 
 export type MicrosoftConnectionRecord = {

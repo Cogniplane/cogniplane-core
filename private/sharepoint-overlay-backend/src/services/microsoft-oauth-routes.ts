@@ -2,11 +2,11 @@ import type { FastifyInstance } from "fastify";
 
 import {
   buildIntegrationRedirectUrl,
+  enforceOAuthCallbackRateLimit,
   mapOAuthProviderError,
+  type RequestLimitsInterface,
   takeOAuthBrowserNonce
-} from "../../../../apps/backend/src/services/integrations/integration-oauth-helpers.js";
-import { enforceOAuthCallbackRateLimit } from "../../../../apps/backend/src/services/integrations/oauth-callback-rate-limit.js";
-import type { RequestLimitsInterface } from "../../../../apps/backend/src/services/request-limits.js";
+} from "../../../../apps/backend/src/overlay-sdk.js";
 import type { MicrosoftConnectionService } from "./microsoft-connection-service.js";
 
 export const MICROSOFT_OAUTH_CALLBACK_PATHS = ["/integrations/microsoft/callback"] as const;

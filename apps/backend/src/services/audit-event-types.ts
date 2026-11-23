@@ -1,3 +1,5 @@
+import type { OverlayAuditEventTypes } from "../overlay-contracts.js";
+
 // Single source of truth for `audit_events.event_type` values.
 //
 // Every `auditEvents.create({ type: ... })` call resolves through
@@ -218,18 +220,5 @@ export const AUDIT_EVENT_TYPES = [
   "user.settings.updated"
 ] as const;
 
-// Event types that an overlay emits through the same audit pipeline. Core does
-// not name them. An overlay adds its names with module augmentation, so that
-// its `auditEvents.create` calls typecheck:
-//
-//   declare module "<path to this file>.js" {
-//     interface OverlayAuditEventTypes {
-//       "user.example.connected": true;
-//     }
-//   }
-//
-// The same stability rule applies: do not rename an event type after release.
-// eslint-disable-next-line @typescript-eslint/no-empty-object-type -- overlays augment this interface.
-export interface OverlayAuditEventTypes {}
-
+// An overlay adds its event types to `OverlayAuditEventTypes` (overlay-contracts.ts).
 export type AuditEventType = (typeof AUDIT_EVENT_TYPES)[number] | keyof OverlayAuditEventTypes;

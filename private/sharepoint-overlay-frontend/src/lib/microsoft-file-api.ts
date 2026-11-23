@@ -1,4 +1,4 @@
-import { requestJson } from "../../../../apps/frontend/src/lib/api-client";
+import { requestJson } from "../../../../apps/frontend/src/overlay-sdk/data";
 
 import { ArtifactEnvelopeSchema, type Artifact } from "@cogniplane/shared-types";
 import {

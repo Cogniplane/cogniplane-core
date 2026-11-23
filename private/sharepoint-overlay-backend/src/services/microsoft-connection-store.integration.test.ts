@@ -26,22 +26,20 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 
+import { OwnerSecurityVersionChangedError } from "../../../../apps/backend/src/overlay-sdk.js";
 import {
   adminDatabaseUrl,
   appPool,
+  bootstrapLocalTenant,
   closePools,
   createRunDatabase,
   dropRunDatabase,
-  superuserPool
-} from "../../../../apps/backend/src/integration/support/database.js";
-import {
   seedMembership,
   seedTenant,
-  seedUser
-} from "../../../../apps/backend/src/integration/support/fixtures.js";
+  seedUser,
+  superuserPool
+} from "../../../../apps/backend/src/integration/support/overlay-testing.js";
 
-import { bootstrapLocalTenant } from "../../../../apps/backend/src/scripts/local-auth-commands-lib.js";
-import { OwnerSecurityVersionChangedError } from "../../../../apps/backend/src/services/auth/security-change.js";
 import { MicrosoftConnectionStore } from "./microsoft-connection-store.js";
 
 const RUN_ENV = ["INTEGRATION_RUN_DATABASE", "INTEGRATION_RUN_ROLE"] as const;

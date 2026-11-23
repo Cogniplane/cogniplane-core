@@ -1,8 +1,10 @@
 import Fastify from "fastify";
 import { afterEach, describe, expect, test, vi } from "vitest";
 
-import type { LimitExceededErrorPayload } from "../../../../apps/backend/src/services/request-limits.js";
-import { createTestConfig } from "../../../../apps/backend/src/test-helpers/test-config.js";
+import {
+  createTestConfig,
+  type LimitExceededErrorPayload
+} from "../../../../apps/backend/src/test-helpers/overlay-testing.js";
 import { registerMicrosoftOAuthRoutes } from "./microsoft-oauth-routes.js";
 
 const CONFIG = createTestConfig({ API_ORIGIN: "https://app.example.com" });

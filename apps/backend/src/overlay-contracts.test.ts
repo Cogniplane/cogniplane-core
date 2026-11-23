@@ -31,8 +31,8 @@ function listSourceFiles(dir: string): string[] {
   });
 }
 
-// These guards cover the overlay entrypoint only. Overlay packages still import
-// backend helpers directly; see docs/overlays.md.
+// These guards cover the direction core -> overlay. `overlay-sdk.test.ts` covers
+// the direction overlay -> core.
 describe("overlay contract boundary", () => {
   it("keeps the contract module inside core", () => {
     const specifiers = importSpecifiers(path.join(SRC_DIR, "overlay-contracts.ts"));

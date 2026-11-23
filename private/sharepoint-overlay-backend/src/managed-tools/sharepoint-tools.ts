@@ -1,7 +1,19 @@
 import path from "node:path";
 
-import { isArtifactPiiEligible, type ArtifactRecord } from "../../../../apps/backend/src/services/artifacts/artifact-store.js";
-import type { ArtifactStorage } from "../../../../apps/backend/src/services/artifacts/artifact-storage.js";
+import {
+  allRequiredObjectSchema,
+  arraySchema,
+  type ArtifactRecord,
+  type ArtifactStorage,
+  boundIntegrationAccount,
+  isArtifactPiiEligible,
+  type ManagedToolDefinition,
+  nullableNumberSchema,
+  nullableStringSchema,
+  safeJsonBody,
+  strictObjectSchema,
+  withManagedToolErrorSchema
+} from "../../../../apps/backend/src/overlay-sdk.js";
 import { hasMicrosoftWriteScope, type MicrosoftConnectionService } from "../services/microsoft-connection-service.js";
 
 const MICROSOFT_WRITE_SCOPE_MISSING =
@@ -14,17 +26,6 @@ import type {
 import { downloadGraphContent, readBodyPrefix } from "../services/microsoft-files-service.js";
 import { isValidGraphId } from "../services/graph-id-validation.js";
 import { buildGraphHeaders, MICROSOFT_REQUEST_TIMEOUT_MS } from "../services/graph-http.js";
-import {
-  allRequiredObjectSchema,
-  arraySchema,
-  nullableNumberSchema,
-  nullableStringSchema,
-  safeJsonBody,
-  strictObjectSchema,
-  withManagedToolErrorSchema,
-  type ManagedToolDefinition
-} from "../../../../apps/backend/src/services/managed-tools/types.js";
-import { boundIntegrationAccount } from "../../../../apps/backend/src/services/integrations/integration-account-binding.js";
 
 const SHAREPOINT_READ_TIMEOUT_MS = 30_000;
 

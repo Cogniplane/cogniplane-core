@@ -1,7 +1,14 @@
 import type { MicrosoftConnectionStatus } from "../../../sharepoint-overlay-contracts/src/index";
-import { OAuthConnectionActions, OAuthConnectionAvailability, OAuthConnectionOverview, OAuthConnectionReadBoundary, OAuthConnectionSectionHeading, type OAuthConnectionReadState } from "@/components/oauth-connection-presentation";
-import { formatMediumDateTime } from "@/lib/time-format";
-import type { OAuthConnectionBusyKey } from "@/hooks/use-oauth-connection";
+import { formatMediumDateTime } from "../../../../apps/frontend/src/overlay-sdk/data";
+import {
+  OAuthConnectionActions,
+  OAuthConnectionAvailability,
+  type OAuthConnectionBusyKey,
+  OAuthConnectionOverview,
+  OAuthConnectionReadBoundary,
+  type OAuthConnectionReadState,
+  OAuthConnectionSectionHeading
+} from "../../../../apps/frontend/src/overlay-sdk/oauth-settings";
 
 type MicrosoftConnectionSectionProps = OAuthConnectionReadState & {
   status: MicrosoftConnectionStatus | null;

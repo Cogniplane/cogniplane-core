@@ -1,7 +1,7 @@
 import { Readable } from "node:stream";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 
-import type { ToolExecutionContext } from "../../../../apps/backend/src/services/auth/tool-execution-context-store.js";
+import type { ToolExecutionContext } from "../../../../apps/backend/src/test-helpers/overlay-testing.js";
 import { createSharepointTools } from "./sharepoint-tools.js";
 
 const fakeContext: ToolExecutionContext = {

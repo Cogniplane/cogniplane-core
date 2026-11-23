@@ -1,9 +1,11 @@
 import Fastify from "fastify";
 import { afterEach, describe, expect, test, vi } from "vitest";
 
-import type { AuditEventInput } from "../../../../apps/backend/src/services/audit-event-store.js";
-import { devDataRoutes } from "../../../../apps/backend/src/test-helpers/data-routes.js";
-import { InMemoryAuditEventStore } from "../../../../apps/backend/src/test-helpers/in-memory-audit-events.js";
+import type { AuditEventInput } from "../../../../apps/backend/src/overlay-sdk.js";
+import {
+  devDataRoutes,
+  InMemoryAuditEventStore
+} from "../../../../apps/backend/src/test-helpers/overlay-testing.js";
 import { registerMicrosoftTenantRoutes } from "./microsoft-tenant-routes.js";
 
 const apps: ReturnType<typeof Fastify>[] = [];

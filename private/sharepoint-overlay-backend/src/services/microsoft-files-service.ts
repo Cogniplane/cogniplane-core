@@ -1,9 +1,11 @@
 import { Readable } from "node:stream";
 
-import { ALLOWED_ARTIFACT_MIME_TYPES } from "../../../../apps/backend/src/lib/allowed-mime-types.js";
-import type { ArtifactRecord } from "../../../../apps/backend/src/services/artifacts/artifact-store.js";
-import type { UploadAdmission } from "../../../../apps/backend/src/services/artifacts/upload-admission.js";
-import { safeJsonBody } from "../../../../apps/backend/src/services/managed-tools/types.js";
+import {
+  ALLOWED_ARTIFACT_MIME_TYPES,
+  type ArtifactRecord,
+  safeJsonBody,
+  type UploadAdmission
+} from "../../../../apps/backend/src/overlay-sdk.js";
 import type { MicrosoftConnectionService, MicrosoftRuntimeCredentials } from "./microsoft-connection-service.js";
 import { assertValidGraphId } from "./graph-id-validation.js";
 import { buildGraphHeaders, MICROSOFT_DOWNLOAD_TIMEOUT_MS, MICROSOFT_REQUEST_TIMEOUT_MS } from "./graph-http.js";

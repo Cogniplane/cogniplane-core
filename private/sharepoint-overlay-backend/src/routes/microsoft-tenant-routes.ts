@@ -1,12 +1,14 @@
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 
-import { requireRole } from "../../../../apps/backend/src/lib/rbac.js";
-import { adminAuditEvent } from "../../../../apps/backend/src/routes/admin/admin-route-helpers.js";
-import type { AuditEventStore } from "../../../../apps/backend/src/services/audit-event-store.js";
+import {
+  adminAuditEvent,
+  type AuditEventStore,
+  parseRequestInput,
+  requireRole,
+  type TenantRuntimeInvalidator
+} from "../../../../apps/backend/src/overlay-sdk.js";
 import type { OverlayRouteControls } from "../../../../apps/backend/src/overlay-contracts.js";
-import type { TenantRuntimeInvalidator } from "../../../../apps/backend/src/services/integrations/contracts.js";
-import { parseRequestInput } from "../../../../apps/backend/src/lib/route-validation.js";
 import {
   isValidEntraTenantId,
   type MicrosoftConnectionService

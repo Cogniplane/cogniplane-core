@@ -5,13 +5,15 @@ import type {
   OverlayHandles,
   OverlayRouteControls
 } from "../../../apps/backend/src/overlay-contracts.js";
-import { getIntegrationDescriptor } from "../../../apps/backend/src/services/integrations/integration-registry.js";
+import {
+  getIntegrationDescriptor,
+  type ManagedToolCatalogEntry
+} from "../../../apps/backend/src/overlay-sdk.js";
 
 import {
   attachMicrosoftRuntimeWiring,
   registerMicrosoftDescriptor
 } from "./integrations/register-microsoft-descriptor.js";
-import type { ManagedToolCatalogEntry } from "../../../apps/backend/src/services/managed-tools/catalog.js";
 import { createSharepointTools, SHAREPOINT_TOOL_CATALOG } from "./managed-tools/sharepoint-tools.js";
 import { loadOverlayConfig } from "./config.js";
 import { registerMicrosoftFileRoutes } from "./routes/microsoft-files.js";
