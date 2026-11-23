@@ -1,10 +1,17 @@
 import { decodeJwt, decodeProtectedHeader } from "jose";
 import { expect, test, vi } from "vitest";
 
-import { decrypt, encrypt } from "../../../../apps/backend/src/lib/crypto-utils.js";
-import { createTestConfig } from "../../../../apps/backend/src/test-helpers/test-config.js";
-import { InMemoryAuditEventStore } from "../../../../apps/backend/src/test-helpers/in-memory-audit-events.js";
-import { IntegrationOAuthStateStore } from "../../../../apps/backend/src/services/integrations/integration-oauth-state-store.js";
+import {
+  type AuditEventInput,
+  decrypt,
+  encrypt,
+  IntegrationOAuthStateStore,
+  OwnerSecurityVersionChangedError
+} from "../../../../apps/backend/src/overlay-sdk.js";
+import {
+  createTestConfig,
+  InMemoryAuditEventStore
+} from "../../../../apps/backend/src/test-helpers/overlay-testing.js";
 
 import {
   hasMicrosoftWriteScope,
@@ -15,8 +22,6 @@ import {
 } from "./microsoft-connection-service.js";
 import type { MicrosoftTenantConfig } from "./microsoft-connection-service.js";
 import type { MicrosoftConnectionRecord, MicrosoftConnectionStore } from "./microsoft-connection-store.js";
-import { OwnerSecurityVersionChangedError } from "../../../../apps/backend/src/services/auth/security-change.js";
-import type { AuditEventInput } from "../../../../apps/backend/src/services/audit-event-store.js";
 
 class InMemoryMicrosoftConnectionStore {
   private records = new Map<string, MicrosoftConnectionRecord>();

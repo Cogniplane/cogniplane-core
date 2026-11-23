@@ -12,7 +12,7 @@ import {
   waitWithinBudget
 } from "./lib/shutdown-budget.js";
 import { registerSseConnections } from "./lib/sse-connections.js";
-import { buildAdminRouteStores, registerAdminRoutes } from "./routes/admin.js";
+import { buildAdminRouteFeatures, registerAdminRoutes } from "./routes/admin.js";
 import type { DataRouteControl } from "./services/data-route-control.js";
 import { buildApprovalRouteStores, registerApprovalRoutes } from "./routes/approvals.js";
 import { buildArtifactRouteStores, registerArtifactRoutes } from "./routes/artifacts.js";
@@ -113,7 +113,7 @@ export async function registerAppRoutes(
       configuredProviders
     })
   );
-  await registerAdminRoutes(app, buildAdminRouteStores(deps, { config: app.config, dataRoutes: routeControls.dataRoutes }));
+  await registerAdminRoutes(app, buildAdminRouteFeatures(deps, { config: app.config, dataRoutes: routeControls.dataRoutes }));
   await registerSessionRoutes(app, buildSessionRouteStores(deps));
   await registerSessionCapabilityRoutes(app, deps);
   await registerProjectCapabilityRoutes(app, deps);

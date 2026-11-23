@@ -2,25 +2,22 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import Fastify, { type FastifyInstance } from "fastify";
 
-import type { Pool } from "../../../apps/backend/src/lib/db.js";
-import type { AttachOverlaysInput, OverlayBootstrap, OverlayHandles } from "../../../apps/backend/src/overlay-contracts.js";
-import type { IntegrationStateRecord } from "../../../apps/backend/src/services/integrations/integration-state-store.js";
+import { getIntegrationDescriptor, type Pool } from "../../../apps/backend/src/overlay-sdk.js";
 import {
   __resetIntegrationRegistryForTesting,
-  getIntegrationDescriptor,
-  IntegrationRegistry
-} from "../../../apps/backend/src/services/integrations/integration-registry.js";
-import { ManagedToolCatalog } from "../../../apps/backend/src/services/managed-tools/catalog.js";
-import {
+  createTestConfig,
+  devDataRoutes,
+  IntegrationRegistry,
+  type IntegrationStateRecord,
+  ManagedToolCatalog,
+  type ManagedToolFactoryDeps,
   ManagedToolFactoryRegistry,
-  type ManagedToolFactoryDeps
-} from "../../../apps/backend/src/services/managed-tools/factory.js";
-import { devDataRoutes } from "../../../apps/backend/src/test-helpers/data-routes.js";
-import { createTestConfig } from "../../../apps/backend/src/test-helpers/test-config.js";
+  PiiImportScopeRegistry
+} from "../../../apps/backend/src/test-helpers/overlay-testing.js";
+import type { AttachOverlaysInput, OverlayBootstrap, OverlayHandles } from "../../../apps/backend/src/overlay-contracts.js";
 
 import { bootstrap } from "./index.js";
 import { SHAREPOINT_TOOL_CATALOG } from "./managed-tools/sharepoint-tools.js";
-import { PiiImportScopeRegistry } from "../../../apps/backend/src/services/pii/pii-import-scopes.js";
 
 // Compile-time check: the overlay entrypoint implements the core contract.
 const contractBootstrap: OverlayBootstrap = bootstrap;

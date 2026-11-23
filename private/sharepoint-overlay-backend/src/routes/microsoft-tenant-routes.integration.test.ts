@@ -17,6 +17,19 @@ import { randomUUID } from "node:crypto";
 import Fastify, { type FastifyInstance } from "fastify";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 
+import { AuditEventStore, decrypt, encrypt } from "../../../../apps/backend/src/overlay-sdk.js";
+import {
+  createTestConfig,
+  DataRouteControl,
+  FakeRefreshTokenRedis,
+  type IntegrationStateRecord,
+  IntegrationStateStore,
+  type LocalAuth,
+  MailOutbox,
+  type OwnerNoticeQueue,
+  RefreshTokenRotationService,
+  StepUpStore
+} from "../../../../apps/backend/src/test-helpers/overlay-testing.js";
 import {
   adminDatabaseUrl,
   appPool,
@@ -24,20 +37,7 @@ import {
   createRunDatabase,
   dropRunDatabase,
   superuserPool
-} from "../../../../apps/backend/src/integration/support/database.js";
-import { decrypt, encrypt } from "../../../../apps/backend/src/lib/crypto-utils.js";
-import { AuditEventStore } from "../../../../apps/backend/src/services/audit-event-store.js";
-import type { LocalAuth } from "../../../../apps/backend/src/services/auth/local-auth.js";
-import { RefreshTokenRotationService } from "../../../../apps/backend/src/services/auth/refresh-token-rotation-service.js";
-import { StepUpStore } from "../../../../apps/backend/src/services/auth/step-up-store.js";
-import { DataRouteControl } from "../../../../apps/backend/src/services/data-route-control.js";
-import {
-  IntegrationStateStore,
-  type IntegrationStateRecord
-} from "../../../../apps/backend/src/services/integrations/integration-state-store.js";
-import { MailOutbox, type OwnerNoticeQueue } from "../../../../apps/backend/src/services/mail/mail-outbox.js";
-import { createTestConfig } from "../../../../apps/backend/src/test-helpers/test-config.js";
-import { FakeRefreshTokenRedis } from "../../../../apps/backend/src/test-helpers/fake-refresh-token-redis.js";
+} from "../../../../apps/backend/src/integration/support/overlay-testing.js";
 import { MicrosoftConnectionService } from "../services/microsoft-connection-service.js";
 import { MicrosoftConnectionStore } from "../services/microsoft-connection-store.js";
 import { registerMicrosoftTenantRoutes } from "./microsoft-tenant-routes.js";

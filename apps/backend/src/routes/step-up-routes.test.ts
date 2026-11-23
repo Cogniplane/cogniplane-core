@@ -25,7 +25,7 @@ import { guardedAuthRedis } from "../test-helpers/redis-write-guard.js";
 import { createFakeWorkOS } from "../test-helpers/fake-workos.js";
 import { InMemoryAuditEventStore } from "../test-helpers/in-memory-audit-events.js";
 import { createTestConfig } from "../test-helpers/test-config.js";
-import { registerAdminRoutes, type AdminRouteStores } from "./admin.js";
+import { registerAdminRoutes, type AdminRouteFeatures } from "./admin.js";
 import { registerAuthRoutes } from "./auth.js";
 import { registerOrganizationSkillSubmissionRoutes, type SubmissionStores } from "./organization-skill-submissions.js";
 import { registerProjectSkillRoutes, type ProjectSkillStores } from "./project-skills.js";
@@ -412,8 +412,11 @@ function policyRuleStore(calls: string[]) {
   };
 }
 
-/** The admin stores: fakes for what the data routes read and write; every other call is recorded and returns nothing. */
-function adminStores(calls: string[], writes: Array<{ method: string; args: unknown[] }>, dataRoutes: DataRouteControl): AdminRouteStores {
+/**
+ * The admin stores: fakes for what the data routes read and write; every other call is recorded and returns nothing.
+ * Every feature gets the same set, and reads the entries that it owns.
+ */
+function adminStores(calls: string[], writes: Array<{ method: string; args: unknown[] }>, dataRoutes: DataRouteControl): AdminRouteFeatures {
   const fixed: Record<string, unknown> = { config: CONFIG, dataRoutes, policyRules: policyRuleStore(calls) };
   const fakes: Record<string, Fakes> = {
     customModels: { list: async () => [] },
@@ -449,12 +452,29 @@ function adminStores(calls: string[], writes: Array<{ method: string; args: unkn
     },
     integrationRegistry: { getIntegrationsForAdmin: async () => [INTEGRATION_VIEW], isReadyToEnable: async () => true }
   };
-  return new Proxy({}, {
+  type Features = Required<AdminRouteFeatures>;
+  type Flat = Features["skills"] & Features["users"] & Features["runtime"] & Features["pii"] & Features["models"] &
+    Features["policy"] & Features["integrations"] & Features["mcpServers"] & Omit<Features["tenantSettings"], "listCustomModels">;
+  const flat = new Proxy({}, {
     get: (_target, key) => {
       if (typeof key !== "string" || key === "then") return undefined;
       return key in fixed ? fixed[key] : recordingStore(calls, key, fakes[key]);
     }
-  }) as AdminRouteStores;
+  }) as Flat;
+  return {
+    skills: flat, users: flat, runtime: flat, pii: flat, models: flat, policy: flat, integrations: flat, mcpServers: flat,
+    personAccess: recordingStore(calls, "personAccess"),
+    modelSpending: recordingStore(calls, "modelSpending"),
+    tenantSettings: {
+      dynamicConfig: flat.dynamicConfig,
+      managedToolCatalog: flat.managedToolCatalog,
+      dataRoutes: flat.dataRoutes,
+      listCustomModels: async (tenantId) => {
+        await flat.customModels.list(tenantId);
+        return [];
+      }
+    }
+  };
 }
 
 type QueuedNotice = { client: unknown; tenantId: string; actorUserId: string; change: DataSettingChange };

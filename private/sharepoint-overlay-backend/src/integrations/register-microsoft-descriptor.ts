@@ -1,10 +1,10 @@
 import type { AttachOverlaysInput } from "../../../../apps/backend/src/overlay-contracts.js";
 import {
-  registerIntegration,
   getIntegrationDescriptor,
   type IntegrationConnectionProbe,
-  type IntegrationOAuthRoutes
-} from "../../../../apps/backend/src/services/integrations/integration-registry.js";
+  type IntegrationOAuthRoutes,
+  registerIntegration
+} from "../../../../apps/backend/src/overlay-sdk.js";
 import type { MicrosoftConnectionService } from "../services/microsoft-connection-service.js";
 import { loadOverlayConfig } from "../config.js";
 import {

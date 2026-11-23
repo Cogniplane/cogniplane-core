@@ -1,24 +1,24 @@
 import Fastify from "fastify";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
-import type { Pool } from "../../../../apps/backend/src/lib/db.js";
-import type { AttachOverlaysInput } from "../../../../apps/backend/src/overlay-contracts.js";
-import type { AuditEventInput } from "../../../../apps/backend/src/services/audit-event-store.js";
-import type { LocalAuth } from "../../../../apps/backend/src/services/auth/local-auth.js";
-import { RefreshTokenRotationService } from "../../../../apps/backend/src/services/auth/refresh-token-rotation-service.js";
-import { OVERLAY_STEP_UP_ACTIONS, type OverlayStepUpAction } from "../../../../apps/backend/src/services/auth/step-up-routes.js";
-import { StepUpStore } from "../../../../apps/backend/src/services/auth/step-up-store.js";
-import { DataRouteControl } from "../../../../apps/backend/src/services/data-route-control.js";
+import type { AuditEventInput, Pool } from "../../../../apps/backend/src/overlay-sdk.js";
 import {
   __resetIntegrationRegistryForTesting,
-  IntegrationRegistry
-} from "../../../../apps/backend/src/services/integrations/integration-registry.js";
-import type { DataSettingChange } from "../../../../apps/backend/src/services/mail/setting-change-notices.js";
-import { ManagedToolCatalog } from "../../../../apps/backend/src/services/managed-tools/catalog.js";
-import { ManagedToolFactoryRegistry } from "../../../../apps/backend/src/services/managed-tools/factory.js";
-import { PiiImportScopeRegistry } from "../../../../apps/backend/src/services/pii/pii-import-scopes.js";
-import { FakeRefreshTokenRedis } from "../../../../apps/backend/src/test-helpers/fake-refresh-token-redis.js";
-import { createTestConfig } from "../../../../apps/backend/src/test-helpers/test-config.js";
+  createTestConfig,
+  DataRouteControl,
+  type DataSettingChange,
+  FakeRefreshTokenRedis,
+  IntegrationRegistry,
+  type LocalAuth,
+  ManagedToolCatalog,
+  ManagedToolFactoryRegistry,
+  OVERLAY_STEP_UP_ACTIONS,
+  type OverlayStepUpAction,
+  PiiImportScopeRegistry,
+  RefreshTokenRotationService,
+  StepUpStore
+} from "../../../../apps/backend/src/test-helpers/overlay-testing.js";
+import type { AttachOverlaysInput } from "../../../../apps/backend/src/overlay-contracts.js";
 import { bootstrap } from "../index.js";
 
 // The overlay's part of the step-up census (apps/backend/src/routes/

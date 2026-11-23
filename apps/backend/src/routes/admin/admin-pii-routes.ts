@@ -14,6 +14,7 @@ import {
   topQuerySchema,
   type KpiDeltas
 } from "./admin-pii-schemas.js";
+import type { AppDependencies } from "../../app-dependencies.js";
 
 // Re-exported so existing test imports keep working without churn.
 export { resolveRange } from "./admin-pii-schemas.js";
@@ -47,6 +48,18 @@ export interface AdminPiiRouteStores {
    * breakerTimeline rather than 404'ing the whole route.
    */
   platformEvents?: Pick<PlatformEventStore, "listByType">;
+}
+
+/** The PII routes' dependencies, taken from the app dependencies they use. */
+export function buildAdminPiiRouteStores(
+  deps: Pick<AppDependencies, "piiCircuitBreaker" | "piiProtection" | "piiAnalytics" | "platformEvents">
+): AdminPiiRouteStores {
+  return {
+    piiCircuitBreaker: deps.piiCircuitBreaker,
+    piiProtection: deps.piiProtection,
+    piiAnalytics: deps.piiAnalytics,
+    platformEvents: deps.platformEvents
+  };
 }
 
 export async function registerAdminPiiRoutes(

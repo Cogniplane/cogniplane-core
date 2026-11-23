@@ -5,8 +5,9 @@
 // packages or `private/` paths here: the public mirror ships this file.
 //
 // Each capability is the narrow set of methods that current overlays call.
-// These types keep the compile-time surface small. They are not a sandbox: an
-// overlay runs in the backend process and can import any backend module.
+// These types keep the compile-time surface small. An overlay imports other
+// backend code only through `overlay-sdk.ts`. Neither is a sandbox: an overlay
+// runs in the backend process.
 
 import type { FastifyInstance } from "fastify";
 
@@ -80,3 +81,18 @@ export type OverlayHandles = {
 
 /** Called once per `buildAppDependencies()`. Each call must return handles for that app only. */
 export type OverlayBootstrap = (input: AttachOverlaysInput) => OverlayHandles;
+
+// Event types that an overlay emits through the core audit pipeline. Core does
+// not name them. An overlay adds its names with module augmentation, so that
+// its `auditEvents.create` calls typecheck:
+//
+//   declare module "<path to this file>.js" {
+//     interface OverlayAuditEventTypes {
+//       "user.example.connected": true;
+//     }
+//   }
+//
+// The stability rule of core event types applies: do not rename an event type
+// after release.
+// eslint-disable-next-line @typescript-eslint/no-empty-object-type -- overlays augment this interface.
+export interface OverlayAuditEventTypes {}

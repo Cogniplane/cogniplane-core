@@ -340,7 +340,7 @@ Deployment of 089:
   transaction; the route kills the released sandbox only after the commit.
 - Add an audit event: add its name to `AUDIT_EVENT_TYPES`
   (`services/audit-event-types.ts`; an overlay augments `OverlayAuditEventTypes`
-  instead) and write it as above. To show it in Admin > History, add an entry
+  of `overlay-contracts.ts` instead) and write it as above. To show it in Admin > History, add an entry
   with its displayable fields to `HISTORY_EVENTS`; put no secret or free text
   there.
 - Per-turn token usage and `cost_usd` are on `messages`.

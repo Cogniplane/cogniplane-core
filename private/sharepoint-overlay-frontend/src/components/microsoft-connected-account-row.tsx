@@ -1,6 +1,6 @@
 "use client";
 
-import { ConnectedAccountRow } from "../../../../apps/frontend/src/components/connected-account-row";
+import { ConnectedAccountRow } from "../../../../apps/frontend/src/overlay-sdk/ui";
 import { useMicrosoftConnection } from "../hooks/use-microsoft-connection";
 
 export function MicrosoftConnectedAccountRow() {

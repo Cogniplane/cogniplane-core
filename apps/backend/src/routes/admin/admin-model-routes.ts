@@ -21,8 +21,9 @@ import type { CustomModelStore } from "../../services/custom-model-store.js";
 import type { TenantSettingsRecord } from "../../services/tenant-settings-store.js";
 import { customModelId, toAvailableModel } from "../../services/custom-model-store.js";
 import type { DynamicConfigService } from "../../services/dynamic-config-service.js";
-import type { OpenRouterCatalogFetcher } from "../../services/openrouter-catalog.js";
+import { buildOpenRouterCatalogFetcher, type OpenRouterCatalogFetcher } from "../../services/openrouter-catalog.js";
 import { adminAuditEvent, withAdmin } from "./admin-route-helpers.js";
+import type { AppDependencies } from "../../app-dependencies.js";
 
 export type ModelAdminRouteStores = {
   customModels: Pick<CustomModelStore, "list" | "create" | "delete">;
@@ -44,6 +45,38 @@ const VENDOR_MODEL_ID_PATTERN = /^[a-z0-9][a-z0-9._:-]*(\/[a-z0-9][a-z0-9._:-]*)
 const deleteQuerySchema = z.object({
   modelId: z.string().trim().min(1).max(200)
 });
+
+/** The model routes' dependencies, taken from the app dependencies they use. */
+export function buildAdminModelRouteStores(
+  deps: Pick<
+    AppDependencies,
+    "customModels" | "dynamicConfig" | "auditEvents" | "tenantOrgSettings" | "providerCredentials"
+  >
+): ModelAdminRouteStores {
+  return {
+    customModels: deps.customModels,
+    dynamicConfig: deps.dynamicConfig,
+    auditEvents: deps.auditEvents,
+    // Per-provider key source for GET /admin/models: a tenant-stored key wins
+    // over the platform env fallback, matching credential resolution order.
+    providerKeySources: async (tenantId) => {
+      const orgSettings = await deps.tenantOrgSettings.get(tenantId);
+      return Object.fromEntries(
+        MODEL_PROVIDERS.map((provider) => [
+          provider,
+          orgSettings.providerKeys[provider]
+            ? "tenant"
+            : deps.providerCredentials.platformProviders.has(provider)
+              ? "platform"
+              : "none"
+        ])
+      ) as Record<ModelProvider, "tenant" | "platform" | "none">;
+    },
+    // One process-wide cached fetcher: the OpenRouter catalog is global, not
+    // tenant-scoped, so all tenants share the cache.
+    fetchOpenRouterCatalog: buildOpenRouterCatalogFetcher()
+  };
+}
 
 export async function registerAdminModelRoutes(
   app: FastifyInstance,

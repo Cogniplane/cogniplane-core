@@ -1,31 +1,31 @@
 import { SignJWT, jwtVerify } from "jose";
 
 import type { OverlayConfig } from "../../../../apps/backend/src/overlay-contracts.js";
-import { decrypt, encrypt } from "../../../../apps/backend/src/lib/crypto-utils.js";
-import type { AuditEventInput, AuditEventStore } from "../../../../apps/backend/src/services/audit-event-store.js";
-// Adds the Microsoft audit event types that this service emits.
-import type {} from "../audit-event-types.js";
-import type { IntegrationStateStore } from "../../../../apps/backend/src/services/integrations/integration-state-store.js";
 import {
+  assertBoundIntegrationAccount,
+  type AuditEventInput,
+  type AuditEventStore,
+  ConnectionConfirmError,
   createOAuthBrowserBinding,
+  decrypt,
+  encrypt,
   getSecretKey,
   getVerificationKey,
+  IntegrationOAuthStateStore,
+  type IntegrationStateStore,
+  type OAuthBrowserBindingCookie,
   oauthBrowserBindingMatches,
-  type OAuthBrowserBindingCookie
-} from "../../../../apps/backend/src/services/integrations/integration-oauth-helpers.js";
-import { IntegrationOAuthStateStore } from "../../../../apps/backend/src/services/integrations/integration-oauth-state-store.js";
-import { uuidv7 } from "../../../../apps/backend/src/lib/uuid.js";
+  OwnerSecurityVersionChangedError,
+  type RuntimeInvalidator,
+  uuidv7
+} from "../../../../apps/backend/src/overlay-sdk.js";
+// Adds the Microsoft audit event types that this service emits.
+import type {} from "../audit-event-types.js";
 import type {
   MicrosoftConnectionRecord,
   MicrosoftConnectionStore,
   MicrosoftOwnerConnectionRecord
 } from "./microsoft-connection-store.js";
-import {
-  ConnectionConfirmError,
-  OwnerSecurityVersionChangedError
-} from "../../../../apps/backend/src/services/auth/security-change.js";
-import type { RuntimeInvalidator } from "../../../../apps/backend/src/services/integrations/contracts.js";
-import { assertBoundIntegrationAccount } from "../../../../apps/backend/src/services/integrations/integration-account-binding.js";
 
 import { MICROSOFT_REQUEST_TIMEOUT_MS } from "./graph-http.js";
 

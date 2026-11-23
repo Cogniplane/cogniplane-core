@@ -3,9 +3,14 @@
 import { useState } from "react";
 
 import type { MicrosoftFile, MicrosoftSite } from "../../../sharepoint-overlay-contracts/src/index";
-import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import {
+  Button,
+  Input,
+  Tabs,
+  TabsContent,
+  TabsList,
+  TabsTrigger
+} from "../../../../apps/frontend/src/overlay-sdk/ui";
 
 type Tab = "search" | "browse";
 

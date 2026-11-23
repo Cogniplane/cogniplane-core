@@ -36,6 +36,7 @@ import {
   type McpConnectionTestService
 } from "../../services/mcp/mcp-connection-test-service.js";
 import { apiError } from "../../lib/http-errors.js";
+import type { AppDependencies } from "../../app-dependencies.js";
 
 const serverIdParamsSchema = z.object({ serverId: adminIdSchema });
 
@@ -44,33 +45,49 @@ function respondMcpServerConflict(reply: FastifyReply) {
   return apiError("mcp_server_conflict", MCP_SERVER_CONFLICT_MESSAGE);
 }
 
+export type AdminMcpServerRouteStores = {
+  mcpAdmin: Pick<
+    McpAdminService,
+    | "listMcpServers"
+    | "listAllowedMcpServerIds"
+    | "createMcpServer"
+    | "updateMcpServer"
+    | "disableMcpServer"
+    | "setMcpServerPublished"
+    | "saveMcpServerWithAudience"
+    | "setInheritedMcpAudience"
+  >;
+  // Optional: when present, the server list is decorated with activation
+  // counts (last 30 days) per server. Failures are swallowed — counts are
+  // decorative. Tests that don't supply it just get servers with no counts.
+  activations?: Pick<ActivationTracker, "countMcpServerActivations">;
+  mcpConnectionTests?: Pick<McpConnectionTestService, "listLatest" | "test">;
+  // The content security policy sources that this server's widgets may use.
+  mcpAppCsp?: Pick<McpAppCspStore, "listForAdmin" | "approve" | "revoke">;
+  // Step-up and owner notice of the routes that change where tool calls go:
+  // a server's address and secret, who uses a shared server (audience and
+  // publish), and a widget domain. Disable, unpublish, and revoke send data
+  // nowhere new.
+  dataRoutes: Pick<DataRouteControl, "requireStepUp" | "ownerNotice">;
+};
+
+/** The MCP server routes' dependencies, taken from the app dependencies they use. */
+export function buildAdminMcpServerRouteStores(
+  deps: Pick<AppDependencies, "mcpAdmin" | "activationTracker" | "mcpConnectionTests" | "mcpAppCsp">,
+  controls: Pick<AdminMcpServerRouteStores, "dataRoutes">
+): AdminMcpServerRouteStores {
+  return {
+    mcpAdmin: deps.mcpAdmin,
+    activations: deps.activationTracker,
+    mcpConnectionTests: deps.mcpConnectionTests,
+    mcpAppCsp: deps.mcpAppCsp,
+    dataRoutes: controls.dataRoutes
+  };
+}
+
 export async function registerAdminMcpServerRoutes(
   app: FastifyInstance,
-  stores: {
-    mcpAdmin: Pick<
-      McpAdminService,
-      | "listMcpServers"
-      | "listAllowedMcpServerIds"
-      | "createMcpServer"
-      | "updateMcpServer"
-      | "disableMcpServer"
-      | "setMcpServerPublished"
-      | "saveMcpServerWithAudience"
-      | "setInheritedMcpAudience"
-    >;
-    // Optional: when present, the server list is decorated with activation
-    // counts (last 30 days) per server. Failures are swallowed — counts are
-    // decorative. Tests that don't supply it just get servers with no counts.
-    activations?: Pick<ActivationTracker, "countMcpServerActivations">;
-    mcpConnectionTests?: Pick<McpConnectionTestService, "listLatest" | "test">;
-    // The content security policy sources that this server's widgets may use.
-    mcpAppCsp?: Pick<McpAppCspStore, "listForAdmin" | "approve" | "revoke">;
-    // Step-up and owner notice of the routes that change where tool calls go:
-    // a server's address and secret, who uses a shared server (audience and
-    // publish), and a widget domain. Disable, unpublish, and revoke send data
-    // nowhere new.
-    dataRoutes: Pick<DataRouteControl, "requireStepUp" | "ownerNotice">;
-  }
+  stores: AdminMcpServerRouteStores
 ): Promise<void> {
   const ACTIVATION_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
   const mcpCreateBodySchema = createMcpCreateBodySchema(app.config?.MCP_UPSTREAM_ALLOW_PRIVATE_ADDRESSES);

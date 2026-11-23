@@ -14,17 +14,15 @@
 import dynamic from "next/dynamic";
 import type { ReactNode } from "react";
 
-import { registerSettingsSection } from "../../../../apps/frontend/src/app/settings/settings-sections";
-import { registerArtifactOrigin } from "../../../../apps/frontend/src/lib/artifact-origins";
-import { registerPiiScopeLabel } from "../../../../apps/frontend/src/lib/pii-scope-labels";
 import {
+  type FileSourceConnectionState,
+  type FileSourceDefinition,
+  type FileSourceFactoryInput,
+  registerArtifactOrigin,
   registerFileSource,
-  type FileSourceFactoryInput
-} from "../../../../apps/frontend/src/hooks/use-file-sources";
-import type {
-  FileSourceConnectionState,
-  FileSourceDefinition
-} from "../../../../apps/frontend/src/components/file-source-picker";
+  registerPiiScopeLabel,
+  registerSettingsSection
+} from "../../../../apps/frontend/src/overlay-sdk/registration";
 
 import { MicrosoftFileSourceBody } from "../components/microsoft-file-source";
 import { MicrosoftConnectedAccountRow } from "../components/microsoft-connected-account-row";

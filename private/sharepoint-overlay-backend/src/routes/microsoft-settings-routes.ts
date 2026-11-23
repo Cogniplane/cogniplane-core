@@ -6,15 +6,16 @@ import {
   MicrosoftUserConnectionSchema
 } from "../../../sharepoint-overlay-contracts/src/index.js";
 
-import { ensureUser } from "../../../../apps/backend/src/lib/db.js";
-import { apiError, notFoundError } from "../../../../apps/backend/src/lib/http-errors.js";
-import { parseRequestInput } from "../../../../apps/backend/src/lib/route-validation.js";
-import { serialize } from "../../../../apps/backend/src/lib/serialize-response.js";
 import {
+  apiError,
   ConnectionConfirmError,
   connectionConfirmErrorStatus,
-  connectionSaverVersion
-} from "../../../../apps/backend/src/services/auth/security-change.js";
+  connectionSaverVersion,
+  ensureUser,
+  notFoundError,
+  parseRequestInput,
+  serialize
+} from "../../../../apps/backend/src/overlay-sdk.js";
 import type { AttachOverlaysInput } from "../../../../apps/backend/src/overlay-contracts.js";
 import {
   MicrosoftConnectionNotConfiguredError,

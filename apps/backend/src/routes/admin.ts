@@ -1,224 +1,135 @@
-import { PersonAccessService } from "../services/person-access-service.js";
-import { registerAdminPersonAccessRoutes } from "./admin/admin-person-access-routes.js";
-import { registerAdminHistoryRoutes } from "./admin/admin-history-routes.js";
-import { registerAdminModelSpendingRoutes } from "./admin/admin-model-spending-routes.js";
-import type { ModelSpendingStore } from "../services/model-spending-store.js";
 import type { FastifyInstance } from "fastify";
 
-import { MODEL_PROVIDERS } from "@cogniplane/shared-types";
-import type { ModelProvider } from "@cogniplane/shared-types";
-
+import type { AppDependencies } from "../app-dependencies.js";
+import type { AppConfig } from "../config.js";
+import type { DataRouteControl } from "../services/data-route-control.js";
+import { PersonAccessService } from "../services/person-access-service.js";
 import { registerAdminArtifactRoutes } from "./admin/admin-artifact-routes.js";
+import { registerAdminHistoryRoutes } from "./admin/admin-history-routes.js";
 import {
+  buildAdminIntegrationsRouteStores,
   registerAdminIntegrationsRoutes,
   type AdminIntegrationsRouteStores
 } from "./admin/admin-integrations-routes.js";
-import { registerAdminMcpServerRoutes } from "./admin/admin-mcp-server-routes.js";
 import {
+  buildAdminMcpServerRouteStores,
+  registerAdminMcpServerRoutes,
+  type AdminMcpServerRouteStores
+} from "./admin/admin-mcp-server-routes.js";
+import {
+  buildAdminModelRouteStores,
   registerAdminModelRoutes,
   type ModelAdminRouteStores
 } from "./admin/admin-model-routes.js";
 import {
+  registerAdminModelSpendingRoutes,
+  type AdminModelSpendingRouteStores
+} from "./admin/admin-model-spending-routes.js";
+import {
+  registerAdminPersonAccessRoutes,
+  type AdminPersonAccessRouteStores
+} from "./admin/admin-person-access-routes.js";
+import {
+  buildAdminPiiRouteStores,
   registerAdminPiiRoutes,
   type AdminPiiRouteStores
 } from "./admin/admin-pii-routes.js";
 import {
+  buildAdminPolicyRouteStores,
   registerAdminPolicyRoutes,
   type PolicyRouteStores
 } from "./admin/admin-policy-routes.js";
-import { registerAdminRuntimeRoutes } from "./admin/admin-runtime-routes.js";
+import {
+  buildAdminRuntimeRouteStores,
+  registerAdminRuntimeRoutes,
+  type AdminRuntimeRouteStores
+} from "./admin/admin-runtime-routes.js";
 import { registerAdminSessionDetailRoute } from "./admin/admin-session-detail.js";
 import { registerAdminSessionRoutes } from "./admin/admin-session-routes.js";
 import {
+  buildAdminSkillRouteStores,
   registerAdminSkillRoutes,
   type AdminSkillRouteStores
 } from "./admin/admin-skill-routes.js";
 import {
+  buildAdminTenantSettingsRouteStores,
   registerAdminTenantSettingsRoutes,
   type TenantSettingsRouteStores
 } from "./admin/admin-tenant-settings-routes.js";
 import { registerAdminTokenUsageRoutes } from "./admin/admin-token-usage-routes.js";
-import { registerAdminUserRoutes } from "./admin/admin-user-routes.js";
-import type { AppConfig } from "../config.js";
-import type { AppDependencies } from "../app-dependencies.js";
-import { buildOpenRouterCatalogFetcher } from "../services/openrouter-catalog.js";
-import type { DataRouteControl } from "../services/data-route-control.js";
+import {
+  buildAdminUserRouteStores,
+  registerAdminUserRoutes,
+  type AdminUserRouteStores
+} from "./admin/admin-user-routes.js";
 
-export function buildAdminRouteStores(
+/**
+ * The admin routes' dependencies, one entry for each feature. Each feature
+ * file owns the type of its entry and the function that builds it, so a
+ * feature's wiring changes and is tested without the other features.
+ */
+export type AdminRouteFeatures = {
+  skills: AdminSkillRouteStores;
+  users: AdminUserRouteStores;
+  /** Absent in a test: the route is not registered. */
+  personAccess?: AdminPersonAccessRouteStores;
+  /** Absent in a test: the routes are not registered. */
+  modelSpending?: AdminModelSpendingRouteStores;
+  runtime: AdminRuntimeRouteStores;
+  /** Absent in a test: the routes are not registered. */
+  pii?: AdminPiiRouteStores;
+  tenantSettings: TenantSettingsRouteStores;
+  models: ModelAdminRouteStores;
+  policy: PolicyRouteStores;
+  integrations: AdminIntegrationsRouteStores;
+  mcpServers: AdminMcpServerRouteStores;
+};
+
+export function buildAdminRouteFeatures(
   deps: AppDependencies,
   extras: {
     config: AppConfig;
-    dataRoutes: DataRouteControl;
-  }
-) {
-  const tenantSettings = {
-    async getMarketplaceManifestUrl(tenantId: string): Promise<string | null> {
-      return (await deps.tenantOrgSettings.get(tenantId)).skillMarketplaceManifestUrl;
-    }
-  };
-
-  // Per-provider key source for GET /admin/models: a tenant-stored key wins
-  // over the platform env fallback, matching credential resolution order.
-  const providerKeySources = async (tenantId: string) => {
-    const orgSettings = await deps.tenantOrgSettings.get(tenantId);
-    return Object.fromEntries(
-      MODEL_PROVIDERS.map((provider) => [
-        provider,
-        orgSettings.providerKeys[provider]
-          ? "tenant"
-          : deps.providerCredentials.platformProviders.has(provider)
-            ? "platform"
-            : "none"
-      ])
-    ) as Record<ModelProvider, "tenant" | "platform" | "none">;
-  };
-
-  return {
-    personAccess: new PersonAccessService(deps),
-    modelSpending: deps.modelSpending,
-    config: extras.config,
-    dataRoutes: extras.dataRoutes,
-    dynamicConfig: deps.dynamicConfig,
-    mcpAdmin: deps.mcpAdmin,
-    skillMarketplace: deps.skillMarketplace,
-    auditEvents: deps.auditEvents,
-    skillBundleStorage: deps.skillBundleStorage,
-    runtimeSessions: deps.runtimeSessions,
-    deepAgentsAdapter: deps.deepAgentsAdapter,
-    runtimeAdapter: deps.runtimeAdapter,
-    tenantMembers: deps.tenantMembers,
-    githubConnections: deps.githubConnectionService,
-    integrationRegistry: deps.integrationRegistry,
-    integrationStates: deps.integrationStates,
-    tenantSettings,
-    providerKeySources,
-    customModels: deps.customModels,
-    // One process-wide cached fetcher: the OpenRouter catalog is global, not
-    // tenant-scoped, so all tenants share the cache.
-    fetchOpenRouterCatalog: buildOpenRouterCatalogFetcher(),
-    activations: deps.activationTracker,
-    mcpConnectionTests: deps.mcpConnectionTests,
-    mcpAppCsp: deps.mcpAppCsp,
-    piiCircuitBreaker: deps.piiCircuitBreaker,
-    piiProtection: deps.piiProtection,
-    piiAnalytics: deps.piiAnalytics,
-    platformEvents: deps.platformEvents,
-    managedToolCatalog: deps.managedToolCatalog,
-    policyRules: deps.policyRules,
-    policyDecisions: deps.policyDecisions,
-    policyService: deps.policyService
-  };
-}
-
-type OptionalAdminPiiRouteStores =
-  | AdminPiiRouteStores
-  | {
-      piiCircuitBreaker?: undefined;
-      piiProtection?: undefined;
-      piiAnalytics?: undefined;
-      platformEvents?: undefined;
-    };
-
-export type AdminRouteStores = AdminSkillRouteStores &
-  Parameters<typeof registerAdminUserRoutes>[1] &
-  Parameters<typeof registerAdminRuntimeRoutes>[1] &
-  Parameters<typeof registerAdminMcpServerRoutes>[1] &
-  TenantSettingsRouteStores &
-  ModelAdminRouteStores &
-  PolicyRouteStores &
-  AdminIntegrationsRouteStores &
-  OptionalAdminPiiRouteStores & {
-    modelSpending?: ModelSpendingStore;
-    personAccess?: Pick<PersonAccessService, "explain">;
     /**
      * Step-up and owner notice of the data routes (tenant settings, MCP
      * servers, integrations), of a Policy Center change that makes the policy
      * weaker, and of a skill release.
      */
     dataRoutes: DataRouteControl;
+  }
+): AdminRouteFeatures {
+  return {
+    skills: buildAdminSkillRouteStores(deps, extras),
+    users: buildAdminUserRouteStores(deps),
+    personAccess: new PersonAccessService(deps),
+    modelSpending: deps.modelSpending,
+    runtime: buildAdminRuntimeRouteStores(deps),
+    pii: buildAdminPiiRouteStores(deps),
+    tenantSettings: buildAdminTenantSettingsRouteStores(deps, extras),
+    models: buildAdminModelRouteStores(deps),
+    policy: buildAdminPolicyRouteStores(deps, extras),
+    integrations: buildAdminIntegrationsRouteStores(deps, extras),
+    mcpServers: buildAdminMcpServerRouteStores(deps, extras)
   };
+}
 
 export async function registerAdminRoutes(
   app: FastifyInstance,
-  stores: AdminRouteStores
+  features: AdminRouteFeatures
 ): Promise<void> {
-  await registerAdminSkillRoutes(app, {
-    dynamicConfig: stores.dynamicConfig,
-    skillReleaseImpact: stores.skillReleaseImpact,
-    skillMarketplace: stores.skillMarketplace,
-    auditEvents: stores.auditEvents,
-    skillBundleStorage: stores.skillBundleStorage,
-    githubConnections: stores.githubConnections,
-    tenantSettings: stores.tenantSettings,
-    activations: stores.activations,
-    dataRoutes: stores.dataRoutes
-  });
-  await registerAdminUserRoutes(app, {
-    tenantMembers: stores.tenantMembers,
-    auditEvents: stores.auditEvents
-  });
-  if (stores.personAccess) await registerAdminPersonAccessRoutes(app, stores.personAccess);
+  await registerAdminSkillRoutes(app, features.skills);
+  await registerAdminUserRoutes(app, features.users);
+  if (features.personAccess) await registerAdminPersonAccessRoutes(app, features.personAccess);
   await registerAdminTokenUsageRoutes(app);
   await registerAdminHistoryRoutes(app);
-  if (stores.modelSpending) await registerAdminModelSpendingRoutes(app, stores.modelSpending);
+  if (features.modelSpending) await registerAdminModelSpendingRoutes(app, features.modelSpending);
   await registerAdminSessionRoutes(app);
   await registerAdminSessionDetailRoute(app);
   await registerAdminArtifactRoutes(app);
-  await registerAdminRuntimeRoutes(app, {
-    auditEvents: stores.auditEvents,
-    runtimeSessions: stores.runtimeSessions,
-    deepAgentsAdapter: stores.deepAgentsAdapter
-  });
-  if (stores.piiCircuitBreaker) {
-    await registerAdminPiiRoutes(app, {
-      piiCircuitBreaker: stores.piiCircuitBreaker,
-      piiProtection: stores.piiProtection,
-      piiAnalytics: stores.piiAnalytics,
-      platformEvents: stores.platformEvents
-    });
-  }
-  await registerAdminTenantSettingsRoutes(app, {
-    dynamicConfig: stores.dynamicConfig,
-    dataRoutes: stores.dataRoutes,
-    managedToolCatalog: stores.managedToolCatalog,
-    // Custom models never advertise reasoning efforts (see CustomModelStore).
-    // Guarded: test wirings pass partial store literals without customModels.
-    listCustomModels: stores.customModels
-      ? async (tenantId) =>
-          (await stores.customModels.list(tenantId)).map((record) => ({
-            id: record.modelId,
-            provider: record.provider,
-            supportedEfforts: []
-          }))
-      : undefined
-  });
-  await registerAdminModelRoutes(app, {
-    customModels: stores.customModels,
-    dynamicConfig: stores.dynamicConfig,
-    auditEvents: stores.auditEvents,
-    providerKeySources: stores.providerKeySources,
-    fetchOpenRouterCatalog: stores.fetchOpenRouterCatalog
-  });
-  await registerAdminPolicyRoutes(app, {
-    policyRules: stores.policyRules,
-    policyDecisions: stores.policyDecisions,
-    policyService: stores.policyService,
-    dataRoutes: stores.dataRoutes
-  });
-  await registerAdminIntegrationsRoutes(app, {
-    config: stores.config,
-    integrationRegistry: stores.integrationRegistry,
-    integrationStates: stores.integrationStates,
-    auditEvents: stores.auditEvents,
-    runtimeAdapter: stores.runtimeAdapter,
-    dataRoutes: stores.dataRoutes
-  });
-
-  await registerAdminMcpServerRoutes(app, {
-    mcpAdmin: stores.mcpAdmin,
-    activations: stores.activations,
-    mcpConnectionTests: stores.mcpConnectionTests,
-    mcpAppCsp: stores.mcpAppCsp,
-    dataRoutes: stores.dataRoutes
-  });
+  await registerAdminRuntimeRoutes(app, features.runtime);
+  if (features.pii) await registerAdminPiiRoutes(app, features.pii);
+  await registerAdminTenantSettingsRoutes(app, features.tenantSettings);
+  await registerAdminModelRoutes(app, features.models);
+  await registerAdminPolicyRoutes(app, features.policy);
+  await registerAdminIntegrationsRoutes(app, features.integrations);
+  await registerAdminMcpServerRoutes(app, features.mcpServers);
 }

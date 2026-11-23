@@ -8,6 +8,8 @@ connectors is in [connectors](connectors.md). Security rules for tools are in
 - An overlay is a workspace package. Core calls its `bootstrap(input)` once for
   each `buildAppDependencies()` and reads back `OverlayHandles`. The contract is
   `apps/backend/src/overlay-contracts.ts`.
+- An overlay imports host code only through the [host entry
+  points](#host-entry-points).
 - The bundled SharePoint overlay (`private/sharepoint-overlay-*`) uses this
   contract. `apps/backend/src/overlays.ts` and `apps/frontend/src/overlays.ts`
   register it.
@@ -34,6 +36,37 @@ Core calls `bootstrap` from `app-dependencies.ts` and `attachRoutes` from
 `app-bootstrap.ts`, after all other routes. Return handles that belong to this
 app only: two apps in one process must not share probes or OAuth handlers.
 
+## Host entry points
+
+An overlay imports host code by relative path, and only from these files:
+
+| File | Use | Importer |
+|---|---|---|
+| `apps/backend/src/overlay-contracts.ts` | Types of the bootstrap input and handles; `OverlayAuditEventTypes` | Backend overlay |
+| `apps/backend/src/overlay-sdk.ts` | Backend helpers (`withTenantScope`, `requireRole`, `serialize`, OAuth helpers, `registerIntegration`, managed tool schemas) | Backend overlay |
+| `apps/backend/src/test-helpers/overlay-testing.ts` | Fakes, and the core classes that build an overlay input | Backend overlay tests |
+| `apps/backend/src/integration/support/overlay-testing.ts` | Throwaway database and fixtures | Backend overlay integration tests |
+| `apps/frontend/src/overlay-sdk/registration.ts` | Registration functions ([Frontend registration](#frontend-registration)) | Frontend overlay |
+| `apps/frontend/src/overlay-sdk/ui.ts` | Shared components | Frontend overlay |
+| `apps/frontend/src/overlay-sdk/data.ts` | API client, query keys, formatters | Frontend overlay |
+| `apps/frontend/src/overlay-sdk/oauth-settings.ts` | Parts of an OAuth settings page | Frontend overlay, not its `register` module |
+
+- `apps/backend/src/overlay-sdk.test.ts` and
+  `apps/frontend/src/overlay-sdk.test.ts` scan the `private/*-backend` and
+  `private/*-frontend` packages. They fail on an import of another host file,
+  on the `@/` alias, and on a `@cogniplane/backend` or `@cogniplane/frontend`
+  package path. Core must not import the entry points.
+- An entry point re-exports names one by one. When your overlay needs a new
+  host name, add it to the entry point; do not import the host file.
+- A host file can move without a change in an overlay: change the path in the
+  entry point. A change to the behavior or the signature of an exported name is
+  a change for every overlay.
+- The frontend `register` module loads on every page. It must not import
+  `apps/frontend/src/overlay-sdk/oauth-settings.ts`, or a module that does,
+  without `next/dynamic`.
+- The entry points are not a sandbox: an overlay runs in the backend process and
+  in the browser bundle.
+
 ## Managed tools
 
 `input.managedToolCatalog` and `input.managedToolFactoryRegistry` are per-app
@@ -56,8 +89,8 @@ input.managedToolFactoryRegistry.register("myint", (coreDeps) =>
 ## Integration descriptor
 
 ```ts
-// Relative path from the overlay package, as the SharePoint overlay does.
-import { getIntegrationDescriptor, registerIntegration } from "../../../apps/backend/src/services/integrations/integration-registry.js";
+// Relative path from the overlay package to the host entry point.
+import { getIntegrationDescriptor, registerIntegration } from "../../../apps/backend/src/overlay-sdk.js";
 
 const descriptor = {
   id: "myint", name: "My Integration", description: "Short description",
@@ -108,7 +141,7 @@ return result.artifact;
 - The registry refuses duplicates and core names (`chatPrompts`, `uploads`,
   `chat_prompt`, `upload`, `skill_corpus`), and freezes after bootstrap.
 - Label the toggle with `registerPiiScopeLabel({ scopeKey, label })`
-  (`apps/frontend/src/lib/pii-scope-labels.ts`).
+  ([Frontend registration](#frontend-registration)).
 
 ## Routes
 
@@ -132,14 +165,14 @@ return result.artifact;
 `apps/frontend/src/overlays.ts` imports the overlay's frontend `register` module
 for its side effects. The SharePoint example
 (`private/sharepoint-overlay-frontend/src/bootstrap/register.tsx`) uses these
-extension points:
+extension points, all from `apps/frontend/src/overlay-sdk/registration.ts`:
 
 | Function | Adds |
 |---|---|
-| `registerSettingsSection` (`app/settings/settings-sections`) | Account row and `/settings/<id>` page |
-| `registerFileSource` (`hooks/use-file-sources`) | A source in the file picker |
-| `registerArtifactOrigin` (`lib/artifact-origins`) | Origin label of imported artifacts |
-| `registerPiiScopeLabel` (`lib/pii-scope-labels`) | Label of a PII import scope toggle |
+| `registerSettingsSection` | Account row and `/settings/<id>` page |
+| `registerFileSource` | A source in the file picker |
+| `registerArtifactOrigin` | Origin label of imported artifacts |
+| `registerPiiScopeLabel` | Label of a PII import scope toggle |
 
 ## Host wiring
 
@@ -158,10 +191,9 @@ overlay's `attachRoutes`, and each optional field takes the value of the overlay
 that provides it. Add the package to `pnpm-workspace.yaml` and to
 `apps/backend/package.json`.
 
-The contract types limit what core passes, but they are not a sandbox: an
-overlay runs in the backend process. Overlays still import some backend helpers
-directly (`withTenantScope`, `requireRole`, `serialize`, OAuth state helpers,
-`registerIntegration`), so the contract stays in `apps/backend/src`.
+The contract types limit what core passes, and the [host entry
+points](#host-entry-points) limit what an overlay imports. They are not a
+sandbox: an overlay runs in the backend process.
 
 Package layout:
 
@@ -192,7 +224,11 @@ these differences:
 
 ## Tests
 
-- Test tool factories with colocated `*.test.ts` and in-memory fakes.
+- Test tool factories with colocated `*.test.ts` and in-memory fakes. Take host
+  fakes and classes from the test [host entry points](#host-entry-points).
+- `routes/full-app-step-up-census.test.ts` builds the full app with the overlay
+  and without it: core must register its routes in both cases, and each route
+  that an overlay adds must have a step-up classification.
 - Call `bootstrap` with two separate inputs: each app registry must get its own
   probes and handlers, and the second call must not throw on the static catalog.
 - Check that every tool id in the descriptor is in the catalog with

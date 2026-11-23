@@ -1,10 +1,15 @@
 import { Readable } from "node:stream";
 import { expect, test } from "vitest";
 
-import type { ArtifactRecord, ArtifactStore } from "../../../../apps/backend/src/services/artifacts/artifact-store.js";
-import type { AuditEventInput } from "../../../../apps/backend/src/services/audit-event-store.js";
-import { SessionUploadAccessError } from "../../../../apps/backend/src/services/session-upload-access.js";
-import { UploadAdmission } from "../../../../apps/backend/src/services/artifacts/upload-admission.js";
+import {
+  type ArtifactRecord,
+  type AuditEventInput,
+  SessionUploadAccessError
+} from "../../../../apps/backend/src/overlay-sdk.js";
+import {
+  type ArtifactStore,
+  UploadAdmission
+} from "../../../../apps/backend/src/test-helpers/overlay-testing.js";
 import {
   MicrosoftConnectionRequiredError,
   MicrosoftFilesService,

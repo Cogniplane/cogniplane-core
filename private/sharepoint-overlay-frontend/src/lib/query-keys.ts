@@ -1,4 +1,4 @@
-import { queryKeys } from "../../../../apps/frontend/src/lib/query-keys";
+import { queryKeys } from "../../../../apps/frontend/src/overlay-sdk/data";
 
 // React Query keys of this overlay. The values did not change when they moved
 // out of core. The settings key stays under the core settings prefix, so an

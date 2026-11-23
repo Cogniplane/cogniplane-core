@@ -36,6 +36,7 @@ that apply to all subsystems are in [security](../security.md).
 | `apps/backend/src/config.ts` | Environment schema and startup validation |
 | `apps/backend/src/app.ts`, `app-dependencies.ts`, `app-bootstrap.ts` | Composition root: builds stores and services, registers routes |
 | `apps/backend/src/runtime-contracts.ts`, `overlay-contracts.ts` | Runtime adapter and overlay contracts |
+| `apps/backend/src/overlay-sdk.ts`, `apps/frontend/src/overlay-sdk/` | The host code that an overlay can import ([overlays](../overlays.md#host-entry-points)) |
 | `apps/backend/src/domain/` | Model catalog (`domain/models.ts`), runtime manifest |
 | `apps/backend/src/routes/` | HTTP entry points; `routes/admin/` is the admin API; `routes/mcp.ts` is the MCP gateway |
 | `apps/backend/src/services/deep-agents/` | Agent runtime: adapter, graph, E2B backend, checkpointer, AG-UI mapping, middleware |
