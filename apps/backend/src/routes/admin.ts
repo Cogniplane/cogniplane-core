@@ -80,6 +80,7 @@ export function buildAdminRouteStores(
     dataRoutes: extras.dataRoutes,
     dynamicConfig: deps.dynamicConfig,
     mcpAdmin: deps.mcpAdmin,
+    skillReleaseImpact: deps.skillReleaseImpact,
     skillMarketplace: deps.skillMarketplace,
     auditEvents: deps.auditEvents,
     skillBundleStorage: deps.skillBundleStorage,
