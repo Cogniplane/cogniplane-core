@@ -19,6 +19,7 @@ import {
   respondAdminMutationError,
   withAdmin
 } from "./admin-route-helpers.js";
+import type { AppDependencies } from "../../app-dependencies.js";
 
 export type TenantSettingsRouteStores = {
   dynamicConfig: Pick<DynamicConfigService, "getOrCreateTenantSettings" | "updateTenantSettings">;
@@ -40,6 +41,25 @@ export type TenantSettingsRouteStores = {
     tenantId: string
   ) => Promise<{ id: string; provider: import("@cogniplane/shared-types").ModelProvider; supportedEfforts: readonly string[] }[]>;
 };
+
+/** The tenant settings routes' dependencies, taken from the app dependencies they use. */
+export function buildAdminTenantSettingsRouteStores(
+  deps: Pick<AppDependencies, "dynamicConfig" | "managedToolCatalog" | "customModels">,
+  controls: Pick<TenantSettingsRouteStores, "dataRoutes">
+): TenantSettingsRouteStores {
+  return {
+    dynamicConfig: deps.dynamicConfig,
+    managedToolCatalog: deps.managedToolCatalog,
+    dataRoutes: controls.dataRoutes,
+    // Custom models never advertise reasoning efforts (see CustomModelStore).
+    listCustomModels: async (tenantId) =>
+      (await deps.customModels.list(tenantId)).map((record) => ({
+        id: record.modelId,
+        provider: record.provider,
+        supportedEfforts: []
+      }))
+  };
+}
 
 export async function registerAdminTenantSettingsRoutes(
   app: FastifyInstance,

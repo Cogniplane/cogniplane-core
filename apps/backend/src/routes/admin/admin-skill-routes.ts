@@ -47,6 +47,7 @@ import {
   SKILL_FILE_PREVIEW_LIMIT_BYTES,
   readSkillRevisionFile
 } from "../../services/skills/skill-revision-file-reader.js";
+import type { AppDependencies } from "../../app-dependencies.js";
 const skillIdParamsSchema = z.object({ skillId: adminIdSchema });
 const skillRevisionFileQuerySchema = z.object({
   path: z.string().min(1).max(1024)
@@ -515,4 +516,36 @@ export async function registerAdminSkillRoutes(
     }
   }));
 
+}
+
+/** The skill routes' dependencies, taken from the app dependencies they use. */
+export function buildAdminSkillRouteStores(
+  deps: Pick<
+    AppDependencies,
+    | "dynamicConfig"
+    | "skillReleaseImpact"
+    | "skillMarketplace"
+    | "auditEvents"
+    | "skillBundleStorage"
+    | "githubConnectionService"
+    | "tenantOrgSettings"
+    | "activationTracker"
+  >,
+  controls: Pick<AdminSkillRouteStores, "dataRoutes">
+): AdminSkillRouteStores {
+  return {
+    dynamicConfig: deps.dynamicConfig,
+    skillReleaseImpact: deps.skillReleaseImpact,
+    skillMarketplace: deps.skillMarketplace,
+    auditEvents: deps.auditEvents,
+    skillBundleStorage: deps.skillBundleStorage,
+    githubConnections: deps.githubConnectionService,
+    tenantSettings: {
+      async getMarketplaceManifestUrl(tenantId: string): Promise<string | null> {
+        return (await deps.tenantOrgSettings.get(tenantId)).skillMarketplaceManifestUrl;
+      }
+    },
+    activations: deps.activationTracker,
+    dataRoutes: controls.dataRoutes
+  };
 }

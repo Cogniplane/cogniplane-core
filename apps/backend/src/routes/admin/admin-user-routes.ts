@@ -17,18 +17,28 @@ import {
 } from "./admin-route-helpers.js";
 import type { AuditEventStore } from "../../services/audit-event-store.js";
 import type { TenantMemberStore } from "../../services/tenant-member-store.js";
+import type { AppDependencies } from "../../app-dependencies.js";
 
 const userIdParamsSchema = z.object({ userId: adminIdSchema });
 const setBetaTesterBodySchema = z.object({
   isBetaTester: z.boolean()
 });
 
+export type AdminUserRouteStores = {
+  tenantMembers: Pick<TenantMemberStore, "listTenantMembers" | "setUserBetaTester">;
+  auditEvents: Pick<AuditEventStore, "create">;
+};
+
+/** The user routes' dependencies, taken from the app dependencies they use. */
+export function buildAdminUserRouteStores(
+  deps: Pick<AppDependencies, "tenantMembers" | "auditEvents">
+): AdminUserRouteStores {
+  return { tenantMembers: deps.tenantMembers, auditEvents: deps.auditEvents };
+}
+
 export async function registerAdminUserRoutes(
   app: FastifyInstance,
-  stores: {
-    tenantMembers: Pick<TenantMemberStore, "listTenantMembers" | "setUserBetaTester">;
-    auditEvents: Pick<AuditEventStore, "create">;
-  }
+  stores: AdminUserRouteStores
 ): Promise<void> {
   app.get("/admin/users", withAdmin(app, async (request) => {
     const users = await stores.tenantMembers.listTenantMembers(request.auth.tenantId);

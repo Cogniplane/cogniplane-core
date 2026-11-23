@@ -40,6 +40,7 @@ import {
   respondAdminNotFound,
   withAdmin
 } from "./admin-route-helpers.js";
+import type { AppDependencies } from "../../app-dependencies.js";
 
 export type PolicyRouteStores = {
   policyRules: Pick<
@@ -136,6 +137,19 @@ function parseDecisionFilters(query: DecisionsQuery): PolicyDecisionFilters | nu
     offset: parseIntParam(query.offset)
   });
   return parsed.success ? parsed.data : null;
+}
+
+/** The Policy Center routes' dependencies, taken from the app dependencies they use. */
+export function buildAdminPolicyRouteStores(
+  deps: Pick<AppDependencies, "policyRules" | "policyDecisions" | "policyService">,
+  controls: Pick<PolicyRouteStores, "dataRoutes">
+): PolicyRouteStores {
+  return {
+    policyRules: deps.policyRules,
+    policyDecisions: deps.policyDecisions,
+    policyService: deps.policyService,
+    dataRoutes: controls.dataRoutes
+  };
 }
 
 export async function registerAdminPolicyRoutes(

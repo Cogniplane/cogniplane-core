@@ -28,6 +28,7 @@ import {
   respondAdminNotFound,
   withAdmin,
 } from "./admin-route-helpers.js";
+import type { AppDependencies } from "../../app-dependencies.js";
 
 export type AdminIntegrationsRouteStores = {
   config: AppConfig;
@@ -108,6 +109,21 @@ async function invalidateAndAudit(
       userAgent: request.headers["user-agent"]
     });
   }
+}
+
+/** The integration routes' dependencies, taken from the app dependencies they use. */
+export function buildAdminIntegrationsRouteStores(
+  deps: Pick<AppDependencies, "integrationRegistry" | "integrationStates" | "auditEvents" | "runtimeAdapter">,
+  controls: Pick<AdminIntegrationsRouteStores, "config" | "dataRoutes">
+): AdminIntegrationsRouteStores {
+  return {
+    config: controls.config,
+    integrationRegistry: deps.integrationRegistry,
+    integrationStates: deps.integrationStates,
+    auditEvents: deps.auditEvents,
+    runtimeAdapter: deps.runtimeAdapter,
+    dataRoutes: controls.dataRoutes
+  };
 }
 
 export async function registerAdminIntegrationsRoutes(

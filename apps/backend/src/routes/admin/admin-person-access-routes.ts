@@ -8,7 +8,9 @@ import { PersonAccessMemberNotFound, type PersonAccessService } from "../../serv
 import { PersonalCapabilityAccessError } from "../../services/personal-capability-store.js";
 import { MemberMcpAccessError } from "../../services/member-mcp-credential-store.js";
 
-export async function registerAdminPersonAccessRoutes(app: FastifyInstance, service: Pick<PersonAccessService, "explain">) {
+export type AdminPersonAccessRouteStores = Pick<PersonAccessService, "explain">;
+
+export async function registerAdminPersonAccessRoutes(app: FastifyInstance, service: AdminPersonAccessRouteStores) {
   app.get("/admin/users/:userId/skills-connections", withAdmin(app, async (request, reply) => {
     reply.header("Cache-Control", "private, no-store");
     const params = z.object({ userId: adminIdSchema }).safeParse(request.params);

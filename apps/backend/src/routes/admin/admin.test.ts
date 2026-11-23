@@ -4,7 +4,7 @@ import multipart from "@fastify/multipart";
 import Fastify, { type FastifyInstance } from "fastify";
 import JSZip from "jszip";
 
-import { registerAdminRoutes, type AdminRouteStores } from "../admin.js";
+import { registerAdminRoutes, type AdminRouteFeatures } from "../admin.js";
 import { handleAppError } from "../../app.js";
 import type { Pool } from "../../lib/db.js";
 import { AdminConfigError } from "../../services/admin-config-error.js";
@@ -65,6 +65,18 @@ function createSkillBundleStorage(): AdminRouteStores["skillBundleStorage"] {
   };
 }
 
+// The tests of this file give one flat set of fakes. The helper below gives
+// each feature the entries that it owns.
+type AdminRouteStores = AdminRouteFeatures["skills"] &
+  AdminRouteFeatures["users"] &
+  AdminRouteFeatures["runtime"] &
+  Omit<AdminRouteFeatures["tenantSettings"], "listCustomModels"> &
+  AdminRouteFeatures["models"] &
+  AdminRouteFeatures["policy"] &
+  AdminRouteFeatures["integrations"] &
+  AdminRouteFeatures["mcpServers"] &
+  Pick<AdminRouteFeatures, "personAccess" | "modelSpending">;
+
 type RequiredAdminTestRouteStore =
   | "dynamicConfig"
   | "skillMarketplace"
@@ -75,22 +87,13 @@ type RequiredAdminTestRouteStore =
   | "tenantMembers";
 
 type AdminTestRouteStores = Pick<AdminRouteStores, RequiredAdminTestRouteStore> &
-  Partial<
-    Omit<
-      AdminRouteStores,
-      | RequiredAdminTestRouteStore
-      | "piiCircuitBreaker"
-      | "piiProtection"
-      | "piiAnalytics"
-      | "platformEvents"
-    >
-  >;
+  Partial<Omit<AdminRouteStores, RequiredAdminTestRouteStore>>;
 
 async function registerTestAdminRoutes(
   app: FastifyInstance,
   stores: AdminTestRouteStores
 ): Promise<void> {
-  await registerAdminRoutes(app, {
+  const flat: AdminRouteStores = {
     dataRoutes: devDataRoutes(),
     config: createTestConfig({}),
     managedToolCatalog: {
@@ -184,11 +187,27 @@ async function registerTestAdminRoutes(
     },
     // The fake of the tests serves the settings and the MCP administration.
     mcpAdmin: stores.dynamicConfig as unknown as AdminRouteStores["mcpAdmin"],
-    ...stores,
-    piiCircuitBreaker: undefined,
-    piiProtection: undefined,
-    piiAnalytics: undefined,
-    platformEvents: undefined
+    ...stores
+  };
+  await registerAdminRoutes(app, {
+    skills: flat,
+    users: flat,
+    personAccess: flat.personAccess,
+    modelSpending: flat.modelSpending,
+    runtime: flat,
+    tenantSettings: {
+      ...flat,
+      listCustomModels: async (tenantId) =>
+        (await flat.customModels.list(tenantId)).map((record) => ({
+          id: record.modelId,
+          provider: record.provider,
+          supportedEfforts: []
+        }))
+    },
+    models: flat,
+    policy: flat,
+    integrations: flat,
+    mcpServers: flat
   });
 }
 

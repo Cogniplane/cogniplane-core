@@ -20,17 +20,31 @@ import {
   createAdminAuditEvent,
   withAdmin
 } from "./admin-route-helpers.js";
+import type { AppDependencies } from "../../app-dependencies.js";
+
+export type AdminRuntimeRouteStores = {
+  auditEvents: Pick<AuditEventStore, "create">;
+  runtimeSessions: Pick<RuntimeSessionStore, "listRecent">;
+  deepAgentsAdapter: Pick<
+    DeepAgentsRuntimeAdapter,
+    "getRuntimeHealthDetail" | "invalidateTenantRuntimes"
+  >;
+};
+
+/** The runtime routes' dependencies, taken from the app dependencies they use. */
+export function buildAdminRuntimeRouteStores(
+  deps: Pick<AppDependencies, "auditEvents" | "runtimeSessions" | "deepAgentsAdapter">
+): AdminRuntimeRouteStores {
+  return {
+    auditEvents: deps.auditEvents,
+    runtimeSessions: deps.runtimeSessions,
+    deepAgentsAdapter: deps.deepAgentsAdapter
+  };
+}
 
 export async function registerAdminRuntimeRoutes(
   app: FastifyInstance,
-  stores: {
-    auditEvents: Pick<AuditEventStore, "create">;
-    runtimeSessions: Pick<RuntimeSessionStore, "listRecent">;
-    deepAgentsAdapter: Pick<
-      DeepAgentsRuntimeAdapter,
-      "getRuntimeHealthDetail" | "invalidateTenantRuntimes"
-    >;
-  }
+  stores: AdminRuntimeRouteStores
 ): Promise<void> {
   app.get("/admin/runtime-sessions", withAdmin(app, async (request) => {
     const runtimeSessions = await stores.runtimeSessions.listRecent(request.auth.tenantId, 100);

@@ -12,8 +12,10 @@ const policySchema = z.object({
 }).strict();
 const idSchema = z.object({ reservationId: z.string().min(1).max(200) });
 
+export type AdminModelSpendingRouteStores = Pick<ModelSpendingStore, "get" | "setPolicy" | "close" | "reconcile">;
+
 export async function registerAdminModelSpendingRoutes(
-  app: FastifyInstance, store: Pick<ModelSpendingStore, "get" | "setPolicy" | "close" | "reconcile">
+  app: FastifyInstance, store: AdminModelSpendingRouteStores
 ): Promise<void> {
   app.get("/admin/model-spending", withAdmin(app, async (request, reply) => {
     const query = z.object({ cursor: z.string().min(1).max(200).optional() }).strict().safeParse(request.query);
